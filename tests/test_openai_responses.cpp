@@ -116,7 +116,12 @@ int test_basic_request_and_resolution() {
                        {"max_output_tokens", 64},
                        {"temperature", 0.3},
                        {"top_p", 0.8},
-                       {"reasoning", Json{{"effort", "medium"}}},
+                       {"reasoning",
+                        Json{{"effort", "medium"},
+                             {"summary", "auto"},
+                             {"context", "auto"},
+                             {"generate_summary", true},
+                             {"mode", "auto"}}},
                        {"metadata", Json{{"trace", "abc"}}}};
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
@@ -140,7 +145,7 @@ int test_basic_request_and_resolution() {
                       "explicit output budget reaches generation request");
     failures +=
         check(request.prompt.generation.reasoning_effort == RequestedReasoningEffort::Medium,
-              "reasoning effort parsed");
+              "nonexecutable reasoning fields are ignored and effort parsed");
     failures += check(request.store && !request.stream && request.parallel_tool_calls,
                       "Responses defaults applied");
 

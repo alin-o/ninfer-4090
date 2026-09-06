@@ -1028,13 +1028,8 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
-        if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
-            bad_request("reasoning." + std::string(key) +
-                            " changes reasoning input or output and is not supported",
-                        "reasoning", "reasoning_option_not_supported");
-        }
-    }
+    // Only "effort" is executable: summary/context/generate_summary/mode have no Engine
+    // counterpart, so they are accepted and ignored (llama.cpp drops everything but effort).
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {
         bad_request("reasoning.effort must be a string", "reasoning");

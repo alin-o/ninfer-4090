@@ -48,6 +48,35 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
+# --- Compiler cache (ccache) -------------------------------------------------
+# Wrap C, C++, and CUDA compiles in ccache when a recent enough version is
+# available (4.6 added usable nvcc support). The launcher applies only to -c
+# compiles, never to the CUDA device-link step. Disable with
+# -DNINFER_USE_CCACHE=OFF.
+option(NINFER_USE_CCACHE "Wrap C, C++, and CUDA compiles in ccache when available" ON)
+if(NINFER_USE_CCACHE)
+  find_program(NINFER_CCACHE_EXECUTABLE ccache)
+  if(NINFER_CCACHE_EXECUTABLE)
+    execute_process(COMMAND "${NINFER_CCACHE_EXECUTABLE}" --version
+                    OUTPUT_VARIABLE _ninfer_ccache_version
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_ninfer_ccache_version MATCHES "ccache version ([0-9]+)\\.([0-9]+)")
+      if("${CMAKE_MATCH_1}.${CMAKE_MATCH_2}" VERSION_GREATER_EQUAL 4.6)
+        set(CMAKE_C_COMPILER_LAUNCHER "${NINFER_CCACHE_EXECUTABLE}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${NINFER_CCACHE_EXECUTABLE}")
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${NINFER_CCACHE_EXECUTABLE}")
+        message(STATUS "ccache: using ${NINFER_CCACHE_EXECUTABLE} "
+                       "v${CMAKE_MATCH_1}.${CMAKE_MATCH_2} for C, C++, and CUDA compiles")
+      else()
+        message(STATUS "ccache: v${CMAKE_MATCH_1}.${CMAKE_MATCH_2} is older than 4.6 "
+                       "(no nvcc support); continuing without a compiler cache")
+      endif()
+    endif()
+  else()
+    message(STATUS "ccache: not found; continuing without a compiler cache")
+  endif()
+endif()
+
 set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_MEDIA_ACQUIRE ON)

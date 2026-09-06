@@ -383,7 +383,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, an empty array, or `["reasoning.encrypted_content"]`; the Codex hint is accepted as a no-op because reasoning items are emitted without opaque encrypted state |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -608,7 +608,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
+moderation, Structured Outputs/JSON mode, `include` values other than `reasoning.encrypted_content`, background execution, compaction,
 files/audio, and OpenAI-hosted/MCP tools. These are compatibility boundaries, not silently
 accepted placeholders.
 

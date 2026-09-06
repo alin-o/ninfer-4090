@@ -1314,11 +1314,21 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         }
     }
     if (body.contains("include") && !body.at("include").is_null()) {
-        if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        if (!body.at("include").is_array()) {
+            bad_request("include must be an array", "include", "invalid_type");
+        }
+        // Codex sends ["reasoning.encrypted_content"] on every turn; it asks for opaque
+        // encrypted reasoning state that this server cannot produce, and its absence is a
+        // no-op for clients (reasoning items are emitted without it). Any other value has
+        // no available response representation and is rejected explicitly.
+        for (const Json& entry : body.at("include")) {
+            const std::string value = entry.is_string() ? entry.get<std::string>() : std::string();
+            if (value != "reasoning.encrypted_content") {
+                bad_request("unsupported include value '" + value +
+                                "' (only "
+                                "'reasoning.encrypted_content' is accepted)",
+                            "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

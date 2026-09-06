@@ -4,15 +4,36 @@ FROM carapa-llama-cpp:latest AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ccache \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY . .
 
-RUN cmake -S . -B /build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DNINFER_BUILD_APPS=ON \
-    -DBUILD_TESTING=OFF \
-    -DNINFER_BUILD_BENCHMARKS=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve
+# /build is a BuildKit cache mount, so Ninja's tree survives across docker
+# builds: even when the source layer changes, only modified files recompile.
+# The toolchain stamp forces a clean tree if the base image's compilers move.
+# Cache-mount contents are invisible outside this RUN (COPY --from=build sees
+# only the image filesystem), so the finished binaries are staged to /out.
+RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build \
+    --mount=type=cache,id=ninfer-4090-sm89-ccache,target=/root/.cache/ccache \
+    set -eux; \
+    export CCACHE_DIR=/root/.cache/ccache; \
+    toolchain="cuda$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')-gcc$(gcc -dumpversion)"; \
+    if [ -f /build/.toolchain ] && [ "$(cat /build/.toolchain)" != "$toolchain" ]; then \
+      echo "toolchain changed to $toolchain; clearing /build"; \
+      find /build -mindepth 1 -delete; \
+    fi; \
+    printf '%s' "$toolchain" > /build/.toolchain; \
+    cmake -S /src -B /build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DNINFER_BUILD_APPS=ON \
+      -DBUILD_TESTING=OFF \
+      -DNINFER_BUILD_BENCHMARKS=OFF; \
+    cmake --build /build --parallel --target ninfer ninfer-serve; \
+    mkdir -p /out; \
+    install -m 0755 /build/apps/ninfer /build/apps/ninfer-serve /out/
 
 FROM carapa-llama-cpp:latest
 
@@ -27,8 +48,8 @@ RUN apt-get update \
     libswscale9 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
-COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /out/ninfer /usr/local/bin/ninfer
+COPY --from=build /out/ninfer-serve /usr/local/bin/ninfer-serve
 
 WORKDIR /workspace
 EXPOSE 8080

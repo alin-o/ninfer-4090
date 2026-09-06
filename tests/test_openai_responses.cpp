@@ -946,6 +946,25 @@ int test_explicit_rejections() {
                           }) == "invalid_type",
                           "client_metadata rejects malformed top-level shapes");
     }
+    value            = base;
+    value["include"] = Json::array({Json("reasoning.encrypted_content")});
+    failures +=
+        check(api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }) == "",
+              "the Codex reasoning include hint is accepted as a no-op");
+
+    value            = base;
+    value["include"] = Json::array({Json("web_search_calls")});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "include_not_supported",
+                      "include values without a response representation are rejected");
+
+    value            = base;
+    value["include"] = "reasoning.encrypted_content";
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "invalid_type",
+                      "include must be an array");
     return failures;
 }
 

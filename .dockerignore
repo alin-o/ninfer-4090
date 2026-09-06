@@ -36,3 +36,7 @@ Dockerfile
 .dockerignore
 .env
 *.sh
+dist
+model-cards
+docs
+*.md

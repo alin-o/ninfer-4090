@@ -829,11 +829,14 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
 
 // Type 'custom' Responses tools take one free-form string. They lower to a normal Engine
 // function whose single string parameter is decoded verbatim, and the wire boundary re-emits
-// custom_tool_call items carrying the raw string.
+// custom_tool_call items carrying the raw string. Clients such as the Codex CLI declare the
+// free-form output grammar in a `format` member (for example a Lark grammar for apply_patch);
+// NInfer accepts that member opaquely and echoes it back, but does not enforce it.
 ParsedFunctionTool
 parse_custom_tool(const Json& item,
                   std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
-    static const std::unordered_set<std::string> allowed_members = {"type", "name", "description"};
+    static const std::unordered_set<std::string> allowed_members = {"type", "name", "description",
+                                                                    "defer_loading", "format"};
     reject_nonnull_unknown_members(item, allowed_members, "tools");
     if (!item.contains("name") || !item.at("name").is_string()) {
         bad_request("custom tool name must be a string", "tools");
@@ -855,7 +858,16 @@ parse_custom_tool(const Json& item,
         }
         description = item.at("description").get<std::string>();
     }
-    parsed.definition.description       = std::move(description);
+    parsed.definition.description = std::move(description);
+    if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+        if (!item.at("defer_loading").is_boolean()) {
+            bad_request("custom tool defer_loading must be a boolean", "tools");
+        }
+        if (item.at("defer_loading").get<bool>()) {
+            bad_request("deferred tool loading is not supported", "tools",
+                        "deferred_tools_not_supported");
+        }
+    }
     parsed.definition.input_schema_json = Json{
         {"type", "object"},
         {"properties", Json{{"input", Json{{"type", "string"}}}}},
@@ -864,6 +876,12 @@ parse_custom_tool(const Json& item,
     parsed.canonical = {{"type", "custom"}, {"name", name}};
     if (!parsed.definition.description.empty()) {
         parsed.canonical["description"] = parsed.definition.description;
+    }
+    if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+        parsed.canonical["defer_loading"] = false;
+    }
+    if (item.contains("format") && !item.at("format").is_null()) {
+        parsed.canonical["format"] = item.at("format");
     }
     return parsed;
 }

@@ -473,7 +473,10 @@ and are declared directly rather than inside a namespace. NInfer lowers each cus
 Engine function with a single required string parameter `input` and re-emits model output as
 `custom_tool_call` Items carrying the raw `input` string instead of an `arguments` JSON object;
 argument streaming events are suppressed for custom tools. History `custom_tool_call` Items are
-replayed verbatim, with their `input` string re-wrapped for the model prompt.
+replayed verbatim, with their `input` string re-wrapped for the model prompt. The free-form
+`format` member (for example the Codex CLI Lark grammar for `apply_patch`) is accepted as opaque
+metadata and echoed in the response `tools` array without enforcement, and `defer_loading`
+follows the same rules as for functions.
 
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct

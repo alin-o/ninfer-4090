@@ -116,12 +116,11 @@ int test_basic_request_and_resolution() {
                        {"max_output_tokens", 64},
                        {"temperature", 0.3},
                        {"top_p", 0.8},
-                       {"reasoning",
-                        Json{{"effort", "medium"},
-                             {"summary", "auto"},
-                             {"context", "auto"},
-                             {"generate_summary", true},
-                             {"mode", "auto"}}},
+                       {"reasoning", Json{{"effort", "medium"},
+                                          {"summary", "auto"},
+                                          {"context", "auto"},
+                                          {"generate_summary", true},
+                                          {"mode", "auto"}}},
                        {"metadata", Json{{"trace", "abc"}}}};
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
@@ -717,6 +716,63 @@ int test_custom_tools() {
                       "custom tool lowers to one Engine function with a single string input");
     failures += check(request.tool_identities.at("apply_patch").custom,
                       "custom identity is recorded for wire restoration");
+
+    const Json freeform = {
+        {"model", "m"},
+        {"input", "patch the build"},
+        {"tools", Json::array({Json{
+                      {"type", "custom"},
+                      {"name", "apply_patch"},
+                      {"description", "The apply_patch tool edits files."},
+                      {"format", Json{{"type", "grammar"},
+                                      {"syntax", "lark"},
+                                      {"definition", "start: begin_patch hunk+ end_patch"}}}}})}};
+    const OpenAIResponsesCreateRequest freeform_request =
+        parse_openai_responses_create_request(freeform, limits());
+    failures += check(
+        freeform_request.tools.size() == 1 && freeform_request.tools[0].at("type") == "custom" &&
+            freeform_request.tools[0].at("format").at("type") == "grammar" &&
+            freeform_request.tools[0].at("format").at("syntax") == "lark" &&
+            freeform_request.tools[0].at("format").at("definition") ==
+                "start: begin_patch hunk+ end_patch" &&
+            Json::parse(freeform_request.prompt.generation.tools[0].input_schema_json) ==
+                Json{{"type", "object"},
+                     {"properties", Json{{"input", Json{{"type", "string"}}}}},
+                     {"required", Json::array({"input"})},
+                     {"additionalProperties", false}},
+        "freeform custom tool format is accepted opaquely and echoed on the wire");
+
+    const Json deferred_on = {
+        {"model", "m"},
+        {"input", "patch"},
+        {"tools", Json::array({Json{
+                      {"type", "custom"}, {"name", "apply_patch"}, {"defer_loading", true}}})}};
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(deferred_on, limits());
+                      }) == "deferred_tools_not_supported",
+                      "defer_loading on a custom tool is rejected explicitly");
+
+    const Json deferred_off = {
+        {"model", "m"},
+        {"input", "patch"},
+        {"tools", Json::array({Json{
+                      {"type", "custom"}, {"name", "apply_patch"}, {"defer_loading", false}}})}};
+    const OpenAIResponsesCreateRequest deferred_request =
+        parse_openai_responses_create_request(deferred_off, limits());
+    failures += check(deferred_request.tools.size() == 1 &&
+                          deferred_request.tools[0].at("defer_loading") == false,
+                      "false defer_loading on a custom tool is a no-op echo");
+
+    const Json custom_unknown_member = {
+        {"model", "m"},
+        {"input", "patch"},
+        {"tools",
+         Json::array({Json{{"type", "custom"}, {"name", "apply_patch"}, {"strict", true}}})}};
+    failures +=
+        check(api_code([&] {
+                  (void)parse_openai_responses_create_request(custom_unknown_member, limits());
+              }) == "parameter_not_supported",
+              "unknown custom tool member is rejected");
 
     const Json history = {
         {"model", "m"},

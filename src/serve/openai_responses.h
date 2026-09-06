@@ -23,6 +23,9 @@ struct GenerationOutcome;
 struct OpenAIResponsesFunctionIdentity {
     std::string name;
     std::optional<std::string> wire_namespace;
+    // Type 'custom' Responses tools take one free-form string. The Engine still sees a normal
+    // function with a single string parameter; the wire boundary restores the custom item shape.
+    bool custom = false;
 
     bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
 };

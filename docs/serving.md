@@ -375,7 +375,7 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
+| `tools` | direct function definitions, direct custom tools, or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
@@ -405,6 +405,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
+| `custom_tool_call` | completed custom-tool call with optional `id` and namespace, plus required `call_id`, `name`, and string `input` |
+| `custom_tool_call_output` | completed custom-tool result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
 `reasoning` -> assistant message content -> `function_call`. Multiple message Items append their
@@ -466,6 +468,13 @@ separate `namespace` and `name` fields in aggregate output, SSE events, and repl
 function name may therefore appear in different namespaces. Namespace members remain ordinary
 client-executed functions; this does not add a remote MCP executor.
 
+Custom tools use the Responses `type:"custom"` form with `name` and an optional `description`,
+and are declared directly rather than inside a namespace. NInfer lowers each custom tool to one
+Engine function with a single required string parameter `input` and re-emits model output as
+`custom_tool_call` Items carrying the raw `input` string instead of an `arguments` JSON object;
+argument streaming events are suppressed for custom tools. History `custom_tool_call` Items are
+replayed verbatim, with their `input` string re-wrapped for the model prompt.
+
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
@@ -475,9 +484,10 @@ without changing declaration order, while `tool_choice:"none"` disables structur
 when the history contains earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+`strict:true`, required or named tool choice, hosted tools, and remote MCP tools are rejected.
+Custom tools cannot be declared inside a namespace. Deferred loading, output schemas, and caller
+restrictions that exclude direct invocation are also rejected because their semantics cannot be
+honored.
 
 ### Response object and usage
 
@@ -486,7 +496,7 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 
 - a `reasoning` Item containing raw `reasoning_text` and an empty summary;
 - an assistant `message` containing an `output_text` part;
-- one or more `function_call` Items.
+- one or more `function_call` or `custom_tool_call` Items.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
@@ -596,7 +606,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+files/audio, and OpenAI-hosted/MCP tools. These are compatibility boundaries, not silently
 accepted placeholders.
 
 ## Anthropic Messages

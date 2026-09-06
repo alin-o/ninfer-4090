@@ -689,6 +689,148 @@ int test_namespace_tools() {
     return failures;
 }
 
+int test_custom_tools() {
+    const Json custom = {
+        {"type", "custom"}, {"name", "apply_patch"}, {"description", "Apply a patch"}};
+    const Json body = {
+        {"model", "m"}, {"input", "patch the build"}, {"tools", Json::array({custom})}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    int failures = 0;
+    failures += check(request.tools.size() == 1 && request.tools[0].at("type") == "custom" &&
+                          request.tools[0].at("name") == "apply_patch" &&
+                          request.tools[0].at("description") == "Apply a patch",
+                      "custom tool wire echo keeps the custom item shape");
+    failures += check(request.prompt.generation.tools.size() == 1 &&
+                          request.prompt.generation.tools[0].name == "apply_patch" &&
+                          request.prompt.generation.tools[0].description == "Apply a patch" &&
+                          Json::parse(request.prompt.generation.tools[0].input_schema_json) ==
+                              Json{{"type", "object"},
+                                   {"properties", Json{{"input", Json{{"type", "string"}}}}},
+                                   {"required", Json::array({"input"})},
+                                   {"additionalProperties", false}},
+                      "custom tool lowers to one Engine function with a single string input");
+    failures += check(request.tool_identities.at("apply_patch").custom,
+                      "custom identity is recorded for wire restoration");
+
+    const Json history = {
+        {"model", "m"},
+        {"input", Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "patch it"}},
+                               Json{{"type", "custom_tool_call"},
+                                    {"call_id", "call_patch"},
+                                    {"name", "apply_patch"},
+                                    {"input", "*** Begin Patch\n*** End Patch"}},
+                               Json{{"type", "custom_tool_call_output"},
+                                    {"call_id", "call_patch"},
+                                    {"name", "apply_patch"},
+                                    {"output", "Done!"}}})}};
+    const OpenAIResponsesCreateRequest replay =
+        parse_openai_responses_create_request(history, limits());
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(replay.prompt, store, "resp_custom", true);
+    failures += check(resolved.generation.messages[1].tool_calls[0].name == "apply_patch" &&
+                          resolved.generation.messages[1].tool_calls[0].arguments_json ==
+                              R"({"input":"*** Begin Patch\n*** End Patch"})" &&
+                          resolved.generation.messages[2].tool_result_name == "apply_patch" &&
+                          replay.prompt.input_items[1].at("type") == "custom_tool_call" &&
+                          replay.prompt.input_items[1].at("call_id") == "call_patch" &&
+                          replay.prompt.input_items[2].at("type") == "custom_tool_call_output",
+                      "custom tool call history lowers to the single input parameter");
+
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "apply_patch", .arguments_json = R"({"input":"*** Begin Patch\n*** End Patch"})"});
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_custom_out", 1, request, {}, outcome);
+    const Json& output = built.body.at("output").at(0);
+    failures += check(output.at("type") == "custom_tool_call" &&
+                          output.at("input") == "*** Begin Patch\n*** End Patch" &&
+                          !output.contains("arguments") &&
+                          built.output_history[0].tool_calls[0].name == "apply_patch",
+                      "terminal response re-emits custom_tool_call with the raw string");
+
+    OpenAIResponsesCreateRequest stream_request = request;
+    stream_request.stream                       = true;
+    OpenAIResponsesEventStream stream("resp_custom_stream", 1, stream_request, {});
+    (void)stream.start();
+    const OpenAIResponsesStreamFinish streamed = stream.finish(outcome);
+    bool saw_added                             = false;
+    bool saw_item_done                         = false;
+    bool saw_arguments                         = false;
+    for (const std::string& wire : streamed.events_before_terminal) {
+        const Json event       = parse_event(wire);
+        const std::string type = event.at("type").get<std::string>();
+        if (type.starts_with("response.function_call_arguments.")) {
+            saw_arguments = true;
+        } else if (type == "response.output_item.added" &&
+                   event.at("item").at("type") == "custom_tool_call") {
+            saw_added =
+                event.at("item").at("input") == "" && !event.at("item").contains("arguments");
+        } else if (type == "response.output_item.done" &&
+                   event.at("item").at("type") == "custom_tool_call") {
+            saw_item_done = event.at("item").at("input") == "*** Begin Patch\n*** End Patch" &&
+                            !event.at("item").contains("arguments");
+        }
+    }
+    failures += check(saw_added && saw_item_done && !saw_arguments,
+                      "custom tool streaming carries input only and suppresses argument events");
+
+    const Json image_history = {
+        {"model", "m"},
+        {"input", Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "patch it"}},
+                               Json{{"type", "custom_tool_call"},
+                                    {"call_id", "call_patch"},
+                                    {"name", "apply_patch"},
+                                    {"input", "*** Begin Patch\n*** End Patch"}},
+                               Json{{"type", "custom_tool_call_output"},
+                                    {"call_id", "call_patch"},
+                                    {"output",
+                                     Json::array({Json{{"type", "input_text"}, {"text", "applied"}},
+                                                  Json{{"type", "input_image"},
+                                                       {"image_url", "data:image/png;base64,AA=="},
+                                                       {"detail", "auto"}}})}}})}};
+    failures += check(api_code([&] {
+                          const OpenAIResponsesCreateRequest parsed =
+                              parse_openai_responses_create_request(image_history, limits());
+                          (void)resolve_openai_responses_prompt(parsed.prompt, store,
+                                                                "resp_custom_mm", true);
+                      }) == "",
+                      "custom_tool_call_output accepts content arrays with images");
+
+    const Json mixed = {
+        {"model", "m"},
+        {"input", "time"},
+        {"tools",
+         Json::array({Json{{"type", "namespace"},
+                           {"name", "mcp__clock"},
+                           {"tools", Json::array({Json{{"type", "function"}, {"name", "now"}}})}},
+                      custom})}};
+    const OpenAIResponsesCreateRequest mixed_request =
+        parse_openai_responses_create_request(mixed, limits());
+    failures += check(mixed_request.prompt.generation.tools.size() == 2 &&
+                          mixed_request.prompt.generation.tools[0].name == "mcp__clock__now" &&
+                          mixed_request.prompt.generation.tools[1].name == "apply_patch" &&
+                          mixed_request.tool_identities.at("apply_patch").custom &&
+                          !mixed_request.tool_identities.at("mcp__clock__now").custom,
+                      "namespaced functions and custom tools share one Engine tool list");
+
+    const Json incomplete_call = {
+        {"model", "m"},
+        {"input", Json::array({Json{{"type", "custom_tool_call"},
+                                    {"call_id", "call_patch"},
+                                    {"name", "apply_patch"},
+                                    {"input", "patch"},
+                                    {"status", "incomplete"}}})},
+    };
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(incomplete_call, limits());
+                      }) == "partial_tool_call_not_supported",
+                      "partial custom_tool_call history remains rejected");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -970,6 +1112,7 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_custom_tools();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

@@ -38,15 +38,26 @@ struct ItemIds {
     std::vector<std::string> call_ids;
 };
 
-void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest& request,
+bool add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest& request,
                                 std::string_view engine_name) {
     const auto position = request.tool_identities.find(std::string(engine_name));
     if (position == request.tool_identities.end()) {
         object["name"] = engine_name;
-        return;
+        return false;
     }
     object["name"] = position->second.name;
     if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
+    return position->second.custom;
+}
+
+// A custom tool call stores its free-form string under the single "input" parameter of the
+// lowered function. The wire item carries the raw string, not the JSON envelope.
+std::string custom_tool_input(const std::string& arguments) {
+    const Json parsed = Json::parse(arguments, nullptr, false);
+    if (parsed.is_object() && parsed.contains("input") && parsed.at("input").is_string()) {
+        return parsed.at("input").get<std::string>();
+    }
+    return arguments;
 }
 
 Json response_common(const std::string& id, std::int64_t created_at,
@@ -141,7 +152,12 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                                                  {"status", "completed"},
                                                  {"call_id", ids.call_ids[index]},
                                                  {"arguments", call.arguments_json}};
-        add_wire_function_identity(item, request, call.name);
+        const bool custom = add_wire_function_identity(item, request, call.name);
+        if (custom) {
+            item["type"]  = "custom_tool_call";
+            item["input"] = custom_tool_input(call.arguments_json);
+            item.erase("arguments");
+        }
         built.output_items.push_back(std::move(item));
     }
 
@@ -453,28 +469,41 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
                                   {"status", "in_progress"},
                                   {"call_id", call_id},
                                   {"arguments", ""}};
-        add_wire_function_identity(added_item, impl_->request, call.name);
+        const bool custom      = add_wire_function_identity(added_item, impl_->request, call.name);
+        if (custom) {
+            added_item["type"]  = "custom_tool_call";
+            added_item["input"] = "";
+            added_item.erase("arguments");
+        }
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.added",
                              Json{{"output_index", output_index}, {"item", added_item}})));
-        if (!call.arguments_json.empty()) {
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
+        if (!custom) {
+            if (!call.arguments_json.empty()) {
+                finished.events_before_terminal.push_back(
+                    sse(impl_->event("response.function_call_arguments.delta",
+                                     Json{{"item_id", item_id},
+                                          {"output_index", output_index},
+                                          {"delta", call.arguments_json}})));
+            }
+            Json arguments_done = {{"item_id", item_id},
+                                   {"output_index", output_index},
+                                   {"arguments", call.arguments_json}};
+            add_wire_function_identity(arguments_done, impl_->request, call.name);
+            finished.events_before_terminal.push_back(sse(
+                impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
         }
-        Json arguments_done = {{"item_id", item_id},
-                               {"output_index", output_index},
-                               {"arguments", call.arguments_json}};
-        add_wire_function_identity(arguments_done, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
         Json done_item = {{"id", item_id},
                           {"type", "function_call"},
                           {"status", "completed"},
                           {"call_id", call_id},
                           {"arguments", call.arguments_json}};
-        add_wire_function_identity(done_item, impl_->request, call.name);
+        (void)add_wire_function_identity(done_item, impl_->request, call.name);
+        if (custom) {
+            done_item["type"]  = "custom_tool_call";
+            done_item["input"] = custom_tool_input(call.arguments_json);
+            done_item.erase("arguments");
+        }
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.done",
                              Json{{"output_index", output_index}, {"item", done_item}})));

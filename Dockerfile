@@ -1,41 +1,41 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+FROM carapa-llama-cpp:latest AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        cmake \
-        libavcodec-dev \
-        libavformat-dev \
-        libavutil-dev \
-        libcurl4-openssl-dev \
-        libswscale-dev \
-        ninja-build \
-        pkg-config \
+    cmake \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libcurl4-openssl-dev \
+    libswscale-dev \
+    ninja-build \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B /build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DNINFER_BUILD_APPS=ON \
-        -DBUILD_TESTING=OFF \
-        -DNINFER_BUILD_BENCHMARKS=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DNINFER_BUILD_APPS=ON \
+    -DBUILD_TESTING=OFF \
+    -DNINFER_BUILD_BENCHMARKS=OFF \
     && cmake --build /build --parallel --target ninfer ninfer-serve
 
-FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM carapa-llama-cpp:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        ca-certificates \
-        libavcodec60 \
-        libavformat60 \
-        libavutil58 \
-        libcurl4t64 \
-        libswscale7 \
+    ca-certificates \
+    libavcodec62 \
+    libavformat62 \
+    libavutil60 \
+    libcurl4t64 \
+    libswscale9 \
     && rm -rf /var/lib/apt/lists/*
 
 # The CUDA runtime image ships forward-compatibility libraries in
@@ -55,4 +55,5 @@ WORKDIR /workspace
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 
-CMD ["ninfer-serve", "--help"]
+ENTRYPOINT ["ninfer-serve"]
+CMD ["--help"]

@@ -34,3 +34,5 @@ models
 
 Dockerfile
 .dockerignore
+.env
+*.sh

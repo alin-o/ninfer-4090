@@ -1,0 +1,1 @@
+docker buildx build . -t ninfer-4090:sm89

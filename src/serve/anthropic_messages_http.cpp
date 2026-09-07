@@ -44,8 +44,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits,
-                                                                     anthropic_thinking_signer_);
+        // The runner uses this side channel to express reasoning levels the
+        // claude CLI cannot put on the wire (notably `none`, to disable
+        // thinking). See claude-runner.ts.
+        std::optional<std::string> reasoning_override;
+        if (req.has_header("x-ninfer-reasoning")) {
+            reasoning_override = req.get_header_value("x-ninfer-reasoning");
+        }
+        request = parse_anthropic_messages_request(parse_json_body(req), limits,
+                                                   anthropic_thinking_signer_, reasoning_override);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;

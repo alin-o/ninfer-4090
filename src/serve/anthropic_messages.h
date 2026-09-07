@@ -28,9 +28,13 @@ struct AnthropicCountTokensRequest {
     GenerationRequest generation;
 };
 
-AnthropicMessagesRequest parse_anthropic_messages_request(const nlohmann::json& body,
-                                                          const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer);
+// `reasoning_override` carries the `x-ninfer-reasoning` header value (see
+// handle_messages). The claude CLI build we target only ever emits *positive*
+// efforts on the wire (default `high`) and cannot express thinking-disable, so
+// the runner injects an explicit effort here as a side channel.
+AnthropicMessagesRequest parse_anthropic_messages_request(
+    const nlohmann::json& body, const RequestLimits& limits, const AnthropicThinkingSigner& signer,
+    const std::optional<std::string>& reasoning_override = std::nullopt);
 AnthropicCountTokensRequest
 parse_anthropic_count_tokens_request(const nlohmann::json& body,
                                      const AnthropicThinkingSigner& signer);

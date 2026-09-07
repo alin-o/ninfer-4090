@@ -147,26 +147,48 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return complete();
     }
 
-    switch (requested) {
-    case RequestedReasoningEffort::Low:
-        result.reasoning_effort = ninfer::ReasoningEffort::Low;
-        break;
-    case RequestedReasoningEffort::Medium:
-        result.reasoning_effort = ninfer::ReasoningEffort::Medium;
-        break;
-    case RequestedReasoningEffort::XHigh:
-        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
-        break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
+    // Map the requested effort onto the nearest engine tier the loaded template
+    // actually supports. The protocol vocabulary (minimal/high/max) is broader than
+    // the engine's (low/medium/xhigh), so `high`/`max` clamp to the strongest
+    // available tier (e.g. xhigh) instead of rejecting — this is what makes the
+    // claude CLI's `high` default usable on effort templates that have no `high`
+    // level. `none` is handled above as a genuine thinking-disable.
+    const auto requested_rank = [&requested]() {
+        switch (requested) {
+        case RequestedReasoningEffort::Minimal: return 1;
+        case RequestedReasoningEffort::Low: return 2;
+        case RequestedReasoningEffort::Medium: return 3;
+        case RequestedReasoningEffort::High: return 4;
+        case RequestedReasoningEffort::XHigh: return 5;
+        case RequestedReasoningEffort::Max: return 6;
+        default: return 0;
+        }
+    }();
+    struct EffortTier {
+        int rank;
+        ninfer::ReasoningEffort effort;
+    };
+    const std::vector<EffortTier> supported_tiers = [&capabilities]() {
+        std::vector<EffortTier> tiers;
+        if (capabilities.reasoning_effort.low) { tiers.push_back({2, ninfer::ReasoningEffort::Low}); }
+        if (capabilities.reasoning_effort.medium) { tiers.push_back({3, ninfer::ReasoningEffort::Medium}); }
+        if (capabilities.reasoning_effort.xhigh) {
+            tiers.push_back({5, ninfer::ReasoningEffort::XHigh});
+        }
+        return tiers;
+    }();
+    if (supported_tiers.empty()) {
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
                               "reasoning_effort", "reasoning_effort_not_supported");
-    case RequestedReasoningEffort::None:
-        break;
     }
+    const EffortTier* chosen = nullptr;
+    for (const auto& tier : supported_tiers) {
+        if (tier.rank >= requested_rank) { chosen = &tier; break; }
+    }
+    if (chosen == nullptr) { chosen = &supported_tiers.back(); }
+    result.reasoning_effort = chosen->effort;
 
     if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
         invalid_prompt_option("reasoning effort '" +

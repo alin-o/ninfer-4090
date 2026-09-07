@@ -8,6 +8,9 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ccache \
     && rm -rf /var/lib/apt/lists/*
 
+# Set to 1 to disable parallel CUDA optimization passes.
+ARG CUDA_SPLIT_COMPILE=2
+
 WORKDIR /src
 COPY . .
 
@@ -19,6 +22,7 @@ COPY . .
 RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build \
     --mount=type=cache,id=ninfer-4090-sm89-ccache,target=/root/.cache/ccache \
     set -eux; \
+    case "$CUDA_SPLIT_COMPILE" in ''|0*|*[!0-9]*) echo "CUDA_SPLIT_COMPILE must be a positive integer" >&2; exit 1;; esac; \
     export CCACHE_DIR=/root/.cache/ccache; \
     toolchain="cuda$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')-gcc$(gcc -dumpversion)"; \
     if [ -f /build/.toolchain ] && [ "$(cat /build/.toolchain)" != "$toolchain" ]; then \
@@ -28,6 +32,7 @@ RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build \
     printf '%s' "$toolchain" > /build/.toolchain; \
     cmake -S /src -B /build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_FLAGS="--split-compile=${CUDA_SPLIT_COMPILE}" \
       -DNINFER_BUILD_APPS=ON \
       -DBUILD_TESTING=OFF \
       -DNINFER_BUILD_BENCHMARKS=OFF; \

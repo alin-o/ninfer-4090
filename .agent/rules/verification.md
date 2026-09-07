@@ -21,8 +21,12 @@ Python environment is not evidence that project test dependencies are present.
 Use `NINFER_VERIFY_PYTHON` and `NINFER_VERIFY_EVAL_PYTHON` to select provisioned
 interpreters. `NINFER_VERIFY_BUILD_DIR` defaults to ignored `build-agent-verify`;
 `CMAKE_BUILD_PARALLEL_LEVEL` defaults to 2 for this command. Do not reuse a CMake
-cache whose `CMAKE_HOME_DIRECTORY` names another checkout. No worktree setup or
-dependency provisioning hook currently exists.
+cache whose `CMAKE_HOME_DIRECTORY` names another checkout. CarapaBox provisions
+the task worktree and shared compiler cache deterministically before the agent
+runs. Task agents use the prepared build; stage prompts must not instruct them
+to invoke or manage worktree lifecycle hooks. Python dependencies come from the
+provisioned container environment, not hook-installed packages. Verification
+sets `TMPDIR` to the checkout's `.local/test-tmp` because `/tmp` is noexec.
 
 Coding runs focused checks while iterating and the canonical command before
 completion. Independent Testing runs the canonical command and applicable

@@ -111,6 +111,12 @@ docker build --tag ninfer-4090:sm89 .
 NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 ```
 
+The Docker build enables `--split-compile=2` to parallelize CUDA compiler
+optimization passes without disabling Release optimizations. Override the positive
+integer build argument with `--build-arg CUDA_SPLIT_COMPILE=N`; use `1` to disable
+it. Build-tool parallelism remains unrestricted, so larger values can increase CPU
+and memory pressure. Build speedup and inference performance have not been benchmarked.
+
 Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
 The profiles as written run one generation slot. `--max-concurrency 2` is measured

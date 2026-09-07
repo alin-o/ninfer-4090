@@ -4,6 +4,10 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+# The sandbox's inherited TMPDIR can point at the main checkout; /tmp is noexec.
+export TMPDIR="$root/.local/test-tmp"
+mkdir -p "$TMPDIR"
+
 python="${NINFER_VERIFY_PYTHON:-python3}"
 eval_python="${NINFER_VERIFY_EVAL_PYTHON:-$python}"
 build_dir="${NINFER_VERIFY_BUILD_DIR:-build-agent-verify}"

@@ -40,3 +40,41 @@ default), so the minimum command is:
 - The `ffmpeg` **CLI is not on `PATH`**, but the FFmpeg **libraries** are
   installed. A `which ffmpeg` miss does NOT mean the build is broken — the build
   links the libs, not the CLI.
+
+## Carapa worktrees and compiler reuse
+
+CarapaBox owns deterministic worktree provisioning. Task agents use the prepared
+build directory; do not put hook invocation, fallback setup, or lifecycle
+management instructions in worker/stage prompts. The details below are for
+maintaining the build and provisioning infrastructure.
+
+Carapa invokes `sh .agent/worktree-setup.sh` from the selected worktree root,
+with no arguments, on add/reuse/reset. The POSIX hook configures the local
+`build-agent-verify` directory without compiling or installing dependencies.
+It uses `NINFER_VERIFY_PYTHON` (otherwise `python3`); the sandbox's provisioned
+`/opt/ninfer-venv/bin/python` can be reused across worktrees.
+
+Setup discovers the main checkout with `git worktree list --porcelain` and
+stores shared compiler objects in its ignored `.cache/ccache`. Each checkout
+gets `.local/ccache.conf` with its own `base_dir` for path normalization.
+`NINFER_CCACHE_CONFIG` persists that file's path in the CMake cache; generated
+compiler launch commands explicitly set `CCACHE_CONFIGPATH`, so they do not
+depend on hook exports surviving. Explicit container `CCACHE_*` overrides still
+take precedence over ccache configuration. Setup rejects symlinked local
+configuration to avoid overwriting provisioned shared files.
+
+The hook disables CMake C++ module scanning because the project has no C++
+modules and the resulting GCC module flags prevent ccache reuse. Other CMake
+build directories retain their existing defaults. Keep source paths, compiler
+options and build-directory layout consistent to maximize cross-checkout hits.
+Do not share or copy CMake caches/build directories across worktrees. The first
+cached compilation populates the cache; configuration, linking (including CUDA
+device linking), and tests still run. The default ccache size limit applies.
+
+`sh .agent/worktree-teardown.sh` is intentionally a no-op: setup creates no
+services or external per-worktree resources, and Carapa owns checkout cleanup.
+Preserve the shared cache on removal/reset. These are lifecycle hooks, not
+per-stage hooks; failures are best-effort unless the operator enables
+`WORKTREE_HOOKS_STRICT`. Do not change that operator setting automatically.
+New worktrees use their own tracked hook copies: uncommitted edits in the main
+checkout are not automatically included.

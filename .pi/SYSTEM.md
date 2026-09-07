@@ -76,8 +76,10 @@ Consolidated behavioral rules extracted from prior group-agent work.
 
 ## Rules available on model decision
 
+- [Use when changing NInfer engine, CUDA operators, target programs, artifacts, CLI, or serving protocols.](.agent/rules/architecture.md)
 - [How to return generated files and screenshots through chat.](.agent/rules/chat-artifacts.md)
 - [Use when configuring or building ninfer with CMake and Ninja in this sandbox, creating a build directory, or choosing build options.](.agent/rules/cmake-build.md)
 - [CarapaBoard MCP tools and required project routing for group operations.](.agent/rules/mcp.md)
 - [Guidance for choosing scheduled tasks, cronjobs, and dataset tasks.](.agent/rules/scheduling-guide.md)
 - [Mandatory routing, dependency, deduplication, and specification rules when creating board tasks.](.agent/rules/task-creation.md)
+- [Use when implementing, testing, or reviewing NInfer changes, running verification, or diagnosing sandbox test prerequisites.](.agent/rules/verification.md)

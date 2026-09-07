@@ -34,9 +34,9 @@ Focused commands are documented in `tests/README.md`: build the affected test
 target, then `ctest --test-dir build-agent-verify -R '<test-name>'
 --output-on-failure`. Use `NINFER_OP_REPORT_STATS=1` with verbose CTest for
 numerical error evidence. The initial two-job native build took about eight
-minutes in this sandbox; CTest took about 14 seconds. Python suite runtime is
-unmeasured because dependencies were missing. Do not treat this as a fast lint
-gate.
+minutes in this sandbox; CTest with the GPU free took about 196 seconds. The
+Python artifact/converter suites took about three seconds. Do not treat the
+full command as a fast lint gate.
 
 GPU/device and real-artifact tests may skip with return code 77. Real engine
 checks need the corresponding `NINFER_QWEN3_6_27B_WEIGHTS` or
@@ -47,15 +47,27 @@ performance benchmarks and external evaluation services are outside this gate.
 Baseline observed during setup on 2026-09-07:
 
 - CMake configure passes with CUDA 13.3.73 and required FFmpeg/libcurl libraries.
-- The Release application/test build passes. CTest reports 30 passes, 65
-  failures and eight skips out of 103 tests. Failed GPU checks report
-  `cudaErrorMemoryAllocation: out of memory` at `cudaSetDevice`/`cudaMalloc`;
-  no GPU correctness claim can be made from this run. Do not stop other GPU
-  workloads to make verification pass.
-- Default Python is `/opt/carapa-harness/venv/bin/python3`; pytest is absent.
-  Evaluation unittest discovery reports four import errors for Rich/PyYAML.
-- `scripts/check-linux-scripts.sh` fails with `Missing executable:` for its
-  generated temporary `ninfer-serve` fixture. This precedes setup changes;
-  its underlying environment/launcher cause has not been established.
+- The Release application/test build passes. After the user freed the GPU,
+  CTest reports 96 passes, zero failures and seven skips out of 103 tests.
+  This supersedes the earlier GPU allocation failures. Real-artifact tests
+  and the NVFP4 A4 test remain skipped. Do not stop other GPU workloads to
+  make verification pass.
+- `NINFER_VERIFY_PYTHON=/opt/ninfer-venv/bin/python` now selects the provisioned
+  Python 3.12 environment with pytest, torch, NumPy, safetensors, PyYAML and
+  Rich installed. Evaluation coordinator tests pass (19 tests). The default
+  harness Python remains separate; use the selected project interpreter.
+- Native Python imports pass. Artifact/converter and benchmark-consumer pytest
+  reports 77 passes. The user approved removing the three upstream-local
+  official-source cases that required a developer's private model directories.
+  Self-contained converter and hash-validation coverage remains; no official
+  model source directory is required for this pytest command.
+- `/tmp` is mounted `noexec`, which blocks the launcher check's generated
+  executable fixture. The existing check passes with a workspace temp root:
+  `mkdir -p .local/test-tmp`, then
+  `TMPDIR="$PWD/.local/test-tmp" bash scripts/check-linux-scripts.sh`.
+  The sandbox now exports `TMPDIR=/workspace/ninfer/.local/test-tmp`, and the
+  launcher check passes without a manual override. The directory is gitignored;
+  no `/tmp` remount is needed. Use a checkout-local override when running from
+  another worktree.
 
 Refresh these baseline notes when new evidence resolves them.

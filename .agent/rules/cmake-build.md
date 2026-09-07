@@ -5,9 +5,11 @@ description: Use when configuring or building ninfer with CMake and Ninja in thi
 
 # Building ninfer with CMake
 
-All build dependencies are already installed in the sandbox, so there is no
-dependency-setup step: the FFmpeg dev libs (`libavformat`, `libavcodec`,
-`libavutil`, `libswscale`), CUDA (≥ 12.8, at `/usr/local/cuda`), and `libcurl`.
+The native build dependencies were confirmed by CMake configuration in this
+sandbox: the FFmpeg dev libs (`libavformat`, `libavcodec`, `libavutil`,
+`libswscale`), CUDA (≥ 12.8, at `/usr/local/cuda`), and `libcurl`. This does not
+cover Python test dependencies; see `verification.md` for the canonical gate
+and its prerequisites.
 
 ## Configure and build
 
@@ -26,7 +28,10 @@ default), so the minimum command is:
   you do not need to pass `CMAKE_*_COMPILER` explicitly.
 - Build options: `NINFER_BUILD_APPS` (CLI + server, default ON), `BUILD_TESTING`,
   `NINFER_BUILD_BENCHMARKS`. `cmake --build` compiles whichever are enabled.
-- Outputs land in `<builddir>/apps/` as `ninfer` and `ninfer-serve`.
+- Outputs land in `<builddir>/apps/` as `ninfer`, `ninfer-serve`, and
+  `ninfer-perplexity`.
+- Use `bash .agent/verify.sh` for the application/test build and test suites.
+  The application-only command above is not the verification gate.
 
 ## Verifying the environment
 

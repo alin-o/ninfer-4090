@@ -155,23 +155,36 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     // level. `none` is handled above as a genuine thinking-disable.
     const auto requested_rank = [&requested]() {
         switch (requested) {
-        case RequestedReasoningEffort::Minimal: return 1;
-        case RequestedReasoningEffort::Low: return 2;
-        case RequestedReasoningEffort::Medium: return 3;
-        case RequestedReasoningEffort::High: return 4;
-        case RequestedReasoningEffort::XHigh: return 5;
-        case RequestedReasoningEffort::Max: return 6;
-        default: return 0;
+        case RequestedReasoningEffort::Minimal:
+            return 1;
+        case RequestedReasoningEffort::Low:
+            return 2;
+        case RequestedReasoningEffort::Medium:
+            return 3;
+        case RequestedReasoningEffort::High:
+            return 4;
+        case RequestedReasoningEffort::XHigh:
+            return 5;
+        case RequestedReasoningEffort::Max:
+            return 6;
+        default:
+            return 0;
         }
     }();
+
     struct EffortTier {
         int rank;
         ninfer::ReasoningEffort effort;
     };
+
     const std::vector<EffortTier> supported_tiers = [&capabilities]() {
         std::vector<EffortTier> tiers;
-        if (capabilities.reasoning_effort.low) { tiers.push_back({2, ninfer::ReasoningEffort::Low}); }
-        if (capabilities.reasoning_effort.medium) { tiers.push_back({3, ninfer::ReasoningEffort::Medium}); }
+        if (capabilities.reasoning_effort.low) {
+            tiers.push_back({2, ninfer::ReasoningEffort::Low});
+        }
+        if (capabilities.reasoning_effort.medium) {
+            tiers.push_back({3, ninfer::ReasoningEffort::Medium});
+        }
         if (capabilities.reasoning_effort.xhigh) {
             tiers.push_back({5, ninfer::ReasoningEffort::XHigh});
         }
@@ -185,7 +198,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     }
     const EffortTier* chosen = nullptr;
     for (const auto& tier : supported_tiers) {
-        if (tier.rank >= requested_rank) { chosen = &tier; break; }
+        if (tier.rank >= requested_rank) {
+            chosen = &tier;
+            break;
+        }
     }
     if (chosen == nullptr) { chosen = &supported_tiers.back(); }
     result.reasoning_effort = chosen->effort;

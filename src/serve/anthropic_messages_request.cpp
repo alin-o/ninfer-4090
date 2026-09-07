@@ -1034,11 +1034,10 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
 
 } // namespace
 
-AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
-                                                          const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer,
-                                                          const std::optional<std::string>&
-                                                              reasoning_override) {
+AnthropicMessagesRequest
+parse_anthropic_messages_request(const Json& body, const RequestLimits& limits,
+                                 const AnthropicThinkingSigner& signer,
+                                 const std::optional<std::string>& reasoning_override) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -1065,13 +1064,14 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     if (reasoning_override) {
         const auto override_effort = parse_requested_reasoning_effort(*reasoning_override);
         if (!override_effort) {
-            bad_request("x-ninfer-reasoning is not a recognized effort value", "x-ninfer-reasoning");
+            bad_request("x-ninfer-reasoning is not a recognized effort value",
+                        "x-ninfer-reasoning");
         }
         // Override both the effort and the thinking flag so the two stay
         // consistent (a `none` that leaves the body's `enable_thinking=true`
         // would trip the conflicting_template_option check downstream).
         result.generation.reasoning_effort = *override_effort;
-        result.generation.enable_thinking = *override_effort != RequestedReasoningEffort::None;
+        result.generation.enable_thinking  = *override_effort != RequestedReasoningEffort::None;
     }
     return result;
 }

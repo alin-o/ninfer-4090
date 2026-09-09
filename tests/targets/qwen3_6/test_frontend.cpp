@@ -1616,6 +1616,11 @@ int test_structural_boundary_discovery_contract() {
     failures += check(origins(leading_project, project) == 1 &&
                           origins(leading_project, instructions) == 1,
                       "complete leading-system project envelope was not classified");
+    const auto embedded_project = render("ordinary prose before the example\n<project>\n## Context\n"
+                                         "<instructions>\nrule\n</instructions>\n</project>");
+    failures += check(origins(embedded_project, project) == 0 &&
+                          origins(embedded_project, instructions) == 0,
+                      "embedded project-envelope lookalike was classified outside leading-system position");
     return failures;
 }
 
@@ -1655,6 +1660,20 @@ int test_structural_boundary_preparation_contract() {
                              data.context_cache.structural_boundaries_accepted >= 4 &&
                              data.context_cache.structural_boundaries_skipped_not_token_boundary == 0,
                          "structural classification changed prepared tokens or lost exact diagnostics");
+    const std::vector<std::uint32_t> exact_frontiers{32, 65, 66, 95};
+    std::vector<std::uint32_t> actual_frontiers;
+    for (const auto& value : data.context_cache.structural_checkpoints) {
+        actual_frontiers.push_back(value.frontier);
+    }
+    failures += check(actual_frontiers == exact_frontiers &&
+                          data.context_cache.structural_boundaries_noncapturable == 0,
+                      "self-contained tokenizer did not map structural boundaries to exact frontiers");
+    failures += check(std::none_of(without.context_cache.opportunities.begin(),
+                                   without.context_cache.opportunities.end(), [](const auto& item) {
+                                       return ninfer::has_shared_candidate_evidence(
+                                           item.evidence,
+                                           ninfer::SharedCandidateEvidence::EngineStructural);
+                                   }), "automatic-write opt-out still published structural opportunities");
     failures += check(checkpoint != data.context_cache.structural_checkpoints.end() &&
                           checkpoint->role == ninfer::targets::qwen3_6::SharedPrefixRole::Harness &&
                           checkpoint->ssd_eligible && cutoff_after_checkpoint,

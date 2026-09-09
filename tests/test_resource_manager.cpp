@@ -2951,6 +2951,51 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
+void test_shared_capture_publishes_immutable_structural_metadata() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    FakeRequestBasePlan request = make_base(271);
+    request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+        .frontier = 64,
+    });
+    const ActiveRequest active = start_active(manager, program, 271, request, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key = FakeShortlistKey{.digest = 271, .frontier = 64},
+        .shared_evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+        .structural_origins = 0x1e,
+        .structural_role = 2,
+        .ssd_eligible = true,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared = true,
+        .physically_feasible = true,
+    };
+    require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 271}, 0,
+                                           {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "metadata fixture could not reserve shared capture");
+    const auto progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(progress).status ==
+                ContextTransactionStatus::Published,
+            "metadata fixture did not publish shared capture");
+    const auto published = manager.shared_catalog_metadata(0);
+    require(published.state == FakeManager::SharedCatalogState::Catalogued &&
+                published.structural_origins == 0x1e && published.structural_role == 2 &&
+                published.ssd_eligible,
+            "shared publication lost structural metadata");
+    (void)finish_active(manager, program, active);
+    const auto catalogued = manager.shared_catalog_metadata(0);
+    require(catalogued.structural_origins == 0x1e && catalogued.structural_role == 2 &&
+                catalogued.ssd_eligible,
+            "terminal demotion changed published shared metadata");
+    manager.clear_after_program_cleanup();
+    const auto cleared = manager.shared_catalog_metadata(0);
+    require(cleared.state == FakeManager::SharedCatalogState::Vacant &&
+                cleared.structural_origins == 0 && cleared.structural_role == 0 &&
+                !cleared.ssd_eligible,
+            "cleared shared catalog retained metadata for a future physical owner");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3303,6 +3348,8 @@ int main() {
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
     run_test("shared fanout owner edges",
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
+    run_test("shared capture structural metadata",
+             test_shared_capture_publishes_immutable_structural_metadata);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("aborted shared capture logical rollback",

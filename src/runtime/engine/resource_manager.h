@@ -1125,6 +1125,25 @@ public:
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
     }
 
+    // Read-only metadata for the existing shared semantic owner.  It has no bearing on
+    // admission or physical placement; later Host/SSD policy can consume it without a second
+    // cache catalog.
+    struct SharedCatalogMetadata {
+        SharedCatalogState state = SharedCatalogState::Vacant;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
+    };
+
+    [[nodiscard]] SharedCatalogMetadata shared_catalog_metadata(std::uint32_t slot) const noexcept {
+        if (slot >= shared_catalog_count_) { return {}; }
+        const SharedCatalogEntry& entry = shared_catalog_[slot];
+        return {.state = entry.state,
+                .structural_origins = entry.structural_origins,
+                .structural_role = entry.structural_role,
+                .ssd_eligible = entry.ssd_eligible};
+    }
+
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
@@ -1690,6 +1709,9 @@ private:
         entry.transaction_pins    = 0;
         entry.explicit_credit     = false;
         entry.credit_expiry_epoch = 0;
+        entry.structural_origins  = 0;
+        entry.structural_role     = 0;
+        entry.ssd_eligible        = false;
         advance_revision(entry.revision);
     }
 

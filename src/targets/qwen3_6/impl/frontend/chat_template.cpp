@@ -50,6 +50,12 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
     constexpr std::uint32_t kVolatility = 1U << 4U;
     const std::string_view text = chat.text;
     if (region_end == 0 || region_end > text.size()) { return; }
+    // Unlike the line-oriented markers below, this legacy envelope is meaningful only as the
+    // first content in the leading rendered system message.  In particular, an example of the
+    // envelope in otherwise trusted instructions must not acquire project semantics.
+    constexpr std::string_view kSystemHeader = "<|im_start|>system\n";
+    const std::size_t leading_system_content =
+        text.starts_with(kSystemHeader) ? kSystemHeader.size() : std::string_view::npos;
     const auto add = [&](std::size_t offset, std::uint32_t origins) {
         auto it = std::find_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
                                [&](const auto& item) { return item.offset == offset; });
@@ -86,7 +92,7 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
         if (!in_fence && !fence_line) {
             // The legacy leading-system project envelope is deliberately a complete, bounded
             // form.  Do not treat a stray <project> in instructions as an anchor.
-            if (!project && trimmed == "<project>" &&
+            if (!project && begin == leading_system_content && trimmed == "<project>" &&
                 text.compare(end, std::string_view("\n## Context\n<instructions>\n").size(),
                              "\n## Context\n<instructions>\n") == 0) {
                 const std::size_t close = text.find("\n</instructions>\n</project>", end);

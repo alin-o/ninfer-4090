@@ -25,7 +25,9 @@ role and SSD eligibility, which travel through CaptureGroup and publication to t
 catalog's existing physical owner.  It does not introduce a second physical cache owner.
 `first_volatile_token` is cumulative: a prefix
 ending before that token remains eligible, while any checkpoint including it is
-not.  Media prompts do not currently receive structural anchors.
+not.  Media prompts retain the same recognized structural checkpoints and may
+produce the corresponding automatic shared-prefix opportunities; their
+`ssd_eligible` metadata is false until a media-aware persistence policy exists.
 
 The repository-local provenance artifact is
 `docs/maintainer/port-reference/ninfer-boundary-port-reference-manifest.json`.

@@ -472,6 +472,9 @@ using FakeContextTransactionProgress =
 struct FakeCaptureAssessment {
     FakeShortlistKey shortlist_key;
     ninfer::SharedCandidateEvidence shared_evidence = ninfer::SharedCandidateEvidence::None;
+    std::uint32_t structural_origins = 0;
+    std::uint8_t structural_role = 0;
+    bool ssd_eligible = false;
     PrefillWork protected_rebuild_work;
     std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};
@@ -1024,7 +1027,7 @@ public:
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
                                               const FakeSharedPrefixHandle&) const {
-        return false;
+        return shared_capture_matches_result;
     }
 
     void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
@@ -1133,6 +1136,7 @@ public:
     bool finish_with_rewrite                             = false;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
+    bool shared_capture_matches_result                   = false;
     bool change_shared_source_residency_on_second_report = false;
     std::uint32_t reported_shared_active_references      = 0;
     ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
@@ -2948,6 +2952,146 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
+void test_shared_capture_publishes_immutable_structural_metadata() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    FakeRequestBasePlan request = make_base(271);
+    request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+        .frontier = 64,
+    });
+    const ActiveRequest active = start_active(manager, program, 271, request, 1);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key = FakeShortlistKey{.digest = 271, .frontier = 64},
+        .shared_evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+        .structural_origins = 0x1e,
+        .structural_role = 2,
+        .ssd_eligible = true,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared = true,
+        .physically_feasible = true,
+    };
+    require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 271}, 0,
+                                           {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "metadata fixture could not reserve shared capture");
+    const auto progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(progress).status ==
+                ContextTransactionStatus::Published,
+            "metadata fixture did not publish shared capture");
+    const auto published = manager.shared_catalog_metadata(0);
+    require(published.state == FakeManager::SharedCatalogState::Catalogued &&
+                published.structural_origins == 0x1e && published.structural_role == 2 &&
+                published.ssd_eligible,
+            "shared publication lost structural metadata");
+    (void)finish_active(manager, program, active);
+    const auto catalogued = manager.shared_catalog_metadata(0);
+    require(catalogued.structural_origins == 0x1e && catalogued.structural_role == 2 &&
+                catalogued.ssd_eligible,
+            "terminal demotion changed published shared metadata");
+    manager.clear_after_program_cleanup();
+    const auto cleared = manager.shared_catalog_metadata(0);
+    require(cleared.state == FakeManager::SharedCatalogState::Vacant &&
+                cleared.structural_origins == 0 && cleared.structural_role == 0 &&
+                !cleared.ssd_eligible,
+            "cleared shared catalog retained metadata for a future physical owner");
+}
+
+void test_shared_republication_replaces_catalog_metadata_with_owner() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const auto publish = [&](std::uint32_t digest, std::uint32_t origins, std::uint8_t role,
+                             bool eligible, std::uint64_t order) {
+        FakeRequestBasePlan request = make_base(digest);
+        request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, digest, request, order);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key = FakeShortlistKey{.digest = digest, .frontier = 64},
+            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .structural_origins = origins,
+            .structural_role = role,
+            .ssd_eligible = eligible,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared = true,
+            .physically_feasible = true,
+        };
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = digest},
+                                               0, {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "republication fixture could not reserve shared capture");
+        require(std::get<FakeManager::ActiveCaptureOutcome>(
+                    manager.progress_context_transaction(program, {})).status ==
+                    ContextTransactionStatus::Published,
+                "republication fixture did not publish shared capture");
+        (void)finish_active(manager, program, active);
+    };
+
+    publish(272, 0x02, 1, true, 1);
+    const auto first = manager.shared_catalog_metadata(0);
+    // Program cleanup removes the old physical semantic owner.  The vacant catalog slot is
+    // then republished by a different owner, which must replace all immutable metadata.
+    manager.clear_after_program_cleanup();
+    const auto vacant = manager.shared_catalog_metadata(0);
+    publish(273, 0x08, 2, false, 2);
+    const auto second = manager.shared_catalog_metadata(0);
+    require(first.state == FakeManager::SharedCatalogState::Catalogued &&
+                first.structural_origins == 0x02 && first.structural_role == 1 &&
+                first.ssd_eligible && vacant.state == FakeManager::SharedCatalogState::Vacant &&
+                vacant.structural_origins == 0 && vacant.structural_role == 0 &&
+                !vacant.ssd_eligible && second.state == FakeManager::SharedCatalogState::Catalogued &&
+                second.structural_origins == 0x08 && second.structural_role == 2 &&
+                !second.ssd_eligible,
+            "shared catalog replacement retained immutable metadata from the prior physical owner");
+}
+
+void test_exact_shared_capture_merges_richer_structural_metadata() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const auto publish = [&](std::uint32_t origins, std::uint8_t role, bool eligible,
+                             std::uint64_t order) {
+        FakeRequestBasePlan request = make_base(274);
+        request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, 274, request, order);
+        program.shared_capture_matches_result = order != 1;
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key = FakeShortlistKey{.digest = 274, .frontier = 64},
+            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .structural_origins = origins,
+            .structural_role = role,
+            .ssd_eligible = eligible,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_private = order != 1,
+            .publishes_shared = true,
+            .physically_feasible = true,
+        };
+        if (order != 1) { program.capture_summary.endpoint = endpoint(274, 64); }
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 274}, 0,
+                                               {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "exact-owner metadata fixture could not reserve capture");
+        require(std::get<FakeManager::ActiveCaptureOutcome>(
+                    manager.progress_context_transaction(program, {})).status ==
+                    ContextTransactionStatus::Published,
+                "exact-owner metadata fixture did not publish or reuse capture");
+        (void)finish_active(manager, program, active);
+    };
+
+    publish(0x02, 1, false, 1);
+    publish(0x18, 2, true, 2);
+    const auto metadata = manager.shared_catalog_metadata(0);
+    require(metadata.state == FakeManager::SharedCatalogState::Catalogued &&
+                metadata.structural_origins == 0x1a && metadata.structural_role == 2 &&
+                metadata.ssd_eligible,
+            "exact shared-owner reuse did not merge richer structural metadata");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3300,6 +3444,12 @@ int main() {
              test_repeated_private_reuse_selects_zero_prefill_shared_promotion);
     run_test("shared fanout owner edges",
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
+    run_test("shared capture structural metadata",
+             test_shared_capture_publishes_immutable_structural_metadata);
+    run_test("shared capture republication metadata",
+             test_shared_republication_replaces_catalog_metadata_with_owner);
+    run_test("exact shared capture metadata merge",
+             test_exact_shared_capture_merges_richer_structural_metadata);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("aborted shared capture logical rollback",

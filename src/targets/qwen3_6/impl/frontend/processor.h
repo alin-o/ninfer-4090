@@ -111,6 +111,14 @@ struct ProcessedInput {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    // Recognition metadata travels with media prompts too. Media anchors are classified by the
+    // Frontend as SSD-ineligible, but recognition diagnostics must not disappear.
+    struct StructuralBoundary {
+        std::optional<std::uint32_t> frontier;
+        std::uint32_t origins = 0;
+    };
+    std::vector<StructuralBoundary> structural_boundaries;
+    std::optional<std::uint32_t> first_volatile_token;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -131,6 +139,10 @@ struct EncodedChat {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    using StructuralBoundary = ProcessedInput::StructuralBoundary;
+    std::vector<StructuralBoundary> structural_boundaries;
+    // First token containing volatile bytes. A candidate ending before this token remains safe.
+    std::optional<std::uint32_t> first_volatile_token;
 };
 
 EncodedChat

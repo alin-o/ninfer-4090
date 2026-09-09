@@ -1,0 +1,5 @@
+[
+  {"name":"codex","body":"# AGENTS.md instructions for /work/x\n<INSTRUCTIONS>\nrule\n</INSTRUCTIONS>\n<environment_context>\nvolatile\n</environment_context>"},
+  {"name":"claude","body":"<system-reminder>\n# claudeMd\nrule\n# currentDate\n2026-09-09\n</system-reminder>"},
+  {"name":"leading-system-project","body":"<project>\n## Context\n<instructions>\nrule\n</instructions>\n</project>"}
+]

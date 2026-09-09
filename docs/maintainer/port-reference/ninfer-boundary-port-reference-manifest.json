@@ -1,0 +1,11 @@
+{
+  "upstream": "llama.cpp",
+  "revision": "983f0aeb7c1b33dd234f16c086a44466e7da1b76",
+  "license": "MIT",
+  "license_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+  "license_file": "llama.cpp-LICENSE",
+  "sanitized_discovery_reference": "llama.cpp-server_checkpoint_discover.md",
+  "fixture_corpus": "../../../tests/fixtures/frontend/boundary-contract-corpus.json",
+  "server-common.cpp": "8c83f75fecae01d58154e6309ec5eb6ac5952aa37a88177abbce6142ee95f7b3",
+  "test_completion.py": "d5cbedfcd14f11246198e7ffb7d36a1ca348f7b2d82ec26dce23537697474d39"
+}

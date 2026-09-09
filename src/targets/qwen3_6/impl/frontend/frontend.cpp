@@ -701,7 +701,9 @@ PreparedContextCache prepare_context_cache(
     std::span<const PromptCacheMarker> rendered_markers,
     std::span<const std::optional<std::uint32_t>> cache_boundaries,
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
-    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
+    std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
+    std::span<const fi::EncodedChat::StructuralBoundary> structural_boundaries = {},
+    std::optional<std::uint32_t> first_volatile_token = std::nullopt) {
     constexpr std::size_t kMaximumExplicitMarkers = 4U;
     if (hints.markers.size() > kMaximumExplicitMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
@@ -738,6 +740,7 @@ PreparedContextCache prepare_context_cache(
         throw std::invalid_argument("context cache retention hint is invalid");
     }
     out.update_session_index = hints.update_session_index;
+    out.first_volatile_token = first_volatile_token;
 
     for (const PromptCacheMarker marker : hints.markers) {
         switch (marker.kind) {
@@ -850,6 +853,118 @@ PreparedContextCache prepare_context_cache(
         add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                         SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
                         engine_order);
+    }
+    // Structural candidates use the same shared catalog as explicit/engine candidates.  They
+    // are immutable prompt metadata, not another physical cache owner.
+    for (const fi::EncodedChat::StructuralBoundary& source : structural_boundaries) {
+        if (!source.frontier) {
+            ++out.structural_boundaries_skipped_not_token_boundary;
+            continue;
+        }
+        ++out.structural_boundaries_accepted;
+        if (*source.frontier == 0) {
+            ++out.structural_boundaries_noncapturable;
+            continue;
+        }
+        // Media prompts retain their recognition metadata for later policy, but their anchors
+        // are not SSD candidates until a media-aware persistence policy exists.
+        const bool eligible = vision_items.empty() &&
+                              (!first_volatile_token || *source.frontier < *first_volatile_token);
+        PreparedStructuralCheckpoint checkpoint{.frontier = *source.frontier,
+                                                 .origins = source.origins,
+                                                 .role = SharedPrefixRole::Transient,
+                                                 .ssd_eligible = eligible};
+        auto existing = std::find_if(out.structural_checkpoints.begin(), out.structural_checkpoints.end(),
+                                     [&](const auto& item) { return item.frontier == checkpoint.frontier; });
+        if (existing == out.structural_checkpoints.end()) { out.structural_checkpoints.push_back(checkpoint); }
+        else { existing->origins |= checkpoint.origins; existing->ssd_eligible |= checkpoint.ssd_eligible; }
+        if (hints.allow_engine_automatic_shared_prefixes) {
+            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
+                            SharedCandidateEvidence::EngineStructural, *source.frontier,
+                            engine_order++);
+            auto opportunity = std::find_if(out.opportunities.rbegin(), out.opportunities.rend(),
+                                            [&](const auto& value) {
+                                                return value.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                                                       value.frontier == *source.frontier;
+                                            });
+            if (opportunity != out.opportunities.rend()) {
+                opportunity->structural_origins |= source.origins;
+                opportunity->ssd_eligible = eligible;
+            }
+        }
+    }
+    std::uint32_t project_frontier = 0;
+    bool has_project_frontier = false;
+    for (const auto& checkpoint : out.structural_checkpoints) {
+        if ((checkpoint.origins & SharedPrefixProjectContext) != 0) {
+            project_frontier = std::max(project_frontier, checkpoint.frontier);
+            has_project_frontier = true;
+        }
+    }
+    // A bounded initial-user envelope starts at rendered/token frontier zero. It cannot be a
+    // capture itself, but it remains a real project delimiter for selecting its instruction
+    // descendant as the project anchor.
+    has_project_frontier = has_project_frontier || std::any_of(
+        structural_boundaries.begin(), structural_boundaries.end(), [](const auto& source) {
+            return (source.origins & SharedPrefixProjectContext) != 0;
+        });
+    // Port the bounded upstream selection: only the deepest stable anchor on each side of a
+    // project boundary is retained. Without a project, select the deepest stable harness
+    // (preferring a cache-marker anchor when present).
+    PreparedStructuralCheckpoint* harness = nullptr;
+    PreparedStructuralCheckpoint* project = nullptr;
+    if (has_project_frontier) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            // A structural boundary after the first volatile token remains useful
+            // recognition evidence, but it cannot turn a post-volatility prefix into a
+            // durable anchor. Select roles from the pre-volatility candidates so the final
+            // stable prefix remains available to a later SSD policy.
+            if (first_volatile_token && checkpoint.frontier >= *first_volatile_token) { continue; }
+            if (checkpoint.frontier <= project_frontier &&
+                (!harness || checkpoint.frontier > harness->frontier)) {
+                harness = &checkpoint;
+            } else if (checkpoint.frontier > project_frontier &&
+                       (!project || checkpoint.frontier > project->frontier)) {
+                project = &checkpoint;
+            }
+        }
+    }
+    if (!harness) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            if ((!has_project_frontier || checkpoint.frontier <= project_frontier) &&
+                (!first_volatile_token || checkpoint.frontier < *first_volatile_token) &&
+                checkpoint.role == SharedPrefixRole::Transient &&
+                (!harness || checkpoint.frontier > harness->frontier)) {
+                harness = &checkpoint;
+            }
+        }
+    }
+    if (!has_project_frontier && harness) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            if ((!first_volatile_token || checkpoint.frontier < *first_volatile_token) &&
+                (checkpoint.origins & SharedPrefixCacheMarker) != 0) {
+                harness = &checkpoint;
+            }
+        }
+    }
+    if (harness) { harness->role = SharedPrefixRole::Harness; }
+    if (project) { project->role = SharedPrefixRole::Project; }
+    // Recognition alone does not make an anchor durable.  Only the selected bounded harness
+    // and project anchors may be considered by a future SSD policy; all other structural
+    // observations remain transient even when they precede the volatility cutoff.
+    for (auto& checkpoint : out.structural_checkpoints) {
+        checkpoint.ssd_eligible = checkpoint.ssd_eligible &&
+                                  checkpoint.role != SharedPrefixRole::Transient;
+    }
+    for (auto& opportunity : out.opportunities) {
+        for (const auto& checkpoint : out.structural_checkpoints) {
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                opportunity.frontier == checkpoint.frontier) {
+                opportunity.structural_origins |= checkpoint.origins;
+                opportunity.structural_role = checkpoint.role;
+                opportunity.ssd_eligible = checkpoint.ssd_eligible;
+            }
+        }
     }
     return out;
 }
@@ -1337,6 +1452,18 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
     return PreparedPromptAccess::view(prompt);
 }
 
+PreparedContextCache FrontendTestAccess::structural_diagnostics(
+    const std::vector<std::pair<std::optional<std::uint32_t>, std::uint32_t>>& boundaries) {
+    std::vector<fi::EncodedChat::StructuralBoundary> encoded;
+    encoded.reserve(boundaries.size());
+    for (const auto& [frontier, origins] : boundaries) {
+        encoded.push_back({.frontier = frontier, .origins = origins});
+    }
+    ContextCacheHints hints;
+    return prepare_context_cache(std::move(hints), 0, {}, {}, {}, {}, std::nullopt, std::nullopt, 1,
+                                 encoded);
+}
+
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const auto start              = Clock::now();
@@ -1377,6 +1504,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.tool_call_output    = tool_call_output;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    std::vector<fi::EncodedChat::StructuralBoundary> structural_boundaries;
+    std::optional<std::uint32_t> first_volatile_token;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
@@ -1415,6 +1544,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             std::move(processed.rewrite_execution_frontiers);
         message_boundaries = std::move(processed.message_boundaries);
         cache_boundaries   = std::move(processed.cache_boundaries);
+        structural_boundaries = std::move(processed.structural_boundaries);
+        first_volatile_token = processed.first_volatile_token;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
@@ -1433,6 +1564,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             std::move(encoded.rewrite_execution_frontiers);
         message_boundaries = std::move(encoded.message_boundaries);
         cache_boundaries   = std::move(encoded.cache_boundaries);
+        structural_boundaries = std::move(encoded.structural_boundaries);
+        first_volatile_token = encoded.first_volatile_token;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
@@ -1440,7 +1573,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
-        checked_token_count(result.token_ids.size()));
+        checked_token_count(result.token_ids.size()), structural_boundaries, first_volatile_token);
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();

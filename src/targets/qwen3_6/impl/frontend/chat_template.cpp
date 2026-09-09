@@ -40,6 +40,169 @@ bool is_instruction_role(ChatRole role) noexcept {
     return role == ChatRole::System || role == ChatRole::Developer;
 }
 
+// Ported from llama.cpp server_checkpoint_discover (983f0aeb7c1b).  This deliberately
+// scans only the initial rendered instruction span; conversation text is untrusted.
+void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) {
+    constexpr std::uint32_t kSystemEnd = 1U << 0U;
+    constexpr std::uint32_t kCacheMarker = 1U << 1U;
+    constexpr std::uint32_t kInstructionsEnd = 1U << 2U;
+    constexpr std::uint32_t kProject = 1U << 3U;
+    constexpr std::uint32_t kVolatility = 1U << 4U;
+    const std::string_view text = chat.text;
+    if (region_end == 0 || region_end > text.size()) { return; }
+    // Unlike the line-oriented markers below, this legacy envelope is meaningful only as the
+    // first content in the leading rendered system message.  In particular, an example of the
+    // envelope in otherwise trusted instructions must not acquire project semantics.
+    constexpr std::string_view kSystemHeader = "<|im_start|>system\n";
+    const std::size_t leading_system_content =
+        text.starts_with(kSystemHeader) ? kSystemHeader.size() : std::string_view::npos;
+    const auto add = [&](std::size_t offset, std::uint32_t origins) {
+        auto it = std::find_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
+                               [&](const auto& item) { return item.offset == offset; });
+        if (it == chat.structural_boundaries.end()) {
+            chat.structural_boundaries.push_back({.offset = offset, .origins = origins});
+        } else { it->origins |= origins; }
+    };
+    bool instructions = false, project = false, volatile_found = false;
+    std::optional<std::size_t> system_end_offset;
+    char fence_char = 0;
+    std::size_t fence_len = 0;
+    for (std::size_t begin = 0; begin < region_end;) {
+        const std::size_t newline = text.find('\n', begin);
+        const std::size_t end = std::min(newline == std::string_view::npos ? text.size() : newline,
+                                         region_end);
+        std::string_view line = text.substr(begin, end - begin);
+        if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
+        std::size_t left = 0, right = line.size();
+        while (left < right && (line[left] == ' ' || line[left] == '\t')) { ++left; }
+        while (right > left && (line[right - 1] == ' ' || line[right - 1] == '\t')) { --right; }
+        const std::string_view trimmed = line.substr(left, right - left);
+        const auto fence_run = [&](char& character) {
+            if (trimmed.empty() || (trimmed[0] != '`' && trimmed[0] != '~')) { return std::size_t{0}; }
+            character = trimmed[0]; std::size_t n = 1;
+            while (n < trimmed.size() && trimmed[n] == character) { ++n; }
+            return n >= 3 ? n : 0;
+        };
+        char fc = 0; const std::size_t fl = fence_run(fc); bool fence_line = false;
+        const bool in_fence = fence_len != 0;
+        if (!in_fence && fl) { fence_char = fc; fence_len = fl; fence_line = true; }
+        else if (in_fence && fc == fence_char && fl >= fence_len && fl == trimmed.size()) {
+            fence_len = 0; fence_line = true;
+        }
+        if (!in_fence && !fence_line) {
+            // The legacy leading-system project envelope is deliberately a complete, bounded
+            // form.  Do not treat a stray <project> in instructions as an anchor.
+            if (!project && begin == leading_system_content && trimmed == "<project>" &&
+                text.compare(end, std::string_view("\n## Context\n<instructions>\n").size(),
+                             "\n## Context\n<instructions>\n") == 0) {
+                const std::size_t close = text.find("\n</instructions>\n</project>", end);
+                if (close != std::string_view::npos && close < region_end) {
+                    add(begin, kProject);
+                    add(close + std::string_view("\n</instructions>\n</project>").size(),
+                        kInstructionsEnd);
+                    project = true;
+                }
+            }
+            constexpr std::string_view kEnd = "<|im_end|>";
+            const std::size_t pos = line.rfind(kEnd);
+            if (pos != std::string_view::npos &&
+                line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
+                // The upstream contract retains only the final system terminator in the
+                // trusted region. Earlier occurrences can be instruction examples.
+                system_end_offset = begin + pos + kEnd.size();
+            }
+            constexpr std::string_view kMarker = "=== CACHE_BREAKPOINT ===";
+            constexpr std::string_view kProjectTag = "<project_context>";
+            constexpr std::string_view kInstructions = "</INSTRUCTIONS>";
+            if (trimmed == kMarker || trimmed == "=== CACHE_BREAKPOINT ===<project_context>") { add(begin + left + kMarker.size(), kCacheMarker); }
+            if (!instructions && (trimmed == kInstructions || trimmed == "</INSTRUCTIONS><|im_end|>")) {
+                add(begin + left + kInstructions.size(), kInstructionsEnd); instructions = true;
+            }
+            if (!project && (trimmed == kProjectTag || trimmed == "=== CACHE_BREAKPOINT ===<project_context>")) {
+                add(begin + line.find(kProjectTag), kProject); project = true;
+            }
+            const auto volatile_line = [&]() {
+                constexpr std::array<std::string_view, 4> prefixes = {"Current working directory: ", "Conversation started: ", "Working directory: ", "Conversation log: "};
+                for (auto prefix : prefixes) if (trimmed.size() > prefix.size() && trimmed.starts_with(prefix)) return true;
+                const auto dated = [&](std::string_view prefix) {
+                    if (!trimmed.starts_with(prefix) || trimmed.size() < prefix.size() + 10) {
+                        return false;
+                    }
+                    for (std::size_t index = 0; index < 10; ++index) {
+                        const char character = trimmed[prefix.size() + index];
+                        if (index == 4 || index == 7) {
+                            if (character != '-') { return false; }
+                        } else if (character < '0' || character > '9') {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                // This is intentionally narrower than Date.  The source contract accepts the
+                // generated Today field itself, not a date-shaped prefix followed by prose.
+                if (dated("Today: ")) {
+                    const std::string_view suffix =
+                        trimmed.substr(std::string_view("Today: ").size() + 10);
+                    const std::size_t suffix_first = suffix.find_first_not_of(" \t");
+                    return suffix_first == std::string_view::npos ||
+                           suffix.substr(suffix_first, suffix.find_last_not_of(" \t") -
+                                                            suffix_first + 1) == kEnd;
+                }
+                if (!dated("Date: ")) { return false; }
+                const std::string_view suffix = trimmed.substr(std::string_view("Date: ").size() + 10);
+                const std::size_t suffix_first = suffix.find_first_not_of(" \t");
+                return suffix_first == std::string_view::npos ||
+                       suffix.substr(suffix_first, suffix.find_last_not_of(" \t") - suffix_first + 1) == kEnd;
+            };
+            if (!volatile_found && volatile_line()) { add(begin, kVolatility); chat.first_volatile_offset = begin; volatile_found = true; }
+        }
+        if (end >= region_end) { break; }
+        begin = end + 1;
+    }
+    if (system_end_offset) { add(*system_end_offset, kSystemEnd); }
+}
+
+// Exact upstream initial-user envelope exceptions.  This is intentionally separate from the
+// trusted system scan: user turns are otherwise never structural input.
+void discover_initial_user_envelope(RenderedChat& chat, std::size_t region_end) {
+    constexpr std::uint32_t kInstructionsEnd = 1U << 2U, kProject = 1U << 3U,
+                            kVolatility = 1U << 4U;
+    const std::string_view text = chat.text;
+    constexpr std::string_view header = "<|im_start|>user\n";
+    if (region_end > text.size() || !text.starts_with(header)) { return; }
+    const auto add = [&](std::size_t offset, std::uint32_t origins) {
+        auto it = std::find_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
+                               [&](const auto& item) { return item.offset == offset; });
+        if (it == chat.structural_boundaries.end()) chat.structural_boundaries.push_back({offset, origins});
+        else it->origins |= origins;
+    };
+    const std::string_view body = text.substr(0, region_end);
+    const std::size_t content = header.size();
+    const std::size_t agents = body.find("# AGENTS.md instructions for ");
+    const std::size_t instructions = body.find("\n<INSTRUCTIONS>\n");
+    const std::size_t instructions_end = body.find("\n</INSTRUCTIONS>", instructions);
+    const std::size_t environment = body.find("\n<environment_context>", instructions_end);
+    const std::size_t environment_end = body.find("</environment_context>", environment);
+    if (agents == content && instructions != std::string_view::npos &&
+        instructions_end != std::string_view::npos && environment != std::string_view::npos &&
+        environment_end != std::string_view::npos) {
+        add(0, kProject);
+        add(instructions_end + std::string_view("\n</INSTRUCTIONS>").size(), kInstructionsEnd);
+        add(environment, kVolatility);
+        chat.first_volatile_offset = environment;
+        return;
+    }
+    const std::size_t reminder = body.find("<system-reminder>\n");
+    const std::size_t claude = body.find("\n# claudeMd\n", reminder);
+    const std::size_t date = body.find("\n# currentDate\n", claude);
+    const std::size_t reminder_end = body.find("</system-reminder>", reminder);
+    if (reminder == content && claude != std::string_view::npos && date != std::string_view::npos &&
+        reminder_end != std::string_view::npos && date < reminder_end) {
+        add(0, kProject); add(date, kInstructionsEnd); add(date, kVolatility);
+        chat.first_volatile_offset = date;
+    }
+}
+
 void validate_instruction_message(const ChatMessage& message) {
     if (message.has_media()) {
         throw std::invalid_argument(
@@ -696,13 +859,22 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     RenderedFragment final = std::move(rendered).release();
-    return RenderedChat{.text                         = std::move(final.text),
+    RenderedChat result{.text                         = std::move(final.text),
                         .literal_spans                = std::move(final.literal_spans),
                         .media_placeholders           = std::move(final.media_placeholders),
                         .rewrite_checkpoint           = rewrite_checkpoint,
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
                         .message_boundaries           = std::move(message_boundaries),
                         .cache_boundaries             = std::move(cache_boundaries)};
+    // The template folds the leading instruction into the initial system span.  Only that
+    // span is eligible for structural recognition, including harness-only prompts.
+    if (message_begin == 1 && !result.message_boundaries.empty() && result.message_boundaries[1]) {
+        discover_structural_boundaries(result, *result.message_boundaries[1]);
+    }
+    if (!messages.empty() && messages.front().role == ChatRole::User && result.message_boundaries[1]) {
+        discover_initial_user_envelope(result, *result.message_boundaries[1]);
+    }
+    return result;
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

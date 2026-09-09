@@ -364,6 +364,17 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix) {
+                auto group = std::find_if(base->shared_candidates.begin(), base->shared_candidates.end(),
+                                          [&](const CaptureGroup& value) {
+                                              return value.frontier == opportunity.frontier;
+                                          });
+                if (group != base->shared_candidates.end()) {
+                    group->structural_origins |= opportunity.structural_origins;
+                    group->structural_role = opportunity.structural_role;
+                    group->ssd_eligible = group->ssd_eligible || opportunity.ssd_eligible;
+                }
+            }
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
@@ -1258,6 +1269,11 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
             existing->shared = true;
             existing->shared_evidence |= selected->shared_evidence;
             existing->input_order = std::min(existing->input_order, selected->input_order);
+            existing->structural_origins |= selected->structural_origins;
+            if (selected->structural_role != qwen3_6::SharedPrefixRole::Transient) {
+                existing->structural_role = selected->structural_role;
+            }
+            existing->ssd_eligible = selected->ssd_eligible;
         }
     }
     plan.shared_candidates.clear();

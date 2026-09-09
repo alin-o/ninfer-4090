@@ -534,6 +534,7 @@ public:
         CaptureAssessment candidate =
             program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
         const SharedPrefixHandle* exact_shared = nullptr;
+        std::uint32_t exact_shared_slot = kInvalidCatalogSlot;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!index.shared || !valid_prefix_index_entry(index) ||
@@ -543,11 +544,15 @@ public:
                 SharedCatalogEntry& entry = shared_catalog_[index.slot];
                 if (program.shared_capture_matches(offer, *entry.handle)) {
                     exact_shared = &*entry.handle;
+                    exact_shared_slot = index.slot;
                     break;
                 }
             }
         }
         if (exact_shared != nullptr) {
+            // Classification is discovered independently by each prepared request. Preserve
+            // all evidence for this one physical semantic owner when an exact reuse matches.
+            merge_shared_metadata(shared_catalog_[exact_shared_slot], candidate);
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
@@ -826,6 +831,9 @@ public:
             .replacement_id       = selected->scenario.replacement_id,
             .replacement_revision = selected->scenario.replacement_revision,
             .shared_evidence      = selected->scenario.assessment.shared_evidence,
+            .structural_origins   = selected->scenario.assessment.structural_origins,
+            .structural_role      = selected->scenario.assessment.structural_role,
+            .ssd_eligible         = selected->scenario.assessment.ssd_eligible,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
             const auto owner_record =
@@ -1122,6 +1130,25 @@ public:
         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
     }
 
+    // Read-only metadata for the existing shared semantic owner.  It has no bearing on
+    // admission or physical placement; later Host/SSD policy can consume it without a second
+    // cache catalog.
+    struct SharedCatalogMetadata {
+        SharedCatalogState state = SharedCatalogState::Vacant;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
+    };
+
+    [[nodiscard]] SharedCatalogMetadata shared_catalog_metadata(std::uint32_t slot) const noexcept {
+        if (slot >= shared_catalog_count_) { return {}; }
+        const SharedCatalogEntry& entry = shared_catalog_[slot];
+        return {.state = entry.state,
+                .structural_origins = entry.structural_origins,
+                .structural_role = entry.structural_role,
+                .ssd_eligible = entry.ssd_eligible};
+    }
+
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
@@ -1269,7 +1296,18 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
     };
+
+    static void merge_shared_metadata(SharedCatalogEntry& entry,
+                                      const CaptureAssessment& candidate) noexcept {
+        entry.structural_origins |= candidate.structural_origins;
+        // Role ordering is durability ordered: Transient < Harness < Project.
+        entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
+        entry.ssd_eligible = entry.ssd_eligible || candidate.ssd_eligible;
+    }
 
     enum class SessionIndexState : std::uint8_t {
         Empty,
@@ -1333,6 +1371,9 @@ private:
         std::uint64_t replacement_id            = 0;
         std::uint64_t replacement_revision      = 0;
         SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -1681,6 +1722,9 @@ private:
         entry.transaction_pins    = 0;
         entry.explicit_credit     = false;
         entry.credit_expiry_epoch = 0;
+        entry.structural_origins  = 0;
+        entry.structural_role     = 0;
+        entry.ssd_eligible        = false;
         advance_revision(entry.revision);
     }
 
@@ -3233,6 +3277,9 @@ private:
                            ? std::numeric_limits<std::uint64_t>::max()
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
+            publication.structural_origins = record->structural_origins;
+            publication.structural_role = record->structural_role;
+            publication.ssd_eligible = record->ssd_eligible;
             advance_revision(publication.revision);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));

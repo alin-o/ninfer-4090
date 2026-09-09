@@ -128,6 +128,14 @@ struct RenderedChat {
     std::vector<std::optional<std::size_t>> message_boundaries;
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
+    // Frontend-owned structural boundaries discovered only in the trusted initial system span.
+    // They travel with the rendered bytes so tokenization can reject inside-token candidates.
+    struct StructuralBoundary {
+        std::size_t offset = 0;
+        std::uint32_t origins = 0;
+    };
+    std::vector<StructuralBoundary> structural_boundaries;
+    std::optional<std::size_t> first_volatile_offset;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

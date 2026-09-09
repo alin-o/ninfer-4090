@@ -732,6 +732,9 @@ struct CaptureAssessment {
     std::shared_ptr<detail::CaptureAssessmentImpl> implementation;
     PrefixShortlistKey shortlist_key;
     SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
+    std::uint32_t structural_origins = 0;
+    std::uint8_t structural_role = 0;
+    bool ssd_eligible = false;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<runtime::CheckpointRecoveryAlternativeWork> projected_recovery_work;

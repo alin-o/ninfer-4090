@@ -857,12 +857,19 @@ PreparedContextCache prepare_context_cache(
     // Structural candidates use the same shared catalog as explicit/engine candidates.  They
     // are immutable prompt metadata, not another physical cache owner.
     for (const fi::EncodedChat::StructuralBoundary& source : structural_boundaries) {
-        if (!source.frontier || *source.frontier == 0) {
+        if (!source.frontier) {
             ++out.structural_boundaries_skipped_not_token_boundary;
             continue;
         }
         ++out.structural_boundaries_accepted;
-        const bool eligible = !first_volatile_token || *source.frontier < *first_volatile_token;
+        if (*source.frontier == 0) {
+            ++out.structural_boundaries_noncapturable;
+            continue;
+        }
+        // Media prompts retain their recognition metadata for later policy, but their anchors
+        // are not SSD candidates until a media-aware persistence policy exists.
+        const bool eligible = vision_items.empty() &&
+                              (!first_volatile_token || *source.frontier < *first_volatile_token);
         PreparedStructuralCheckpoint checkpoint{.frontier = *source.frontier,
                                                  .origins = source.origins,
                                                  .role = SharedPrefixRole::Transient,
@@ -1514,6 +1521,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             std::move(processed.rewrite_execution_frontiers);
         message_boundaries = std::move(processed.message_boundaries);
         cache_boundaries   = std::move(processed.cache_boundaries);
+        structural_boundaries = std::move(processed.structural_boundaries);
+        first_volatile_token = processed.first_volatile_token;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));

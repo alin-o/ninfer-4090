@@ -178,7 +178,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(248046, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
          added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
          added(248057, "<|video_pad|>", true), added(248068, "<think>"),
-         added(248069, "</think>")});
+         added(248069, "</think>"), added(249000, "=== CACHE_BREAKPOINT ==="),
+         added(249001, "<project_context>"), added(249002, "</INSTRUCTIONS>"),
+         added(249003, "Current working directory: ")});
     nlohmann::json vocab           = {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}};
     vocab[byte_level_symbol(0x80)] = kByte80Token;
     vocab[byte_level_symbol(0xe0)] = kByteE0Token;
@@ -192,6 +194,12 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     vocab[byte_level_symbol(0x98)] = kByte98Token;
     vocab[byte_level_symbol(0xc2)] = kByteC2Token;
     vocab[byte_level_symbol(0xa2)] = kByteA2Token;
+    // Keep the component fixture self-contained: arbitrary ASCII harness text must tokenize
+    // without the official tokenizer artifact. Existing deliberately asserted byte IDs win.
+    for (int byte = 0; byte != 128; ++byte) {
+        const std::string symbol = byte_level_symbol(static_cast<std::uint8_t>(byte));
+        if (!vocab.contains(symbol)) { vocab[symbol] = 1000 + byte; }
+    }
     result.tokenizer_json          = nlohmann::json{
                  {"model",
                   {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
@@ -1611,6 +1619,76 @@ int test_structural_boundary_discovery_contract() {
     return failures;
 }
 
+int test_structural_boundary_preparation_contract() {
+    // This corpus is a repository-local, sanitized derivative of the upstream completion
+    // fixture semantics. It deliberately uses the self-contained tokenizer fixture.
+    const nlohmann::json corpus = nlohmann::json::parse(read_file(
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/boundary-contract-corpus.json"));
+    const std::string system = corpus.at("coincident_and_volatile").get<std::string>();
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    const auto make_input = [&](bool automatic) {
+        ninfer::PromptInput input;
+        input.messages.push_back(ninfer::ChatMessage{.role = ninfer::ChatRole::System,
+                                                      .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                                 .text = system}}});
+        input.messages.push_back(ninfer::ChatMessage{.role = ninfer::ChatRole::User,
+                                                      .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                                 .text = "x"}}});
+        input.context_cache.allow_engine_automatic_shared_prefixes = automatic;
+        return input;
+    };
+    const auto disabled = frontend.prepare(make_input(false));
+    const auto enabled = frontend.prepare(make_input(true));
+    const auto& without = FrontendFactory::inspect(disabled);
+    const auto& data = FrontendFactory::inspect(enabled);
+    const auto checkpoint = std::find_if(data.context_cache.structural_checkpoints.begin(),
+                                         data.context_cache.structural_checkpoints.end(),
+                                         [](const auto& item) {
+                                             return (item.origins &
+                                                     ninfer::targets::qwen3_6::SharedPrefixCacheMarker) != 0 &&
+                                                    (item.origins &
+                                                     ninfer::targets::qwen3_6::SharedPrefixProjectContext) != 0;
+                                         });
+    const bool cutoff_after_checkpoint = data.context_cache.first_volatile_token && checkpoint !=
+        data.context_cache.structural_checkpoints.end() && checkpoint->frontier < *data.context_cache.first_volatile_token;
+    int failures = check(data.token_ids == without.token_ids &&
+                             data.context_cache.structural_boundaries_accepted >= 4 &&
+                             data.context_cache.structural_boundaries_skipped_not_token_boundary == 0,
+                         "structural classification changed prepared tokens or lost exact diagnostics");
+    failures += check(checkpoint != data.context_cache.structural_checkpoints.end() &&
+                          checkpoint->role == ninfer::targets::qwen3_6::SharedPrefixRole::Harness &&
+                          checkpoint->ssd_eligible && cutoff_after_checkpoint,
+                      "coincident structural origins, role, or volatility eligibility were lost");
+    failures += check(std::none_of(data.context_cache.structural_checkpoints.begin(),
+                                   data.context_cache.structural_checkpoints.end(),
+                                   [&](const auto& item) {
+                                       return data.context_cache.first_volatile_token &&
+                                              item.frontier >= *data.context_cache.first_volatile_token &&
+                                              item.ssd_eligible;
+                                   }), "volatile checkpoint descendant remained SSD eligible");
+    return failures;
+}
+
+int test_media_structural_diagnostics_are_preserved() {
+    const nlohmann::json corpus = nlohmann::json::parse(read_file(
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/boundary-contract-corpus.json"));
+    ninfer::PromptInput input;
+    input.messages.push_back(ninfer::ChatMessage{.role = ninfer::ChatRole::System,
+                                                  .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                             .text = corpus.at("coincident_and_volatile").get<std::string>()}}});
+    input.messages.push_back(image_input().messages.front());
+    input.context_cache.allow_engine_automatic_shared_prefixes = true;
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data = FrontendFactory::inspect(prepared);
+    return check(data.has_media() && data.context_cache.first_volatile_token &&
+                     data.context_cache.structural_boundaries_accepted >= 4 &&
+                     std::all_of(data.context_cache.structural_checkpoints.begin(),
+                                 data.context_cache.structural_checkpoints.end(),
+                                 [](const auto& checkpoint) { return !checkpoint.ssd_eligible; }),
+                 "media preparation discarded recognition metadata or exposed an SSD anchor");
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -2361,7 +2439,9 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
-    const int structural_failures = test_structural_boundary_discovery_contract();
+    const int structural_failures = test_structural_boundary_discovery_contract() +
+                                    test_structural_boundary_preparation_contract() +
+                                    test_media_structural_diagnostics_are_preserved();
     if (!official_files_available()) {
         std::cout << "skip: official Qwen3.6-27B tokenizer files not found "
                      "(set NINFER_QWEN3_6_27B_HF_DIR)\n";
@@ -2369,7 +2449,7 @@ int main() {
     }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
-    int failures                  = 0;
+    int failures                  = structural_failures;
     failures += test_official_tokenizer_merge();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();

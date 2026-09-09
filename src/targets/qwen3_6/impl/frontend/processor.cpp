@@ -1097,6 +1097,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
+    output.structural_boundaries       = std::move(encoded.structural_boundaries);
+    output.first_volatile_token        = encoded.first_volatile_token;
     stats.prompt_tokens                = output.input_ids.size();
     enforce_media_resource_limits(stats, options_);
 

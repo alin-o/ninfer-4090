@@ -140,6 +140,9 @@ struct PreparedContextCache {
     std::optional<std::uint32_t> first_volatile_token;
     // Recognition mapping diagnostics, independent of admission/cache availability.
     std::uint32_t structural_boundaries_accepted = 0;
+    // Exact token boundaries at frontier zero are recognized but cannot be captured.
+    // Keep them separate from byte-to-token mapping failures.
+    std::uint32_t structural_boundaries_noncapturable = 0;
     std::uint32_t structural_boundaries_skipped_not_token_boundary = 0;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;

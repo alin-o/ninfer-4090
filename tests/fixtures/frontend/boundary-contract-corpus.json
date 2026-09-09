@@ -1,0 +1,4 @@
+{
+  "provenance": "Sanitized fixture semantics from llama.cpp test_completion.py at 983f0aeb7c1b33dd234f16c086a44466e7da1b76.",
+  "coincident_and_volatile": "=== CACHE_BREAKPOINT ===<project_context>\n</INSTRUCTIONS>\nCurrent working directory: x"
+}

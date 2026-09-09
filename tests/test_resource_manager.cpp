@@ -472,6 +472,9 @@ using FakeContextTransactionProgress =
 struct FakeCaptureAssessment {
     FakeShortlistKey shortlist_key;
     ninfer::SharedCandidateEvidence shared_evidence = ninfer::SharedCandidateEvidence::None;
+    std::uint32_t structural_origins = 0;
+    std::uint8_t structural_role = 0;
+    bool ssd_eligible = false;
     PrefillWork protected_rebuild_work;
     std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};

@@ -534,6 +534,7 @@ public:
         CaptureAssessment candidate =
             program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
         const SharedPrefixHandle* exact_shared = nullptr;
+        std::uint32_t exact_shared_slot = kInvalidCatalogSlot;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!index.shared || !valid_prefix_index_entry(index) ||
@@ -543,11 +544,15 @@ public:
                 SharedCatalogEntry& entry = shared_catalog_[index.slot];
                 if (program.shared_capture_matches(offer, *entry.handle)) {
                     exact_shared = &*entry.handle;
+                    exact_shared_slot = index.slot;
                     break;
                 }
             }
         }
         if (exact_shared != nullptr) {
+            // Classification is discovered independently by each prepared request. Preserve
+            // all evidence for this one physical semantic owner when an exact reuse matches.
+            merge_shared_metadata(shared_catalog_[exact_shared_slot], candidate);
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
@@ -1295,6 +1300,14 @@ private:
         std::uint8_t structural_role = 0;
         bool ssd_eligible = false;
     };
+
+    static void merge_shared_metadata(SharedCatalogEntry& entry,
+                                      const CaptureAssessment& candidate) noexcept {
+        entry.structural_origins |= candidate.structural_origins;
+        // Role ordering is durability ordered: Transient < Harness < Project.
+        entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
+        entry.ssd_eligible = entry.ssd_eligible || candidate.ssd_eligible;
+    }
 
     enum class SessionIndexState : std::uint8_t {
         Empty,

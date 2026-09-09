@@ -1791,9 +1791,20 @@ int test_structural_boundary_inside_token_mapping_skip() {
                                    .tokenizer_config_json = resources().tokenizer_config_json,
                                    .generation_config_json = resources().generation_config_json});
     const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered, 64);
-    return check(encoded.input_ids.size() == 1 && encoded.structural_boundaries.size() == 1 &&
-                     !encoded.structural_boundaries.front().frontier,
-                 "inside-token structural boundary was rounded instead of reported as unmappable");
+    int failures = check(encoded.input_ids.size() == 1 && encoded.structural_boundaries.size() == 1 &&
+                             !encoded.structural_boundaries.front().frontier,
+                         "inside-token structural boundary was rounded instead of reported as unmappable");
+
+    // Pass the encoded mapping result through the frontend's structural classification path.
+    const auto cache = FrontendFactory::structural_diagnostics({
+        {std::nullopt, ninfer::targets::qwen3_6::SharedPrefixSystemEnd},
+        {1, ninfer::targets::qwen3_6::SharedPrefixInstructionsEnd},
+    });
+    failures += check(cache.structural_boundaries_skipped_not_token_boundary == 1 &&
+                          cache.structural_boundaries_accepted >= 1 &&
+                          cache.structural_boundaries_noncapturable == 0,
+                      "prepared structural diagnostics did not report the mapping skip separately");
+    return failures;
 }
 
 int test_media_structural_diagnostics_are_preserved() {

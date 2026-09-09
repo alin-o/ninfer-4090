@@ -1027,7 +1027,7 @@ public:
 
     [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
                                               const FakeSharedPrefixHandle&) const {
-        return false;
+        return shared_capture_matches_result;
     }
 
     void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
@@ -1136,6 +1136,7 @@ public:
     bool finish_with_rewrite                             = false;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
+    bool shared_capture_matches_result                   = false;
     bool change_shared_source_residency_on_second_report = false;
     std::uint32_t reported_shared_active_references      = 0;
     ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
@@ -3047,6 +3048,50 @@ void test_shared_republication_replaces_catalog_metadata_with_owner() {
             "shared catalog replacement retained immutable metadata from the prior physical owner");
 }
 
+void test_exact_shared_capture_merges_richer_structural_metadata() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const auto publish = [&](std::uint32_t origins, std::uint8_t role, bool eligible,
+                             std::uint64_t order) {
+        FakeRequestBasePlan request = make_base(274);
+        request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, 274, request, order);
+        program.shared_capture_matches_result = order != 1;
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key = FakeShortlistKey{.digest = 274, .frontier = 64},
+            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .structural_origins = origins,
+            .structural_role = role,
+            .ssd_eligible = eligible,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_private = order != 1,
+            .publishes_shared = true,
+            .physically_feasible = true,
+        };
+        if (order != 1) { program.capture_summary.endpoint = endpoint(274, 64); }
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 274}, 0,
+                                               {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "exact-owner metadata fixture could not reserve capture");
+        require(std::get<FakeManager::ActiveCaptureOutcome>(
+                    manager.progress_context_transaction(program, {})).status ==
+                    ContextTransactionStatus::Published,
+                "exact-owner metadata fixture did not publish or reuse capture");
+        (void)finish_active(manager, program, active);
+    };
+
+    publish(0x02, 1, false, 1);
+    publish(0x18, 2, true, 2);
+    const auto metadata = manager.shared_catalog_metadata(0);
+    require(metadata.state == FakeManager::SharedCatalogState::Catalogued &&
+                metadata.structural_origins == 0x1a && metadata.structural_role == 2 &&
+                metadata.ssd_eligible,
+            "exact shared-owner reuse did not merge richer structural metadata");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3403,6 +3448,8 @@ int main() {
              test_shared_capture_publishes_immutable_structural_metadata);
     run_test("shared capture republication metadata",
              test_shared_republication_replaces_catalog_metadata_with_owner);
+    run_test("exact shared capture metadata merge",
+             test_exact_shared_capture_merges_richer_structural_metadata);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("aborted shared capture logical rollback",

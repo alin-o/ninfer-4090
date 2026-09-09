@@ -915,6 +915,11 @@ PreparedContextCache prepare_context_cache(
     PreparedStructuralCheckpoint* project = nullptr;
     if (has_project_frontier) {
         for (auto& checkpoint : out.structural_checkpoints) {
+            // A structural boundary after the first volatile token remains useful
+            // recognition evidence, but it cannot turn a post-volatility prefix into a
+            // durable anchor. Select roles from the pre-volatility candidates so the final
+            // stable prefix remains available to a later SSD policy.
+            if (first_volatile_token && checkpoint.frontier >= *first_volatile_token) { continue; }
             if (checkpoint.frontier <= project_frontier &&
                 (!harness || checkpoint.frontier > harness->frontier)) {
                 harness = &checkpoint;
@@ -927,6 +932,7 @@ PreparedContextCache prepare_context_cache(
     if (!harness) {
         for (auto& checkpoint : out.structural_checkpoints) {
             if ((!has_project_frontier || checkpoint.frontier <= project_frontier) &&
+                (!first_volatile_token || checkpoint.frontier < *first_volatile_token) &&
                 checkpoint.role == SharedPrefixRole::Transient &&
                 (!harness || checkpoint.frontier > harness->frontier)) {
                 harness = &checkpoint;
@@ -935,7 +941,8 @@ PreparedContextCache prepare_context_cache(
     }
     if (!has_project_frontier && harness) {
         for (auto& checkpoint : out.structural_checkpoints) {
-            if ((checkpoint.origins & SharedPrefixCacheMarker) != 0) {
+            if ((!first_volatile_token || checkpoint.frontier < *first_volatile_token) &&
+                (checkpoint.origins & SharedPrefixCacheMarker) != 0) {
                 harness = &checkpoint;
             }
         }
@@ -1443,6 +1450,18 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
+}
+
+PreparedContextCache FrontendTestAccess::structural_diagnostics(
+    const std::vector<std::pair<std::optional<std::uint32_t>, std::uint32_t>>& boundaries) {
+    std::vector<fi::EncodedChat::StructuralBoundary> encoded;
+    encoded.reserve(boundaries.size());
+    for (const auto& [frontier, origins] : boundaries) {
+        encoded.push_back({.frontier = frontier, .origins = origins});
+    }
+    ContextCacheHints hints;
+    return prepare_context_cache(std::move(hints), 0, {}, {}, {}, {}, std::nullopt, std::nullopt, 1,
+                                 encoded);
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {

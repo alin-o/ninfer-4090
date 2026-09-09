@@ -284,8 +284,34 @@ void test_kv_store(ninfer::DeviceContext& device) {
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
+    expect(extents.valid(second_host_extent) &&
+               host_arena.occupied_bytes() == 2U * host_layout.page_stride,
+           "KV Host restore retains its backing after H2D");
+    expect(pages.drop_device_replica(logical_pages[0]) &&
+               pages.drop_device_replica(logical_pages[1]),
+           "retained Host backing supports a later offload without another D2H");
+    auto selected_restore_reservation = physical_pages.reserve(1);
+    expect(selected_restore_reservation.has_value(), "selected-prefix Device reservation");
+    const std::array selected_restore_destination{
+        pages.reserve_device_replica(logical_pages[0], *selected_restore_reservation)};
+    physical_pages.copy_from_host(extents.view(second_host_extent).subview(0, 1),
+                                  selected_restore_destination, device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    pages.publish_device_replica(logical_pages[0]);
+    expect(pages.device_resident(logical_pages[0]) && !pages.device_resident(logical_pages[1]) &&
+               pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]) &&
+               extents.valid(second_host_extent),
+           "selected-prefix restore uploads only its missing page and preserves Host backing");
+    auto remaining_restore_reservation = physical_pages.reserve(1);
+    expect(remaining_restore_reservation.has_value(), "remaining KV Host restore reservation");
+    const std::array remaining_restore_destination{
+        pages.reserve_device_replica(logical_pages[1], *remaining_restore_reservation)};
+    physical_pages.copy_from_host(extents.view(second_host_extent).subview(1, 1),
+                                  remaining_restore_destination, device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    pages.publish_device_replica(logical_pages[1]);
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
-           "KV Host restore republishes Device replicas before releasing the extent");
+           "KV Host extent releases only after both restored replicas are resident");
     auto activation = addresses.prepare_activation(*address, 3, 1);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2 &&
                physical_pages.reserved_pages() == 1,

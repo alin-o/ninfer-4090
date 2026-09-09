@@ -7421,6 +7421,9 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     CaptureAssessment assessment;
     assessment.shortlist_key   = group.identity->shortlist_key;
     assessment.shared_evidence = group.shared_evidence;
+    assessment.structural_origins = group.structural_origins;
+    assessment.structural_role = static_cast<std::uint8_t>(group.structural_role);
+    assessment.ssd_eligible = group.ssd_eligible;
     assessment.protected_rebuild_work =
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;

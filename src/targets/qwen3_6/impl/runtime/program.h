@@ -102,6 +102,9 @@ struct CaptureGroup {
     bool shared                             = false;
     bool long_anchor                        = false;
     SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
+    std::uint32_t structural_origins = 0;
+    qwen3_6::SharedPrefixRole structural_role = qwen3_6::SharedPrefixRole::Transient;
+    bool ssd_eligible = false;
 };
 
 enum class MtpBridgeMode : std::uint8_t {

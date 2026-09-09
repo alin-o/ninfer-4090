@@ -790,6 +790,10 @@ PreparedContextCache prepare_context_cache(
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
+        // A shared prefix must end before the first token containing volatile bytes.  Private
+        // anchors retain their existing semantics.
+        if (kind == PromptCacheMarkerKind::SharedStablePrefix && first_volatile_token &&
+            frontier >= *first_volatile_token) { return; }
         const auto duplicate = std::find_if(
             out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
                 return existing.kind == kind && existing.frontier == frontier;
@@ -857,7 +861,11 @@ PreparedContextCache prepare_context_cache(
     // Structural candidates use the same shared catalog as explicit/engine candidates.  They
     // are immutable prompt metadata, not another physical cache owner.
     for (const fi::EncodedChat::StructuralBoundary& source : structural_boundaries) {
-        if (!source.frontier || *source.frontier == 0) { continue; }
+        if (!source.frontier || *source.frontier == 0) {
+            ++out.structural_boundaries_skipped_not_token_boundary;
+            continue;
+        }
+        ++out.structural_boundaries_accepted;
         const bool eligible = !first_volatile_token || *source.frontier < *first_volatile_token;
         PreparedStructuralCheckpoint checkpoint{.frontier = *source.frontier,
                                                  .origins = source.origins,
@@ -871,6 +879,15 @@ PreparedContextCache prepare_context_cache(
             add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                             SharedCandidateEvidence::EngineStructural, *source.frontier,
                             engine_order++);
+            auto opportunity = std::find_if(out.opportunities.rbegin(), out.opportunities.rend(),
+                                            [&](const auto& value) {
+                                                return value.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                                                       value.frontier == *source.frontier;
+                                            });
+            if (opportunity != out.opportunities.rend()) {
+                opportunity->structural_origins |= source.origins;
+                opportunity->ssd_eligible = true;
+            }
         }
     }
     std::uint32_t project_frontier = 0;
@@ -883,6 +900,16 @@ PreparedContextCache prepare_context_cache(
         if (!checkpoint.ssd_eligible) { continue; }
         if (checkpoint.frontier <= project_frontier) checkpoint.role = SharedPrefixRole::Harness;
         else if (project_frontier != 0) checkpoint.role = SharedPrefixRole::Project;
+    }
+    for (auto& opportunity : out.opportunities) {
+        for (const auto& checkpoint : out.structural_checkpoints) {
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                opportunity.frontier == checkpoint.frontier) {
+                opportunity.structural_origins |= checkpoint.origins;
+                opportunity.structural_role = checkpoint.role;
+                opportunity.ssd_eligible = checkpoint.ssd_eligible;
+            }
+        }
     }
     return out;
 }

@@ -826,6 +826,9 @@ public:
             .replacement_id       = selected->scenario.replacement_id,
             .replacement_revision = selected->scenario.replacement_revision,
             .shared_evidence      = selected->scenario.assessment.shared_evidence,
+            .structural_origins   = selected->scenario.assessment.structural_origins,
+            .structural_role      = selected->scenario.assessment.structural_role,
+            .ssd_eligible         = selected->scenario.assessment.ssd_eligible,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
             const auto owner_record =
@@ -1269,6 +1272,9 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
     };
 
     enum class SessionIndexState : std::uint8_t {
@@ -1333,6 +1339,9 @@ private:
         std::uint64_t replacement_id            = 0;
         std::uint64_t replacement_revision      = 0;
         SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
+        std::uint32_t structural_origins = 0;
+        std::uint8_t structural_role = 0;
+        bool ssd_eligible = false;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -3233,6 +3242,9 @@ private:
                            ? std::numeric_limits<std::uint64_t>::max()
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
+            publication.structural_origins = record->structural_origins;
+            publication.structural_role = record->structural_role;
+            publication.ssd_eligible = record->ssd_eligible;
             advance_revision(publication.revision);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));

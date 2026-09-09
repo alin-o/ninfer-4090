@@ -83,6 +83,19 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
             fence_len = 0; fence_line = true;
         }
         if (!in_fence && !fence_line) {
+            // The legacy leading-system project envelope is deliberately a complete, bounded
+            // form.  Do not treat a stray <project> in instructions as an anchor.
+            if (!project && trimmed == "<project>" &&
+                text.compare(end, std::string_view("\n## Context\n<instructions>\n").size(),
+                             "\n## Context\n<instructions>\n") == 0) {
+                const std::size_t close = text.find("\n</instructions>\n</project>", end);
+                if (close != std::string_view::npos && close < region_end) {
+                    add(begin, kProject);
+                    add(close + std::string_view("\n</instructions>\n</project>").size(),
+                        kInstructionsEnd);
+                    project = true;
+                }
+            }
             constexpr std::string_view kEnd = "<|im_end|>";
             const std::size_t pos = line.rfind(kEnd);
             if (pos != std::string_view::npos && line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
@@ -108,6 +121,47 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
         }
         if (end >= region_end) { break; }
         begin = end + 1;
+    }
+}
+
+// Exact upstream initial-user envelope exceptions.  This is intentionally separate from the
+// trusted system scan: user turns are otherwise never structural input.
+void discover_initial_user_envelope(RenderedChat& chat, std::size_t region_end) {
+    constexpr std::uint32_t kInstructionsEnd = 1U << 2U, kProject = 1U << 3U,
+                            kVolatility = 1U << 4U;
+    const std::string_view text = chat.text;
+    constexpr std::string_view header = "<|im_start|>user\n";
+    if (region_end > text.size() || !text.starts_with(header)) { return; }
+    const auto add = [&](std::size_t offset, std::uint32_t origins) {
+        auto it = std::find_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
+                               [&](const auto& item) { return item.offset == offset; });
+        if (it == chat.structural_boundaries.end()) chat.structural_boundaries.push_back({offset, origins});
+        else it->origins |= origins;
+    };
+    const std::string_view body = text.substr(0, region_end);
+    const std::size_t content = header.size();
+    const std::size_t agents = body.find("# AGENTS.md instructions for ");
+    const std::size_t instructions = body.find("\n<INSTRUCTIONS>\n");
+    const std::size_t instructions_end = body.find("\n</INSTRUCTIONS>", instructions);
+    const std::size_t environment = body.find("\n<environment_context>", instructions_end);
+    const std::size_t environment_end = body.find("</environment_context>", environment);
+    if (agents == content && instructions != std::string_view::npos &&
+        instructions_end != std::string_view::npos && environment != std::string_view::npos &&
+        environment_end != std::string_view::npos) {
+        add(0, kProject);
+        add(instructions_end + std::string_view("\n</INSTRUCTIONS>").size(), kInstructionsEnd);
+        add(environment, kVolatility);
+        chat.first_volatile_offset = environment;
+        return;
+    }
+    const std::size_t reminder = body.find("<system-reminder>\n");
+    const std::size_t claude = body.find("\n# claudeMd\n", reminder);
+    const std::size_t date = body.find("\n# currentDate\n", claude);
+    const std::size_t reminder_end = body.find("</system-reminder>", reminder);
+    if (reminder == content && claude != std::string_view::npos && date != std::string_view::npos &&
+        reminder_end != std::string_view::npos && date < reminder_end) {
+        add(0, kProject); add(date, kInstructionsEnd); add(date, kVolatility);
+        chat.first_volatile_offset = date;
     }
 }
 
@@ -778,6 +832,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     // span is eligible for structural recognition, including harness-only prompts.
     if (message_begin == 1 && !result.message_boundaries.empty() && result.message_boundaries[1]) {
         discover_structural_boundaries(result, *result.message_boundaries[1]);
+    }
+    if (!messages.empty() && messages.front().role == ChatRole::User && result.message_boundaries[1]) {
+        discover_initial_user_envelope(result, *result.message_boundaries[1]);
     }
     return result;
 }

@@ -2,7 +2,11 @@
 
 The Qwen3.6 Frontend recognizes structural cache boundaries only while rendering
 the initial folded System/Developer instruction span.  User, Tool and Assistant
-content is deliberately outside that trusted region.  The recognizer is ported
+content is deliberately outside that trusted region, except for the complete initial-user
+Codex AGENTS/INSTRUCTIONS/environment and Claude system-reminder/claudeMd/currentDate
+envelopes.  These bounded upstream exceptions, plus the complete leading-system
+`<project>/## Context/<instructions>` envelope, are recognized as a whole; lookalikes do
+not authorize a boundary.  The recognizer is ported
 from llama.cpp `server_checkpoint_discover` at
 `983f0aeb7c1b33dd234f16c086a44466e7da1b76`; the source hashes and MIT license
 are retained in the repository-local port reference manifest described below.
@@ -16,8 +20,9 @@ tokenization call.  A candidate that does not land on an exact token frontier
 is retained only as a mapping skip; it is never rounded into a cache prefix.
 
 `PreparedContextCache::structural_checkpoints` publishes the merged origin bits,
-role and SSD eligibility for later catalog consumers.  It does not introduce a
-second physical cache owner.  `first_volatile_token` is cumulative: a prefix
+role and SSD eligibility, which travel through CaptureGroup and publication to the shared
+catalog's existing physical owner.  It does not introduce a second physical cache owner.
+`first_volatile_token` is cumulative: a prefix
 ending before that token remains eligible, while any checkpoint including it is
 not.  Media prompts do not currently receive structural anchors.
 

@@ -364,6 +364,14 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
+            if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix) {
+                auto& group = base->shared_candidates.back();
+                if (group.frontier == opportunity.frontier) {
+                    group.structural_origins |= opportunity.structural_origins;
+                    group.structural_role = opportunity.structural_role;
+                    group.ssd_eligible = group.ssd_eligible || opportunity.ssd_eligible;
+                }
+            }
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {

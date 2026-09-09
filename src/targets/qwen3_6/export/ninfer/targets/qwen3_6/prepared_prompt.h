@@ -101,17 +101,21 @@ struct PreparedSessionKey {
                                          const PreparedSessionKey&) noexcept = default;
 };
 
+enum class SharedPrefixRole : std::uint8_t { Transient, Harness, Project };
+
 struct PreparedCacheOpportunity {
     PromptCacheMarkerKind kind       = PromptCacheMarkerKind::SharedStablePrefix;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     std::uint32_t frontier           = 0;
     std::uint32_t input_order        = 0;
+    // Immutable classification attached to the one shared semantic owner.
+    std::uint32_t structural_origins = 0;
+    SharedPrefixRole structural_role = SharedPrefixRole::Transient;
+    bool ssd_eligible = false;
 
     [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
                                          PreparedCacheOpportunity) noexcept = default;
 };
-
-enum class SharedPrefixRole : std::uint8_t { Transient, Harness, Project };
 
 enum SharedPrefixOrigin : std::uint32_t {
     SharedPrefixSystemEnd = 1U << 0U,
@@ -134,6 +138,9 @@ struct PreparedContextCache {
     std::vector<PreparedCacheOpportunity> opportunities;
     std::vector<PreparedStructuralCheckpoint> structural_checkpoints;
     std::optional<std::uint32_t> first_volatile_token;
+    // Recognition mapping diagnostics, independent of admission/cache availability.
+    std::uint32_t structural_boundaries_accepted = 0;
+    std::uint32_t structural_boundaries_skipped_not_token_boundary = 0;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };

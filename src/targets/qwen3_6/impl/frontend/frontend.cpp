@@ -942,6 +942,13 @@ PreparedContextCache prepare_context_cache(
     }
     if (harness) { harness->role = SharedPrefixRole::Harness; }
     if (project) { project->role = SharedPrefixRole::Project; }
+    // Recognition alone does not make an anchor durable.  Only the selected bounded harness
+    // and project anchors may be considered by a future SSD policy; all other structural
+    // observations remain transient even when they precede the volatility cutoff.
+    for (auto& checkpoint : out.structural_checkpoints) {
+        checkpoint.ssd_eligible = checkpoint.ssd_eligible &&
+                                  checkpoint.role != SharedPrefixRole::Transient;
+    }
     for (auto& opportunity : out.opportunities) {
         for (const auto& checkpoint : out.structural_checkpoints) {
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&

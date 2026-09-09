@@ -1708,6 +1708,20 @@ int test_structural_boundary_preparation_contract() {
                                               item.frontier >= *data.context_cache.first_volatile_token &&
                                               item.ssd_eligible;
                                    }), "volatile checkpoint descendant remained SSD eligible");
+    const auto transient = std::find_if(data.context_cache.structural_checkpoints.begin(),
+                                        data.context_cache.structural_checkpoints.end(),
+                                        [](const auto& item) {
+                                            return item.role == ninfer::targets::qwen3_6::SharedPrefixRole::Transient;
+                                        });
+    failures += check(transient != data.context_cache.structural_checkpoints.end() &&
+                          !transient->ssd_eligible &&
+                          std::none_of(data.context_cache.opportunities.begin(),
+                                       data.context_cache.opportunities.end(),
+                                       [&](const auto& item) {
+                                           return item.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                                                  item.frontier == transient->frontier && item.ssd_eligible;
+                                       }),
+                      "unselected stable structural checkpoint remained SSD eligible");
     return failures;
 }
 
@@ -1732,6 +1746,9 @@ int test_structural_boundary_roles_and_initial_envelope_diagnostics() {
     };
     const auto harness = prepare("=== CACHE_BREAKPOINT ===");
     const auto project = prepare("=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>");
+    const auto prepared_envelope = prepare("# AGENTS.md instructions for /opaque\n<INSTRUCTIONS>\nrule\n"
+                                           "</INSTRUCTIONS>\n<environment_context>\nopaque\n"
+                                           "</environment_context>", true);
     std::vector<fi::ChatMessage> envelope_messages;
     fi::ChatMessage envelope_message;
     envelope_message.role = ninfer::ChatRole::User;
@@ -1758,8 +1775,25 @@ int test_structural_boundary_roles_and_initial_envelope_diagnostics() {
     return check(has_role(harness, ninfer::targets::qwen3_6::SharedPrefixRole::Harness) &&
                      has_role(project, ninfer::targets::qwen3_6::SharedPrefixRole::Harness) &&
                      has_role(project, ninfer::targets::qwen3_6::SharedPrefixRole::Project) &&
-                     envelope_zero,
+                     envelope_zero && prepared_envelope.structural_boundaries_noncapturable == 1,
                  "harness/project role selection or frontier-zero envelope diagnostics were lost");
+}
+
+int test_structural_boundary_inside_token_mapping_skip() {
+    // The tokenizer fixture has a single added token for "helloST".  This is a deliberately
+    // structural byte offset inside that one token: the encoded form must preserve the rejected
+    // mapping instead of rounding it to a cacheable frontier.
+    fi::RenderedChat rendered;
+    rendered.text = "helloST";
+    rendered.structural_boundaries.push_back(
+        {.offset = 5, .origins = ninfer::targets::qwen3_6::SharedPrefixSystemEnd});
+    const fi::Tokenizer tokenizer({.tokenizer_json = resources().tokenizer_json,
+                                   .tokenizer_config_json = resources().tokenizer_config_json,
+                                   .generation_config_json = resources().generation_config_json});
+    const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered, 64);
+    return check(encoded.input_ids.size() == 1 && encoded.structural_boundaries.size() == 1 &&
+                     !encoded.structural_boundaries.front().frontier,
+                 "inside-token structural boundary was rounded instead of reported as unmappable");
 }
 
 int test_media_structural_diagnostics_are_preserved() {
@@ -2541,6 +2575,7 @@ int main() {
     const int structural_failures = test_structural_boundary_discovery_contract() +
                                     test_structural_boundary_preparation_contract() +
                                     test_structural_boundary_roles_and_initial_envelope_diagnostics() +
+                                    test_structural_boundary_inside_token_mapping_skip() +
                                     test_media_structural_diagnostics_are_preserved();
     if (!official_files_available()) {
         std::cout << "skip: official Qwen3.6-27B tokenizer files not found "

@@ -2996,6 +2996,57 @@ void test_shared_capture_publishes_immutable_structural_metadata() {
             "cleared shared catalog retained metadata for a future physical owner");
 }
 
+void test_shared_republication_replaces_catalog_metadata_with_owner() {
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const auto publish = [&](std::uint32_t digest, std::uint32_t origins, std::uint8_t role,
+                             bool eligible, std::uint64_t order) {
+        FakeRequestBasePlan request = make_base(digest);
+        request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const ActiveRequest active = start_active(manager, program, digest, request, order);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key = FakeShortlistKey{.digest = digest, .frontier = 64},
+            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .structural_origins = origins,
+            .structural_role = role,
+            .ssd_eligible = eligible,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared = true,
+            .physically_feasible = true,
+        };
+        require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = digest},
+                                               0, {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
+                "republication fixture could not reserve shared capture");
+        require(std::get<FakeManager::ActiveCaptureOutcome>(
+                    manager.progress_context_transaction(program, {})).status ==
+                    ContextTransactionStatus::Published,
+                "republication fixture did not publish shared capture");
+        (void)finish_active(manager, program, active);
+    };
+
+    publish(272, 0x02, 1, true, 1);
+    const auto first = manager.shared_catalog_metadata(0);
+    // Program cleanup removes the old physical semantic owner.  The vacant catalog slot is
+    // then republished by a different owner, which must replace all immutable metadata.
+    manager.clear_after_program_cleanup();
+    const auto vacant = manager.shared_catalog_metadata(0);
+    publish(273, 0x08, 2, false, 2);
+    const auto second = manager.shared_catalog_metadata(0);
+    require(first.state == FakeManager::SharedCatalogState::Catalogued &&
+                first.structural_origins == 0x02 && first.structural_role == 1 &&
+                first.ssd_eligible && vacant.state == FakeManager::SharedCatalogState::Vacant &&
+                vacant.structural_origins == 0 && vacant.structural_role == 0 &&
+                !vacant.ssd_eligible && second.state == FakeManager::SharedCatalogState::Catalogued &&
+                second.structural_origins == 0x08 && second.structural_role == 2 &&
+                !second.ssd_eligible,
+            "shared catalog replacement retained immutable metadata from the prior physical owner");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3350,6 +3401,8 @@ int main() {
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture structural metadata",
              test_shared_capture_publishes_immutable_structural_metadata);
+    run_test("shared capture republication metadata",
+             test_shared_republication_replaces_catalog_metadata_with_owner);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("aborted shared capture logical rollback",

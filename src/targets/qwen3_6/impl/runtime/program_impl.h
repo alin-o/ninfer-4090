@@ -45,8 +45,8 @@ using Clock = std::chrono::steady_clock;
 // the same hash over the prefix its frontier covers (session_snapshot_impl.h calls through
 // here for the full ledger).
 std::string ledger_prefix_digest(std::span<const TokenId> ledger) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    const auto* bytes  = reinterpret_cast<const unsigned char*>(ledger.data());
+    std::uint64_t hash      = 1469598103934665603ULL;
+    const auto* bytes       = reinterpret_cast<const unsigned char*>(ledger.data());
     const std::size_t count = ledger.size() * sizeof(TokenId);
     for (std::size_t index = 0; index < count; ++index) {
         hash = (hash ^ bytes[index]) * 1099511628211ULL;
@@ -751,20 +751,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group),
-      kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
-      kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
-      proposal_head(plan.proposal_head),
-      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      kv_quant_group(plan.kv_quant_group), kv_packed_v(plan.kv_packed_v),
+      kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v), kv_packed_k(plan.kv_packed_k),
+      kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
+      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
+      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       text_kv_bytes(plan.persistent.decoder.text_kv.payload_bytes()),
       mtp_kv_bytes(plan.persistent.decoder.mtp_kv ? plan.persistent.decoder.mtp_kv->payload_bytes()
                                                   : 0),
       gdn_state_bytes(plan.persistent.state_images.linear.payload_bytes()),
       dflash_kv_bytes(plan.persistent.dflash ? plan.persistent.dflash->kv_payload_bytes() : 0),
-      replay_records_bytes(plan.persistent.replay_records
-                               ? plan.persistent.replay_records->payload_bytes()
-                               : 0),
+      replay_records_bytes(
+          plan.persistent.replay_records ? plan.persistent.replay_records->payload_bytes() : 0),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -5778,7 +5777,7 @@ void ProgramImplCore::publish_pressure_work(
             } else if (!change.host_released) {
                 if (pressure_state_drops_host(action)
                         ? !state_store->drop_host_replica(*source)
-                        : !state_store->drop_device_replica(*source)) {
+                        : !state_store->offload_retained_device_replica(*source)) {
                     std::terminate();
                 }
                 work.mutation_published = true;
@@ -5803,7 +5802,7 @@ void ProgramImplCore::publish_pressure_work(
                     change.backup.reset();
                 }
                 for (const LogicalKVPageHandle page : change.pages) {
-                    if (!pages.drop_device_replica(page)) { std::terminate(); }
+                    if (!pages.offload_retained_device_replica(page)) { std::terminate(); }
                 }
                 work.mutation_published = true;
             };
@@ -7419,11 +7418,11 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
                                 exact_shared == nullptr && shared_prefix_capacity != 0;
 
     CaptureAssessment assessment;
-    assessment.shortlist_key   = group.identity->shortlist_key;
-    assessment.shared_evidence = group.shared_evidence;
+    assessment.shortlist_key      = group.identity->shortlist_key;
+    assessment.shared_evidence    = group.shared_evidence;
     assessment.structural_origins = group.structural_origins;
-    assessment.structural_role = static_cast<std::uint8_t>(group.structural_role);
-    assessment.ssd_eligible = group.ssd_eligible;
+    assessment.structural_role    = static_cast<std::uint8_t>(group.structural_role);
+    assessment.ssd_eligible       = group.ssd_eligible;
     assessment.protected_rebuild_work =
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;
@@ -12247,7 +12246,8 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         break;
     case DType::I8:
         // This fork's packed/rotated/E8 modes all report through the I8 storage family.
-        out.kv_cache = kv_e8_root ? KvCacheStorage::RK2V4E8
+        out.kv_cache =
+            kv_e8_root ? KvCacheStorage::RK2V4E8
                        : (kv_e8_lattice
                               ? KvCacheStorage::RK4V4E8
                               : (kv_packed_k

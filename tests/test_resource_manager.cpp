@@ -472,9 +472,9 @@ using FakeContextTransactionProgress =
 struct FakeCaptureAssessment {
     FakeShortlistKey shortlist_key;
     ninfer::SharedCandidateEvidence shared_evidence = ninfer::SharedCandidateEvidence::None;
-    std::uint32_t structural_origins = 0;
-    std::uint8_t structural_role = 0;
-    bool ssd_eligible = false;
+    std::uint32_t structural_origins                = 0;
+    std::uint8_t structural_role                    = 0;
+    bool ssd_eligible                               = false;
     PrefillWork protected_rebuild_work;
     std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};
@@ -694,6 +694,27 @@ public:
             target_feasible(std::span<const FakeTargetDecision>{})
                 ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                 : ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        if (materialization_capacity_pages) {
+            const std::uint32_t selected_occupancy = materialization_selected_prefix_pages +
+                                                     materialization_bounded_tail_pages +
+                                                     materialization_continuation_growth_pages;
+            materialization_selected_prefix_admitted =
+                selected_occupancy <= *materialization_capacity_pages &&
+                materialization_full_parent_pages > *materialization_capacity_pages;
+            plan.identity.physical_status =
+                materialization_selected_prefix_admitted
+                    ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
+                    : ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+            plan.transfers.push_back(ContextTransferRequirement{
+                .resource  = ninfer::runtime::ContextResourceClass::MainKV,
+                .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
+                .work      = {.payload_bytes   = materialization_missing_upload_pages,
+                              .copy_operations = materialization_missing_upload_pages == 0 ? 0U : 1U},
+            });
+            plan.identity.machine_work.candidate_transfers[1] = plan.transfers.front().work;
+            plan.identity.machine_work.optimistic_candidate_transfers[1] =
+                plan.transfers.front().work;
+        }
         plan.identity.source_mode = plan.source_mode;
         plan.identity.expandable  = plan.identity.physical_status !=
                                    ninfer::runtime::MaterializationPhysicalStatus::Feasible;
@@ -769,6 +790,10 @@ public:
         ++start_calls;
         started_source_id   = plan.admission.private_source_id;
         started_source_mode = plan.admission.source_mode;
+        if (materialization_capacity_pages) {
+            materialization_started_with_selected_prefix = materialization_selected_prefix_admitted;
+            materialization_uploaded_pages               = materialization_missing_upload_pages;
+        }
         started_action_ids.clear();
         for (const auto& action : plan.private_actions) { started_action_ids.push_back(action.id); }
         for (const auto& action : plan.shared_actions) { started_action_ids.push_back(action.id); }
@@ -1121,25 +1146,34 @@ public:
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
     std::optional<std::uint64_t> required_action_id;
-    std::uint32_t pressure_assessment_delay_us           = 0;
-    std::uint64_t pressure_checkpoint_recovery_ns        = 100;
-    bool require_evictions                               = false;
-    bool abort_start                                     = false;
-    bool abort_progress                                  = false;
-    bool malform_last_private_victim                     = false;
-    bool malform_last_capture_private_victim             = false;
-    bool malform_private_checkpoint_identity             = false;
-    bool reverse_pressure_results                        = false;
-    bool progress_in_progress_once                       = false;
-    bool finish_fail_next                                = false;
-    bool finish_release                                  = false;
-    bool finish_with_rewrite                             = false;
-    bool abort_capture_start                             = false;
-    bool report_shared_source_summary                    = false;
-    bool shared_capture_matches_result                   = false;
-    bool change_shared_source_residency_on_second_report = false;
-    std::uint32_t reported_shared_active_references      = 0;
-    ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
+    std::uint32_t pressure_assessment_delay_us    = 0;
+    std::uint64_t pressure_checkpoint_recovery_ns = 100;
+    bool require_evictions                        = false;
+    bool abort_start                              = false;
+    std::optional<std::uint32_t> materialization_capacity_pages;
+    std::uint32_t materialization_selected_prefix_pages     = 0;
+    std::uint32_t materialization_bounded_tail_pages        = 0;
+    std::uint32_t materialization_continuation_growth_pages = 0;
+    std::uint32_t materialization_full_parent_pages         = 0;
+    std::uint32_t materialization_missing_upload_pages      = 0;
+    bool materialization_selected_prefix_admitted           = false;
+    bool materialization_started_with_selected_prefix       = false;
+    std::uint32_t materialization_uploaded_pages            = 0;
+    bool abort_progress                                     = false;
+    bool malform_last_private_victim                        = false;
+    bool malform_last_capture_private_victim                = false;
+    bool malform_private_checkpoint_identity                = false;
+    bool reverse_pressure_results                           = false;
+    bool progress_in_progress_once                          = false;
+    bool finish_fail_next                                   = false;
+    bool finish_release                                     = false;
+    bool finish_with_rewrite                                = false;
+    bool abort_capture_start                                = false;
+    bool report_shared_source_summary                       = false;
+    bool shared_capture_matches_result                      = false;
+    bool change_shared_source_residency_on_second_report    = false;
+    std::uint32_t reported_shared_active_references         = 0;
+    ContextTransactionStatus capture_status                 = ContextTransactionStatus::Published;
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
@@ -2360,6 +2394,39 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+void test_selected_prefix_admission_avoids_full_parent_materialization() {
+    // This is deliberately a Program admission fixture, rather than a page-store-only
+    // restore: the pool can hold the requested boundary, its private tail, and the
+    // complete continuation reservation, but cannot ever hold the full parent.
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 71, make_base(71), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.materialization_capacity_pages            = 4;
+    program.materialization_selected_prefix_pages     = 1;
+    program.materialization_bounded_tail_pages        = 1;
+    program.materialization_continuation_growth_pages = 2;
+    program.materialization_full_parent_pages         = 8;
+    program.materialization_missing_upload_pages      = 1;
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{71}, make_base(71), 2);
+    require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
+            "selected boundary was not offered to Program admission");
+    require(manager.reserve_materialization(program, std::move(*reuse.choice),
+                                            FakePreparedPrompt{71}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "selected prefix plus tail and continuation growth was not reserved");
+    auto outcome = std::get<FakeManager::MaterializationOutcome>(
+        manager.progress_context_transaction(program, {}));
+    require(outcome.status == ContextTransactionStatus::Published &&
+                program.materialization_selected_prefix_admitted &&
+                program.materialization_started_with_selected_prefix &&
+                program.materialization_uploaded_pages == 1 &&
+                program.materialization_full_parent_pages > *program.materialization_capacity_pages,
+            "Program admitted only the selected frontier and uploaded no full-parent suffix");
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -2957,20 +3024,20 @@ void test_shared_capture_publishes_immutable_structural_metadata() {
     FakeProgram program;
     FakeRequestBasePlan request = make_base(271);
     request.cache.opportunities.push_back(FakeContextCache::Opportunity{
-        .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
         .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
         .frontier = 64,
     });
     const ActiveRequest active = start_active(manager, program, 271, request, 1);
     program.capture_assessment = FakeCaptureAssessment{
-        .shortlist_key = FakeShortlistKey{.digest = 271, .frontier = 64},
-        .shared_evidence = ninfer::SharedCandidateEvidence::EngineStructural,
-        .structural_origins = 0x1e,
-        .structural_role = 2,
-        .ssd_eligible = true,
+        .shortlist_key          = FakeShortlistKey{.digest = 271, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::EngineStructural,
+        .structural_origins     = 0x1e,
+        .structural_role        = 2,
+        .ssd_eligible           = true,
         .protected_rebuild_work = PrefillWork{.tokens = 64},
-        .publishes_shared = true,
-        .physically_feasible = true,
+        .publishes_shared       = true,
+        .physically_feasible    = true,
     };
     require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 271}, 0,
                                            {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
@@ -3004,28 +3071,28 @@ void test_shared_republication_replaces_catalog_metadata_with_owner() {
                              bool eligible, std::uint64_t order) {
         FakeRequestBasePlan request = make_base(digest);
         request.cache.opportunities.push_back(FakeContextCache::Opportunity{
-            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
             .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
             .frontier = 64,
         });
         const ActiveRequest active = start_active(manager, program, digest, request, order);
         program.capture_assessment = FakeCaptureAssessment{
-            .shortlist_key = FakeShortlistKey{.digest = digest, .frontier = 64},
-            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-            .structural_origins = origins,
-            .structural_role = role,
-            .ssd_eligible = eligible,
+            .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .structural_origins     = origins,
+            .structural_role        = role,
+            .ssd_eligible           = eligible,
             .protected_rebuild_work = PrefillWork{.tokens = 64},
-            .publishes_shared = true,
-            .physically_feasible = true,
+            .publishes_shared       = true,
+            .physically_feasible    = true,
         };
         require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = digest},
                                                0, {}) ==
                     FakeManager::ActiveCaptureReserveResult::Reserved,
                 "republication fixture could not reserve shared capture");
         require(std::get<FakeManager::ActiveCaptureOutcome>(
-                    manager.progress_context_transaction(program, {})).status ==
-                    ContextTransactionStatus::Published,
+                    manager.progress_context_transaction(program, {}))
+                        .status == ContextTransactionStatus::Published,
                 "republication fixture did not publish shared capture");
         (void)finish_active(manager, program, active);
     };
@@ -3042,7 +3109,8 @@ void test_shared_republication_replaces_catalog_metadata_with_owner() {
                 first.structural_origins == 0x02 && first.structural_role == 1 &&
                 first.ssd_eligible && vacant.state == FakeManager::SharedCatalogState::Vacant &&
                 vacant.structural_origins == 0 && vacant.structural_role == 0 &&
-                !vacant.ssd_eligible && second.state == FakeManager::SharedCatalogState::Catalogued &&
+                !vacant.ssd_eligible &&
+                second.state == FakeManager::SharedCatalogState::Catalogued &&
                 second.structural_origins == 0x08 && second.structural_role == 2 &&
                 !second.ssd_eligible,
             "shared catalog replacement retained immutable metadata from the prior physical owner");
@@ -3055,30 +3123,31 @@ void test_exact_shared_capture_merges_richer_structural_metadata() {
                              std::uint64_t order) {
         FakeRequestBasePlan request = make_base(274);
         request.cache.opportunities.push_back(FakeContextCache::Opportunity{
-            .kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
             .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
             .frontier = 64,
         });
-        const ActiveRequest active = start_active(manager, program, 274, request, order);
+        const ActiveRequest active            = start_active(manager, program, 274, request, order);
         program.shared_capture_matches_result = order != 1;
-        program.capture_assessment = FakeCaptureAssessment{
-            .shortlist_key = FakeShortlistKey{.digest = 274, .frontier = 64},
-            .shared_evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-            .structural_origins = origins,
-            .structural_role = role,
-            .ssd_eligible = eligible,
-            .protected_rebuild_work = PrefillWork{.tokens = 64},
-            .publishes_private = order != 1,
-            .publishes_shared = true,
-            .physically_feasible = true,
+        program.capture_assessment            = FakeCaptureAssessment{
+                       .shortlist_key          = FakeShortlistKey{.digest = 274, .frontier = 64},
+                       .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                       .structural_origins     = origins,
+                       .structural_role        = role,
+                       .ssd_eligible           = eligible,
+                       .protected_rebuild_work = PrefillWork{.tokens = 64},
+                       .publishes_private      = order != 1,
+                       .publishes_shared       = true,
+                       .physically_feasible    = true,
         };
         if (order != 1) { program.capture_summary.endpoint = endpoint(274, 64); }
         require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 274}, 0,
-                                               {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                                               {}) ==
+                    FakeManager::ActiveCaptureReserveResult::Reserved,
                 "exact-owner metadata fixture could not reserve capture");
         require(std::get<FakeManager::ActiveCaptureOutcome>(
-                    manager.progress_context_transaction(program, {})).status ==
-                    ContextTransactionStatus::Published,
+                    manager.progress_context_transaction(program, {}))
+                        .status == ContextTransactionStatus::Published,
                 "exact-owner metadata fixture did not publish or reuse capture");
         (void)finish_active(manager, program, active);
     };
@@ -3410,6 +3479,8 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("selected-prefix Program admission",
+             test_selected_prefix_admission_avoids_full_parent_materialization);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);

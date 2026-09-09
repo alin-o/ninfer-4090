@@ -300,6 +300,12 @@ public:
         return true;
     }
 
+    // A Host-backed immutable checkpoint is already safely spilled.  Pressure can
+    // reclaim its Device slot directly; it must not schedule another State D2H.
+    [[nodiscard]] bool offload_retained_device_replica(StateImageHandle handle) noexcept {
+        return drop_device_replica(handle);
+    }
+
     [[nodiscard]] bool drop_host_replica(StateImageHandle handle) noexcept {
         if (!valid(handle)) { return false; }
         Object& object = objects_[handle.index_];

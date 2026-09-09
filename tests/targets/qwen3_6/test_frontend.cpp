@@ -1549,6 +1549,42 @@ int test_explicit_leading_instruction_cache_boundary() {
                  "full-system marker");
 }
 
+int test_structural_boundary_discovery_contract() {
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        fi::ChatMessage value;
+        value.role = role;
+        value.parts.push_back(fi::ChatPart::text_part(std::move(text)));
+        return value;
+    };
+    const auto render = [&](std::string system, bool user = true) {
+        std::vector<fi::ChatMessage> messages;
+        messages.push_back(message(ninfer::ChatRole::System, std::move(system)));
+        if (user) { messages.push_back(message(ninfer::ChatRole::User, "question")); }
+        return thinking_toggle_template().render(messages, {.enable_thinking = false});
+    };
+    const auto origins = [](const fi::RenderedChat& chat, std::uint32_t bit) {
+        return std::count_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
+                             [bit](const auto& item) { return (item.origins & bit) != 0; });
+    };
+    constexpr std::uint32_t marker = 1U << 1U, instructions = 1U << 2U, project = 1U << 3U;
+    constexpr std::uint32_t volatility = 1U << 4U;
+    const auto trusted = render("Harness\n=== CACHE_BREAKPOINT ===<project_context>\n"
+                                "</INSTRUCTIONS>\nCurrent working directory: /opaque");
+    int failures = check(origins(trusted, marker) == 1 && origins(trusted, project) == 1 &&
+                             origins(trusted, instructions) == 1 && origins(trusted, volatility) == 1 &&
+                             trusted.first_volatile_offset.has_value(),
+                         "trusted structural boundaries or volatility cutoff were not discovered");
+    const auto fenced = render("```text\n=== CACHE_BREAKPOINT ===\n</INSTRUCTIONS>\n"
+                               "<project_context>\nCurrent working directory: /opaque\n```\nstable");
+    failures += check(origins(fenced, marker) == 0 && origins(fenced, instructions) == 0 &&
+                          origins(fenced, project) == 0 && !fenced.first_volatile_offset,
+                      "fenced structural-marker lookalikes were accepted");
+    const auto plain = render("Date: {\"type\": \"string\"}\nordinary instructions");
+    failures += check(!plain.first_volatile_offset,
+                      "plain schema date text was classified as volatile metadata");
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -2299,10 +2335,11 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+    const int structural_failures = test_structural_boundary_discovery_contract();
     if (!official_files_available()) {
         std::cout << "skip: official Qwen3.6-27B tokenizer files not found "
                      "(set NINFER_QWEN3_6_27B_HF_DIR)\n";
-        return 0;
+        return structural_failures;
     }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);

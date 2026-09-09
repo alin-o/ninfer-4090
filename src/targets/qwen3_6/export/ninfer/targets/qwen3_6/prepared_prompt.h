@@ -111,10 +111,29 @@ struct PreparedCacheOpportunity {
                                          PreparedCacheOpportunity) noexcept = default;
 };
 
+enum class SharedPrefixRole : std::uint8_t { Transient, Harness, Project };
+
+enum SharedPrefixOrigin : std::uint32_t {
+    SharedPrefixSystemEnd = 1U << 0U,
+    SharedPrefixCacheMarker = 1U << 1U,
+    SharedPrefixInstructionsEnd = 1U << 2U,
+    SharedPrefixProjectContext = 1U << 3U,
+    SharedPrefixVolatilityCutoff = 1U << 4U,
+};
+
+struct PreparedStructuralCheckpoint {
+    std::uint32_t frontier = 0;
+    std::uint32_t origins = 0;
+    SharedPrefixRole role = SharedPrefixRole::Transient;
+    bool ssd_eligible = false;
+};
+
 struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     runtime::RetentionClass retention = runtime::RetentionClass::RecentPrivate;
     std::vector<PreparedCacheOpportunity> opportunities;
+    std::vector<PreparedStructuralCheckpoint> structural_checkpoints;
+    std::optional<std::uint32_t> first_volatile_token;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };

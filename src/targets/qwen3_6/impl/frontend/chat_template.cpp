@@ -40,6 +40,77 @@ bool is_instruction_role(ChatRole role) noexcept {
     return role == ChatRole::System || role == ChatRole::Developer;
 }
 
+// Ported from llama.cpp server_checkpoint_discover (983f0aeb7c1b).  This deliberately
+// scans only the initial rendered instruction span; conversation text is untrusted.
+void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) {
+    constexpr std::uint32_t kSystemEnd = 1U << 0U;
+    constexpr std::uint32_t kCacheMarker = 1U << 1U;
+    constexpr std::uint32_t kInstructionsEnd = 1U << 2U;
+    constexpr std::uint32_t kProject = 1U << 3U;
+    constexpr std::uint32_t kVolatility = 1U << 4U;
+    const std::string_view text = chat.text;
+    if (region_end == 0 || region_end > text.size()) { return; }
+    const auto add = [&](std::size_t offset, std::uint32_t origins) {
+        auto it = std::find_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
+                               [&](const auto& item) { return item.offset == offset; });
+        if (it == chat.structural_boundaries.end()) {
+            chat.structural_boundaries.push_back({.offset = offset, .origins = origins});
+        } else { it->origins |= origins; }
+    };
+    bool instructions = false, project = false, volatile_found = false;
+    char fence_char = 0;
+    std::size_t fence_len = 0;
+    for (std::size_t begin = 0; begin < region_end;) {
+        const std::size_t newline = text.find('\n', begin);
+        const std::size_t end = std::min(newline == std::string_view::npos ? text.size() : newline,
+                                         region_end);
+        std::string_view line = text.substr(begin, end - begin);
+        if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
+        std::size_t left = 0, right = line.size();
+        while (left < right && (line[left] == ' ' || line[left] == '\t')) { ++left; }
+        while (right > left && (line[right - 1] == ' ' || line[right - 1] == '\t')) { --right; }
+        const std::string_view trimmed = line.substr(left, right - left);
+        const auto fence_run = [&](char& character) {
+            if (trimmed.empty() || (trimmed[0] != '`' && trimmed[0] != '~')) { return std::size_t{0}; }
+            character = trimmed[0]; std::size_t n = 1;
+            while (n < trimmed.size() && trimmed[n] == character) { ++n; }
+            return n >= 3 ? n : 0;
+        };
+        char fc = 0; const std::size_t fl = fence_run(fc); bool fence_line = false;
+        const bool in_fence = fence_len != 0;
+        if (!in_fence && fl) { fence_char = fc; fence_len = fl; fence_line = true; }
+        else if (in_fence && fc == fence_char && fl >= fence_len && fl == trimmed.size()) {
+            fence_len = 0; fence_line = true;
+        }
+        if (!in_fence && !fence_line) {
+            constexpr std::string_view kEnd = "<|im_end|>";
+            const std::size_t pos = line.rfind(kEnd);
+            if (pos != std::string_view::npos && line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
+                add(begin + pos + kEnd.size(), kSystemEnd);
+            }
+            constexpr std::string_view kMarker = "=== CACHE_BREAKPOINT ===";
+            constexpr std::string_view kProjectTag = "<project_context>";
+            constexpr std::string_view kInstructions = "</INSTRUCTIONS>";
+            if (trimmed == kMarker || trimmed == "=== CACHE_BREAKPOINT ===<project_context>") { add(begin + left + kMarker.size(), kCacheMarker); }
+            if (!instructions && (trimmed == kInstructions || trimmed == "</INSTRUCTIONS><|im_end|>")) {
+                add(begin + left + kInstructions.size(), kInstructionsEnd); instructions = true;
+            }
+            if (!project && (trimmed == kProjectTag || trimmed == "=== CACHE_BREAKPOINT ===<project_context>")) {
+                add(begin + line.find(kProjectTag), kProject); project = true;
+            }
+            const auto volatile_line = [&]() {
+                constexpr std::array<std::string_view, 4> prefixes = {"Current working directory: ", "Conversation started: ", "Working directory: ", "Conversation log: "};
+                for (auto prefix : prefixes) if (trimmed.size() > prefix.size() && trimmed.starts_with(prefix)) return true;
+                const auto dated = [&](std::string_view prefix) { return trimmed.starts_with(prefix) && trimmed.size() >= prefix.size() + 10 && std::isdigit(static_cast<unsigned char>(trimmed[prefix.size()])) && trimmed[prefix.size()+4] == '-' && trimmed[prefix.size()+7] == '-'; };
+                return dated("Today: ") || dated("Date: ");
+            };
+            if (!volatile_found && volatile_line()) { add(begin, kVolatility); chat.first_volatile_offset = begin; volatile_found = true; }
+        }
+        if (end >= region_end) { break; }
+        begin = end + 1;
+    }
+}
+
 void validate_instruction_message(const ChatMessage& message) {
     if (message.has_media()) {
         throw std::invalid_argument(
@@ -696,13 +767,19 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     RenderedFragment final = std::move(rendered).release();
-    return RenderedChat{.text                         = std::move(final.text),
+    RenderedChat result{.text                         = std::move(final.text),
                         .literal_spans                = std::move(final.literal_spans),
                         .media_placeholders           = std::move(final.media_placeholders),
                         .rewrite_checkpoint           = rewrite_checkpoint,
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
                         .message_boundaries           = std::move(message_boundaries),
                         .cache_boundaries             = std::move(cache_boundaries)};
+    // The template folds the leading instruction into the initial system span.  Only that
+    // span is eligible for structural recognition, including harness-only prompts.
+    if (message_begin == 1 && !result.message_boundaries.empty() && result.message_boundaries[1]) {
+        discover_structural_boundaries(result, *result.message_boundaries[1]);
+    }
+    return result;
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

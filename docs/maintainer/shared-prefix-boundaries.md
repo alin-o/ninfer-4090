@@ -1,0 +1,27 @@
+# Shared prefix boundary discovery
+
+The Qwen3.6 Frontend recognizes structural cache boundaries only while rendering
+the initial folded System/Developer instruction span.  User, Tool and Assistant
+content is deliberately outside that trusted region.  The recognizer is ported
+from llama.cpp `server_checkpoint_discover` at
+`983f0aeb7c1b33dd234f16c086a44466e7da1b76`; the source hashes and MIT license
+are retained in the repository-local port reference manifest described below.
+
+Recognized whole lines are the system terminator, `=== CACHE_BREAKPOINT ===`
+(including its immediately-adjacent `<project_context>` form),
+`</INSTRUCTIONS>`, `<project_context>`, and the first supported volatile
+metadata field.  Horizontal whitespace is accepted and fenced blocks are
+ignored.  The boundary bytes are sent through the normal rendered-chat
+tokenization call.  A candidate that does not land on an exact token frontier
+is retained only as a mapping skip; it is never rounded into a cache prefix.
+
+`PreparedContextCache::structural_checkpoints` publishes the merged origin bits,
+role and SSD eligibility for later catalog consumers.  It does not introduce a
+second physical cache owner.  `first_volatile_token` is cumulative: a prefix
+ending before that token remains eligible, while any checkpoint including it is
+not.  Media prompts do not currently receive structural anchors.
+
+The repository-local provenance artifact is
+`docs/maintainer/port-reference/ninfer-boundary-port-reference-manifest.json`.
+It records the upstream source revision and hashes; tests use local fixtures and
+do not require an upstream checkout.

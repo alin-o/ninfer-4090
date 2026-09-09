@@ -131,6 +131,13 @@ struct EncodedChat {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    struct StructuralBoundary {
+        std::optional<std::uint32_t> frontier;
+        std::uint32_t origins = 0;
+    };
+    std::vector<StructuralBoundary> structural_boundaries;
+    // First token containing volatile bytes. A candidate ending before this token remains safe.
+    std::optional<std::uint32_t> first_volatile_token;
 };
 
 EncodedChat

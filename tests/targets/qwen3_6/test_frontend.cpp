@@ -1573,6 +1573,7 @@ int test_structural_boundary_discovery_contract() {
     const auto render_initial_user = [&](std::string body) {
         std::vector<fi::ChatMessage> messages;
         messages.push_back(message(ninfer::ChatRole::User, std::move(body)));
+        messages.push_back(message(ninfer::ChatRole::User, "question"));
         return thinking_toggle_template().render(messages, {.enable_thinking = false});
     };
     const auto origins = [](const fi::RenderedChat& chat, std::uint32_t bit) {
@@ -1598,6 +1599,10 @@ int test_structural_boundary_discovery_contract() {
     const auto malformed_date = render("Date: 202x-09-09\nDate: 2026-09-09 extra");
     failures += check(!malformed_date.first_volatile_offset,
                       "malformed or suffixed Date metadata was classified as volatile");
+    const auto today = render("Today: 2026-09-09");
+    const auto suffixed_today = render("Today: 2026-09-09 arbitrary prose");
+    failures += check(today.first_volatile_offset && !suffixed_today.first_volatile_offset,
+                      "Today metadata accepted a date-shaped prefix with arbitrary suffix prose");
     const auto system_ends = render("example <|im_end|>\nmore instructions\n<|im_end|>");
     failures += check(origins(system_ends, 1U << 0U) == 1,
                       "only the final trusted system terminator may be structural");
@@ -1621,6 +1626,24 @@ int test_structural_boundary_discovery_contract() {
     failures += check(origins(embedded_project, project) == 0 &&
                           origins(embedded_project, instructions) == 0,
                       "embedded project-envelope lookalike was classified outside leading-system position");
+    const auto render_untrusted = [&](ninfer::ChatRole role) {
+        std::vector<fi::ChatMessage> messages;
+        messages.push_back(message(ninfer::ChatRole::System, "stable"));
+        messages.push_back(message(role, "=== CACHE_BREAKPOINT ===<project_context>\n"
+                                              "</INSTRUCTIONS>\nCurrent working directory: /opaque"));
+        if (role != ninfer::ChatRole::User) {
+            messages.push_back(message(ninfer::ChatRole::User, "question"));
+        }
+        return thinking_toggle_template().render(messages, {.enable_thinking = false});
+    };
+    for (const ninfer::ChatRole role : {ninfer::ChatRole::User, ninfer::ChatRole::Tool,
+                                        ninfer::ChatRole::Assistant}) {
+        const auto untrusted = render_untrusted(role);
+        failures += check(origins(untrusted, marker) == 0 && origins(untrusted, project) == 0 &&
+                              origins(untrusted, instructions) == 0 &&
+                              !untrusted.first_volatile_offset,
+                          "conversation marker lookalike acquired structural semantics");
+    }
     return failures;
 }
 
@@ -1688,6 +1711,57 @@ int test_structural_boundary_preparation_contract() {
     return failures;
 }
 
+int test_structural_boundary_roles_and_initial_envelope_diagnostics() {
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    const auto prepare = [&](std::string system, bool initial_user = false) {
+        ninfer::PromptInput input;
+        input.messages.push_back(ninfer::ChatMessage{
+            .role = initial_user ? ninfer::ChatRole::User : ninfer::ChatRole::System,
+            .parts = {{.kind = ninfer::MessagePartKind::Text, .text = std::move(system)}}});
+        if (!initial_user) {
+            input.messages.push_back(ninfer::ChatMessage{
+                .role = ninfer::ChatRole::User,
+                .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "question"}}});
+        } else {
+            input.messages.push_back(ninfer::ChatMessage{
+                .role = ninfer::ChatRole::User,
+                .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "question"}}});
+        }
+        input.context_cache.allow_engine_automatic_shared_prefixes = true;
+        return FrontendFactory::inspect(frontend.prepare(std::move(input))).context_cache;
+    };
+    const auto harness = prepare("=== CACHE_BREAKPOINT ===");
+    const auto project = prepare("=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>");
+    std::vector<fi::ChatMessage> envelope_messages;
+    fi::ChatMessage envelope_message;
+    envelope_message.role = ninfer::ChatRole::User;
+    envelope_message.parts.push_back(fi::ChatPart::text_part(
+        "# AGENTS.md instructions for /opaque\n<INSTRUCTIONS>\nrule\n</INSTRUCTIONS>\n"
+        "<environment_context>\nopaque\n</environment_context>"));
+    envelope_messages.push_back(std::move(envelope_message));
+    fi::ChatMessage query_message;
+    query_message.role = ninfer::ChatRole::User;
+    query_message.parts.push_back(fi::ChatPart::text_part("question"));
+    envelope_messages.push_back(std::move(query_message));
+    const auto envelope = thinking_toggle_template().render(envelope_messages,
+                                                            {.enable_thinking = false});
+    const bool envelope_zero = std::any_of(envelope.structural_boundaries.begin(),
+                                           envelope.structural_boundaries.end(),
+                                           [](const auto& boundary) {
+                                               return boundary.offset == 0 &&
+                                                      (boundary.origins & (1U << 3U)) != 0;
+                                           });
+    const auto has_role = [](const auto& cache, ninfer::targets::qwen3_6::SharedPrefixRole role) {
+        return std::any_of(cache.structural_checkpoints.begin(), cache.structural_checkpoints.end(),
+                           [role](const auto& checkpoint) { return checkpoint.role == role; });
+    };
+    return check(has_role(harness, ninfer::targets::qwen3_6::SharedPrefixRole::Harness) &&
+                     has_role(project, ninfer::targets::qwen3_6::SharedPrefixRole::Harness) &&
+                     has_role(project, ninfer::targets::qwen3_6::SharedPrefixRole::Project) &&
+                     envelope_zero,
+                 "harness/project role selection or frontier-zero envelope diagnostics were lost");
+}
+
 int test_media_structural_diagnostics_are_preserved() {
     const nlohmann::json corpus = nlohmann::json::parse(read_file(
         NINFER_SOURCE_DIR "/tests/fixtures/frontend/boundary-contract-corpus.json"));
@@ -1700,12 +1774,18 @@ int test_media_structural_diagnostics_are_preserved() {
     const Frontend frontend = FrontendFactory::create_component(resources());
     const auto prepared = frontend.prepare(std::move(input));
     const auto& data = FrontendFactory::inspect(prepared);
+    const auto has_role = [&](ninfer::targets::qwen3_6::SharedPrefixRole role) {
+        return std::any_of(data.context_cache.structural_checkpoints.begin(),
+                           data.context_cache.structural_checkpoints.end(),
+                           [role](const auto& checkpoint) { return checkpoint.role == role; });
+    };
     return check(data.has_media() && data.context_cache.first_volatile_token &&
                      data.context_cache.structural_boundaries_accepted >= 4 &&
+                     has_role(ninfer::targets::qwen3_6::SharedPrefixRole::Harness) &&
                      std::all_of(data.context_cache.structural_checkpoints.begin(),
                                  data.context_cache.structural_checkpoints.end(),
                                  [](const auto& checkpoint) { return !checkpoint.ssd_eligible; }),
-                 "media preparation discarded recognition metadata or exposed an SSD anchor");
+                 "media preparation discarded harness classification or exposed an SSD anchor");
 }
 
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
@@ -2460,6 +2540,7 @@ int test_media_preparation_cancellation() {
 int main() {
     const int structural_failures = test_structural_boundary_discovery_contract() +
                                     test_structural_boundary_preparation_contract() +
+                                    test_structural_boundary_roles_and_initial_envelope_diagnostics() +
                                     test_media_structural_diagnostics_are_preserved();
     if (!official_files_available()) {
         std::cout << "skip: official Qwen3.6-27B tokenizer files not found "

@@ -138,7 +138,16 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
                     }
                     return true;
                 };
-                if (dated("Today: ")) { return true; }
+                // This is intentionally narrower than Date.  The source contract accepts the
+                // generated Today field itself, not a date-shaped prefix followed by prose.
+                if (dated("Today: ")) {
+                    const std::string_view suffix =
+                        trimmed.substr(std::string_view("Today: ").size() + 10);
+                    const std::size_t suffix_first = suffix.find_first_not_of(" \t");
+                    return suffix_first == std::string_view::npos ||
+                           suffix.substr(suffix_first, suffix.find_last_not_of(" \t") -
+                                                            suffix_first + 1) == kEnd;
+                }
                 if (!dated("Date: ")) { return false; }
                 const std::string_view suffix = trimmed.substr(std::string_view("Date: ").size() + 10);
                 const std::size_t suffix_first = suffix.find_first_not_of(" \t");

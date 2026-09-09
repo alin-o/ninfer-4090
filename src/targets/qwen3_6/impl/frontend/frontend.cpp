@@ -915,7 +915,6 @@ PreparedContextCache prepare_context_cache(
     PreparedStructuralCheckpoint* project = nullptr;
     if (has_project_frontier) {
         for (auto& checkpoint : out.structural_checkpoints) {
-            if (!checkpoint.ssd_eligible) { continue; }
             if (checkpoint.frontier <= project_frontier &&
                 (!harness || checkpoint.frontier > harness->frontier)) {
                 harness = &checkpoint;
@@ -927,8 +926,7 @@ PreparedContextCache prepare_context_cache(
     }
     if (!harness) {
         for (auto& checkpoint : out.structural_checkpoints) {
-            if (checkpoint.ssd_eligible &&
-                (!has_project_frontier || checkpoint.frontier <= project_frontier) &&
+            if ((!has_project_frontier || checkpoint.frontier <= project_frontier) &&
                 checkpoint.role == SharedPrefixRole::Transient &&
                 (!harness || checkpoint.frontier > harness->frontier)) {
                 harness = &checkpoint;
@@ -937,8 +935,7 @@ PreparedContextCache prepare_context_cache(
     }
     if (!has_project_frontier && harness) {
         for (auto& checkpoint : out.structural_checkpoints) {
-            if (checkpoint.ssd_eligible &&
-                (checkpoint.origins & SharedPrefixCacheMarker) != 0) {
+            if ((checkpoint.origins & SharedPrefixCacheMarker) != 0) {
                 harness = &checkpoint;
             }
         }

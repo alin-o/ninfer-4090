@@ -790,10 +790,6 @@ PreparedContextCache prepare_context_cache(
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
-        // A shared prefix must end before the first token containing volatile bytes.  Private
-        // anchors retain their existing semantics.
-        if (kind == PromptCacheMarkerKind::SharedStablePrefix && first_volatile_token &&
-            frontier >= *first_volatile_token) { return; }
         const auto duplicate = std::find_if(
             out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
                 return existing.kind == kind && existing.frontier == frontier;
@@ -875,7 +871,7 @@ PreparedContextCache prepare_context_cache(
                                      [&](const auto& item) { return item.frontier == checkpoint.frontier; });
         if (existing == out.structural_checkpoints.end()) { out.structural_checkpoints.push_back(checkpoint); }
         else { existing->origins |= checkpoint.origins; existing->ssd_eligible |= checkpoint.ssd_eligible; }
-        if (eligible) {
+        if (hints.allow_engine_automatic_shared_prefixes) {
             add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                             SharedCandidateEvidence::EngineStructural, *source.frontier,
                             engine_order++);
@@ -886,21 +882,62 @@ PreparedContextCache prepare_context_cache(
                                             });
             if (opportunity != out.opportunities.rend()) {
                 opportunity->structural_origins |= source.origins;
-                opportunity->ssd_eligible = true;
+                opportunity->ssd_eligible = eligible;
             }
         }
     }
     std::uint32_t project_frontier = 0;
+    bool has_project_frontier = false;
     for (const auto& checkpoint : out.structural_checkpoints) {
         if ((checkpoint.origins & SharedPrefixProjectContext) != 0) {
             project_frontier = std::max(project_frontier, checkpoint.frontier);
+            has_project_frontier = true;
         }
     }
-    for (auto& checkpoint : out.structural_checkpoints) {
-        if (!checkpoint.ssd_eligible) { continue; }
-        if (checkpoint.frontier <= project_frontier) checkpoint.role = SharedPrefixRole::Harness;
-        else if (project_frontier != 0) checkpoint.role = SharedPrefixRole::Project;
+    // A bounded initial-user envelope starts at rendered/token frontier zero. It cannot be a
+    // capture itself, but it remains a real project delimiter for selecting its instruction
+    // descendant as the project anchor.
+    has_project_frontier = has_project_frontier || std::any_of(
+        structural_boundaries.begin(), structural_boundaries.end(), [](const auto& source) {
+            return (source.origins & SharedPrefixProjectContext) != 0;
+        });
+    // Port the bounded upstream selection: only the deepest stable anchor on each side of a
+    // project boundary is retained. Without a project, select the deepest stable harness
+    // (preferring a cache-marker anchor when present).
+    PreparedStructuralCheckpoint* harness = nullptr;
+    PreparedStructuralCheckpoint* project = nullptr;
+    if (has_project_frontier) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            if (!checkpoint.ssd_eligible) { continue; }
+            if (checkpoint.frontier <= project_frontier &&
+                (!harness || checkpoint.frontier > harness->frontier)) {
+                harness = &checkpoint;
+            } else if (checkpoint.frontier > project_frontier &&
+                       (!project || checkpoint.frontier > project->frontier)) {
+                project = &checkpoint;
+            }
+        }
     }
+    if (!harness) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            if (checkpoint.ssd_eligible &&
+                (!has_project_frontier || checkpoint.frontier <= project_frontier) &&
+                checkpoint.role == SharedPrefixRole::Transient &&
+                (!harness || checkpoint.frontier > harness->frontier)) {
+                harness = &checkpoint;
+            }
+        }
+    }
+    if (!has_project_frontier && harness) {
+        for (auto& checkpoint : out.structural_checkpoints) {
+            if (checkpoint.ssd_eligible &&
+                (checkpoint.origins & SharedPrefixCacheMarker) != 0) {
+                harness = &checkpoint;
+            }
+        }
+    }
+    if (harness) { harness->role = SharedPrefixRole::Harness; }
+    if (project) { project->role = SharedPrefixRole::Project; }
     for (auto& opportunity : out.opportunities) {
         for (const auto& checkpoint : out.structural_checkpoints) {
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&

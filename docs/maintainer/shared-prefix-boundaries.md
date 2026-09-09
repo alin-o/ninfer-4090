@@ -11,11 +11,12 @@ from llama.cpp `server_checkpoint_discover` at
 `983f0aeb7c1b33dd234f16c086a44466e7da1b76`; the source hashes and MIT license
 are retained in the repository-local port reference manifest described below.
 
-Recognized whole lines are the system terminator, `=== CACHE_BREAKPOINT ===`
+Recognized whole lines are the final system terminator, `=== CACHE_BREAKPOINT ===`
 (including its immediately-adjacent `<project_context>` form),
 `</INSTRUCTIONS>`, `<project_context>`, and the first supported volatile
 metadata field.  Horizontal whitespace is accepted and fenced blocks are
-ignored.  The boundary bytes are sent through the normal rendered-chat
+ignored. `Today:` requires an exact `YYYY-MM-DD`; `Date:` additionally permits
+only an empty or final-terminator suffix. The boundary bytes are sent through the normal rendered-chat
 tokenization call.  A candidate that does not land on an exact token frontier
 is retained only as a mapping skip; it is never rounded into a cache prefix.
 

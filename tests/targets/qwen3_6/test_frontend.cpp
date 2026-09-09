@@ -1562,6 +1562,11 @@ int test_structural_boundary_discovery_contract() {
         if (user) { messages.push_back(message(ninfer::ChatRole::User, "question")); }
         return thinking_toggle_template().render(messages, {.enable_thinking = false});
     };
+    const auto render_initial_user = [&](std::string body) {
+        std::vector<fi::ChatMessage> messages;
+        messages.push_back(message(ninfer::ChatRole::User, std::move(body)));
+        return thinking_toggle_template().render(messages, {.enable_thinking = false});
+    };
     const auto origins = [](const fi::RenderedChat& chat, std::uint32_t bit) {
         return std::count_if(chat.structural_boundaries.begin(), chat.structural_boundaries.end(),
                              [bit](const auto& item) { return (item.origins & bit) != 0; });
@@ -1582,6 +1587,27 @@ int test_structural_boundary_discovery_contract() {
     const auto plain = render("Date: {\"type\": \"string\"}\nordinary instructions");
     failures += check(!plain.first_volatile_offset,
                       "plain schema date text was classified as volatile metadata");
+    const auto malformed_date = render("Date: 202x-09-09\nDate: 2026-09-09 extra");
+    failures += check(!malformed_date.first_volatile_offset,
+                      "malformed or suffixed Date metadata was classified as volatile");
+    const auto system_ends = render("example <|im_end|>\nmore instructions\n<|im_end|>");
+    failures += check(origins(system_ends, 1U << 0U) == 1,
+                      "only the final trusted system terminator may be structural");
+    const auto codex = render_initial_user("# AGENTS.md instructions for /opaque\n<INSTRUCTIONS>\n"
+                                           "rule\n</INSTRUCTIONS>\n<environment_context>\n"
+                                           "volatile\n</environment_context>");
+    const auto claude = render_initial_user("<system-reminder>\n# claudeMd\nrule\n"
+                                            "# currentDate\n2026-09-09\n</system-reminder>");
+    failures += check(origins(codex, project) == 1 && origins(codex, instructions) == 1 &&
+                          origins(codex, volatility) == 1 && codex.first_volatile_offset &&
+                          origins(claude, project) == 1 && origins(claude, instructions) == 1 &&
+                          origins(claude, volatility) == 1 && claude.first_volatile_offset,
+                      "bounded initial-user Codex or Claude envelope was not classified");
+    const auto leading_project = render("<project>\n## Context\n<instructions>\nrule\n"
+                                        "</instructions>\n</project>");
+    failures += check(origins(leading_project, project) == 1 &&
+                          origins(leading_project, instructions) == 1,
+                      "complete leading-system project envelope was not classified");
     return failures;
 }
 

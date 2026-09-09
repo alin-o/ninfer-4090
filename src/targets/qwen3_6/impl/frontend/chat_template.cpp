@@ -58,6 +58,7 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
         } else { it->origins |= origins; }
     };
     bool instructions = false, project = false, volatile_found = false;
+    std::optional<std::size_t> system_end_offset;
     char fence_char = 0;
     std::size_t fence_len = 0;
     for (std::size_t begin = 0; begin < region_end;) {
@@ -98,8 +99,11 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
             }
             constexpr std::string_view kEnd = "<|im_end|>";
             const std::size_t pos = line.rfind(kEnd);
-            if (pos != std::string_view::npos && line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
-                add(begin + pos + kEnd.size(), kSystemEnd);
+            if (pos != std::string_view::npos &&
+                line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
+                // The upstream contract retains only the final system terminator in the
+                // trusted region. Earlier occurrences can be instruction examples.
+                system_end_offset = begin + pos + kEnd.size();
             }
             constexpr std::string_view kMarker = "=== CACHE_BREAKPOINT ===";
             constexpr std::string_view kProjectTag = "<project_context>";
@@ -114,14 +118,33 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
             const auto volatile_line = [&]() {
                 constexpr std::array<std::string_view, 4> prefixes = {"Current working directory: ", "Conversation started: ", "Working directory: ", "Conversation log: "};
                 for (auto prefix : prefixes) if (trimmed.size() > prefix.size() && trimmed.starts_with(prefix)) return true;
-                const auto dated = [&](std::string_view prefix) { return trimmed.starts_with(prefix) && trimmed.size() >= prefix.size() + 10 && std::isdigit(static_cast<unsigned char>(trimmed[prefix.size()])) && trimmed[prefix.size()+4] == '-' && trimmed[prefix.size()+7] == '-'; };
-                return dated("Today: ") || dated("Date: ");
+                const auto dated = [&](std::string_view prefix) {
+                    if (!trimmed.starts_with(prefix) || trimmed.size() < prefix.size() + 10) {
+                        return false;
+                    }
+                    for (std::size_t index = 0; index < 10; ++index) {
+                        const char character = trimmed[prefix.size() + index];
+                        if (index == 4 || index == 7) {
+                            if (character != '-') { return false; }
+                        } else if (character < '0' || character > '9') {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                if (dated("Today: ")) { return true; }
+                if (!dated("Date: ")) { return false; }
+                const std::string_view suffix = trimmed.substr(std::string_view("Date: ").size() + 10);
+                const std::size_t suffix_first = suffix.find_first_not_of(" \t");
+                return suffix_first == std::string_view::npos ||
+                       suffix.substr(suffix_first, suffix.find_last_not_of(" \t") - suffix_first + 1) == kEnd;
             };
             if (!volatile_found && volatile_line()) { add(begin, kVolatility); chat.first_volatile_offset = begin; volatile_found = true; }
         }
         if (end >= region_end) { break; }
         begin = end + 1;
     }
+    if (system_end_offset) { add(*system_end_offset, kSystemEnd); }
 }
 
 // Exact upstream initial-user envelope exceptions.  This is intentionally separate from the

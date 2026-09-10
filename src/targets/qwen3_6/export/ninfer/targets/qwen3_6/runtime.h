@@ -56,17 +56,37 @@ struct GraphExecutionProfile {
 // byte layout is a target-private format; callers treat it as opaque and durable only across
 // processes serving the identical model and KV configuration.
 struct RetainedSessionSnapshot {
+    RetainedSessionSnapshot()                                              = default;
+    RetainedSessionSnapshot(const RetainedSessionSnapshot&)                = delete;
+    RetainedSessionSnapshot& operator=(const RetainedSessionSnapshot&)     = delete;
+    RetainedSessionSnapshot(RetainedSessionSnapshot&&) noexcept            = default;
+    RetainedSessionSnapshot& operator=(RetainedSessionSnapshot&&) noexcept = default;
+
+    ~RetainedSessionSnapshot() noexcept {
+        // A discarded pending snapshot must not release pinned D2H backing while CUDA still
+        // owns it.  This is deliberately independent of the consumer callback.
+        if (settle_transfer) {
+            try {
+                settle_transfer();
+            } catch (...) {}
+        }
+    }
+
     std::vector<std::uint8_t> bytes;
     // Exact pinned transfer reservation, available before the first D2H copy. Pending
     // snapshots keep `bytes` empty and retain this accounting size through completion.
     std::size_t transfer_bytes = 0;
-    std::uint32_t tokens = 0;
+    std::uint32_t tokens       = 0;
     std::string session_digest;
     // Set only by begin_save_continuation(). Consumers must invoke this before reading bytes.
     // It waits for the producer event (not unrelated device work), then assembles `bytes` from
     // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
     // submits immutable CUDA ranges and never lets a Host worker mutate its stores or catalog.
     std::function<void(std::vector<std::uint8_t>&)> await_transfer;
+    // Internal lifetime settlement for pending CUDA work.  Consumers never need to invoke it.
+    std::function<void()> settle_transfer;
+    // An Engine-owned bounded-writer reservation, acquired before staging allocation.
+    std::shared_ptr<void> queue_reservation;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
@@ -741,9 +761,9 @@ struct CaptureAssessment {
     std::shared_ptr<detail::CaptureAssessmentImpl> implementation;
     PrefixShortlistKey shortlist_key;
     SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
-    std::uint32_t structural_origins = 0;
-    std::uint8_t structural_role = 0;
-    bool ssd_eligible = false;
+    std::uint32_t structural_origins        = 0;
+    std::uint8_t structural_role            = 0;
+    bool ssd_eligible                       = false;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<runtime::CheckpointRecoveryAlternativeWork> projected_recovery_work;
@@ -993,7 +1013,8 @@ public:
     // snapshots expose their exact pinned reservation in `transfer_bytes`.
     [[nodiscard]] RetainedSessionSnapshot
     begin_save_continuation(const ContinuationHandle<Variant>& continuation,
-                            std::string_view model_binding);
+                            std::string_view model_binding,
+                            const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] ContinuationHandle<Variant>
     restore_continuation(std::span<const std::uint8_t> snapshot, std::string_view model_binding);
     // Reuse metadata of one catalogued continuation, as the Engine catalog consumes it when it

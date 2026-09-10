@@ -3,6 +3,7 @@
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/mtp_alignment.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
+#include <ninfer/targets/qwen3_6/runtime.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -355,6 +356,17 @@ void test_rebuild_work_prompt_frontier_boundary() {
            "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
+void test_discarded_pending_snapshot_settles_its_transfer() {
+    // The consumer may abandon a pending auto-save after cancellation or a writer failure.
+    // Settlement is snapshot ownership, not a callback obligation.
+    std::uint32_t settlements = 0;
+    {
+        q36::RetainedSessionSnapshot snapshot;
+        snapshot.settle_transfer = [&] { ++settlements; };
+    }
+    expect(settlements == 1, "discarded pending snapshot did not settle its transfer");
+}
+
 } // namespace
 
 int main() {
@@ -365,6 +377,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_discarded_pending_snapshot_settles_its_transfer();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

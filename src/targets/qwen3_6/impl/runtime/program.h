@@ -97,14 +97,14 @@ struct PreparedCaptureIdentity {
 struct CaptureGroup {
     std::shared_ptr<const PreparedCaptureIdentity> identity;
     std::optional<RewriteCheckpointKind> rewrite;
-    std::uint32_t frontier                  = 0;
-    std::uint32_t input_order               = 0;
-    bool shared                             = false;
-    bool long_anchor                        = false;
-    SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
-    std::uint32_t structural_origins = 0;
+    std::uint32_t frontier                    = 0;
+    std::uint32_t input_order                 = 0;
+    bool shared                               = false;
+    bool long_anchor                          = false;
+    SharedCandidateEvidence shared_evidence   = SharedCandidateEvidence::None;
+    std::uint32_t structural_origins          = 0;
     qwen3_6::SharedPrefixRole structural_role = qwen3_6::SharedPrefixRole::Transient;
-    bool ssd_eligible = false;
+    bool ssd_eligible                         = false;
 };
 
 enum class MtpBridgeMode : std::uint8_t {
@@ -434,6 +434,7 @@ struct SequenceState {
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
 };
+
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
     StateImageHandle state;
@@ -719,10 +720,11 @@ public:
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
-    begin_save_continuation(const ContinuationHandle& continuation,
-                            std::string_view model_binding);
+    begin_save_continuation(const ContinuationHandle& continuation, std::string_view model_binding,
+                            const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
                                                           std::string_view model_binding);
+
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;
     }
@@ -975,9 +977,9 @@ private:
         // Cancellation is adopted at a worker boundary, but an enqueued transfer retains pins
         // until its completion event has settled.  This prevents an abort from recycling a
         // source or destination that CUDA may still access.
-        bool cancel_pending                = false;
-        std::uint8_t transfer_timer_mask   = 0;
-        bool published                     = false;
+        bool cancel_pending              = false;
+        std::uint8_t transfer_timer_mask = 0;
+        bool published                   = false;
     };
 
     std::uint64_t next_capture_offer_id_ = 1;

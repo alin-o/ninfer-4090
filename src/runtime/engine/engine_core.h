@@ -318,8 +318,7 @@ public:
         if (!context_cache_enabled_) {
             // Without the cache no finished request retains its session, so a restored
             // continuation could never be reused; refuse instead of stranding it.
-            throw std::invalid_argument(
-                "session restore requires the context cache to be enabled");
+            throw std::invalid_argument("session restore requires the context cache to be enabled");
         }
         require_settled_slot(slot);
         bool have_idle_lane = false;
@@ -331,8 +330,7 @@ public:
                                "session restore requires an idle Engine lane");
         }
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
-        if (view.state == ResourceManagement::CatalogState::Catalogued &&
-            view.handle != nullptr) {
+        if (view.state == ResourceManagement::CatalogState::Catalogued && view.handle != nullptr) {
             // Involuntary for whatever session held the slot: the client asked for a restore,
             // not for that session's destruction.
             spill_catalog_slot(slot, *view.handle);
@@ -340,7 +338,7 @@ public:
             (void)instance_.program->release_continuation(std::move(evicted));
         }
         clear_slot_session(slot);
-        auto restored             = instance_.program->restore_continuation(snapshot, model_binding);
+        auto restored = instance_.program->restore_continuation(snapshot, model_binding);
         const std::uint32_t tokens = instance_.program->continuation_depth(restored);
         std::string digest         = instance_.program->continuation_digest(restored);
         const auto summary         = instance_.program->continuation_summary(restored);
@@ -364,8 +362,7 @@ public:
         require_session_digest(view, expected_digest);
         // Explicit erase is a deletion request: never auto-save, and drop the binding.
         clear_slot_session(slot);
-        if (view.state != ResourceManagement::CatalogState::Catalogued ||
-            view.handle == nullptr) {
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
             return 0;
         }
         const std::uint32_t tokens = instance_.program->continuation_depth(*view.handle);
@@ -391,10 +388,12 @@ public:
     // that receives (path, snapshot) for each spilled session and writes the file off-thread.
     void set_eviction_sink(
         std::string model_binding,
-        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
+        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink,
+        std::function<std::shared_ptr<void>(std::size_t)> reserve) {
         std::scoped_lock lock(execution_mutex_);
         eviction_model_binding_ = std::move(model_binding);
         eviction_sink_          = std::move(sink);
+        eviction_reserve_       = std::move(reserve);
     }
 
 private:
@@ -410,8 +409,7 @@ private:
         if (view.state == ResourceManagement::CatalogState::Claimed ||
             view.state == ResourceManagement::CatalogState::ReservedForActive ||
             view.active_references != 0) {
-            throw RequestError(RequestErrorKind::Overloaded,
-                               "slot is in use by an active request");
+            throw RequestError(RequestErrorKind::Overloaded, "slot is in use by an active request");
         }
     }
 
@@ -438,8 +436,9 @@ private:
             return;
         }
         try {
-            auto snapshot =
-                instance_.program->begin_save_continuation(handle, eviction_model_binding_);
+            auto snapshot = instance_.program->begin_save_continuation(
+                handle, eviction_model_binding_, eviction_reserve_);
+            if (!snapshot.queue_reservation) { return; }
             eviction_sink_(slot_session_paths_[slot], std::move(snapshot));
         } catch (...) {
             // The session was going to be destroyed either way; losing the spill costs the
@@ -628,8 +627,8 @@ private:
         record_program_timing(timing, measurement.exposed);
     }
 
-    void record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                       std::uint64_t RuntimeHostWorkStats::*invocation_member,
+    void record_detail(std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                       std::uint64_t RuntimeHostWorkStats::* invocation_member,
                        Clock::time_point started) noexcept {
         RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
         stats.*elapsed_member += elapsed_ns(started, Clock::now());
@@ -638,8 +637,8 @@ private:
 
     class DetailScope {
     public:
-        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                    std::uint64_t RuntimeHostWorkStats::*invocation_member,
+        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                    std::uint64_t RuntimeHostWorkStats::* invocation_member,
                     nvtx::Name range_name) noexcept
             : owner_(owner), elapsed_member_(elapsed_member), invocation_member_(invocation_member),
               started_(Clock::now()) {
@@ -656,8 +655,8 @@ private:
 
     private:
         EngineCore& owner_;
-        std::uint64_t RuntimeHostWorkStats::*elapsed_member_;
-        std::uint64_t RuntimeHostWorkStats::*invocation_member_;
+        std::uint64_t RuntimeHostWorkStats::* elapsed_member_;
+        std::uint64_t RuntimeHostWorkStats::* invocation_member_;
         Clock::time_point started_;
         std::optional<nvtx::ScopedRange> range_;
     };
@@ -1974,7 +1973,7 @@ private:
                                        static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);
         const Clock::time_point decode_started = Clock::now();
-        auto pending = instance_.program->decode(
+        auto pending                           = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
         cumulative_stats_.decode_seconds_total +=
             std::chrono::duration<double>(Clock::now() - decode_started).count();
@@ -2228,6 +2227,8 @@ private:
     // that drains it lives in Engine::Impl. Guarded by execution_mutex_.
     std::string eviction_model_binding_;
     std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> eviction_sink_;
+    std::function<std::shared_ptr<void>(std::size_t)> eviction_reserve_;
+
     // Fork-local session persistence, guarded by execution_mutex_: the session file each slot
     // is bound to (spill target on eviction) and the digest/checkpoint cache that keeps stats
     // publication from hashing a deep ledger every unit.
@@ -2238,6 +2239,7 @@ private:
         std::string digest;
         std::vector<SlotCheckpoint> checkpoints;
     };
+
     std::vector<std::string> slot_session_paths_;
     std::vector<SlotDigestCacheEntry> slot_digest_cache_;
     // Guarded by stats_mutex_, republished at every unit boundary.

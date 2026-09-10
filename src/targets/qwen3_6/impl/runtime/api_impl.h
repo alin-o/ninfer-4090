@@ -20,11 +20,13 @@ SequencePlan<Variant>::SequencePlan(
 template <>
 SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
     : impl_(std::move(other.impl_)) {}
+
 template <>
 SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
     impl_ = std::move(other.impl_);
     return *this;
 }
+
 template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
@@ -86,11 +88,13 @@ RequestBasePlan<Variant>::RequestBasePlan(
 template <>
 RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
     : impl_(std::move(other.impl_)) {}
+
 template <>
 RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
     impl_ = std::move(other.impl_);
     return *this;
 }
+
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -580,8 +584,8 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
-std::uint32_t
-Program<Variant>::continuation_depth(const ContinuationHandle<Variant>& continuation) const noexcept {
+std::uint32_t Program<Variant>::continuation_depth(
+    const ContinuationHandle<Variant>& continuation) const noexcept {
     return impl_->continuation_depth(continuation);
 }
 
@@ -605,10 +609,10 @@ Program<Variant>::save_continuation(const ContinuationHandle<Variant>& continuat
 }
 
 template <>
-RetainedSessionSnapshot
-Program<Variant>::begin_save_continuation(const ContinuationHandle<Variant>& continuation,
-                                          std::string_view model_binding) {
-    return impl_->begin_save_continuation(continuation, model_binding);
+RetainedSessionSnapshot Program<Variant>::begin_save_continuation(
+    const ContinuationHandle<Variant>& continuation, std::string_view model_binding,
+    const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
+    return impl_->begin_save_continuation(continuation, model_binding, reserve);
 }
 
 template <>

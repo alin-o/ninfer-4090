@@ -165,7 +165,7 @@ std::vector<VisionItem> read_vision_items(SnapshotReader& reader, std::size_t to
         item.patch_begin   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
         item.patch_count   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
         reader.bytes(item.content_digest.data(), item.content_digest.size());
-        item.timestamps = read_vector<double>(reader, tokens, "vision timestamp");
+        item.timestamps           = read_vector<double>(reader, tokens, "vision timestamp");
         const std::uint32_t spans = reader.pod<std::uint32_t>();
         if (spans > tokens) {
             throw std::invalid_argument("session snapshot vision span count is out of range");
@@ -180,17 +180,17 @@ std::vector<VisionItem> read_vision_items(SnapshotReader& reader, std::size_t to
 }
 
 struct SnapshotConfig {
-    std::uint32_t kv_dtype             = 0;
-    std::int32_t kv_quant_group        = 0;
-    std::uint32_t kv_flags             = 0;
-    std::uint32_t speculative_backend  = 0;
-    std::uint32_t draft_window         = 0;
-    std::uint32_t page_size            = 0;
-    std::uint64_t state_image_bytes    = 0;
-    std::uint32_t text_plane_count     = 0;
-    std::uint64_t text_page_stride     = 0;
-    std::uint32_t backend_plane_count  = 0;
-    std::uint64_t backend_page_stride  = 0;
+    std::uint32_t kv_dtype            = 0;
+    std::int32_t kv_quant_group       = 0;
+    std::uint32_t kv_flags            = 0;
+    std::uint32_t speculative_backend = 0;
+    std::uint32_t draft_window        = 0;
+    std::uint32_t page_size           = 0;
+    std::uint64_t state_image_bytes   = 0;
+    std::uint32_t text_plane_count    = 0;
+    std::uint64_t text_page_stride    = 0;
+    std::uint32_t backend_plane_count = 0;
+    std::uint64_t backend_page_stride = 0;
 };
 
 struct SnapshotSession {
@@ -318,9 +318,8 @@ ProgramImplCore::continuation_checkpoints(const ContinuationHandle& continuation
     out.reserve(frontiers.size());
     for (const std::uint32_t frontier : frontiers) {
         if (frontier == 0 || frontier > depth) { continue; }
-        out.push_back(SlotCheckpoint{
-            frontier, ledger_prefix_digest(
-                          std::span<const TokenId>(sequence.ledger.data(), frontier))});
+        out.push_back(SlotCheckpoint{frontier, ledger_prefix_digest(std::span<const TokenId>(
+                                                   sequence.ledger.data(), frontier))});
     }
     return out;
 }
@@ -343,9 +342,9 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
     return snapshot;
 }
 
-qwen3_6::RetainedSessionSnapshot
-ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
-                                         std::string_view model_binding) {
+qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
+    const ContinuationHandle& continuation, std::string_view model_binding,
+    const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
     if (!valid_continuation(continuation)) {
         throw std::invalid_argument("continuation holds no retained session");
     }
@@ -362,9 +361,9 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
 
     const std::size_t tokens = sequence.ledger.size();
     if (tokens == 0 || tokens > capacity || sequence.prefix_identity.size() != tokens ||
-        sequence.prefix_digests.size() != tokens ||
-        sequence.ledger_frontier != tokens || sequence.execution_frontier > tokens ||
-        tokens - sequence.execution_frontier > 1 || !sequence.endpoint_valid || !sequence.kv) {
+        sequence.prefix_digests.size() != tokens || sequence.ledger_frontier != tokens ||
+        sequence.execution_frontier > tokens || tokens - sequence.execution_frontier > 1 ||
+        !sequence.endpoint_valid || !sequence.kv) {
         throw std::logic_error("retained session ledger and identity are inconsistent");
     }
     if (sequence.state.fork_pending || sequence.state.read != sequence.state.write ||
@@ -403,8 +402,8 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
         anchor_images.push_back(image_index(anchor.state));
     }
 
-    const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
-    const HostKVPageLayout text_layout = plan_host_kv_page_layout(text_pool.geometry());
+    const DeviceKVPagePool& text_pool    = text_kv_pages->physical_pool();
+    const HostKVPageLayout text_layout   = plan_host_kv_page_layout(text_pool.geometry());
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     std::optional<HostKVPageLayout> backend_layout;
     if (backend != nullptr) {
@@ -412,8 +411,8 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     }
 
     const KVAddressSpaceHandle text_address = sequence.kv->text;
-    const std::uint32_t text_committed = text_kv_addresses->committed_frontier(text_address);
-    const std::uint32_t text_pages     = kv_pages_for_frontier(text_committed);
+    const std::uint32_t text_committed      = text_kv_addresses->committed_frontier(text_address);
+    const std::uint32_t text_pages          = kv_pages_for_frontier(text_committed);
     if (text_pages == 0 || text_pages > text_kv_addresses->mapped_pages(text_address) ||
         sequence.execution_frontier > text_committed) {
         throw std::logic_error("retained session Text KV coverage is inconsistent");
@@ -436,9 +435,8 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     SnapshotConfig config;
     config.kv_dtype       = static_cast<std::uint32_t>(kv_dtype);
     config.kv_quant_group = kv_quant_group;
-    config.kv_flags       = (kv_packed_v ? kKvFlagPackedV : 0U) |
-                      (kv_rotate_k ? kKvFlagRotateK : 0U) | (kv_rotate_v ? kKvFlagRotateV : 0U) |
-                      (kv_packed_k ? kKvFlagPackedK : 0U) |
+    config.kv_flags = (kv_packed_v ? kKvFlagPackedV : 0U) | (kv_rotate_k ? kKvFlagRotateK : 0U) |
+                      (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
                       (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
     config.speculative_backend = static_cast<std::uint32_t>(speculative_backend);
     config.draft_window        = draft_window;
@@ -447,8 +445,7 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     config.text_plane_count    = static_cast<std::uint32_t>(text_pool.plane_count());
     config.text_page_stride    = text_layout.page_stride;
     if (backend != nullptr) {
-        config.backend_plane_count =
-            static_cast<std::uint32_t>(backend->page_pool().plane_count());
+        config.backend_plane_count = static_cast<std::uint32_t>(backend->page_pool().plane_count());
         config.backend_page_stride = backend_layout->page_stride;
     }
 
@@ -512,9 +509,46 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     const std::size_t backend_kv_offset =
         writer.reserve_payload(config.backend_page_stride * session.backend_pages);
 
+    // Reserve the complete bounded writer footprint before allocating pinned backing or
+    // submitting D2H.  A full queue therefore drops an involuntary spill without placing work
+    // on the execution thread's transfer dependency chain.
+    if (reserve) {
+        snapshot.queue_reservation = reserve(snapshot.bytes.size());
+        if (!snapshot.queue_reservation) { return {}; }
+    }
+
     auto transfer_backing = std::make_shared<PinnedHostBuffer>(snapshot.bytes.size());
     std::memcpy(transfer_backing->data(), snapshot.bytes.data(), snapshot.bytes.size());
     std::uint8_t* base = static_cast<std::uint8_t*>(transfer_backing->data());
+
+    // Own submission cleanup before the first possible CUDA copy.  If later validation or a
+    // copier throws, destruction records/drains transfer-stream work before backing is freed.
+    struct PendingTransferSettlement {
+        DeviceContext* device = nullptr;
+        std::shared_ptr<PinnedHostBuffer> backing;
+        std::shared_ptr<CudaCompletionEvent> completion;
+        bool submitted = false;
+        bool recorded  = false;
+
+        void settle() noexcept {
+            if (!submitted || !device || !completion) { return; }
+            try {
+                device->bind_to_current_thread();
+                if (!recorded) {
+                    completion->record(device->transfer_stream);
+                    recorded = true;
+                }
+                completion->synchronize();
+            } catch (...) {}
+        }
+
+        ~PendingTransferSettlement() { settle(); }
+    };
+
+    auto pending        = std::make_shared<PendingTransferSettlement>();
+    pending->device     = &device;
+    pending->backing    = transfer_backing;
+    pending->completion = std::make_shared<CudaCompletionEvent>(device);
     for (std::size_t index = 0; index < unique_states.size(); ++index) {
         const StateImageHandle image  = unique_states[index];
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
@@ -522,10 +556,10 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
             const qwen3_6::HostStateImageConstView view = state_store->host_view(image);
             std::memcpy(image_out, view.data, state_layout.image_bytes);
         } else {
+            pending->submitted = true;
             state_images->copy_to_host(
                 state_store->physical_slot(image),
-                qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(image_out),
-                                            &state_layout},
+                qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(image_out), &state_layout},
                 device.transfer_stream);
             ++snapshot_traffic_.state_d2h_count;
             snapshot_traffic_.state_d2h_bytes += state_layout.image_bytes;
@@ -534,54 +568,54 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
 
     // KV pages: device-resident runs go through the pool's page copier; demoted pages are read
     // from their published Host replicas without touching the device.
-    const auto copy_address_pages =
-        [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-            const DeviceKVPagePool& pool, KVAddressSpaceHandle address, std::uint32_t page_count,
-            const HostKVPageLayout& layout, std::size_t payload_offset, std::uint64_t& d2h_pages,
-            std::uint64_t& d2h_bytes) {
-            std::vector<DeviceKVPageHandle> run;
-            run.reserve(page_count);
-            std::uint32_t run_begin = 0;
-            const auto flush_run    = [&] {
-                if (run.empty()) { return; }
-                pool.copy_to_host(
-                    std::span<const DeviceKVPageHandle>(run.data(), run.size()),
-                    reinterpret_cast<std::byte*>(base + payload_offset +
-                                                 static_cast<std::size_t>(run_begin) *
-                                                     layout.page_stride),
-                    layout, device.transfer_stream);
-                d2h_pages += run.size();
-                d2h_bytes += run.size() * layout.page_stride;
-                run.clear();
-            };
-            for (std::uint32_t page = 0; page < page_count; ++page) {
-                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-                if (pages.device_resident(logical)) {
-                    if (run.empty()) { run_begin = page; }
-                    run.push_back(pages.physical(logical));
-                    continue;
-                }
-                flush_run();
-                if (!pages.host_resident(logical) || !pages.host_replica_current(logical)) {
-                    throw std::logic_error("retained session KV page has no current replica");
-                }
-                if (!host_kv_extents) {
-                    throw std::logic_error("retained session Host replica has no extent store");
-                }
-                const HostKVPageReplica& replica = pages.host_replica(logical);
-                const HostKVAllocationConstView view = host_kv_extents->view(replica.extent);
-                if (view.layout().page_stride != layout.page_stride ||
-                    replica.page_offset >= view.page_count()) {
-                    throw std::logic_error("retained session Host replica layout is inconsistent");
-                }
-                std::memcpy(base + payload_offset +
-                                static_cast<std::size_t>(page) * layout.page_stride,
-                            view.data() +
-                                static_cast<std::size_t>(replica.page_offset) * layout.page_stride,
-                            layout.page_stride);
+    const auto copy_address_pages = [&](const KVAddressSpaceStore& addresses,
+                                        const LogicalKVPageStore& pages,
+                                        const DeviceKVPagePool& pool, KVAddressSpaceHandle address,
+                                        std::uint32_t page_count, const HostKVPageLayout& layout,
+                                        std::size_t payload_offset, std::uint64_t& d2h_pages,
+                                        std::uint64_t& d2h_bytes) {
+        std::vector<DeviceKVPageHandle> run;
+        run.reserve(page_count);
+        std::uint32_t run_begin = 0;
+        const auto flush_run    = [&] {
+            if (run.empty()) { return; }
+            pending->submitted = true;
+            pool.copy_to_host(std::span<const DeviceKVPageHandle>(run.data(), run.size()),
+                                 reinterpret_cast<std::byte*>(base + payload_offset +
+                                                              static_cast<std::size_t>(run_begin) *
+                                                                  layout.page_stride),
+                                 layout, device.transfer_stream);
+            d2h_pages += run.size();
+            d2h_bytes += run.size() * layout.page_stride;
+            run.clear();
+        };
+        for (std::uint32_t page = 0; page < page_count; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (pages.device_resident(logical)) {
+                if (run.empty()) { run_begin = page; }
+                run.push_back(pages.physical(logical));
+                continue;
             }
             flush_run();
-        };
+            if (!pages.host_resident(logical) || !pages.host_replica_current(logical)) {
+                throw std::logic_error("retained session KV page has no current replica");
+            }
+            if (!host_kv_extents) {
+                throw std::logic_error("retained session Host replica has no extent store");
+            }
+            const HostKVPageReplica& replica     = pages.host_replica(logical);
+            const HostKVAllocationConstView view = host_kv_extents->view(replica.extent);
+            if (view.layout().page_stride != layout.page_stride ||
+                replica.page_offset >= view.page_count()) {
+                throw std::logic_error("retained session Host replica layout is inconsistent");
+            }
+            std::memcpy(base + payload_offset + static_cast<std::size_t>(page) * layout.page_stride,
+                        view.data() +
+                            static_cast<std::size_t>(replica.page_offset) * layout.page_stride,
+                        layout.page_stride);
+        }
+        flush_run();
+    };
     copy_address_pages(*text_kv_addresses, *text_kv_pages, text_pool, text_address,
                        session.text_pages, text_layout, text_kv_offset,
                        snapshot_traffic_.main_kv_d2h_pages, snapshot_traffic_.main_kv_d2h_bytes);
@@ -597,28 +631,26 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     // recycle a StateImage/KV page, and a later kernel must not overwrite it while this D2H
     // read is still in flight.  This is a stream dependency, not a device-wide synchronize.
     // Later transfer-stream users are already ordered by stream FIFO.
-    auto completion = std::make_shared<CudaCompletionEvent>(device);
-    completion->record(device.transfer_stream);
-    completion->wait(device.stream);
+    pending->completion->record(device.transfer_stream);
+    pending->recorded = true;
+    pending->completion->wait(device.stream);
     const std::size_t transfer_bytes = snapshot.bytes.size();
     snapshot.transfer_bytes          = transfer_bytes;
     snapshot.bytes.clear();
     snapshot.bytes.shrink_to_fit();
-    snapshot.await_transfer = [this, completion, transfer_backing = std::move(transfer_backing),
-                               transfer_bytes](std::vector<std::uint8_t>& bytes) {
-        device.bind_to_current_thread();
-        completion->synchronize();
+    snapshot.await_transfer = [pending, transfer_bytes](std::vector<std::uint8_t>& bytes) {
+        pending->settle();
         // This bounded Host-consumer step runs after the producer event. It is the only point
         // that creates pageable file bytes, so the Engine worker remains free while D2H runs.
         bytes.resize(transfer_bytes);
-        std::memcpy(bytes.data(), transfer_backing->data(), transfer_bytes);
+        std::memcpy(bytes.data(), pending->backing->data(), transfer_bytes);
     };
+    snapshot.settle_transfer = [pending] { pending->settle(); };
     return snapshot;
 }
 
-ContinuationHandle
-ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
-                                      std::string_view model_binding) {
+ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
+                                                         std::string_view model_binding) {
     if (has_context_transaction() || pending_transaction_) {
         throw std::logic_error("cannot restore a session during a resource transaction");
     }
@@ -678,8 +710,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     }
     const std::uint32_t backend_plane_count =
         backend != nullptr ? static_cast<std::uint32_t>(backend->page_pool().plane_count()) : 0U;
-    const std::uint64_t backend_page_stride =
-        backend != nullptr ? backend_layout->page_stride : 0U;
+    const std::uint64_t backend_page_stride = backend != nullptr ? backend_layout->page_stride : 0U;
     if (config.backend_plane_count != backend_plane_count ||
         config.backend_page_stride != backend_page_stride) {
         throw std::invalid_argument(
@@ -693,8 +724,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     if (session.tokens == 0 || session.tokens > capacity) {
         throw std::invalid_argument("session snapshot depth exceeds the server context");
     }
-    if (session.ledger_frontier != session.tokens ||
-        session.execution_frontier > session.tokens ||
+    if (session.ledger_frontier != session.tokens || session.execution_frontier > session.tokens ||
         session.tokens - session.execution_frontier > 1 ||
         session.text_kv_valid > session.text_committed_frontier ||
         session.execution_frontier > session.text_committed_frontier ||
@@ -731,8 +761,8 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     std::vector<std::uint32_t> rewrite_frontiers =
         read_vector<std::uint32_t>(reader, session.tokens, "rewrite frontier");
     std::vector<std::array<std::uint64_t, 2>> digest_image =
-        read_vector<std::array<std::uint64_t, 2>>(reader, static_cast<std::size_t>(session.tokens) + 1U,
-                                                  "shortlist digest");
+        read_vector<std::array<std::uint64_t, 2>>(
+            reader, static_cast<std::size_t>(session.tokens) + 1U, "shortlist digest");
     if (token_types.size() != session.tokens || positions[0].size() != session.tokens ||
         positions[1].size() != session.tokens || positions[2].size() != session.tokens ||
         digest_image.size() != static_cast<std::size_t>(session.tokens) + 1U) {
@@ -743,9 +773,9 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     }
 
     // Checkpoint directory.
-    const std::uint8_t rewrite_valid_flag  = reader.pod<std::uint8_t>();
-    const std::uint8_t rewrite_kind_value  = reader.pod<std::uint8_t>();
-    const std::uint32_t rewrite_frontier   = reader.pod<std::uint32_t>();
+    const std::uint8_t rewrite_valid_flag   = reader.pod<std::uint8_t>();
+    const std::uint8_t rewrite_kind_value   = reader.pod<std::uint8_t>();
+    const std::uint32_t rewrite_frontier    = reader.pod<std::uint32_t>();
     const runtime::PrefillWork rewrite_work = reader.pod<runtime::PrefillWork>();
     if (rewrite_valid_flag != 0 &&
         (rewrite_frontier == 0 || rewrite_frontier > session.tokens ||
@@ -753,12 +783,14 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
          rewrite_kind_value > static_cast<std::uint8_t>(RewriteCheckpointKind::ResponseReplay))) {
         throw std::invalid_argument("session snapshot rewrite checkpoint is inconsistent");
     }
+
     struct SnapshotAnchor {
         std::uint32_t frontier = 0;
         std::uint32_t ordinal  = 0;
         runtime::PrefillWork rebuild_work;
         std::int32_t image = -1;
     };
+
     const std::uint32_t anchor_count = reader.pod<std::uint32_t>();
     if (anchor_count > 64U) {
         throw std::invalid_argument("session snapshot anchor count is out of range");
@@ -804,8 +836,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         image_payloads[index] = reader.payload(state_layout.image_bytes);
     }
     const std::uint8_t* state_payload = image_payloads[static_cast<std::size_t>(endpoint_image)];
-    const std::uint8_t* text_payload =
-        reader.payload(config.text_page_stride * session.text_pages);
+    const std::uint8_t* text_payload = reader.payload(config.text_page_stride * session.text_pages);
     const std::uint8_t* backend_payload =
         session.backend_pages != 0
             ? reader.payload(config.backend_page_stride * session.backend_pages)
@@ -815,8 +846,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     }
 
     if (text_pool.available_pages() < session.text_pages ||
-        (backend != nullptr &&
-         backend->page_pool().available_pages() < session.backend_pages)) {
+        (backend != nullptr && backend->page_pool().available_pages() < session.backend_pages)) {
         throw std::invalid_argument(
             "session snapshot does not fit the free KV capacity; evict other sessions first");
     }
@@ -831,9 +861,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             break;
         }
     }
-    if (!free_row) {
-        throw std::logic_error("session restore requires an idle execution lane");
-    }
+    if (!free_row) { throw std::logic_error("session restore requires an idle execution lane"); }
 
     std::optional<std::uint32_t> slot_index = allocate_continuation_slot();
     if (!slot_index) {
@@ -848,10 +876,10 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     try {
         // Every restored image prefers a Device slot and falls back to a HostOnly replica (the
         // shape a demoted checkpoint has) when the Device pool is occupied by other sessions.
-        const auto stage_image = [&](const std::uint8_t* payload)
-            -> std::optional<StateImageHandle> {
-            const qwen3_6::HostStateImageConstView view{
-                reinterpret_cast<const std::byte*>(payload), &state_layout};
+        const auto stage_image =
+            [&](const std::uint8_t* payload) -> std::optional<StateImageHandle> {
+            const qwen3_6::HostStateImageConstView view{reinterpret_cast<const std::byte*>(payload),
+                                                        &state_layout};
             std::optional<StateImageHandle> handle = state_store->reserve_reset(device.stream);
             if (handle) {
                 state_images->copy_from_host(view, state_store->physical_slot(*handle),
@@ -883,11 +911,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             if (anchor.ordinal <= anchor_capacity) { upload_image(anchor.image); }
         }
 
-        const auto build_address =
-            [&](KVAddressSpaceStore& addresses, DeviceKVPagePool& pool, std::uint32_t page_count,
-                std::uint32_t committed, const HostKVPageLayout& layout,
-                const std::uint8_t* payload, std::uint64_t& h2d_pages,
-                std::uint64_t& h2d_bytes) -> KVAddressSpaceHandle {
+        const auto build_address = [&](KVAddressSpaceStore& addresses, DeviceKVPagePool& pool,
+                                       std::uint32_t page_count, std::uint32_t committed,
+                                       const HostKVPageLayout& layout, const std::uint8_t* payload,
+                                       std::uint64_t& h2d_pages,
+                                       std::uint64_t& h2d_bytes) -> KVAddressSpaceHandle {
             std::optional<KVAddressSpaceHandle> address = addresses.create_inactive();
             if (!address) {
                 throw std::invalid_argument(
@@ -904,10 +932,10 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
                 for (std::uint32_t page = 0; page < page_count; ++page) {
                     destinations.push_back(addresses.physical_page(*address, page));
                 }
-                pool.copy_from_host(reinterpret_cast<const std::byte*>(payload), layout,
-                                    std::span<const DeviceKVPageHandle>(destinations.data(),
-                                                                        destinations.size()),
-                                    device.stream);
+                pool.copy_from_host(
+                    reinterpret_cast<const std::byte*>(payload), layout,
+                    std::span<const DeviceKVPageHandle>(destinations.data(), destinations.size()),
+                    device.stream);
                 h2d_pages += page_count;
                 h2d_bytes += static_cast<std::uint64_t>(page_count) * layout.page_stride;
             } catch (...) {
@@ -917,11 +945,10 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             }
             return *address;
         };
-        text_address = build_address(*text_kv_addresses, text_kv_pages->physical_pool(),
-                                     session.text_pages, session.text_committed_frontier,
-                                     text_layout, text_payload,
-                                     snapshot_traffic_.main_kv_h2d_pages,
-                                     snapshot_traffic_.main_kv_h2d_bytes);
+        text_address =
+            build_address(*text_kv_addresses, text_kv_pages->physical_pool(), session.text_pages,
+                          session.text_committed_frontier, text_layout, text_payload,
+                          snapshot_traffic_.main_kv_h2d_pages, snapshot_traffic_.main_kv_h2d_bytes);
         if (backend != nullptr) {
             backend_address = build_address(
                 *backend_kv_addresses, backend->page_pool(), session.backend_pages,
@@ -951,17 +978,17 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_digests.restore(std::move(digest_image));
         sequence.prefix_digests.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-        sequence.execution_frontier       = session.execution_frontier;
-        sequence.ledger_frontier          = session.ledger_frontier;
-        sequence.text_kv_valid            = session.text_kv_valid;
-        sequence.mtp_kv_valid             = session.mtp_kv_valid;
-        sequence.dflash_context_frontier  = 0;
-        sequence.rope_delta               = session.rope_delta;
-        sequence.mtp_draft_count          = 0;
-        sequence.tail_hidden_valid        = session.tail_hidden_valid != 0;
-        sequence.state_source_retained    = false;
-        sequence.endpoint_valid           = true;
-        sequence.rewrite_checkpoint       = {};
+        sequence.execution_frontier      = session.execution_frontier;
+        sequence.ledger_frontier         = session.ledger_frontier;
+        sequence.text_kv_valid           = session.text_kv_valid;
+        sequence.mtp_kv_valid            = session.mtp_kv_valid;
+        sequence.dflash_context_frontier = 0;
+        sequence.rope_delta              = session.rope_delta;
+        sequence.mtp_draft_count         = 0;
+        sequence.tail_hidden_valid       = session.tail_hidden_valid != 0;
+        sequence.state_source_retained   = false;
+        sequence.endpoint_valid          = true;
+        sequence.rewrite_checkpoint      = {};
         sequence.rewrite_state.reset();
         sequence.reserved_state.reset();
         sequence.rebuild_work       = session.rebuild_work;
@@ -975,8 +1002,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
                 state_store->freeze(*image);
             }
         }
-        const auto resolve_image =
-            [&](std::int32_t index) -> std::optional<StateImageHandle> {
+        const auto resolve_image = [&](std::int32_t index) -> std::optional<StateImageHandle> {
             if (index == endpoint_image) { return sequence.state.read; }
             return extra_images[static_cast<std::size_t>(index)];
         };

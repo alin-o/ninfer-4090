@@ -11,6 +11,7 @@
 #include "targets/registry.h"
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -50,6 +51,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.auto_save_queue_jobs == 0) { options.auto_save_queue_jobs = 2; }
+    if (options.auto_save_queue_bytes == 0) { options.auto_save_queue_bytes = 1ULL << 30U; }
+    if (options.auto_save_queue_bytes == 0) {
+        throw std::invalid_argument("auto-save queue byte capacity must be nonzero");
     }
 
     ContextCacheOptions& cache      = options.context_cache;
@@ -310,8 +316,18 @@ public:
 
     void enqueue_write(std::string path, targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
         std::unique_lock lock(writer_mutex);
+        const std::size_t bytes = snapshot.bytes.size();
+        // This callback is invoked while the Engine owns its resource transaction. Never wait
+        // there: a full writer queue is an intentional best-effort spill drop, not a reason to
+        // stall unrelated admitted execution or to retain an unbounded pinned host image.
+        if (pending_writes.size() >= options.auto_save_queue_jobs ||
+            bytes > options.auto_save_queue_bytes - queued_write_bytes) {
+            ++rejected_write_jobs;
+            return;
+        }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
         pending_writes.push_back(PendingWrite{std::move(path), std::move(snapshot)});
+        queued_write_bytes += bytes;
         lock.unlock();
         writer_cv.notify_one();
     }
@@ -331,13 +347,25 @@ public:
     ModelSamplingDefaults sampling_defaults;
     Core core;
 
-    std::mutex writer_mutex;
+    mutable std::mutex writer_mutex;
     std::condition_variable writer_cv;
     std::deque<PendingWrite> pending_writes;
+    std::size_t queued_write_bytes = 0;
     bool write_in_flight = false;
     bool writer_stop     = false;
     std::thread writer;
     SlotSpillGuard spill_guard;
+    std::atomic<std::uint64_t> in_flight_write_bytes{0};
+    std::atomic<std::uint64_t> rejected_write_jobs{0};
+
+    [[nodiscard]] RuntimeStats with_auto_save_stats(RuntimeStats stats) const noexcept {
+        std::lock_guard lock(writer_mutex);
+        stats.auto_save_queued_jobs = static_cast<std::uint32_t>(pending_writes.size());
+        stats.auto_save_queued_bytes = queued_write_bytes;
+        stats.auto_save_in_flight_bytes = in_flight_write_bytes.load(std::memory_order_relaxed);
+        stats.auto_save_rejected_jobs = rejected_write_jobs.load(std::memory_order_relaxed);
+        return stats;
+    }
 
 private:
     void writer_loop() {
@@ -347,7 +375,9 @@ private:
             if (pending_writes.empty()) { break; }
             PendingWrite item = std::move(pending_writes.front());
             pending_writes.pop_front();
+            queued_write_bytes -= item.snapshot.bytes.size();
             write_in_flight = true;
+            in_flight_write_bytes.store(item.snapshot.bytes.size(), std::memory_order_relaxed);
             lock.unlock();
 
             SlotAutoSaveEvent event;
@@ -378,6 +408,7 @@ private:
             }
 
             lock.lock();
+            in_flight_write_bytes.store(0, std::memory_order_relaxed);
             write_in_flight = false;
             writer_cv.notify_all();
         }
@@ -646,7 +677,7 @@ bool Engine::healthy() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    return impl_->with_auto_save_stats(std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -655,7 +686,7 @@ RuntimeStats Engine::runtime_stats() const {
                 return core->runtime_stats();
             }
         },
-        impl_->core);
+        impl_->core));
 }
 
 // Write-then-rename keeps a torn write from ever shadowing a good snapshot at `path`. The

@@ -66,7 +66,7 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     const std::uint64_t in_flight  = active_.size();
     const std::uint64_t processing = std::min<std::uint64_t>(in_flight, max_concurrency);
     std::string out;
-    out.reserve(704);
+    out.reserve(1024);
     append_counter(out, "llamacpp:prompt_tokens_total", live.computed_prefill_tokens);
     append_counter(out, "llamacpp:prompt_seconds_total", live.prefill_seconds_total);
     append_counter(out, "llamacpp:tokens_predicted_total", live.committed_decode_tokens);
@@ -77,6 +77,10 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);
+    append_counter(out, "ninfer:auto_save_queued_jobs", live.auto_save_queued_jobs);
+    append_counter(out, "ninfer:auto_save_queued_bytes", live.auto_save_queued_bytes);
+    append_counter(out, "ninfer:auto_save_in_flight_bytes", live.auto_save_in_flight_bytes);
+    append_counter(out, "ninfer:auto_save_rejected_jobs_total", live.auto_save_rejected_jobs);
     return out;
 }
 

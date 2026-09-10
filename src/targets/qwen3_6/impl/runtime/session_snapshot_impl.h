@@ -513,7 +513,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                 state_store->physical_slot(image),
                 qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(image_out),
                                             &state_layout},
-                device.stream);
+                device.transfer_stream);
             ++snapshot_traffic_.state_d2h_count;
             snapshot_traffic_.state_d2h_bytes += state_layout.image_bytes;
         }
@@ -536,7 +536,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                     reinterpret_cast<std::byte*>(base + payload_offset +
                                                  static_cast<std::size_t>(run_begin) *
                                                      layout.page_stride),
-                    layout, device.stream);
+                    layout, device.transfer_stream);
                 d2h_pages += run.size();
                 d2h_bytes += run.size() * layout.page_stride;
                 run.clear();
@@ -578,7 +578,10 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                            backend_kv_offset, snapshot_traffic_.backend_kv_d2h_pages,
                            snapshot_traffic_.backend_kv_d2h_bytes);
     }
-    device.synchronize();
+    // Snapshot traffic is intentionally isolated from model execution.  Waiting only for this
+    // producer stream preserves the ordering of the immutable source ranges without imposing a
+    // device-wide barrier on unrelated admitted lanes.
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     return snapshot;
 }
 

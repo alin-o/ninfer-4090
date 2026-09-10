@@ -847,9 +847,12 @@ admission path.
 
 `Program::begin_save_continuation` follows the same rule for an eviction spill: it returns an
 opaque snapshot whose `await_transfer` producer-event callback must run before a Host worker reads
-`bytes`.  The normal `save_continuation` API settles that callback for synchronous callers.  The
-Engine auto-save writer instead owns the wait, so enqueuing an already bounded spill does not
-block the execution worker or create another resource owner.
+`bytes`.  Its queue reservation covers two complete images: pinned D2H backing plus either the
+submission assembly image or the post-event pageable output. The normal `save_continuation` API
+settles that callback for synchronous callers. The Engine auto-save writer instead owns the wait,
+so enqueuing an already bounded spill does not block the execution worker or create another
+resource owner. Its public queue gauges exclude the active writer; active bytes are reported
+separately.
 
 ### 9.4 Commit
 

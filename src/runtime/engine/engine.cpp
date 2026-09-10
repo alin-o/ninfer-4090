@@ -384,8 +384,10 @@ public:
 
     [[nodiscard]] RuntimeStats with_auto_save_stats(RuntimeStats stats) const noexcept {
         std::lock_guard lock(writer_mutex);
-        stats.auto_save_queued_jobs     = reserved_write_jobs;
-        stats.auto_save_queued_bytes    = reserved_write_bytes;
+        // Queue gauges exclude the active consumer.  Reservation is deliberately internal: it
+        // includes the active item's double-residency allowance so admission remains bounded.
+        stats.auto_save_queued_jobs     = static_cast<std::uint32_t>(pending_writes.size());
+        stats.auto_save_queued_bytes    = queued_write_bytes;
         stats.auto_save_in_flight_bytes = in_flight_write_bytes.load(std::memory_order_relaxed);
         stats.auto_save_rejected_jobs   = rejected_write_jobs.load(std::memory_order_relaxed);
         return stats;

@@ -499,23 +499,37 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     writer.pod<std::int32_t>(rewrite_image);
     for (const std::int32_t index : anchor_images) { writer.pod<std::int32_t>(index); }
 
-    // Size the payload before allocating its final, pinned transfer backing. CUDA must never
-    // receive the ordinary vector storage as an asynchronous D2H destination: pageable storage
-    // may make cudaMemcpyAsync synchronously stage on the Engine worker.
-    const std::size_t state_offset =
-        writer.reserve_payload(state_layout.image_bytes * unique_states.size());
-    const std::size_t text_kv_offset =
-        writer.reserve_payload(config.text_page_stride * session.text_pages);
-    const std::size_t backend_kv_offset =
-        writer.reserve_payload(config.backend_page_stride * session.backend_pages);
+    // Account before growing the pageable assembly image.  During submission it coexists with
+    // the pinned D2H backing; during consumption a freshly assembled pageable image coexists
+    // with that backing.  Two complete images is therefore the actual bounded footprint.
+    const std::size_t header_bytes = snapshot.bytes.size();
+    const std::size_t state_bytes = state_layout.image_bytes * unique_states.size();
+    const std::size_t text_bytes = config.text_page_stride * session.text_pages;
+    const std::size_t backend_bytes = config.backend_page_stride * session.backend_pages;
+    if (state_bytes > std::numeric_limits<std::size_t>::max() - header_bytes ||
+        text_bytes > std::numeric_limits<std::size_t>::max() - header_bytes - state_bytes ||
+        backend_bytes > std::numeric_limits<std::size_t>::max() - header_bytes - state_bytes -
+                            text_bytes) {
+        throw std::overflow_error("session snapshot size overflows host accounting");
+    }
+    const std::size_t transfer_bytes = header_bytes + state_bytes + text_bytes + backend_bytes;
+    if (transfer_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
+        throw std::overflow_error("session snapshot double residency overflows host accounting");
+    }
 
     // Reserve the complete bounded writer footprint before allocating pinned backing or
     // submitting D2H.  A full queue therefore drops an involuntary spill without placing work
     // on the execution thread's transfer dependency chain.
     if (reserve) {
-        snapshot.queue_reservation = reserve(snapshot.bytes.size());
+        snapshot.queue_reservation = reserve(transfer_bytes * 2U);
         if (!snapshot.queue_reservation) { return {}; }
     }
+
+    // Size the payload after the reservation succeeds. CUDA must never receive the ordinary
+    // vector storage as an asynchronous D2H destination.
+    const std::size_t state_offset = writer.reserve_payload(state_bytes);
+    const std::size_t text_kv_offset = writer.reserve_payload(text_bytes);
+    const std::size_t backend_kv_offset = writer.reserve_payload(backend_bytes);
 
     auto transfer_backing = std::make_shared<PinnedHostBuffer>(snapshot.bytes.size());
     std::memcpy(transfer_backing->data(), snapshot.bytes.data(), snapshot.bytes.size());
@@ -527,8 +541,13 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
         DeviceContext* device = nullptr;
         std::shared_ptr<PinnedHostBuffer> backing;
         std::shared_ptr<CudaCompletionEvent> completion;
+        std::shared_ptr<CudaCompletionEvent> producer;
+        StateImageStore* state_store = nullptr;
+        std::vector<StateImageHandle> state_sources;
+        std::vector<std::pair<LogicalKVPageStore*, LogicalKVPageHandle>> kv_sources;
         bool submitted = false;
         bool recorded  = false;
+        std::exception_ptr failure;
 
         void settle() noexcept {
             if (!submitted || !device || !completion) { return; }
@@ -539,6 +558,17 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
                     recorded = true;
                 }
                 completion->synchronize();
+            } catch (...) { failure = std::current_exception(); }
+            // cudaEventSynchronize reports an asynchronous copy failure only after the stream
+            // has reached its terminal event.  Either outcome is settled, so pins must not
+            // leak and no partial image is published (the consumer receives the exception).
+            try {
+                for (const StateImageHandle source : state_sources) {
+                    state_store->unpin_snapshot_source(source);
+                }
+                state_sources.clear();
+                for (const auto& [pages, source] : kv_sources) { pages->unpin_source(source); }
+                kv_sources.clear();
             } catch (...) {}
         }
 
@@ -549,6 +579,13 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     pending->device     = &device;
     pending->backing    = transfer_backing;
     pending->completion = std::make_shared<CudaCompletionEvent>(device);
+    pending->producer   = std::make_shared<CudaCompletionEvent>(device);
+    pending->state_store = state_store.get();
+    // Establish the execution producer dependency before transfer-stream reads.  The pins are
+    // Program ownership capabilities, not merely CUDA ordering, and survive continuation
+    // release until completion settlement.
+    pending->producer->record(device.stream);
+    pending->producer->wait(device.transfer_stream);
     for (std::size_t index = 0; index < unique_states.size(); ++index) {
         const StateImageHandle image  = unique_states[index];
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
@@ -556,6 +593,8 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
             const qwen3_6::HostStateImageConstView view = state_store->host_view(image);
             std::memcpy(image_out, view.data, state_layout.image_bytes);
         } else {
+            state_store->pin_snapshot_source(image);
+            pending->state_sources.push_back(image);
             pending->submitted = true;
             state_images->copy_to_host(
                 state_store->physical_slot(image),
@@ -569,7 +608,7 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     // KV pages: device-resident runs go through the pool's page copier; demoted pages are read
     // from their published Host replicas without touching the device.
     const auto copy_address_pages = [&](const KVAddressSpaceStore& addresses,
-                                        const LogicalKVPageStore& pages,
+                                        LogicalKVPageStore& pages,
                                         const DeviceKVPagePool& pool, KVAddressSpaceHandle address,
                                         std::uint32_t page_count, const HostKVPageLayout& layout,
                                         std::size_t payload_offset, std::uint64_t& d2h_pages,
@@ -592,6 +631,11 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
         for (std::uint32_t page = 0; page < page_count; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.device_resident(logical)) {
+                if (!pages.can_pin_source(logical)) {
+                    throw std::logic_error("retained session KV snapshot source is not stable");
+                }
+                pages.pin_source(logical);
+                pending->kv_sources.emplace_back(&pages, logical);
                 if (run.empty()) { run_begin = page; }
                 run.push_back(pages.physical(logical));
                 continue;
@@ -634,12 +678,15 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     pending->completion->record(device.transfer_stream);
     pending->recorded = true;
     pending->completion->wait(device.stream);
-    const std::size_t transfer_bytes = snapshot.bytes.size();
+    if (snapshot.bytes.size() != transfer_bytes) {
+        throw std::logic_error("session snapshot payload sizing changed after reservation");
+    }
     snapshot.transfer_bytes          = transfer_bytes;
     snapshot.bytes.clear();
     snapshot.bytes.shrink_to_fit();
     snapshot.await_transfer = [pending, transfer_bytes](std::vector<std::uint8_t>& bytes) {
         pending->settle();
+        if (pending->failure) { std::rethrow_exception(pending->failure); }
         // This bounded Host-consumer step runs after the producer event. It is the only point
         // that creates pageable file bytes, so the Engine worker remains free while D2H runs.
         bytes.resize(transfer_bytes);

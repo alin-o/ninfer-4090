@@ -1032,6 +1032,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    settle_snapshot_sources();
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
@@ -6009,6 +6010,21 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     if (cancellation.requested()) { transaction.cancel_pending = true; }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
+        // An eviction auto-save may still be reading an otherwise releasable victim on the
+        // transfer stream.  Keep the transaction sealed until the worker can retire those
+        // source pins; unrelated admitted lanes remain runnable between progress boundaries.
+        // Preflight already proved every selected victim releasable before the observer ran, so
+        // retry only while this bounded handoff is outstanding and preserve the strict check
+        // below for every other topology change.
+        if (!snapshot_source_retirements_.empty()) {
+            for (std::size_t position = 0; position < transaction.victim_count; ++position) {
+                if (transaction.pressure[position].option.evicts_continuation &&
+                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
+            }
+        }
         if (transaction.cancel_pending) {
             abort_transaction();
             return out;
@@ -6336,6 +6352,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    // Source pins are Program capabilities.  The Host writer may wait for and consume its
+    // private image, but only this worker boundary mutates State/KV ownership.
+    retire_ready_snapshot_sources();
     // After this point pressure work is allowed to mutate/release selected victims.  A snapshot
     // may only be sealed in the reservation window above.
     snapshot_save_window_ = false;
@@ -6378,6 +6397,27 @@ void ProgramImplCore::finalize_context_transaction() noexcept {
         },
         context_transaction_);
     if (terminal) { context_transaction_.emplace<std::monostate>(); }
+}
+
+void ProgramImplCore::retire_ready_snapshot_sources() {
+    auto retirement = snapshot_source_retirements_.begin();
+    while (retirement != snapshot_source_retirements_.end()) {
+        if (!retirement->ready()) {
+            ++retirement;
+            continue;
+        }
+        retirement->retire();
+        retirement = snapshot_source_retirements_.erase(retirement);
+    }
+}
+
+void ProgramImplCore::settle_snapshot_sources() noexcept {
+    for (SnapshotSourceRetirement& retirement : snapshot_source_retirements_) {
+        try {
+            retirement.retire();
+        } catch (...) {}
+    }
+    snapshot_source_retirements_.clear();
 }
 
 bool ProgramImplCore::has_context_transaction() const noexcept {
@@ -9256,6 +9296,10 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     const bool valid               = !has_context_transaction() && !pending_transaction_ &&
                        valid_continuation(continuation) && !materialization_pins(index, generation);
     if (!valid) { return out; }
+    // Direct destructive callers have no open context transaction through which to revisit an
+    // asynchronous eviction spill.  Settle that bounded handoff here; materialization pressure
+    // instead defers at progress boundaries so unrelated admitted lanes remain runnable.
+    if (!snapshot_source_retirements_.empty()) { settle_snapshot_sources(); }
     try {
         if (!can_release_continuation_slot_strict(index)) { return out; }
     } catch (...) { return out; }
@@ -9333,6 +9377,7 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 
 void ProgramImplCore::fail_all_cleanup() noexcept {
     pending_transaction_.reset();
+    settle_snapshot_sources();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);

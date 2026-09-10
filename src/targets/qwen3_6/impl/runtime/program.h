@@ -26,6 +26,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -987,10 +988,20 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
     ContextTransaction context_transaction_;
+
+    struct SnapshotSourceRetirement {
+        std::function<bool()> ready;
+        std::function<void()> retire;
+    };
+
+    std::vector<SnapshotSourceRetirement> snapshot_source_retirements_;
     // Set only between materialization reservation and its first physical progress step.  The
     // Engine uses this interval to seal an involuntarily evicted continuation's immutable D2H
     // snapshot after the topology is reserved but before any source can be mutated.
     bool snapshot_save_window_ = false;
+
+    void retire_ready_snapshot_sources();
+    void settle_snapshot_sources() noexcept;
 
     [[nodiscard]] MaterializationResult
     progress_materialization_transaction(runtime::CancellationFlagView cancellation);

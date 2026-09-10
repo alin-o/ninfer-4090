@@ -497,13 +497,6 @@ public:
         return true;
     }
 
-    // The pressure path uses this only after a current Host extent has already been
-    // published.  Keep the name separate from a generic replica release so callers
-    // cannot accidentally turn a duplicate eviction into another D2H operation.
-    [[nodiscard]] bool offload_retained_device_replica(LogicalKVPageHandle handle) noexcept {
-        return drop_device_replica(handle);
-    }
-
     [[nodiscard]] bool host_replica_current(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];

@@ -5777,7 +5777,7 @@ void ProgramImplCore::publish_pressure_work(
             } else if (!change.host_released) {
                 if (pressure_state_drops_host(action)
                         ? !state_store->drop_host_replica(*source)
-                        : !state_store->offload_retained_device_replica(*source)) {
+                        : !state_store->drop_device_replica(*source)) {
                     std::terminate();
                 }
                 work.mutation_published = true;
@@ -5802,7 +5802,7 @@ void ProgramImplCore::publish_pressure_work(
                     change.backup.reset();
                 }
                 for (const LogicalKVPageHandle page : change.pages) {
-                    if (!pages.offload_retained_device_replica(page)) { std::terminate(); }
+                    if (!pages.drop_device_replica(page)) { std::terminate(); }
                 }
                 work.mutation_published = true;
             };

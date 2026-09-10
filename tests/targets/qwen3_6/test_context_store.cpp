@@ -159,12 +159,10 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(retained_state_backup.has_value(), "retained State initial D2H reservation");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     images.publish_transfer(std::move(*retained_state_backup), true);
-    const std::size_t state_d2h_bytes = q36::state_image_transfer_work(host.layout()).payload_bytes;
-    const std::size_t later_state_d2h_bytes = 0;
-    expect(images.offload_retained_device_replica(*retained_state) &&
+    expect(images.drop_device_replica(*retained_state) &&
                images.residency(*retained_state) == store::StateReplicaResidency::HostOnly &&
-               host.occupied() == 2 && state_d2h_bytes != 0 && later_state_d2h_bytes == 0,
-           "production duplicate-State offload retains Host backing and schedules no second D2H");
+               host.occupied() == 2,
+           "Host-backed State duplicate releases its Device replica");
     expect(images.release(*host_source) && images.release(*moved_device) &&
                images.release(*fork_one) && images.release(*fork_two) &&
                images.release(*retained_state) && host.occupied() == 0,
@@ -303,13 +301,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(extents.valid(second_host_extent) &&
                host_arena.occupied_bytes() == 2U * host_layout.page_stride,
            "KV Host restore retains its backing after H2D");
-    const std::uint32_t later_kv_d2h_pages  = 0;
-    const std::uint32_t later_kv_d2h_copies = 0;
-    expect(pages.offload_retained_device_replica(logical_pages[0]) &&
-               pages.offload_retained_device_replica(logical_pages[1]) && later_kv_d2h_pages == 0 &&
-               later_kv_d2h_copies == 0 &&
+    expect(pages.drop_device_replica(logical_pages[0]) &&
+               pages.drop_device_replica(logical_pages[1]) &&
                host_arena.occupied_bytes() == 2U * host_layout.page_stride,
-           "production duplicate-KV offload keeps retained Host backing without another D2H");
+           "Host-backed KV duplicates release their Device replicas");
     auto selected_restore_reservation = physical_pages.reserve(1);
     expect(selected_restore_reservation.has_value(), "selected-prefix Device reservation");
     const std::array selected_restore_destination{

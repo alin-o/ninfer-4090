@@ -428,6 +428,68 @@ int exercise_host_restore(const char* artifact) {
         return 1;
     }
 
+    // Restore must not consume Host backing.  Make an unrelated five-page request while the
+    // restored checkpoint is still a Host+Device duplicate: production pressure must reclaim
+    // the duplicate Device replicas, rather than copy unchanged State/KV back to Host again.
+    if (after_restore.host_state_occupied_slots == 0 || after_restore.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host restore lost its backing before duplicate-pressure admission: state="
+                  << after_restore.host_state_occupied_slots
+                  << " kv=" << after_restore.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+    ninfer::PromptInput duplicate_pressure = retained_input();
+    duplicate_pressure.context_cache.session_key = "host-restore-duplicate-pressure";
+    const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
+    const ninfer::GenerationResult duplicate_removed =
+        engine.generate(engine.prepare(std::move(duplicate_pressure)), options(1, false));
+    const ninfer::RuntimeStats after_duplicate_pressure = engine.runtime_stats();
+    if (duplicate_removed.generated_token_ids.size() != 1 ||
+        after_duplicate_pressure.pressure_private_owners_degraded <=
+            before_duplicate_pressure.pressure_private_owners_degraded ||
+        after_duplicate_pressure.state_d2h_count != before_duplicate_pressure.state_d2h_count ||
+        after_duplicate_pressure.state_d2h_bytes != before_duplicate_pressure.state_d2h_bytes ||
+        after_duplicate_pressure.main_kv_d2h_pages !=
+            before_duplicate_pressure.main_kv_d2h_pages ||
+        after_duplicate_pressure.main_kv_d2h_bytes !=
+            before_duplicate_pressure.main_kv_d2h_bytes ||
+        after_duplicate_pressure.backend_kv_d2h_pages !=
+            before_duplicate_pressure.backend_kv_d2h_pages ||
+        after_duplicate_pressure.backend_kv_d2h_bytes !=
+            before_duplicate_pressure.backend_kv_d2h_bytes ||
+        after_duplicate_pressure.host_state_occupied_slots == 0 ||
+        after_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host-backed duplicate pressure scheduled D2H or released backing early: "
+                  << "degraded=" << before_duplicate_pressure.pressure_private_owners_degraded
+                  << '/' << after_duplicate_pressure.pressure_private_owners_degraded
+                  << " state_d2h=" << before_duplicate_pressure.state_d2h_count << '/'
+                  << after_duplicate_pressure.state_d2h_count
+                  << " main_d2h=" << before_duplicate_pressure.main_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.main_kv_d2h_pages
+                  << " backend_d2h=" << before_duplicate_pressure.backend_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.backend_kv_d2h_pages
+                  << " host_state=" << after_duplicate_pressure.host_state_occupied_slots
+                  << " host_kv=" << after_duplicate_pressure.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
+    // These two catalogued owners are the final references in this isolated Engine.  Erasing
+    // them exercises production cleanup and proves the physical Host quota is released then,
+    // not at H2D or duplicate Device removal.
+    if (restored.slot < 0 || duplicate_removed.slot < 0 ||
+        engine.erase_slot(static_cast<std::uint32_t>(restored.slot), restored.session_digest) == 0 ||
+        engine.erase_slot(static_cast<std::uint32_t>(duplicate_removed.slot),
+                          duplicate_removed.session_digest) == 0) {
+        std::cerr << "Host backing cleanup fixture did not retain erasable catalogued owners\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats after_cleanup = engine.runtime_stats();
+    if (after_cleanup.host_state_occupied_slots != 0 || after_cleanup.host_kv_occupied_bytes != 0) {
+        std::cerr << "final Host dependency release did not recover physical capacity: state="
+                  << after_cleanup.host_state_occupied_slots
+                  << " kv=" << after_cleanup.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
     // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
     return 0;
@@ -1401,13 +1463,20 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     const std::uint64_t restored_pages =
         after_resume.main_kv_h2d_pages - before_resume.main_kv_h2d_pages;
     const std::uint32_t reused_pages = (resumed.reused_prompt_tokens + 63U) / 64U;
+    // The real Program enters this transaction with a 121-page parent which cannot be admitted
+    // together with the bounded tail and continuation reservation.  It instead selects the
+    // 120-page turn-closure frontier and restores precisely its four missing Host ranges.
+    // The retained Host extent is deliberately still charged after H2D.
     if (resumed.generated_token_ids.size() != 1 ||
         resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
-        reused_pages != 120 || restored_pages != 4) {
+        reused_pages != 120 || restored_pages != 4 ||
+        after_resume.host_kv_occupied_bytes != before_resume.host_kv_occupied_bytes) {
         std::cerr << "pressure-resume did not restore the retained turn closure: path="
                   << static_cast<int>(resumed.prefix_reuse_path)
                   << " reused=" << resumed.reused_prompt_tokens << " reused_pages=" << reused_pages
-                  << " restored=" << restored_pages << '\n';
+                  << " restored=" << restored_pages
+                  << " host_kv=" << before_resume.host_kv_occupied_bytes << '/'
+                  << after_resume.host_kv_occupied_bytes << '\n';
         return 1;
     }
     return 0;

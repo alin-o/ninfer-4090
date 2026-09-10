@@ -70,8 +70,26 @@ struct RetainedSessionSnapshot {
                 settle_transfer();
             } catch (...) {}
         }
+        // The queue reservation covers both the pinned producer image and the pageable
+        // assembly image.  Release those owners before returning the capacity; member
+        // destruction alone runs in reverse declaration order and would otherwise return
+        // queue capacity while `bytes` and the pinned backing captured by the callbacks live.
+        release_storage();
     }
 
+    // Consumer-side terminal release.  It is separate so a queue owner can release capacity
+    // outside its accounting mutex after publication.
+    void release_storage() noexcept {
+        bytes.clear();
+        bytes.shrink_to_fit();
+        await_transfer = {};
+        settle_transfer = {};
+        queue_reservation.reset();
+    }
+
+    // Keep the reservation first so ordinary reverse-order destruction drops the byte/callback
+    // owners before it.  The destructor above also makes that ordering explicit for moves.
+    std::shared_ptr<void> queue_reservation;
     std::vector<std::uint8_t> bytes;
     // Exact pinned transfer reservation, available before the first D2H copy. Pending
     // snapshots keep `bytes` empty and retain this accounting size through completion.
@@ -86,7 +104,6 @@ struct RetainedSessionSnapshot {
     // Internal lifetime settlement for pending CUDA work.  Consumers never need to invoke it.
     std::function<void()> settle_transfer;
     // An Engine-owned bounded-writer reservation, acquired before staging allocation.
-    std::shared_ptr<void> queue_reservation;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside

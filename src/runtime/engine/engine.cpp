@@ -384,11 +384,17 @@ public:
 
     [[nodiscard]] RuntimeStats with_auto_save_stats(RuntimeStats stats) const noexcept {
         std::lock_guard lock(writer_mutex);
-        // Queue gauges exclude the active consumer.  Reservation is deliberately internal: it
-        // includes the active item's double-residency allowance so admission remains bounded.
+        // Report the resident footprint, not only one image's transfer payload.  Every queued
+        // or active producer owns pinned D2H backing plus the pageable assembly allowance.
+        const auto resident_bytes = [](std::uint64_t payload) noexcept {
+            return payload > std::numeric_limits<std::uint64_t>::max() / 2U
+                       ? std::numeric_limits<std::uint64_t>::max()
+                       : payload * 2U;
+        };
         stats.auto_save_queued_jobs     = static_cast<std::uint32_t>(pending_writes.size());
-        stats.auto_save_queued_bytes    = queued_write_bytes;
-        stats.auto_save_in_flight_bytes = in_flight_write_bytes.load(std::memory_order_relaxed);
+        stats.auto_save_queued_bytes    = resident_bytes(queued_write_bytes);
+        stats.auto_save_in_flight_bytes = resident_bytes(
+            in_flight_write_bytes.load(std::memory_order_relaxed));
         stats.auto_save_rejected_jobs   = rejected_write_jobs.load(std::memory_order_relaxed);
         return stats;
     }
@@ -434,14 +440,15 @@ private:
                 } catch (...) {}
             }
 
-            // Release only after the producer has settled and file publication has reached its
-            // terminal outcome.  This keeps queued + active writer work inside one bound.
-            item.snapshot.queue_reservation.reset();
-
             lock.lock();
             in_flight_write_bytes.store(0, std::memory_order_relaxed);
             write_in_flight = false;
             writer_cv.notify_all();
+            // Destroy both backing images before their reservation.  This must happen without
+            // writer_mutex_: the reservation deleter takes that mutex to publish capacity.
+            lock.unlock();
+            item.snapshot.release_storage();
+            lock.lock();
         }
     }
 

@@ -38,6 +38,23 @@ struct SnapshotShutdownCleanup {
     std::uint64_t host_kv_bytes        = 0;
 };
 
+enum class SharedSnapshotImportStage : std::uint8_t {
+    StateAllocated,
+    MainKvAllocated,
+    BeforeCatalogPublication,
+};
+
+// Deterministic adoption checkpoints for real-Program rollback regressions. Production never
+// installs this hook. The callback may request cancellation or throw an injected exception.
+struct SharedSnapshotImportTestGate {
+    void* context                                                      = nullptr;
+    void (*checkpoint)(void* context, SharedSnapshotImportStage stage) = nullptr;
+};
+
+void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* gate) noexcept;
+void clear_shared_snapshot_import_gate() noexcept;
+void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage);
+
 void install_snapshot_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_snapshot_transfer_gate() noexcept;
 [[nodiscard]] const ContextTransferTestGate* snapshot_transfer_gate() noexcept;

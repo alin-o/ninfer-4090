@@ -1606,6 +1606,50 @@ private:
     bool active_capture_ = false;
 };
 
+class SharedSnapshotImportGate {
+public:
+    enum class Action : std::uint8_t { Reject, Fail, Cancel };
+
+    SharedSnapshotImportGate(ninfer::runtime::testing::SharedSnapshotImportStage stage,
+                             Action action, std::atomic<bool>* cancellation = nullptr)
+        : stage_(stage), action_(action), cancellation_(cancellation) {
+        registration_ = ninfer::runtime::testing::SharedSnapshotImportTestGate{
+            .context    = this,
+            .checkpoint = &checkpoint,
+        };
+        ninfer::runtime::testing::install_shared_snapshot_import_gate(&registration_);
+    }
+
+    ~SharedSnapshotImportGate() { ninfer::runtime::testing::clear_shared_snapshot_import_gate(); }
+
+    SharedSnapshotImportGate(const SharedSnapshotImportGate&)            = delete;
+    SharedSnapshotImportGate& operator=(const SharedSnapshotImportGate&) = delete;
+
+private:
+    static void checkpoint(void* context,
+                           ninfer::runtime::testing::SharedSnapshotImportStage stage) {
+        auto& gate = *static_cast<SharedSnapshotImportGate*>(context);
+        if (stage != gate.stage_) { return; }
+        switch (gate.action_) {
+        case Action::Reject:
+            throw std::invalid_argument("injected recoverable shared import rejection");
+        case Action::Fail:
+            throw std::logic_error("injected fatal shared import invariant failure");
+        case Action::Cancel:
+            if (gate.cancellation_ == nullptr) {
+                throw std::logic_error("shared import cancellation gate has no flag");
+            }
+            gate.cancellation_->store(true, std::memory_order_release);
+            return;
+        }
+    }
+
+    ninfer::runtime::testing::SharedSnapshotImportTestGate registration_;
+    ninfer::runtime::testing::SharedSnapshotImportStage stage_;
+    Action action_;
+    std::atomic<bool>* cancellation_ = nullptr;
+};
+
 class CountingOutputSink final : public ninfer::OutputSink {
 public:
     void start(ninfer::GenerationStart) override { started.store(true, std::memory_order_release); }
@@ -3654,6 +3698,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
 
     std::vector<std::uint8_t> bytes;
     std::vector<ninfer::TokenId> expected_tokens;
+    ninfer::runtime::testing::SealedSharedSnapshotTestImport source_validated;
     {
         ninfer::Engine source(shared_snapshot_engine_options(artifact));
         if (source.count_tokens(shared_snapshot_prompt()) + 3U > source.options().max_context) {
@@ -3693,6 +3738,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
         }
         bytes = std::move(snapshot.bytes);
         snapshot.release_storage();
+        source_validated = Access::parse(source, bytes);
     }
 
     {
@@ -3714,143 +3760,262 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
         }
     }
 
-    ninfer::Engine target(shared_snapshot_engine_options(artifact));
-    if (Access::import_cancelled(target, bytes) != 2U) {
-        std::cerr << "shared snapshot cancellation was not terminal before adoption\n";
-        return 1;
-    }
-    const auto imported = Access::import(target, bytes);
-    if (imported.disposition != 0U || imported.frontier == 0 ||
-        imported.main_frontier != imported.frontier ||
-        imported.backend_frontier + 1U != imported.frontier ||
-        imported.state_residency != ninfer::runtime::ReplicaResidency::HostOnly) {
-        std::cerr << "shared snapshot import lost its State/KV boundary: disposition="
-                  << imported.disposition << " frontier=" << imported.frontier
-                  << " main=" << imported.main_frontier << " backend=" << imported.backend_frontier
-                  << '\n';
-        return 1;
-    }
-    const auto repeated = Access::import(target, bytes);
-    if (repeated.disposition != 1U || repeated.slot != imported.slot ||
-        repeated.frontier != imported.frontier) {
-        std::cerr << "repeated shared snapshot import did not coalesce exactly\n";
-        return 1;
-    }
+    {
+        ninfer::Engine target(shared_snapshot_engine_options(artifact));
+        ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
+        constexpr std::string_view resident_prefix = "unrelated durable owner\n";
+        resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
+        resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
+            static_cast<std::uint32_t>(resident_prefix.size());
+        const ninfer::GenerationResult resident_generated =
+            target.generate(target.prepare(resident_prompt), fixed_output(3));
+        if (resident_generated.generated_token_ids.size() != 3) {
+            std::cerr << "shared snapshot rollback fixture did not create existing owners\n";
+            return 1;
+        }
+        const auto same_physical_owners = [](const ninfer::RuntimeStats& left,
+                                             const ninfer::RuntimeStats& right) {
+            return left.context_cache_owners == right.context_cache_owners &&
+                   left.device_state_occupied_slots == right.device_state_occupied_slots &&
+                   left.host_state_occupied_slots == right.host_state_occupied_slots &&
+                   left.device_main_kv_occupied_pages == right.device_main_kv_occupied_pages &&
+                   left.device_backend_kv_occupied_pages ==
+                       right.device_backend_kv_occupied_pages &&
+                   left.host_kv_occupied_bytes == right.host_kv_occupied_bytes;
+        };
+        const auto owner_count = [](const ninfer::RuntimeStats& stats) {
+            std::uint64_t count = 0;
+            for (const std::uint32_t owners : stats.context_cache_owners) { count += owners; }
+            return count;
+        };
+        ninfer::RuntimeStats rollback_baseline = target.runtime_stats();
+        if (owner_count(rollback_baseline) < 2) {
+            std::cerr << "shared snapshot rollback fixture lacks existing shared/private owners\n";
+            return 1;
+        }
 
-    const auto expect_rejected = [&](std::span<const std::uint8_t> candidate,
-                                     std::string_view label) {
+        bool foreign_rejected = false;
         try {
-            (void)Access::import(target, candidate);
-        } catch (const std::invalid_argument&) { return true; }
-        std::cerr << "shared snapshot " << label << " input was accepted\n";
-        return false;
-    };
+            Access::import_validated(target, source_validated);
+        } catch (const std::invalid_argument&) { foreign_rejected = true; }
+        if (!foreign_rejected || !target.healthy() ||
+            !same_physical_owners(rollback_baseline, target.runtime_stats())) {
+            std::cerr << "shared snapshot accepted a plan sealed by another Program\n";
+            return 1;
+        }
 
-    bytes.back() ^= 0x1U;
-    const bool corrupt_rejected = expect_rejected(bytes, "corrupt");
-    bytes.back() ^= 0x1U;
-    if (!corrupt_rejected ||
-        !expect_rejected(std::span<const std::uint8_t>(bytes).first(bytes.size() - 1U),
-                         "truncated")) {
-        return 1;
+        bool allocated_rejected = false;
+        {
+            SharedSnapshotImportGate gate(
+                ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                SharedSnapshotImportGate::Action::Reject);
+            try {
+                (void)Access::import(target, bytes);
+            } catch (const std::invalid_argument&) { allocated_rejected = true; }
+        }
+        if (!allocated_rejected || !target.healthy() ||
+            !same_physical_owners(rollback_baseline, target.runtime_stats())) {
+            std::cerr << "shared snapshot post-Main-KV rejection did not roll back accounting\n";
+            return 1;
+        }
+        const ninfer::GenerationResult reused_resident =
+            target.generate(target.prepare(resident_prompt), fixed_output(3));
+        if (reused_resident.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix) {
+            std::cerr << "shared snapshot rollback damaged an existing reusable owner\n";
+            return 1;
+        }
+        rollback_baseline = target.runtime_stats();
+
+        std::atomic<bool> cancellation{false};
+        std::uint32_t cancelled_disposition = 0;
+        {
+            SharedSnapshotImportGate gate(
+                ninfer::runtime::testing::SharedSnapshotImportStage::BeforeCatalogPublication,
+                SharedSnapshotImportGate::Action::Cancel, &cancellation);
+            cancelled_disposition = Access::import_with_cancellation(target, bytes, cancellation);
+        }
+        if (cancelled_disposition != 2U || !target.healthy() ||
+            !same_physical_owners(rollback_baseline, target.runtime_stats())) {
+            std::cerr << "shared snapshot pre-publication cancellation did not release its owner\n";
+            return 1;
+        }
+        const auto imported = Access::import(target, bytes);
+        if (imported.disposition != 0U || imported.frontier == 0 ||
+            imported.main_frontier != imported.frontier ||
+            imported.backend_frontier + 1U != imported.frontier ||
+            imported.state_residency != ninfer::runtime::ReplicaResidency::HostOnly) {
+            std::cerr << "shared snapshot import lost its State/KV boundary: disposition="
+                      << imported.disposition << " frontier=" << imported.frontier
+                      << " main=" << imported.main_frontier
+                      << " backend=" << imported.backend_frontier << '\n';
+            return 1;
+        }
+        const auto repeated = Access::import(target, bytes);
+        if (repeated.disposition != 1U || repeated.slot != imported.slot ||
+            repeated.frontier != imported.frontier) {
+            std::cerr << "repeated shared snapshot import did not coalesce exactly\n";
+            return 1;
+        }
+
+        const auto expect_rejected = [&](std::span<const std::uint8_t> candidate,
+                                         std::string_view label) {
+            try {
+                (void)Access::import(target, candidate);
+            } catch (const std::invalid_argument&) { return true; }
+            std::cerr << "shared snapshot " << label << " input was accepted\n";
+            return false;
+        };
+
+        bytes.back() ^= 0x1U;
+        const bool corrupt_rejected = expect_rejected(bytes, "corrupt");
+        bytes.back() ^= 0x1U;
+        if (!corrupt_rejected ||
+            !expect_rejected(std::span<const std::uint8_t>(bytes).first(bytes.size() - 1U),
+                             "truncated")) {
+            return 1;
+        }
+        bytes.push_back(0);
+        const bool trailing_rejected = expect_rejected(bytes, "trailing");
+        bytes.pop_back();
+        if (!trailing_rejected) { return 1; }
+
+        const std::uint32_t binding_size = snapshot_pod<std::uint32_t>(bytes, 60);
+        if (binding_size == 0 || 64U + binding_size > bytes.size()) {
+            std::cerr << "shared snapshot test could not locate the model binding\n";
+            return 1;
+        }
+        bytes[64] ^= 0x1U;
+        refresh_shared_snapshot_checksum(bytes);
+        const bool model_rejected = expect_rejected(bytes, "wrong-model");
+        bytes[64] ^= 0x1U;
+        refresh_shared_snapshot_checksum(bytes);
+        if (!model_rejected) { return 1; }
+
+        constexpr std::size_t snapshot_config_bytes    = 56;
+        constexpr std::size_t shared_config_tail_bytes = 20;
+        const std::size_t config_offset                = 64U + binding_size;
+        const std::size_t identity_tag_offset = config_offset + snapshot_config_bytes + 16U;
+        const std::uint32_t identity_tag = snapshot_pod<std::uint32_t>(bytes, identity_tag_offset);
+        set_snapshot_pod(bytes, identity_tag_offset, identity_tag ^ 1U);
+        refresh_shared_snapshot_checksum(bytes);
+        const bool config_rejected = expect_rejected(bytes, "wrong-config");
+        set_snapshot_pod(bytes, identity_tag_offset, identity_tag);
+        refresh_shared_snapshot_checksum(bytes);
+        if (!config_rejected) { return 1; }
+
+        constexpr std::size_t boundary_bytes = 3U * sizeof(std::uint32_t) + sizeof(std::uint8_t) +
+                                               sizeof(ninfer::runtime::PrefillWork) +
+                                               2U * sizeof(std::uint32_t);
+        constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
+                                                 3U * sizeof(std::uint8_t) + sizeof(std::uint32_t);
+        const std::size_t identity_size_offset =
+            config_offset + snapshot_config_bytes + shared_config_tail_bytes + boundary_bytes +
+            provenance_bytes + 32U + 2U * sizeof(std::uint64_t);
+        const std::uint64_t identity_size =
+            snapshot_pod<std::uint64_t>(bytes, identity_size_offset);
+        const std::size_t identity_offset = identity_size_offset + sizeof(std::uint64_t);
+        if (identity_size <= sizeof(std::uint64_t) || identity_offset > bytes.size() ||
+            identity_size > bytes.size() - identity_offset) {
+            std::cerr << "shared snapshot test could not locate the exact prefix identity\n";
+            return 1;
+        }
+        bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+        refresh_shared_snapshot_checksum(bytes);
+        const bool identity_rejected = expect_rejected(bytes, "wrong-prefix");
+        bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+        refresh_shared_snapshot_checksum(bytes);
+        if (!identity_rejected) { return 1; }
+
+        std::array<std::uint8_t, kSharedSnapshotHeaderBytes> original_header{};
+        std::memcpy(original_header.data(), bytes.data(), original_header.size());
+        const std::size_t original_size = bytes.size();
+        const std::uint64_t text_page_stride =
+            snapshot_pod<std::uint64_t>(bytes, config_offset + 36U);
+        const std::uint64_t backend_page_stride =
+            snapshot_pod<std::uint64_t>(bytes, config_offset + 48U);
+        if (text_page_stride >
+            std::numeric_limits<std::size_t>::max() - backend_page_stride - 16384U) {
+            std::cerr << "shared snapshot test page geometry is not representable\n";
+            return 1;
+        }
+        const std::size_t oversized_padding =
+            static_cast<std::size_t>(text_page_stride + backend_page_stride) + 16384U;
+        bytes.resize(original_size + oversized_padding, 0);
+        set_snapshot_pod<std::uint64_t>(bytes, 12, bytes.size());
+        set_snapshot_pod<std::uint64_t>(bytes, 20, bytes.size() - kSharedSnapshotHeaderBytes);
+        refresh_shared_snapshot_checksum(bytes);
+        bool oversized_rejected = false;
+        try {
+            (void)Access::import(target, bytes);
+        } catch (const std::invalid_argument&) { oversized_rejected = true; }
+        bytes.resize(original_size);
+        std::memcpy(bytes.data(), original_header.data(), original_header.size());
+        if (!oversized_rejected) {
+            std::cerr << "shared snapshot oversized input was accepted\n";
+            return 1;
+        }
+
+        const ninfer::GenerationResult continued =
+            target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
+        if (continued.generated_token_ids != expected_tokens ||
+            continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+            continued.reused_prompt_tokens != imported.frontier) {
+            std::cerr << "shared snapshot continuation diverged: path="
+                      << static_cast<int>(continued.prefix_reuse_path)
+                      << " reused=" << continued.reused_prompt_tokens
+                      << " expected=" << imported.frontier << '\n';
+            return 1;
+        }
+
+        auto round_trip = Access::export_slot(target, imported.slot);
+        round_trip.await_transfer(round_trip.bytes);
+        const bool exact_round_trip = round_trip.bytes == bytes;
+        round_trip.release_storage();
+        if (!exact_round_trip) {
+            std::cerr << "shared snapshot State/Main/MTP payload did not round-trip exactly\n";
+            return 1;
+        }
     }
-    bytes.push_back(0);
-    const bool trailing_rejected = expect_rejected(bytes, "trailing");
-    bytes.pop_back();
-    if (!trailing_rejected) { return 1; }
 
-    const std::uint32_t binding_size = snapshot_pod<std::uint32_t>(bytes, 60);
-    if (binding_size == 0 || 64U + binding_size > bytes.size()) {
-        std::cerr << "shared snapshot test could not locate the model binding\n";
-        return 1;
-    }
-    bytes[64] ^= 0x1U;
-    refresh_shared_snapshot_checksum(bytes);
-    const bool model_rejected = expect_rejected(bytes, "wrong-model");
-    bytes[64] ^= 0x1U;
-    refresh_shared_snapshot_checksum(bytes);
-    if (!model_rejected) { return 1; }
-
-    constexpr std::size_t snapshot_config_bytes    = 56;
-    constexpr std::size_t shared_config_tail_bytes = 20;
-    const std::size_t config_offset                = 64U + binding_size;
-    const std::size_t identity_tag_offset          = config_offset + snapshot_config_bytes + 16U;
-    const std::uint32_t identity_tag = snapshot_pod<std::uint32_t>(bytes, identity_tag_offset);
-    set_snapshot_pod(bytes, identity_tag_offset, identity_tag ^ 1U);
-    refresh_shared_snapshot_checksum(bytes);
-    const bool config_rejected = expect_rejected(bytes, "wrong-config");
-    set_snapshot_pod(bytes, identity_tag_offset, identity_tag);
-    refresh_shared_snapshot_checksum(bytes);
-    if (!config_rejected) { return 1; }
-
-    constexpr std::size_t boundary_bytes = 3U * sizeof(std::uint32_t) + sizeof(std::uint8_t) +
-                                           sizeof(ninfer::runtime::PrefillWork) +
-                                           2U * sizeof(std::uint32_t);
-    constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
-                                             3U * sizeof(std::uint8_t) + sizeof(std::uint32_t);
-    const std::size_t identity_size_offset = config_offset + snapshot_config_bytes +
-                                             shared_config_tail_bytes + boundary_bytes +
-                                             provenance_bytes + 32U + 2U * sizeof(std::uint64_t);
-    const std::uint64_t identity_size = snapshot_pod<std::uint64_t>(bytes, identity_size_offset);
-    const std::size_t identity_offset = identity_size_offset + sizeof(std::uint64_t);
-    if (identity_size <= sizeof(std::uint64_t) || identity_offset > bytes.size() ||
-        identity_size > bytes.size() - identity_offset) {
-        std::cerr << "shared snapshot test could not locate the exact prefix identity\n";
-        return 1;
-    }
-    bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
-    refresh_shared_snapshot_checksum(bytes);
-    const bool identity_rejected = expect_rejected(bytes, "wrong-prefix");
-    bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
-    refresh_shared_snapshot_checksum(bytes);
-    if (!identity_rejected) { return 1; }
-
-    std::array<std::uint8_t, kSharedSnapshotHeaderBytes> original_header{};
-    std::memcpy(original_header.data(), bytes.data(), original_header.size());
-    const std::size_t original_size      = bytes.size();
-    const std::uint64_t text_page_stride = snapshot_pod<std::uint64_t>(bytes, config_offset + 36U);
-    const std::uint64_t backend_page_stride =
-        snapshot_pod<std::uint64_t>(bytes, config_offset + 48U);
-    if (text_page_stride > std::numeric_limits<std::size_t>::max() - backend_page_stride - 16384U) {
-        std::cerr << "shared snapshot test page geometry is not representable\n";
-        return 1;
-    }
-    const std::size_t oversized_padding =
-        static_cast<std::size_t>(text_page_stride + backend_page_stride) + 16384U;
-    bytes.resize(original_size + oversized_padding, 0);
-    set_snapshot_pod<std::uint64_t>(bytes, 12, bytes.size());
-    set_snapshot_pod<std::uint64_t>(bytes, 20, bytes.size() - kSharedSnapshotHeaderBytes);
-    refresh_shared_snapshot_checksum(bytes);
-    bool oversized_rejected = false;
-    try {
-        (void)Access::import(target, bytes);
-    } catch (const std::invalid_argument&) { oversized_rejected = true; }
-    bytes.resize(original_size);
-    std::memcpy(bytes.data(), original_header.data(), original_header.size());
-    if (!oversized_rejected) {
-        std::cerr << "shared snapshot oversized input was accepted\n";
-        return 1;
-    }
-
-    const ninfer::GenerationResult continued =
-        target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
-    if (continued.generated_token_ids != expected_tokens ||
-        continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
-        continued.reused_prompt_tokens != imported.frontier) {
-        std::cerr << "shared snapshot continuation diverged: path="
-                  << static_cast<int>(continued.prefix_reuse_path)
-                  << " reused=" << continued.reused_prompt_tokens
-                  << " expected=" << imported.frontier << '\n';
-        return 1;
-    }
-
-    auto round_trip = Access::export_slot(target, imported.slot);
-    round_trip.await_transfer(round_trip.bytes);
-    const bool exact_round_trip = round_trip.bytes == bytes;
-    round_trip.release_storage();
-    if (!exact_round_trip) {
-        std::cerr << "shared snapshot State/Main/MTP payload did not round-trip exactly\n";
-        return 1;
+    {
+        ninfer::Engine failed(shared_snapshot_engine_options(artifact));
+        ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
+        constexpr std::string_view resident_prefix = "fatal owner fixture\n";
+        resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
+        resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
+            static_cast<std::uint32_t>(resident_prefix.size());
+        (void)failed.generate(failed.prepare(resident_prompt), fixed_output(3));
+        std::uint64_t owners_before = 0;
+        for (const std::uint32_t owners : failed.runtime_stats().context_cache_owners) {
+            owners_before += owners;
+        }
+        bool injected = false;
+        {
+            SharedSnapshotImportGate gate(
+                ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                SharedSnapshotImportGate::Action::Fail);
+            try {
+                (void)Access::import(failed, bytes);
+            } catch (const std::logic_error&) { injected = true; }
+        }
+        const ninfer::RuntimeStats cleaned = failed.runtime_stats();
+        std::uint64_t owners_after         = 0;
+        for (const std::uint32_t owners : cleaned.context_cache_owners) { owners_after += owners; }
+        bool unavailable = false;
+        try {
+            (void)Access::import(failed, bytes);
+        } catch (const ninfer::RequestError& error) {
+            unavailable = error.kind() == ninfer::RequestErrorKind::Unavailable;
+        }
+        if (owners_before < 2 || !injected || failed.healthy() || !unavailable ||
+            owners_after != 0 || cleaned.device_state_occupied_slots != 0 ||
+            cleaned.host_state_occupied_slots != 0 || cleaned.device_main_kv_occupied_pages != 0 ||
+            cleaned.device_backend_kv_occupied_pages != 0 || cleaned.host_kv_occupied_bytes != 0) {
+            std::cerr << "shared snapshot invariant failure did not latch and clean the Engine"
+                      << " before=" << owners_before << " after=" << owners_after
+                      << " healthy=" << failed.healthy() << '\n';
+            return 1;
+        }
     }
     return 0;
 }

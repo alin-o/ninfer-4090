@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,8 @@ public:
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
     using ResourceManagement = ResourceManager<Package>;
     using ResourceInspection = typename ResourceManagement::Inspection;
+    using ValidatedSharedPrefixImport =
+        typename ResourceManagement::ValidatedSharedPrefixImport;
     using Clock              = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
@@ -363,6 +366,7 @@ public:
         std::uint32_t slot, std::string_view model_binding,
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {}) {
         std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
         if (instance_.program->has_context_transaction()) {
             throw RequestError(RequestErrorKind::Overloaded,
                                "shared catalog is busy with a resource transaction");
@@ -372,21 +376,24 @@ public:
             view.handle == nullptr) {
             throw std::invalid_argument("shared catalog slot holds no prefix");
         }
-        return instance_.program->begin_export_shared_prefix(
-            *view.handle, model_binding,
-            targets::qwen3_6::SharedPrefixPersistenceMetadata{
-                .evidence             = view.metadata.evidence,
-                .structural_origins   = view.metadata.structural_origins,
-                .structural_role      = view.metadata.structural_role,
-                .ssd_eligible         = view.metadata.ssd_eligible,
-                .first_volatile_token = view.metadata.first_volatile_token},
-            reserve);
+        return run_shared_snapshot_operation([&] {
+            return instance_.program->begin_export_shared_prefix(
+                *view.handle, model_binding,
+                targets::qwen3_6::SharedPrefixPersistenceMetadata{
+                    .evidence             = view.metadata.evidence,
+                    .structural_origins   = view.metadata.structural_origins,
+                    .structural_role      = view.metadata.structural_role,
+                    .ssd_eligible         = view.metadata.ssd_eligible,
+                    .first_volatile_token = view.metadata.first_volatile_token},
+                reserve);
+        });
     }
 
     [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult
     import_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
                          runtime::CancellationFlagView cancellation = {}) {
         std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
             throw std::invalid_argument("shared snapshot import requires the context cache");
         }
@@ -400,10 +407,37 @@ public:
                                    "shared snapshot import was cancelled");
             }
         };
-        auto imported = instance_.program->parse_shared_prefix(snapshot, model_binding, checkpoint);
-        auto result = resources_.adopt_imported_shared(*instance_.program, imported, cancellation);
-        publish_runtime_stats();
-        return result;
+        return run_shared_snapshot_operation(
+            [&] {
+                auto imported =
+                    instance_.program->parse_shared_prefix(snapshot, model_binding, checkpoint);
+                return resources_.adopt_imported_shared(
+                    *instance_.program, imported, cancellation,
+                    [] {
+                        testing::shared_snapshot_import_checkpoint(
+                            testing::SharedSnapshotImportStage::BeforeCatalogPublication);
+                    });
+            },
+            true);
+    }
+
+    // Internal regression seam for retaining a genuinely Program-sealed Host plan across the
+    // lifetime of its parsing Engine and presenting it to another Program.
+    [[nodiscard]] ValidatedSharedPrefixImport
+    parse_shared_prefix_for_test(std::span<const std::uint8_t> snapshot,
+                                 std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        return run_shared_snapshot_operation(
+            [&] { return instance_.program->parse_shared_prefix(snapshot, model_binding); });
+    }
+
+    [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult
+    adopt_validated_shared_prefix_for_test(const ValidatedSharedPrefixImport& imported) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        return run_shared_snapshot_operation(
+            [&] { return resources_.adopt_imported_shared(*instance_.program, imported); }, true);
     }
 
     [[nodiscard]] std::optional<typename Package::SharedPrefixSummary>
@@ -459,6 +493,51 @@ public:
     }
 
 private:
+    void require_shared_snapshot_engine_healthy() const {
+        std::lock_guard lock(queue_mutex_);
+        if (stopping_ || failed_) {
+            throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
+        }
+    }
+
+    void publish_recoverable_shared_snapshot_stats() {
+        try {
+            publish_runtime_stats();
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            fail_all_locked(error);
+            std::rethrow_exception(error);
+        }
+    }
+
+    template <class Operation>
+    [[nodiscard]] auto run_shared_snapshot_operation(Operation&& operation,
+                                                     bool publish_on_success = false)
+        -> std::invoke_result_t<Operation> {
+        require_shared_snapshot_engine_healthy();
+        try {
+            auto result = std::forward<Operation>(operation)();
+            if (publish_on_success) { publish_runtime_stats(); }
+            return result;
+        } catch (const std::invalid_argument&) {
+            publish_recoverable_shared_snapshot_stats();
+            throw;
+        } catch (const std::bad_alloc&) {
+            publish_recoverable_shared_snapshot_stats();
+            throw;
+        } catch (const std::overflow_error&) {
+            publish_recoverable_shared_snapshot_stats();
+            throw;
+        } catch (const std::length_error&) {
+            publish_recoverable_shared_snapshot_stats();
+            throw;
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            fail_all_locked(error);
+            std::rethrow_exception(error);
+        }
+    }
+
     void require_settled_slot(std::uint32_t slot) const {
         if (slot >= resources_.catalog_capacity()) {
             throw std::invalid_argument("slot id is outside the retained-session catalog");

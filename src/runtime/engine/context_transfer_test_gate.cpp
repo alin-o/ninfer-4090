@@ -28,8 +28,25 @@ std::atomic<std::uint64_t> shutdown_host_kv_bytes{0};
 std::atomic<const ContextTransferTestGate*> active_capture_gate{nullptr};
 std::atomic<std::uint64_t> active_capture_waits{0};
 std::atomic<std::uint64_t> active_capture_cancellations{0};
+std::atomic<const SharedSnapshotImportTestGate*> shared_import_gate{nullptr};
 
 } // namespace
+
+void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* installed) noexcept {
+    shared_import_gate.store(installed, std::memory_order_release);
+}
+
+void clear_shared_snapshot_import_gate() noexcept {
+    shared_import_gate.store(nullptr, std::memory_order_release);
+}
+
+void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage) {
+    const SharedSnapshotImportTestGate* installed =
+        shared_import_gate.load(std::memory_order_acquire);
+    if (installed != nullptr && installed->checkpoint != nullptr) {
+        installed->checkpoint(installed->context, stage);
+    }
+}
 
 void install_snapshot_transfer_gate(const ContextTransferTestGate* installed) noexcept {
     waits.store(0, std::memory_order_release);

@@ -845,6 +845,10 @@ public:
 
 private:
     std::shared_ptr<const void> implementation_;
+    // A validated payload is sealed to the exact Program lifetime which interpreted its private
+    // State/KV geometry. Retaining the token prevents allocator address reuse from impersonating
+    // a destroyed parsing Program.
+    std::shared_ptr<const void> validating_program_;
     SharedPrefixSummary summary_;
     SharedPrefixPersistenceMetadata metadata_;
     std::string content_digest_;
@@ -1128,8 +1132,10 @@ public:
     void reset_memory_peaks() noexcept;
 
 private:
-    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
+    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl,
+                     std::shared_ptr<const void> shared_import_identity) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
+    std::shared_ptr<const void> shared_import_identity_;
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,

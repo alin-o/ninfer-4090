@@ -1972,6 +1972,8 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
         if (!state) {
             throw std::invalid_argument("shared snapshot does not fit the Host State capacity");
         }
+        runtime::testing::shared_snapshot_import_checkpoint(
+            runtime::testing::SharedSnapshotImportStage::StateAllocated);
 
         std::optional<std::int32_t> free_row;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -2033,6 +2035,8 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
         text_address = build_address(*text_kv_addresses, *text_kv_pages, text_layout,
                                      backing->boundary.frontier,
                                      backing->storage.data() + backing->text_offset);
+        runtime::testing::shared_snapshot_import_checkpoint(
+            runtime::testing::SharedSnapshotImportStage::MainKvAllocated);
         if (backing->boundary.backend_frontier != 0) {
             backend_address = build_address(*backend_kv_addresses, *backend_kv_pages,
                                             *backend_layout, backing->boundary.backend_frontier,

@@ -65,13 +65,18 @@ Host State/KV replicas copy directly to the immutable assembly buffer; they are 
 to download them again. Device-only ranges remain pinned until their transfer event settles.
 Imported State and KV retain complete immutable Host backing. Adoption may upload KV to establish
 the Program's normal address-space representation, but publication is sealed and revalidated
-before ResourceManager installs the logical owner.
+before ResourceManager installs the logical owner. A validated Host plan also carries the identity
+of the exact `Program` which checked the model binding and private execution geometry. Neither
+coalescing nor allocation accepts that plan through another `Program`, even when both Programs use
+the same target Variant; callers must parse again against the receiving Program.
 
 ResourceManager first coalesces an exact resident identity. Otherwise it proves a vacant shared
 catalog cell, asks Program to adopt the physical owner, revalidates the returned summary, and then
 publishes it transactionally. Cancellation or capacity failure releases any unpublished owner;
 checksum and compatibility failures allocate nothing. Valid existing shared and private owners and
-their accounting remain unchanged.
+their accounting remain unchanged. Recoverable validation, capacity, allocation, and cancellation
+outcomes refresh physical accounting after rollback. CUDA failures and invariant violations use
+Engine's permanent failure latch and all-owner cleanup, matching failures from worker execution.
 
 Filesystem indexing, crash-consistent publication, and SSD eviction/replacement policy are outside
 this format contract. Durable catalog code consumes the stable Program codec and Engine import

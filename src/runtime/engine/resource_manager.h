@@ -1283,7 +1283,8 @@ public:
     // catalog cell participates in this path.
     [[nodiscard]] SharedImportAdoptionResult
     adopt_imported_shared(Program& program, const ValidatedSharedPrefixImport& imported,
-                          CancellationFlagView cancellation = {}) {
+                          CancellationFlagView cancellation = {},
+                          const std::function<void()>& before_publication = {}) {
         if (!std::holds_alternative<std::monostate>(transaction_)) {
             throw std::logic_error("shared snapshot adoption requires a settled resource catalog");
         }
@@ -1330,6 +1331,7 @@ public:
             release_publication();
             throw std::logic_error("Program returned an invalid shared snapshot publication");
         }
+        if (before_publication) { before_publication(); }
         if (cancellation.requested()) {
             release_publication();
             return {.disposition = SharedImportDisposition::Cancelled};

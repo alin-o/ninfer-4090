@@ -48,6 +48,9 @@ checks need the corresponding `NINFER_QWEN3_6_27B_WEIGHTS` or
 do not establish GPU correctness. Resident-server smoke tests, model downloads,
 performance benchmarks and external evaluation services are outside this gate.
 
+The known Qwen3.8 model is `/models/qwen3_8_27b.ninfer`; use
+`export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer`.
+
 Baseline observed during setup on 2026-09-07:
 
 - CMake configure passes with CUDA 13.3.73 and required FFmpeg/libcurl libraries.

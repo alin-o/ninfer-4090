@@ -22,3 +22,12 @@ prompts. Use the owning project's ID for project-scoped board operations.
 
 Tool availability and schemas are authoritative. Do not infer objective-only
 operations from tools that happen to be available.
+
+## Persistent Stage Instructions
+
+Use `add_task_comment` with `persistent: true` for task instructions that must
+survive retries, including artifact paths, environment setup and recurring
+verification requirements. Attach them to every relevant executable stage.
+Persistent notes replace that stage's existing note, so preserve still-applicable
+instructions when updating. Use one-shot notes only for guidance intended for a
+single run.

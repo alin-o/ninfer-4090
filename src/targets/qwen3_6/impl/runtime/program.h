@@ -969,6 +969,10 @@ private:
         std::uint64_t recycled_state_epoch = 0;
         bool transfer_enqueue_pending      = false;
         bool transfer_submitted            = false;
+        // Cancellation is adopted at a worker boundary, but an enqueued transfer retains pins
+        // until its completion event has settled.  This prevents an abort from recycling a
+        // source or destination that CUDA may still access.
+        bool cancel_pending                = false;
         std::uint8_t transfer_timer_mask   = 0;
         bool published                     = false;
     };

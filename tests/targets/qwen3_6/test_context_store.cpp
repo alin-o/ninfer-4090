@@ -124,6 +124,8 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(d2h.has_value() &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "incomplete State D2H does not publish a Host replica");
+    expect(images.source_pins(*host_source) == 1 && !images.release(*host_source),
+           "in-flight State D2H pins its immutable source until transfer settlement");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     images.publish_transfer(std::move(*d2h), true);
     expect(images.residency(*host_source) == store::StateReplicaResidency::Both,

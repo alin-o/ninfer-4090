@@ -8430,6 +8430,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
     }
+    if (cancellation.requested()) { transaction.cancel_pending = true; }
     const auto abort = [&]() -> ActiveCaptureResult {
         abort_active_capture(transaction);
         if (transaction.lane < max_concurrency && requests[transaction.lane].prefill) {
@@ -8472,7 +8473,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -8695,9 +8696,9 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (has_pressure() && pressure_transition.phase != PressureTransitionPhase::Committed) {
         throw std::logic_error("capture pressure transition did not reach a stable phase");
     }
-    if (cancellation.requested()) { return abort(); }
+    if (transaction.cancel_pending) { return abort(); }
     if (!transaction.prepared) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             prepare_active_capture(transaction);
         } catch (...) {
@@ -8707,7 +8708,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
     }
     if (transaction.transfer_enqueue_pending) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
@@ -8763,7 +8764,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
         transaction.transfer_submitted = false;
     }
-    if (cancellation.requested()) { return abort(); }
+    if (transaction.cancel_pending) { return abort(); }
     return publish_active_capture(transaction);
 }
 

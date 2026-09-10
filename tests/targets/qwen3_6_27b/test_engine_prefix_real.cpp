@@ -3767,6 +3767,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
         resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
         resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
             static_cast<std::uint32_t>(resident_prefix.size());
+        resident_prompt.context_cache.session_key = "shared-snapshot-rollback-private";
+        resident_prompt.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         const ninfer::GenerationResult resident_generated =
             target.generate(target.prepare(resident_prompt), fixed_output(3));
         if (resident_generated.generated_token_ids.size() != 3) {
@@ -3984,6 +3986,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
         resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
         resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
             static_cast<std::uint32_t>(resident_prefix.size());
+        resident_prompt.context_cache.session_key = "shared-snapshot-fatal-private";
+        resident_prompt.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         (void)failed.generate(failed.prepare(resident_prompt), fixed_output(3));
         std::uint64_t owners_before = 0;
         for (const std::uint32_t owners : failed.runtime_stats().context_cache_owners) {

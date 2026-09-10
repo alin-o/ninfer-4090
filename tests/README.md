@@ -116,6 +116,16 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+The supported Qwen3.8 groupwise route uses the same real-Engine test with its
+own artifact variable.  Its `pressure-resume` and `host-restore` scenarios
+exercise rk4v4-e8 KV with MTP:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=pressure-resume \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
 The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
 score tile, overlapping target suffixes, and repeated-window State/KV isolation:
 

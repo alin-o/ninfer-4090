@@ -51,6 +51,15 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     return options;
 }
 
+ninfer::EngineOptions groupwise_host_restore_engine_options(const char* artifact) {
+    ninfer::EngineOptions options = host_restore_engine_options(artifact);
+    options.kv_cache              = ninfer::KvCacheStorage::RK4V4E8;
+    // Pressure first needs one cell for the Host-demoted source and one for the unrelated Root
+    // request that creates the pressure. The consuming restore then runs with this two-cell
+    // catalog full, so it must reuse the selected source cell rather than require a third cell.
+    return options;
+}
+
 ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                        = artifact;
@@ -145,6 +154,13 @@ ninfer::EngineOptions pressure_resume_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 4;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+ninfer::EngineOptions groupwise_pressure_resume_engine_options(const char* artifact) {
+    ninfer::EngineOptions options = pressure_resume_engine_options(artifact);
+    options.kv_cache              = ninfer::KvCacheStorage::RK4V4E8;
+    options.speculative           = groupwise_host_restore_engine_options(artifact).speculative;
     return options;
 }
 
@@ -344,8 +360,9 @@ int exercise_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
-int exercise_host_restore(const char* artifact) {
-    ninfer::Engine engine(host_restore_engine_options(artifact));
+int exercise_host_restore(const char* artifact, bool groupwise_backing = false) {
+    ninfer::Engine engine(groupwise_backing ? groupwise_host_restore_engine_options(artifact)
+                                            : host_restore_engine_options(artifact));
     auto options = [](std::uint32_t outputs, bool reuse) {
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = outputs;
@@ -413,6 +430,7 @@ int exercise_host_restore(const char* artifact) {
     if (restored.generated_token_ids.size() != 2 ||
         restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
         restored.reused_prompt_tokens == 0 ||
+        (groupwise_backing && restored.slot != retained.slot) ||
         after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
         after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
         after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
@@ -420,11 +438,82 @@ int exercise_host_restore(const char* artifact) {
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
+                  << " slots=" << retained.slot << '/' << restored.slot
                   << " state=" << after_restore.state_h2d_count
                   << " main=" << after_restore.main_kv_h2d_pages
                   << " backend=" << after_restore.backend_kv_h2d_pages
                   << " degraded=" << after_restore.pressure_private_owners_degraded
                   << " evicted=" << after_restore.pressure_private_owners_evicted << '\n';
+        return 1;
+    }
+
+    if (!groupwise_backing) { return 0; }
+
+    // Restore must not consume the Host-backed prefix. The resumed endpoint itself is newly
+    // generated, so pressure may back up its one mutable tail, but not the unchanged prefix.
+    if (after_restore.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host restore lost its backing before duplicate-pressure admission: state="
+                  << after_restore.host_state_occupied_slots
+                  << " kv=" << after_restore.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+    // The consuming restore now owns the original catalog cell.  Keep it catalogued through
+    // pressure so production must retain its Host replica while reclaiming only duplicate Device
+    // residency; there is no stale source owner acting as a backing keeper.
+    const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
+    if (before_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "consuming Host restore released its backing before pressure\n";
+        return 1;
+    }
+    ninfer::PromptInput duplicate_pressure       = retained_input();
+    duplicate_pressure.context_cache.session_key = "host-restore-duplicate-pressure";
+    const ninfer::GenerationResult duplicate_removed =
+        engine.generate(engine.prepare(std::move(duplicate_pressure)), options(1, false));
+    const ninfer::RuntimeStats after_duplicate_pressure = engine.runtime_stats();
+    if (duplicate_removed.generated_token_ids.size() != 1 ||
+        after_duplicate_pressure.pressure_private_owners_degraded <=
+            before_duplicate_pressure.pressure_private_owners_degraded ||
+        // The resumed request advanced each component by one partial page.  Its newly published
+        // endpoint therefore needs exactly one new Host State and one Main/MTP page backup; any
+        // larger delta would recopy unchanged Host-backed prefix pages or State.
+        after_duplicate_pressure.state_d2h_count != before_duplicate_pressure.state_d2h_count + 1 ||
+        after_duplicate_pressure.main_kv_d2h_pages !=
+            before_duplicate_pressure.main_kv_d2h_pages + 1 ||
+        after_duplicate_pressure.backend_kv_d2h_pages !=
+            before_duplicate_pressure.backend_kv_d2h_pages + 1 ||
+        after_duplicate_pressure.host_state_occupied_slots == 0 ||
+        after_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host-backed duplicate pressure recopied unchanged backing or lost quota: "
+                  << "degraded=" << before_duplicate_pressure.pressure_private_owners_degraded
+                  << '/' << after_duplicate_pressure.pressure_private_owners_degraded
+                  << " state_d2h=" << before_duplicate_pressure.state_d2h_count << '/'
+                  << after_duplicate_pressure.state_d2h_count
+                  << " main_d2h=" << before_duplicate_pressure.main_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.main_kv_d2h_pages
+                  << " backend_d2h=" << before_duplicate_pressure.backend_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.backend_kv_d2h_pages
+                  << " host_state=" << after_duplicate_pressure.host_state_occupied_slots
+                  << " host_kv=" << after_duplicate_pressure.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
+    // The unrelated pressure request is not catalogued.  The consumed-and-restored continuation
+    // is therefore the sole backing dependency, and releasing it must recover the Host quota.
+    const std::uint32_t restored_released =
+        restored.slot < 0
+            ? 0
+            : engine.erase_slot(static_cast<std::uint32_t>(restored.slot), restored.session_digest);
+    if (restored_released == 0 || duplicate_removed.slot >= 0) {
+        std::cerr << "Host backing cleanup fixture did not retain its sole consumed owner: "
+                  << "restored=" << restored.slot << '/' << restored_released
+                  << " duplicate=" << duplicate_removed.slot << '\n';
+        return 1;
+    }
+    const ninfer::RuntimeStats after_cleanup = engine.runtime_stats();
+    if (after_cleanup.host_state_occupied_slots != 0 || after_cleanup.host_kv_occupied_bytes != 0) {
+        std::cerr << "final Host dependency release did not recover physical capacity: state="
+                  << after_cleanup.host_state_occupied_slots
+                  << " kv=" << after_cleanup.host_kv_occupied_bytes << '\n';
         return 1;
     }
 
@@ -684,8 +773,8 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
 int automatic_anchor_case(const char* artifact, std::uint32_t cap, std::uint32_t rewrite_index,
                           ninfer::PrefixReusePath expected, const char* label) {
     ninfer::EngineOptions options = private_long_anchor_engine_options(artifact);
-    options.max_context                                     = 1024;
-    options.kv_capacity                                     = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.max_context           = 1024;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(1024);
     options.context_cache.max_long_anchors_per_continuation = cap;
     options.context_cache.max_private_continuations         = 2;
     // One continuation may hold endpoint + rewrite + cap anchors; the active lane needs its own.
@@ -754,9 +843,9 @@ int automatic_anchor_case(const char* artifact, std::uint32_t cap, std::uint32_t
     if (expected == ninfer::PrefixReusePath::PrivateLongAnchor &&
         (rewritten.reused_prompt_tokens == 0 ||
          rewritten.reused_prompt_tokens >= rewritten.prompt.prompt_tokens)) {
-        std::cerr << label << ": anchor reuse was empty or total (reused="
-                  << rewritten.reused_prompt_tokens << " prompt=" << rewritten.prompt.prompt_tokens
-                  << ")\n";
+        std::cerr << label
+                  << ": anchor reuse was empty or total (reused=" << rewritten.reused_prompt_tokens
+                  << " prompt=" << rewritten.prompt.prompt_tokens << ")\n";
         return 1;
     }
     return 0;
@@ -764,8 +853,8 @@ int automatic_anchor_case(const char* artifact, std::uint32_t cap, std::uint32_t
 
 int exercise_automatic_private_anchors(const char* artifact) {
     // Shallow rewrite (message 4 of 6) at the default cap of 2: covered, restores at an anchor.
-    if (const int r = automatic_anchor_case(artifact, 2, 4, ninfer::PrefixReusePath::PrivateLongAnchor,
-                                            "cap=2 shallow rewrite");
+    if (const int r = automatic_anchor_case(
+            artifact, 2, 4, ninfer::PrefixReusePath::PrivateLongAnchor, "cap=2 shallow rewrite");
         r != 0) {
         return r;
     }
@@ -778,8 +867,8 @@ int exercise_automatic_private_anchors(const char* artifact) {
     }
     // The same deep rewrite with the cap (and the automatic count) raised to 5 retains every
     // interior boundary, so the anchor below the edit survives and reuse is restored.
-    if (const int r = automatic_anchor_case(artifact, 5, 1, ninfer::PrefixReusePath::PrivateLongAnchor,
-                                            "cap=5 deep rewrite");
+    if (const int r = automatic_anchor_case(
+            artifact, 5, 1, ninfer::PrefixReusePath::PrivateLongAnchor, "cap=5 deep rewrite");
         r != 0) {
         return r;
     }
@@ -1323,11 +1412,13 @@ ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     return options;
 }
 
-int exercise_pressure_partial_spill_and_resume(const char* artifact) {
+int exercise_pressure_partial_spill_and_resume(const char* artifact,
+                                               bool groupwise_backing = false) {
     constexpr std::uint32_t kLongPromptTokens  = 7683;
     constexpr std::uint32_t kLongOutputTokens  = 31;
     constexpr std::uint32_t kShortPromptTokens = 350;
-    ninfer::Engine engine(pressure_resume_engine_options(artifact));
+    ninfer::Engine engine(groupwise_backing ? groupwise_pressure_resume_engine_options(artifact)
+                                            : pressure_resume_engine_options(artifact));
 
     const std::optional<std::string> long_text =
         exact_repeated_prompt_text(engine, kLongPromptTokens, "alpha");
@@ -1377,13 +1468,15 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
                                             before_pressure.pressure_private_owners_degraded;
     const std::uint64_t pressure_evicted = after_pressure.pressure_private_owners_evicted -
                                            before_pressure.pressure_private_owners_evicted;
+    const std::uint64_t expected_spill_pages = groupwise_backing ? 6 : 4;
     if (short_b.generated_token_ids.size() != 1 || pressure_main_pages != 4 ||
-        pressure_spill_pages != 4 || pressure_drops != 1 || pressure_degraded != 1 ||
-        pressure_evicted != 0 ||
+        pressure_spill_pages != expected_spill_pages || pressure_drops != 1 ||
+        pressure_degraded != 1 || pressure_evicted != 0 ||
         after_pressure.state_d2h_count != before_pressure.state_d2h_count ||
         short_b.materialization.selected_maximal_fallback) {
-        std::cerr << "pressure-resume did not select endpoint-drop plus four-page spill: main="
-                  << pressure_main_pages << " spill=" << pressure_spill_pages
+        std::cerr << "pressure-resume did not select endpoint-drop plus "
+                  << (groupwise_backing ? "bounded MTP spill" : "four-page spill")
+                  << ": main=" << pressure_main_pages << " spill=" << pressure_spill_pages
                   << " drops=" << pressure_drops << " degraded=" << pressure_degraded
                   << " evicted=" << pressure_evicted
                   << " state=" << (after_pressure.state_d2h_count - before_pressure.state_d2h_count)
@@ -1401,13 +1494,23 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     const std::uint64_t restored_pages =
         after_resume.main_kv_h2d_pages - before_resume.main_kv_h2d_pages;
     const std::uint32_t reused_pages = (resumed.reused_prompt_tokens + 63U) / 64U;
+    // The groupwise transaction enters with a 121-page parent which cannot be admitted together
+    // with its bounded tail and continuation reservation. It selects the 120-page frontier and
+    // restores only its four missing Host ranges; retained backing remains charged after H2D.
     if (resumed.generated_token_ids.size() != 1 ||
         resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
-        reused_pages != 120 || restored_pages != 4) {
+        reused_pages != 120 || restored_pages != 4 ||
+        (groupwise_backing &&
+         after_resume.host_kv_occupied_bytes < before_resume.host_kv_occupied_bytes)) {
         std::cerr << "pressure-resume did not restore the retained turn closure: path="
                   << static_cast<int>(resumed.prefix_reuse_path)
                   << " reused=" << resumed.reused_prompt_tokens << " reused_pages=" << reused_pages
-                  << " restored=" << restored_pages << '\n';
+                  << " restored=" << restored_pages;
+        if (groupwise_backing) {
+            std::cerr << " host_kv=" << before_resume.host_kv_occupied_bytes << '/'
+                      << after_resume.host_kv_occupied_bytes;
+        }
+        std::cerr << '\n';
         return 1;
     }
     return 0;
@@ -1726,16 +1829,18 @@ int verify_loaded_product(const ninfer::Engine& engine, std::string_view expecte
 // catalog leaves the evictor no vacant publication cell, which forces the eviction (a larger
 // catalog would let both sessions coexist).
 int exercise_auto_save_evicted(const char* artifact) {
-    ninfer::EngineOptions options                    = engine_options(artifact);
-    options.enable_vision                            = false;
-    options.auto_save_evicted                        = true;
-    options.context_cache.max_private_continuations  = 1;
+    ninfer::EngineOptions options                   = engine_options(artifact);
+    options.enable_vision                           = false;
+    options.auto_save_evicted                       = true;
+    options.context_cache.max_private_continuations = 1;
     ninfer::Engine engine(options);
 
     const std::string slot_file =
         (std::filesystem::temp_directory_path() / "ninfer-auto-save-test.bin").string();
+
     struct FileGuard {
         std::string path;
+
         ~FileGuard() { (void)std::remove(path.c_str()); }
     } guard{slot_file};
 
@@ -1783,8 +1888,7 @@ int exercise_auto_save_evicted(const char* artifact) {
         return 1;
     }
     const ninfer::GenerationResult evictor = engine.generate(
-        engine.prepare(
-            chat({text_message(ninfer::ChatRole::User, "Name two colors. Be brief.")})),
+        engine.prepare(chat({text_message(ninfer::ChatRole::User, "Name two colors. Be brief.")})),
         request);
     if (evictor.reused_prompt_tokens != 0) {
         std::cerr << "auto-save evictor unexpectedly reused the previous session\n";
@@ -1801,7 +1905,8 @@ int exercise_auto_save_evicted(const char* artifact) {
     }
     const ninfer::ChatMessage assistant2 =
         text_message(ninfer::ChatRole::Assistant, second.content);
-    const ninfer::ChatMessage turn3 = text_message(ninfer::ChatRole::User, "Now two birds. Be brief.");
+    const ninfer::ChatMessage turn3 =
+        text_message(ninfer::ChatRole::User, "Now two birds. Be brief.");
     const ninfer::GenerationResult resumed = engine.generate(
         engine.prepare(chat({turn1, assistant1, turn2, assistant2, turn3})), request);
     if (resumed.reused_prompt_tokens == 0) {
@@ -1831,8 +1936,10 @@ int exercise_auto_save_binding_is_per_session(const char* artifact) {
 
     const std::string slot_file =
         (std::filesystem::temp_directory_path() / "ninfer-auto-save-binding-test.bin").string();
+
     struct FileGuard {
         std::string path;
+
         ~FileGuard() { (void)std::remove(path.c_str()); }
     } guard{slot_file};
 
@@ -1928,8 +2035,10 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
         (std::filesystem::temp_directory_path() / "ninfer-stale-copy-A.bin").string();
     const std::string file_c =
         (std::filesystem::temp_directory_path() / "ninfer-stale-copy-C.bin").string();
+
     struct FileGuard {
         std::string a, c;
+
         ~FileGuard() {
             (void)std::remove(a.c_str());
             (void)std::remove(c.c_str());
@@ -1958,8 +2067,8 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
 
     // An unrelated session C, saved to its own file: the thing we will restore OVER the stale
     // copy later to displace it.
-    const ninfer::GenerationResult c = engine.generate(
-        engine.prepare(chat({user("Name two colors. Be brief.")})), request);
+    const ninfer::GenerationResult c =
+        engine.generate(engine.prepare(chat({user("Name two colors. Be brief.")})), request);
     if (c.slot < 0 || c.session_digest.empty()) {
         std::cerr << "stale-copy fixture: C did not retain a catalogued session\n";
         return 1;
@@ -1975,7 +2084,7 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
         std::cerr << "stale-copy fixture: A1 did not retain a catalogued session of its own\n";
         return 1;
     }
-    const auto slot_a1 = static_cast<std::uint32_t>(a1.slot);
+    const auto slot_a1                    = static_cast<std::uint32_t>(a1.slot);
     const ninfer::SlotSaveResult saved_a1 = engine.save_slot(slot_a1, file_a, a1.session_digest);
 
     // Session A, newer state: rewrite the third message. The divergence sits two messages back,
@@ -2095,11 +2204,20 @@ int main() {
         return 77;
     }
     if (scenario != nullptr && std::string_view(scenario) == "pressure-resume") {
-        if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
-            std::cerr << "pressure-resume requires NINFER_QWEN3_8_27B_NVFP4_WEIGHTS\n";
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "pressure-resume requires NINFER_QWEN3_8_27B_WEIGHTS\n";
             return 1;
         }
-        const int result = exercise_pressure_partial_spill_and_resume(qwen38_nvfp4);
+        const int result = exercise_pressure_partial_spill_and_resume(qwen38_groupwise, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "host-restore") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "host-restore requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_host_restore(qwen38_groupwise, true);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
@@ -2157,8 +2275,8 @@ int main() {
     if (scenario != nullptr && std::string_view(scenario) == "automatic-private-anchors") {
         const char* artifact = nvfp4 != nullptr && *nvfp4 != '\0' ? nvfp4 : groupwise;
         if (artifact == nullptr || *artifact == '\0') {
-            artifact = qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0' ? qwen38_nvfp4
-                                                                          : qwen38_groupwise;
+            artifact =
+                qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0' ? qwen38_nvfp4 : qwen38_groupwise;
         }
         if (artifact == nullptr || *artifact == '\0') {
             std::cerr << "automatic-private-anchors requires a 27B artifact\n";
@@ -2179,6 +2297,13 @@ int main() {
         }
     }
     if (qwen38_groupwise != nullptr && *qwen38_groupwise != '\0') {
+        if (const int result = exercise_host_restore(qwen38_groupwise, true); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_pressure_partial_spill_and_resume(qwen38_groupwise, true);
+            result != 0) {
+            return result;
+        }
         if (const int result =
                 exercise_concurrent_resource_settlement(qwen38_groupwise, "qwen3_8_27b");
             result != 0) {

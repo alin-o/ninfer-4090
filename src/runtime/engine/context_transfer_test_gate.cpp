@@ -29,6 +29,8 @@ std::atomic<const ContextTransferTestGate*> active_capture_gate{nullptr};
 std::atomic<std::uint64_t> active_capture_waits{0};
 std::atomic<std::uint64_t> active_capture_cancellations{0};
 std::atomic<const SharedSnapshotImportTestGate*> shared_import_gate{nullptr};
+std::atomic<const SharedSnapshotExportTestGate*> shared_export_gate{nullptr};
+std::atomic<std::uint64_t> shared_export_pin_count{0};
 
 } // namespace
 
@@ -46,6 +48,34 @@ void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage) {
     if (installed != nullptr && installed->checkpoint != nullptr) {
         installed->checkpoint(installed->context, stage);
     }
+}
+
+void install_shared_snapshot_export_gate(const SharedSnapshotExportTestGate* installed) noexcept {
+    shared_export_gate.store(installed, std::memory_order_release);
+}
+
+void clear_shared_snapshot_export_gate() noexcept {
+    shared_export_gate.store(nullptr, std::memory_order_release);
+}
+
+void shared_snapshot_export_checkpoint(SharedSnapshotExportStage stage) {
+    const SharedSnapshotExportTestGate* installed =
+        shared_export_gate.load(std::memory_order_acquire);
+    if (installed != nullptr && installed->checkpoint != nullptr) {
+        installed->checkpoint(installed->context, stage);
+    }
+}
+
+void note_shared_snapshot_export_pin_acquired() noexcept {
+    shared_export_pin_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void note_shared_snapshot_export_pin_released() noexcept {
+    shared_export_pin_count.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+std::uint64_t shared_snapshot_export_pinned_sources() noexcept {
+    return shared_export_pin_count.load(std::memory_order_acquire);
 }
 
 void install_snapshot_transfer_gate(const ContextTransferTestGate* installed) noexcept {

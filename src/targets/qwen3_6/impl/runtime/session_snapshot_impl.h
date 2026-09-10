@@ -1580,8 +1580,12 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
             try {
                 for (const StateImageHandle source : state_sources) {
                     states->unpin_snapshot_source(source);
+                    runtime::testing::note_shared_snapshot_export_pin_released();
                 }
-                for (const auto& [store, source] : kv_sources) { store->unpin_source(source); }
+                for (const auto& [store, source] : kv_sources) {
+                    store->unpin_source(source);
+                    runtime::testing::note_shared_snapshot_export_pin_released();
+                }
             } catch (...) {}
             state_sources.clear();
             kv_sources.clear();
@@ -1606,8 +1610,19 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
         const auto view = state_store->host_view(shared.state);
         std::memcpy(base + state_offset, view.data, state_bytes);
     } else {
+        // Tracking insertion may allocate. Until it succeeds this scope owns the pin; afterward
+        // SharedTransferSettlement owns it through transfer completion and retirement.
         state_store->pin_snapshot_source(shared.state);
-        pending->state_sources.push_back(shared.state);
+        runtime::testing::note_shared_snapshot_export_pin_acquired();
+        try {
+            runtime::testing::shared_snapshot_export_checkpoint(
+                runtime::testing::SharedSnapshotExportStage::StatePinnedBeforeRegistration);
+            pending->state_sources.push_back(shared.state);
+        } catch (...) {
+            state_store->unpin_snapshot_source(shared.state);
+            runtime::testing::note_shared_snapshot_export_pin_released();
+            throw;
+        }
         pending->submitted = true;
         state_images->copy_to_host(
             state_store->physical_slot(shared.state),
@@ -1645,7 +1660,16 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
                     throw std::logic_error("shared snapshot KV source is not immutable");
                 }
                 pages.pin_source(logical);
-                pending->kv_sources.emplace_back(&pages, logical);
+                runtime::testing::note_shared_snapshot_export_pin_acquired();
+                try {
+                    runtime::testing::shared_snapshot_export_checkpoint(
+                        runtime::testing::SharedSnapshotExportStage::KvPinnedBeforeRegistration);
+                    pending->kv_sources.emplace_back(&pages, logical);
+                } catch (...) {
+                    pages.unpin_source(logical);
+                    runtime::testing::note_shared_snapshot_export_pin_released();
+                    throw;
+                }
                 if (run.empty()) { run_begin = page; }
                 run.push_back(pages.physical(logical));
                 continue;

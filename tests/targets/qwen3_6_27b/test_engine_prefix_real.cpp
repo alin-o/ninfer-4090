@@ -18,6 +18,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -1648,6 +1649,37 @@ private:
     ninfer::runtime::testing::SharedSnapshotImportStage stage_;
     Action action_;
     std::atomic<bool>* cancellation_ = nullptr;
+};
+
+class SharedSnapshotExportAllocationGate {
+public:
+    explicit SharedSnapshotExportAllocationGate(
+        ninfer::runtime::testing::SharedSnapshotExportStage stage)
+        : stage_(stage) {
+        registration_ = ninfer::runtime::testing::SharedSnapshotExportTestGate{
+            .context    = this,
+            .checkpoint = &checkpoint,
+        };
+        ninfer::runtime::testing::install_shared_snapshot_export_gate(&registration_);
+    }
+
+    ~SharedSnapshotExportAllocationGate() {
+        ninfer::runtime::testing::clear_shared_snapshot_export_gate();
+    }
+
+    SharedSnapshotExportAllocationGate(const SharedSnapshotExportAllocationGate&) = delete;
+    SharedSnapshotExportAllocationGate&
+    operator=(const SharedSnapshotExportAllocationGate&) = delete;
+
+private:
+    static void checkpoint(void* context,
+                           ninfer::runtime::testing::SharedSnapshotExportStage stage) {
+        auto& gate = *static_cast<SharedSnapshotExportAllocationGate*>(context);
+        if (stage == gate.stage_) { throw std::bad_alloc(); }
+    }
+
+    ninfer::runtime::testing::SharedSnapshotExportTestGate registration_;
+    ninfer::runtime::testing::SharedSnapshotExportStage stage_;
 };
 
 class CountingOutputSink final : public ninfer::OutputSink {
@@ -3693,7 +3725,8 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
     return 0;
 }
 
-int exercise_shared_snapshot_round_trip(const char* artifact) {
+int exercise_shared_snapshot_round_trip(const char* artifact,
+                                        bool allocation_rollback_only = false) {
     using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
 
     std::vector<std::uint8_t> bytes;
@@ -3711,7 +3744,51 @@ int exercise_shared_snapshot_round_trip(const char* artifact) {
             std::cerr << "shared snapshot source did not complete deterministic generation\n";
             return 1;
         }
-        expected_tokens = generated.generated_token_ids;
+        expected_tokens                   = generated.generated_token_ids;
+        const auto same_source_accounting = [](const ninfer::RuntimeStats& left,
+                                               const ninfer::RuntimeStats& right) {
+            return left.context_cache_owners == right.context_cache_owners &&
+                   left.device_state_occupied_slots == right.device_state_occupied_slots &&
+                   left.host_state_occupied_slots == right.host_state_occupied_slots &&
+                   left.device_main_kv_occupied_pages == right.device_main_kv_occupied_pages &&
+                   left.device_backend_kv_occupied_pages ==
+                       right.device_backend_kv_occupied_pages &&
+                   left.host_kv_occupied_bytes == right.host_kv_occupied_bytes;
+        };
+        const ninfer::RuntimeStats export_baseline = source.runtime_stats();
+        const auto expect_allocation_rollback      = [&](auto stage, std::string_view label) {
+            const std::uint64_t pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            bool rejected = false;
+            {
+                SharedSnapshotExportAllocationGate gate(stage);
+                try {
+                    (void)Access::export_first_durable(source);
+                } catch (const std::bad_alloc&) { rejected = true; }
+                if (ninfer::runtime::testing::shared_snapshot_export_pinned_sources() !=
+                    pins_before) {
+                    std::cerr << "shared snapshot " << label
+                              << " allocation failure leaked a source pin\n";
+                    return false;
+                }
+            }
+            if (!rejected || !source.healthy() ||
+                !same_source_accounting(export_baseline, source.runtime_stats())) {
+                std::cerr << "shared snapshot " << label
+                          << " allocation failure changed source ownership/accounting\n";
+                return false;
+            }
+            return true;
+        };
+        if (!expect_allocation_rollback(
+                ninfer::runtime::testing::SharedSnapshotExportStage::StatePinnedBeforeRegistration,
+                "State pin registration") ||
+            !expect_allocation_rollback(
+                ninfer::runtime::testing::SharedSnapshotExportStage::KvPinnedBeforeRegistration,
+                "KV pin registration")) {
+            return 1;
+        }
+        if (allocation_rollback_only) { return 0; }
         std::pair<std::uint32_t, ninfer::targets::qwen3_6::RetainedSessionSnapshot> exported;
         try {
             exported = Access::export_first_durable(source);
@@ -4116,6 +4193,16 @@ int main() {
             return 1;
         }
         const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-snapshot-export-allocation") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-snapshot-export-allocation requires "
+                         "NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise, true);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

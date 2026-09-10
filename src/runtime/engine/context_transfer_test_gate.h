@@ -55,6 +55,27 @@ void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* gat
 void clear_shared_snapshot_import_gate() noexcept;
 void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage);
 
+enum class SharedSnapshotExportStage : std::uint8_t {
+    StatePinnedBeforeRegistration,
+    KvPinnedBeforeRegistration,
+};
+
+// Deterministic source-registration checkpoints for real-Program export rollback regressions.
+// The callback runs after the physical source is pinned but before the pin is appended to the
+// transfer settlement's cleanup vector, so an injected bad_alloc exercises the actual ownership
+// gap that the guarded registration must close.
+struct SharedSnapshotExportTestGate {
+    void* context                                                      = nullptr;
+    void (*checkpoint)(void* context, SharedSnapshotExportStage stage) = nullptr;
+};
+
+void install_shared_snapshot_export_gate(const SharedSnapshotExportTestGate* gate) noexcept;
+void clear_shared_snapshot_export_gate() noexcept;
+void shared_snapshot_export_checkpoint(SharedSnapshotExportStage stage);
+void note_shared_snapshot_export_pin_acquired() noexcept;
+void note_shared_snapshot_export_pin_released() noexcept;
+[[nodiscard]] std::uint64_t shared_snapshot_export_pinned_sources() noexcept;
+
 void install_snapshot_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_snapshot_transfer_gate() noexcept;
 [[nodiscard]] const ContextTransferTestGate* snapshot_transfer_gate() noexcept;

@@ -408,9 +408,13 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
         .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
     continuation.messages.push_back(std::move(followup));
 
+    // This must be a distinct root owner. Reusing the retained session key lets the logical
+    // catalog replace the source rather than exercising physical admission pressure.
+    ninfer::PromptInput pressure_input       = continuation;
+    pressure_input.context_cache.session_key = "host-restore-pressure";
     const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
     const ninfer::GenerationResult pressure_result =
-        engine.generate(engine.prepare(continuation), options(2, false));
+        engine.generate(engine.prepare(std::move(pressure_input)), options(2, false));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
     if (pressure_result.generated_token_ids.size() != 2 ||
         after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||

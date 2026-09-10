@@ -338,7 +338,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                                    std::string_view model_binding) {
     qwen3_6::RetainedSessionSnapshot snapshot =
         begin_save_continuation(continuation, model_binding);
-    if (snapshot.await_transfer) { snapshot.await_transfer(); }
+    if (snapshot.await_transfer) { snapshot.await_transfer(snapshot.bytes); }
     snapshot.await_transfer = {};
     return snapshot;
 }
@@ -502,8 +502,9 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     writer.pod<std::int32_t>(rewrite_image);
     for (const std::int32_t index : anchor_images) { writer.pod<std::int32_t>(index); }
 
-    // Size the device payload in one pass so the vector's storage is final before any
-    // cudaMemcpyAsync records a destination pointer.
+    // Size the payload before allocating its final, pinned transfer backing. CUDA must never
+    // receive the ordinary vector storage as an asynchronous D2H destination: pageable storage
+    // may make cudaMemcpyAsync synchronously stage on the Engine worker.
     const std::size_t state_offset =
         writer.reserve_payload(state_layout.image_bytes * unique_states.size());
     const std::size_t text_kv_offset =
@@ -511,7 +512,9 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     const std::size_t backend_kv_offset =
         writer.reserve_payload(config.backend_page_stride * session.backend_pages);
 
-    std::uint8_t* base = snapshot.bytes.data();
+    auto transfer_backing = std::make_shared<PinnedHostBuffer>(snapshot.bytes.size());
+    std::memcpy(transfer_backing->data(), snapshot.bytes.data(), snapshot.bytes.size());
+    std::uint8_t* base = static_cast<std::uint8_t*>(transfer_backing->data());
     for (std::size_t index = 0; index < unique_states.size(); ++index) {
         const StateImageHandle image  = unique_states[index];
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
@@ -597,9 +600,18 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
     auto completion = std::make_shared<CudaCompletionEvent>(device);
     completion->record(device.transfer_stream);
     completion->wait(device.stream);
-    snapshot.await_transfer = [this, completion] {
+    const std::size_t transfer_bytes = snapshot.bytes.size();
+    snapshot.transfer_bytes          = transfer_bytes;
+    snapshot.bytes.clear();
+    snapshot.bytes.shrink_to_fit();
+    snapshot.await_transfer = [this, completion, transfer_backing = std::move(transfer_backing),
+                               transfer_bytes](std::vector<std::uint8_t>& bytes) {
         device.bind_to_current_thread();
         completion->synchronize();
+        // This bounded Host-consumer step runs after the producer event. It is the only point
+        // that creates pageable file bytes, so the Engine worker remains free while D2H runs.
+        bytes.resize(transfer_bytes);
+        std::memcpy(bytes.data(), transfer_backing->data(), transfer_bytes);
     };
     return snapshot;
 }

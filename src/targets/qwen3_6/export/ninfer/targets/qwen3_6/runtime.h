@@ -57,11 +57,16 @@ struct GraphExecutionProfile {
 // processes serving the identical model and KV configuration.
 struct RetainedSessionSnapshot {
     std::vector<std::uint8_t> bytes;
+    // Exact pinned transfer reservation, available before the first D2H copy. Pending
+    // snapshots keep `bytes` empty and retain this accounting size through completion.
+    std::size_t transfer_bytes = 0;
     std::uint32_t tokens = 0;
     std::string session_digest;
-    // Set only by begin_save_continuation().  Consumers must invoke this before reading bytes;
-    // it waits for the producer event, not for unrelated device work.
-    std::function<void()> await_transfer;
+    // Set only by begin_save_continuation(). Consumers must invoke this before reading bytes.
+    // It waits for the producer event (not unrelated device work), then assembles `bytes` from
+    // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
+    // submits immutable CUDA ranges and never lets a Host worker mutate its stores or catalog.
+    std::function<void(std::vector<std::uint8_t>&)> await_transfer;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
@@ -984,7 +989,8 @@ public:
     save_continuation(const ContinuationHandle<Variant>& continuation,
                       std::string_view model_binding);
     // Queues immutable continuation copies on the transfer stream. The returned bytes may be
-    // consumed only after RetainedSessionSnapshot::await_transfer has completed.
+    // consumed only after RetainedSessionSnapshot::await_transfer has completed. Pending
+    // snapshots expose their exact pinned reservation in `transfer_bytes`.
     [[nodiscard]] RetainedSessionSnapshot
     begin_save_continuation(const ContinuationHandle<Variant>& continuation,
                             std::string_view model_binding);

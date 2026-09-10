@@ -318,13 +318,20 @@ public:
 
     void enqueue_write(std::string path, targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
         std::unique_lock lock(writer_mutex);
-        const std::size_t bytes = snapshot.bytes.size();
+        // begin_save_continuation has reserved the immutable pinned image, but has intentionally
+        // not assembled pageable file bytes yet. Its eventual byte count is carried by the
+        // transfer backing and is materialized by the bounded writer below.
+        const std::size_t bytes = snapshot.transfer_bytes;
         // This callback is invoked while the Engine owns its resource transaction. Never wait
         // there: a full writer queue is an intentional best-effort spill drop, not a reason to
         // stall unrelated admitted execution or to retain an unbounded pinned host image.
         if (pending_writes.size() >= options.auto_save_queue_jobs ||
             bytes > options.auto_save_queue_bytes - queued_write_bytes) {
             ++rejected_write_jobs;
+            // A rejected asynchronous snapshot still owns source pins and a producer event.
+            // Settle it before destruction so pinned backing and recycled source storage cannot
+            // race a queued D2H read. This is a transfer-event wait, never a global sync.
+            if (snapshot.await_transfer) { snapshot.await_transfer(snapshot.bytes); }
             return;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
@@ -377,18 +384,18 @@ private:
             if (pending_writes.empty()) { break; }
             PendingWrite item = std::move(pending_writes.front());
             pending_writes.pop_front();
-            queued_write_bytes -= item.snapshot.bytes.size();
+            queued_write_bytes -= item.snapshot.transfer_bytes;
             write_in_flight = true;
-            in_flight_write_bytes.store(item.snapshot.bytes.size(), std::memory_order_relaxed);
+            in_flight_write_bytes.store(item.snapshot.transfer_bytes, std::memory_order_relaxed);
             lock.unlock();
 
             SlotAutoSaveEvent event;
             event.path         = item.path;
             event.tokens       = item.snapshot.tokens;
-            event.bytes        = item.snapshot.bytes.size();
+            event.bytes        = item.snapshot.transfer_bytes;
             const auto started = std::chrono::steady_clock::now();
             try {
-                if (item.snapshot.await_transfer) { item.snapshot.await_transfer(); }
+                if (item.snapshot.await_transfer) { item.snapshot.await_transfer(item.snapshot.bytes); }
                 if (const std::optional<std::uint32_t> deeper =
                         spill_guard.blocks(item.path, item.snapshot.tokens)) {
                     // A stale copy of the session must not roll the file back (D3).

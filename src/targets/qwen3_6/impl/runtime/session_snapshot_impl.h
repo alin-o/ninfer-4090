@@ -336,6 +336,16 @@ ProgramImplCore::continuation_summary(const ContinuationHandle& continuation) co
 qwen3_6::RetainedSessionSnapshot
 ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                                    std::string_view model_binding) {
+    qwen3_6::RetainedSessionSnapshot snapshot =
+        begin_save_continuation(continuation, model_binding);
+    if (snapshot.await_transfer) { snapshot.await_transfer(); }
+    snapshot.await_transfer = {};
+    return snapshot;
+}
+
+qwen3_6::RetainedSessionSnapshot
+ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
+                                         std::string_view model_binding) {
     if (!valid_continuation(continuation)) {
         throw std::invalid_argument("continuation holds no retained session");
     }
@@ -578,10 +588,15 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                            backend_kv_offset, snapshot_traffic_.backend_kv_d2h_pages,
                            snapshot_traffic_.backend_kv_d2h_bytes);
     }
-    // Snapshot traffic is intentionally isolated from model execution.  Waiting only for this
-    // producer stream preserves the ordering of the immutable source ranges without imposing a
-    // device-wide barrier on unrelated admitted lanes.
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    // Keep the producer event with the immutable host payload. The Engine's bounded writer
+    // waits for it off the execution worker, while later transfer-stream work remains ordered
+    // after these source reads before any source can be reused.
+    auto completion = std::make_shared<CudaCompletionEvent>(device);
+    completion->record(device.transfer_stream);
+    snapshot.await_transfer = [this, completion] {
+        device.bind_to_current_thread();
+        completion->synchronize();
+    };
     return snapshot;
 }
 

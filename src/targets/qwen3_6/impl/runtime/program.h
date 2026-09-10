@@ -718,6 +718,9 @@ public:
     continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
+    begin_save_continuation(const ContinuationHandle& continuation,
+                            std::string_view model_binding);
     [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
                                                           std::string_view model_binding);
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {

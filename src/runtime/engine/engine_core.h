@@ -427,10 +427,10 @@ private:
         }
     }
 
-    // Best-effort spill of a retained session about to be destroyed involuntarily. The device
-    // snapshot runs on the calling thread (it synchronizes the stream); the file write happens
-    // on the Engine's writer thread through the sink. Only sessions bound to a slot file are
-    // spilled, and a spill failure never blocks the eviction itself.
+    // Best-effort spill of a retained session about to be destroyed involuntarily. Submission
+    // only queues immutable D2H ranges; the bounded writer waits for their producer event
+    // before reading the payload. Only sessions bound to a slot file are spilled, and a spill
+    // failure never blocks the eviction itself.
     void spill_catalog_slot(std::uint32_t slot,
                             const typename Package::ContinuationHandle& handle) noexcept {
         if (!eviction_sink_ || slot >= slot_session_paths_.size() ||
@@ -438,7 +438,8 @@ private:
             return;
         }
         try {
-            auto snapshot = instance_.program->save_continuation(handle, eviction_model_binding_);
+            auto snapshot =
+                instance_.program->begin_save_continuation(handle, eviction_model_binding_);
             eviction_sink_(slot_session_paths_[slot], std::move(snapshot));
         } catch (...) {
             // The session was going to be destroyed either way; losing the spill costs the

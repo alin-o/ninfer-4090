@@ -300,8 +300,10 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
-        core.emplace<std::monostate>();
+        // Auto-save snapshots retain producer events that reference the Program's device
+        // context. Drain their bounded Host consumer before destroying the Engine core.
         stop_writer();
+        core.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
@@ -386,6 +388,7 @@ private:
             event.bytes        = item.snapshot.bytes.size();
             const auto started = std::chrono::steady_clock::now();
             try {
+                if (item.snapshot.await_transfer) { item.snapshot.await_transfer(); }
                 if (const std::optional<std::uint32_t> deeper =
                         spill_guard.blocks(item.path, item.snapshot.tokens)) {
                     // A stale copy of the session must not roll the file back (D3).

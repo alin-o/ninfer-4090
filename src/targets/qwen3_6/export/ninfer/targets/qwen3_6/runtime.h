@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <memory>
 #include <optional>
@@ -58,6 +59,9 @@ struct RetainedSessionSnapshot {
     std::vector<std::uint8_t> bytes;
     std::uint32_t tokens = 0;
     std::string session_digest;
+    // Set only by begin_save_continuation().  Consumers must invoke this before reading bytes;
+    // it waits for the producer event, not for unrelated device work.
+    std::function<void()> await_transfer;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
@@ -979,6 +983,11 @@ public:
     [[nodiscard]] RetainedSessionSnapshot
     save_continuation(const ContinuationHandle<Variant>& continuation,
                       std::string_view model_binding);
+    // Queues immutable continuation copies on the transfer stream. The returned bytes may be
+    // consumed only after RetainedSessionSnapshot::await_transfer has completed.
+    [[nodiscard]] RetainedSessionSnapshot
+    begin_save_continuation(const ContinuationHandle<Variant>& continuation,
+                            std::string_view model_binding);
     [[nodiscard]] ContinuationHandle<Variant>
     restore_continuation(std::span<const std::uint8_t> snapshot, std::string_view model_binding);
     // Reuse metadata of one catalogued continuation, as the Engine catalog consumes it when it

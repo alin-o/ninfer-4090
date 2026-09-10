@@ -605,6 +605,13 @@ Program<Variant>::save_continuation(const ContinuationHandle<Variant>& continuat
 }
 
 template <>
+RetainedSessionSnapshot
+Program<Variant>::begin_save_continuation(const ContinuationHandle<Variant>& continuation,
+                                          std::string_view model_binding) {
+    return impl_->begin_save_continuation(continuation, model_binding);
+}
+
+template <>
 ContinuationHandle<Variant>
 Program<Variant>::restore_continuation(std::span<const std::uint8_t> snapshot,
                                        std::string_view model_binding) {

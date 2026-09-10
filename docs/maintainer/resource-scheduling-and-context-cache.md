@@ -845,6 +845,12 @@ publication.  Their result is adopted by the Engine at a unit boundary.  Full qu
 request's existing deadline/backpressure path; they are never an unbounded alternate cache or an
 admission path.
 
+`Program::begin_save_continuation` follows the same rule for an eviction spill: it returns an
+opaque snapshot whose `await_transfer` producer-event callback must run before a Host worker reads
+`bytes`.  The normal `save_continuation` API settles that callback for synchronous callers.  The
+Engine auto-save writer instead owns the wait, so enqueuing an already bounded spill does not
+block the execution worker or create another resource owner.
+
 ### 9.4 Commit
 
 Commit 发布：

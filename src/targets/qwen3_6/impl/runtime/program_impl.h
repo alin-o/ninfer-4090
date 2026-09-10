@@ -4526,6 +4526,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -6335,6 +6336,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    // After this point pressure work is allowed to mutate/release selected victims.  A snapshot
+    // may only be sealed in the reservation window above.
+    snapshot_save_window_ = false;
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress<Variant> {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {

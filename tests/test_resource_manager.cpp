@@ -2454,6 +2454,29 @@ void test_committed_victim_survives_transaction_abort() {
             "committed victim eviction was incorrectly rolled back with request-local abort");
 }
 
+void test_eviction_observer_runs_after_physical_reservation() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 10, make_base(10), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(manager, program, 20, make_base(20), 2);
+    (void)finish_active(manager, program, second);
+
+    bool observed = false;
+    manager.set_eviction_observer([&](std::uint32_t, const FakeContinuationHandle&) {
+        observed = true;
+        require(program.has_context_transaction(),
+                "eviction observer ran before Program reserved the physical topology");
+    });
+    auto inspection = manager.inspect(program, FakePreparedPrompt{30}, make_base(30), 3);
+    require(inspection.choice.has_value(), "observer ordering fixture did not require eviction");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{30}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "observer ordering fixture could not reserve materialization");
+    require(observed, "eviction observer was not notified for the selected victim");
+}
+
 void test_uncommitted_pressure_acknowledgement_is_not_degradation() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3483,6 +3506,8 @@ int main() {
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
+    run_test("eviction observer reservation ordering",
+             test_eviction_observer_runs_after_physical_reservation);
     run_test("uncommitted pressure acknowledgement",
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
     run_test("aborted source is not a hit",

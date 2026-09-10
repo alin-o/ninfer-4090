@@ -987,6 +987,10 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
     ContextTransaction context_transaction_;
+    // Set only between materialization reservation and its first physical progress step.  The
+    // Engine uses this interval to seal an involuntarily evicted continuation's immutable D2H
+    // snapshot after the topology is reserved but before any source can be mutated.
+    bool snapshot_save_window_ = false;
 
     [[nodiscard]] MaterializationResult
     progress_materialization_transaction(runtime::CancellationFlagView cancellation);

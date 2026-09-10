@@ -351,9 +351,14 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     if (model_binding.size() > 4096) {
         throw std::invalid_argument("session snapshot model binding is too long");
     }
-    if (has_context_transaction() || pending_transaction_) {
-        throw std::logic_error("cannot snapshot a session during a resource transaction");
+    if (pending_transaction_ || (has_context_transaction() && !snapshot_save_window_)) {
+        throw std::logic_error("cannot snapshot a session during a pending transaction");
     }
+    // ResourceManager may start an eviction spill immediately after Program has reserved a
+    // materialization topology and before the first physical transaction step.  That window is
+    // safe: no source mutation has been submitted, while the reservation prevents a competing
+    // topology from invalidating the selected immutable ranges.  Once a generated round is
+    // pending or physical progress begins, retain the ordinary no-snapshot rule above.
     if (speculative_backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("session persistence does not support the DFlash backend");
     }

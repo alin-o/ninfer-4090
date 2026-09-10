@@ -430,9 +430,6 @@ public:
         }
         validate_choice(choice, resource_revision);
         MaterializationRecord record = take_materialization_record(choice);
-        // Fork-local, and order-critical: the observer reads the record's claim spans, so it
-        // must run before upstream moves the record into the open transaction.
-        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<MaterializationRecord>(std::move(record));
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
@@ -446,6 +443,11 @@ public:
             return cancellation.requested() ? MaterializationReserveResult::Aborted
                                             : MaterializationReserveResult::Stale;
         }
+        // A spill pins immutable source ranges until its transfer-stream producer event settles.
+        // It must be started only after Program has accepted this exact topology: starting it
+        // while planning can turn a feasible pressure eviction into an unreleaseable source.
+        // reserve_materialization only opens the transaction; no physical mutation has run yet.
+        observe_planned_evictions(open.private_claims);
         observe_planner_diagnostics(open.diagnostics);
         return MaterializationReserveResult::Reserved;
     }

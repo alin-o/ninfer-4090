@@ -25,6 +25,11 @@
 
 namespace ninfer::runtime {
 
+namespace testing {
+template <class Package>
+struct ResourceManagerTestAccess;
+}
+
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
 
 enum class LogicalLaneState : std::uint8_t {
@@ -87,6 +92,8 @@ public:
     using CapturePlanner                    = SharedCapturePlanner<Package>;
 
 private:
+    friend struct testing::ResourceManagerTestAccess<Package>;
+
     // A transaction capability is a point-in-time structural snapshot. An active edge is a
     // durable logical lease on the owner and deliberately does not freeze that snapshot's
     // generation: another reader may change replica residency while the same owner remains live.
@@ -839,7 +846,6 @@ public:
             .structural_origins   = selected->scenario.assessment.structural_origins,
             .structural_role      = selected->scenario.assessment.structural_role,
             .ssd_eligible         = selected->scenario.assessment.ssd_eligible,
-            .unique_reclamation   = selected->plan.unique_reclamation,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
             const auto owner_record =
@@ -1462,7 +1468,6 @@ private:
         std::uint32_t structural_origins        = 0;
         std::uint8_t structural_role            = 0;
         bool ssd_eligible                       = false;
-        UniquePhysicalReclamation unique_reclamation;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -2652,16 +2657,6 @@ private:
         }
     }
 
-    void observe_committed_reclamation(const MaterializationDiagnostics& diagnostics) noexcept {
-        observe_committed_reclamation(UniquePhysicalReclamation{
-            .device_state_slots      = diagnostics.reclaimed_device_state_slots,
-            .device_main_kv_pages    = diagnostics.reclaimed_device_main_kv_pages,
-            .device_backend_kv_pages = diagnostics.reclaimed_device_backend_kv_pages,
-            .host_state_slots        = diagnostics.reclaimed_host_state_slots,
-            .host_kv_bytes           = diagnostics.reclaimed_host_kv_bytes,
-        });
-    }
-
     void observe_committed_reclamation(const UniquePhysicalReclamation& reclamation) noexcept {
         saturating_add(context_stats_.reclaimed_device_state_slots_total,
                        reclamation.device_state_slots);
@@ -3141,13 +3136,13 @@ private:
         }
 
         if (published) { observe_selected_hit(*record); }
-        if (published) { observe_committed_reclamation(record->diagnostics); }
         for (const OwnerClaim& claim : record->private_claims) {
             apply_private_action(claim, published, private_result_for(claim));
         }
         for (const OwnerClaim& claim : record->shared_claims) {
             apply_shared_action(claim, published, shared_result_for(claim));
         }
+        observe_committed_reclamation(result.committed_reclamation);
 
         bool retained_private_source = false;
         if (record->private_source) {
@@ -3366,7 +3361,7 @@ private:
         for (const OwnerClaim& claim : record->shared_claims) {
             apply_shared_action(claim, published, shared_result_for(claim));
         }
-        if (published) { observe_committed_reclamation(record->unique_reclamation); }
+        observe_committed_reclamation(result.committed_reclamation);
         if (result.status == ContextTransactionStatus::Aborted) {
             if (record->publication_slot != kInvalidCatalogSlot) {
                 SharedCatalogEntry& publication = shared_catalog_[record->publication_slot];
@@ -3708,5 +3703,26 @@ private:
     std::uint64_t retention_epoch_       = 0;
     std::uint64_t demand_epoch_          = 0;
 };
+
+namespace testing {
+
+template <class Package>
+struct ResourceManagerTestAccess {
+    using Manager = ResourceManager<Package>;
+
+    static bool publish_catalogued_session(Manager& manager,
+                                           const typename Manager::CacheSessionKey& key,
+                                           std::uint32_t slot, std::uint64_t publication_order) {
+        auto& entry = manager.catalog_.at(slot);
+        if (entry.state != Manager::CatalogState::Catalogued || !entry.handle || entry.id == 0) {
+            throw std::logic_error("test session publication owner is not catalogued");
+        }
+        entry.session   = key;
+        entry.retention = RetentionClass::LiveSession;
+        return manager.publish_session(key, slot, entry.id, entry.revision, publication_order);
+    }
+};
+
+} // namespace testing
 
 } // namespace ninfer::runtime

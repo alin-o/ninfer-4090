@@ -1999,6 +1999,40 @@ int exercise_cache_fixture_equivalence(const char* artifact) {
         device_hash   = token_fixture_hash(device_tokens);
     }
 
+    std::uint64_t existing_hash = 0;
+    {
+        // Existing cache baseline: anonymous exact-prefix reuse with Device-only checkpointing,
+        // before explicit conversation-head identity participates. The rendered request fixture
+        // and greedy generation settings are identical to the new Device/Host paths below.
+        ninfer::EngineOptions options            = groupwise_host_restore_engine_options(artifact);
+        options.context_cache.device_state_slots = 1;
+        options.context_cache.host_state_slots   = 0;
+        options.context_cache.host_kv_capacity_bytes            = 0;
+        options.context_cache.max_private_continuations         = 2;
+        options.context_cache.max_shared_prefixes               = 0;
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        ninfer::Engine engine(std::move(options));
+        ninfer::PromptInput existing_initial = initial_input("unused-existing-session");
+        existing_initial.context_cache.session_key.reset();
+        existing_initial.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(std::move(existing_initial)), fixed_output(5));
+        ninfer::PromptInput existing_continuation =
+            continuation_input("unused-existing-session", initial);
+        existing_continuation.context_cache.session_key.reset();
+        existing_continuation.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        const ninfer::GenerationResult existing =
+            engine.generate(engine.prepare(std::move(existing_continuation)), fixed_output(2));
+        existing_hash = token_fixture_hash(existing.generated_token_ids);
+        if (initial.generated_token_ids != initial_tokens ||
+            existing.generated_token_ids != device_tokens || existing.reused_prompt_tokens == 0 ||
+            existing.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+            std::cerr << "existing-cache fixture diverged from deterministic reference: hashes="
+                      << existing_hash << '/' << device_hash << '\n';
+            return 1;
+        }
+    }
+
     std::uint64_t disabled_hash = 0;
     {
         ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
@@ -2011,8 +2045,8 @@ int exercise_cache_fixture_equivalence(const char* artifact) {
         disabled_hash = token_fixture_hash(disabled.generated_token_ids);
         if (disabled.generated_token_ids != device_tokens || disabled.reused_prompt_tokens != 0 ||
             disabled.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
-            std::cerr << "disabled-cache fixture diverged from Device reuse: hashes="
-                      << disabled_hash << '/' << device_hash << '\n';
+            std::cerr << "disabled-cache fixture diverged from existing/Device reuse: hashes="
+                      << disabled_hash << '/' << existing_hash << '/' << device_hash << '\n';
             return 1;
         }
     }
@@ -2050,13 +2084,15 @@ int exercise_cache_fixture_equivalence(const char* artifact) {
             after_host.state_h2d_count <= after_pressure.state_h2d_count ||
             after_host.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
             after_host.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
-            std::cerr << "Host fixture diverged from Device/disabled reference: hashes="
-                      << host_hash << '/' << device_hash << '/' << disabled_hash << '\n';
+            std::cerr << "Host fixture diverged from existing/Device/disabled reference: hashes="
+                      << host_hash << '/' << existing_hash << '/' << device_hash << '/'
+                      << disabled_hash << '\n';
             return 1;
         }
     }
     if (std::getenv("NINFER_REPORT_CACHE_FIXTURE_HASHES") != nullptr) {
-        std::cout << "cache_fixture_hash disabled=" << disabled_hash << " device=" << device_hash
+        std::cout << "cache_fixture_hash disabled=" << disabled_hash
+                  << " existing=" << existing_hash << " device=" << device_hash
                   << " host=" << host_hash << '\n';
     }
     return 0;
@@ -2129,6 +2165,105 @@ int exercise_target_cache_calibration(const char* artifact) {
               << ninfer::context_cost_preset_source_name(load.context_cost.transfer_source)
               << " prefill_cost="
               << ninfer::context_cost_preset_source_name(load.context_cost.prefill_source) << '\n';
+    return 0;
+}
+
+int exercise_four_request_root_fallback(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 4;
+    options.max_pending_requests             = 4;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.context_cache.device_state_slots = 0;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 4;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        const ninfer::GenerationResult warm = engine.generate(
+            engine.prepare(session_turn("four-pressure-owner-" + std::to_string(row),
+                                        "Retain one deterministic pressure owner " +
+                                            std::to_string(row) + '.')),
+            fixed_output(1));
+        if (warm.generated_token_ids.size() != 1) {
+            std::cerr << "four-request pressure fixture did not populate owner " << row << '\n';
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    if (before.device_state_occupied_slots != 4 || before.host_state_occupied_slots != 0 ||
+        before.host_kv_occupied_bytes != 0) {
+        std::cerr << "four-request pressure fixture did not fill its bounded Device-only cache: "
+                  << before.device_state_occupied_slots << '/' << before.host_state_occupied_slots
+                  << '/' << before.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
+    std::array<CountingOutputSink, 4> sinks;
+    std::array<std::atomic<bool>, 4> cancelled{};
+    std::vector<std::future<ninfer::GenerationResult>> requests;
+    requests.reserve(4);
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        auto handle = engine.submit(
+            engine.prepare_tokens(
+                {248045, 846, 198, static_cast<ninfer::TokenId>(9200 + row), 248046, 198}, false),
+            fixed_output(64, false), ninfer::OutputConsumerMode::Streaming);
+        requests.push_back(
+            std::async(std::launch::async, [handle = std::move(handle), &sink = sinks[row],
+                                            &cancel = cancelled[row]]() mutable {
+                return handle.wait(&sink, ninfer::CancellationView([&] {
+                    return cancel.load(std::memory_order_acquire);
+                }));
+            }));
+    }
+
+    const bool four_admitted = wait_until(
+        [&] {
+            const bool all_started =
+                std::all_of(sinks.begin(), sinks.end(), [](const CountingOutputSink& sink) {
+                    return sink.started.load(std::memory_order_acquire);
+                });
+            return all_started && engine.runtime_stats().running_requests == 4;
+        },
+        std::chrono::seconds(120));
+    for (auto& flag : cancelled) { flag.store(true, std::memory_order_release); }
+    std::array<ninfer::GenerationResult, 4> results;
+    for (std::size_t row = 0; row < requests.size(); ++row) { results[row] = requests[row].get(); }
+    if (!four_admitted) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "constrained pressure did not admit four requests concurrently: running="
+                  << stats.running_requests
+                  << " fallback=" << stats.pressure_maximal_fallback_selections << '\n';
+        return 1;
+    }
+    for (const ninfer::GenerationResult& result : results) {
+        if (result.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+            std::cerr << "constrained four-request admission selected a non-root source\n";
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    if (after.pressure_maximal_fallback_selections <= before.pressure_maximal_fallback_selections ||
+        after.reclaimed_device_state_slots_total < before.reclaimed_device_state_slots_total + 4U ||
+        after.device_state_occupied_slots > 4 || after.host_state_occupied_slots != 0 ||
+        after.host_kv_occupied_bytes != 0 || after.running_requests != 0 ||
+        after.materializing_requests != 0 || after.terminal_pending_requests != 0) {
+        std::cerr << "four-request root fallback did not reclaim bounded physical capacity: "
+                  << "fallback=" << before.pressure_maximal_fallback_selections << '/'
+                  << after.pressure_maximal_fallback_selections
+                  << " state_reclaimed=" << before.reclaimed_device_state_slots_total << '/'
+                  << after.reclaimed_device_state_slots_total
+                  << " occupancy=" << after.device_state_occupied_slots << '/'
+                  << after.host_state_occupied_slots << '/' << after.host_kv_occupied_bytes
+                  << " running=" << after.running_requests << '\n';
+        return 1;
+    }
     return 0;
 }
 
@@ -3553,6 +3688,15 @@ int main() {
             return 1;
         }
         const int result = exercise_target_cache_calibration(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "four-request-root-fallback") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "four-request-root-fallback requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_four_request_root_fallback(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

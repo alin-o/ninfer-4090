@@ -916,6 +916,7 @@ private:
         std::vector<DeviceKVPageHandle> backend_restore_destinations;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
+        runtime::UniquePhysicalReclamation committed_reclamation;
         bool state_restored                           = false;
         bool transfer_submitted                       = false;
         std::uint8_t transfer_timer_mask              = 0;
@@ -962,6 +963,7 @@ private:
         std::vector<runtime::ContextTransferRequirement> transfer_requirements;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
+        runtime::UniquePhysicalReclamation committed_reclamation;
         std::vector<std::uint32_t> victim_indices;
         std::vector<std::uint64_t> victim_generations;
         std::vector<MaterializationTransaction::PressureWork> pressure;
@@ -1076,6 +1078,8 @@ private:
     [[nodiscard]] detail::PhysicalResources
     resident_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    void observe_physical_reclamation(detail::PhysicalResources before,
+                                      runtime::UniquePhysicalReclamation& total) const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,

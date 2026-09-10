@@ -470,6 +470,7 @@ struct FakeMaterializationSharedSourceResult {
 
 struct FakeMaterializationResult {
     ContextTransactionStatus status = ContextTransactionStatus::Aborted;
+    UniquePhysicalReclamation committed_reclamation;
     std::optional<FakeStartResult> published;
     std::optional<FakeMaterializationSourceResult> source;
     std::optional<FakeMaterializationSharedSourceResult> shared_source;
@@ -487,6 +488,7 @@ struct FakeSharedPrefixPublication {
 struct FakeActiveCaptureResult {
     ContextTransactionStatus status     = ContextTransactionStatus::Aborted;
     bool capacity_preparation_committed = false;
+    UniquePhysicalReclamation committed_reclamation;
     FakeContinuationSummary active_summary;
     std::optional<FakeSharedPrefixPublication> shared;
     std::vector<FakeMaterializationVictimResult> victims;
@@ -838,6 +840,8 @@ public:
             FakeActiveCaptureResult result;
             result.status =
                 cancellation.requested() ? ContextTransactionStatus::Aborted : capture_status;
+            result.committed_reclamation =
+                committed_reclamation_override.value_or(target_reclamation);
             if (pending_plan_) {
                 for (std::size_t index = 0; index < pending_plan_->private_actions.size();
                      ++index) {
@@ -917,9 +921,10 @@ public:
         require(pending_plan_.has_value(), "fake materialization plan disappeared");
         const FakeResourcePlan& plan = *pending_plan_;
         FakeMaterializationResult result;
-        result.status = (abort_progress || cancellation.requested())
-                            ? ContextTransactionStatus::Aborted
-                            : ContextTransactionStatus::Published;
+        result.status                = (abort_progress || cancellation.requested())
+                                           ? ContextTransactionStatus::Aborted
+                                           : ContextTransactionStatus::Published;
+        result.committed_reclamation = committed_reclamation_override.value_or(target_reclamation);
         for (std::size_t index = 0; index < plan.private_actions.size(); ++index) {
             const FakeTargetDecision& action = plan.private_actions[index];
             const bool evicted               = action.evicts_continuation;
@@ -1168,11 +1173,12 @@ public:
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
     std::optional<std::uint64_t> required_action_id;
-    std::uint32_t pressure_assessment_delay_us           = 0;
-    std::uint64_t pressure_checkpoint_recovery_ns        = 100;
-    bool require_evictions                               = false;
-    bool private_pressure_eviction_only                  = false;
-    bool abort_start                                     = false;
+    std::uint32_t pressure_assessment_delay_us    = 0;
+    std::uint64_t pressure_checkpoint_recovery_ns = 100;
+    bool require_evictions                        = false;
+    bool private_pressure_eviction_only           = false;
+    bool abort_start                              = false;
+    std::optional<UniquePhysicalReclamation> committed_reclamation_override;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
     bool malform_last_capture_private_victim             = false;
@@ -1818,7 +1824,8 @@ struct FakePackage {
     using CacheSessionKey            = FakeCacheSessionKey;
 };
 
-using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
+using FakeManager           = ninfer::runtime::ResourceManager<FakePackage>;
+using FakeManagerTestAccess = ninfer::runtime::testing::ResourceManagerTestAccess<FakePackage>;
 
 FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity = 4,
                          std::uint32_t shared_capacity = 0, bool cache_enabled = true) {
@@ -2679,6 +2686,62 @@ void test_cancelled_replacement_preserves_successful_head_until_atomic_publish()
     require(program.started_source_id == replacement.sequence.id &&
                 program.started_source_mode == PrivateSourceMode::Retain,
             "complete replacement was not published atomically as the repeated head");
+    (void)manager.abort(program, repeated.lane, repeated.sequence);
+}
+
+void test_claimed_head_supersession_settles_without_stale_session_dependency() {
+    FakeManager manager = make_manager(2, 4);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    const ActiveRequest head = start_active(
+        manager, program, 42, make_base(42, session, RetentionClass::LiveSession, true), 1);
+    (void)finish_active(manager, program, head, 16);
+
+    // Prepare the replacement continuation, then let a different admission claim the current
+    // head for pressure. The test access below models the ordered terminal publication itself
+    // (the public finish API deliberately rejects overlap): it must demote the claimed owner
+    // without releasing or retargeting the outstanding claim.
+    const ActiveRequest replacement = start_active(manager, program, 99, make_base(99), 2);
+    (void)finish_active(manager, program, replacement, 16);
+    program.required_pressure_actions = 1;
+    program.required_action_id        = 1000U + head.sequence.id;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 3);
+    require(inspection.choice.has_value(), "claimed-head fixture found no pressure plan");
+    const LaneId pressure_lane = inspection.choice->destination();
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{77}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "claimed-head pressure transaction was not reserved");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed,
+            "current conversation head was not claimed by the outstanding transaction");
+
+    require(FakeManagerTestAccess::publish_catalogued_session(manager, session, 1, 2),
+            "claimed-head replacement publication was rejected");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed,
+            "session supersession disturbed the outstanding prior-owner claim");
+
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "claimed prior owner did not settle after session supersession");
+    auto activation                            = std::move(*outcome.activation);
+    const FakeSequenceHandle pressure_sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+    (void)manager.abort(program, pressure_lane, pressure_sequence);
+
+    program.required_pressure_actions = 0;
+    program.required_action_id.reset();
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.session_supersessions_total == 1 &&
+                stats.context_cache_owners[context_cache_owner_metric_index(
+                    ContextCacheMetricRole::ConversationHead, ContextCacheMetricPlacement::Device,
+                    ContextCacheMetricPin::Unpinned, ContextCacheMetricIdentity::Explicit)] == 1,
+            "claimed-head settlement left a pinned or duplicate conversation head");
+    const ActiveRequest repeated = start_active(
+        manager, program, 99, make_base(99, session, RetentionClass::LiveSession, true), 4);
+    require(program.started_source_id == replacement.sequence.id,
+            "settled prior-owner claim restored a stale session dependency");
     (void)manager.abort(program, repeated.lane, repeated.sequence);
 }
 
@@ -3592,6 +3655,47 @@ void test_program_projected_unique_reclamation_is_observable() {
     (void)finish_active(manager, program, alias);
 }
 
+void test_cancelled_pressure_reports_only_committed_unique_reclamation() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest victim = start_active(manager, program, 71, make_base(71), 1);
+    (void)finish_active(manager, program, victim);
+
+    program.required_pressure_actions      = 1;
+    program.private_pressure_eviction_only = true;
+    program.target_reclamation             = UniquePhysicalReclamation{
+                    .device_state_slots      = 2,
+                    .device_main_kv_pages    = 17,
+                    .device_backend_kv_pages = 9,
+                    .host_state_slots        = 2,
+                    .host_kv_bytes           = 8192,
+    };
+    program.committed_reclamation_override = UniquePhysicalReclamation{
+        .device_state_slots   = 1,
+        .device_main_kv_pages = 5,
+    };
+    auto inspection = manager.inspect(program, FakePreparedPrompt{72}, make_base(72), 2);
+    require(inspection.choice.has_value(), "cancelled reclamation fixture found no pressure plan");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{72}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "cancelled reclamation fixture did not reserve pressure");
+    std::atomic<bool> cancelled{true};
+    auto progress       = manager.progress_context_transaction(program, {&cancelled});
+    const auto& outcome = std::get<FakeManager::MaterializationOutcome>(progress);
+    require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation,
+            "cancelled pressure unexpectedly published an activation");
+
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.reclaimed_device_state_slots_total == 1 &&
+                stats.reclaimed_device_main_kv_pages_total == 5 &&
+                stats.reclaimed_device_backend_kv_pages_total == 0 &&
+                stats.reclaimed_host_state_slots_total == 0 &&
+                stats.reclaimed_host_kv_bytes_total == 0,
+            "cancelled pressure counted the planned target instead of its committed subset");
+}
+
 void test_shortlist_collision_requires_program_exact_verification() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3724,6 +3828,8 @@ int main() {
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("cancelled atomic session replacement",
              test_cancelled_replacement_preserves_successful_head_until_atomic_publish);
+    run_test("claimed-head session supersession",
+             test_claimed_head_supersession_settles_without_stale_session_dependency);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
              test_pressure_tries_every_preserving_alternative_before_eviction);
@@ -3771,6 +3877,8 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("Program-projected unique reclamation",
              test_program_projected_unique_reclamation_is_observable);
+    run_test("cancelled committed unique reclamation",
+             test_cancelled_pressure_reports_only_committed_unique_reclamation);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
     run_test("inferred lineage exact verification",

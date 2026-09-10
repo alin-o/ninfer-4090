@@ -793,6 +793,14 @@ public:
     progress_context_transaction(CancellationFlagView cancellation) {
         require(transaction_kind_ != TransactionKind::None,
                 "fake Program has no context transaction");
+        // Deterministic producer-event delay.  It holds this transaction at an Engine boundary
+        // without requiring CUDA, so the regression can prove that adoption waits for a complete
+        // immutable image while unrelated admitted work remains runnable.
+        if (delayed_transfer_units != 0) {
+            --delayed_transfer_units;
+            timeline.push_back("transfer-pending");
+            return ContextTransactionInProgress{};
+        }
         if (progress_in_progress_once) {
             progress_in_progress_once = false;
             return ContextTransactionInProgress{};
@@ -961,6 +969,7 @@ public:
     }
 
     void finalize_context_transaction() noexcept {
+        timeline.push_back("transfer-settled");
         transaction_kind_ = TransactionKind::None;
         pending_plan_.reset();
         pending_capture_publish_shared_ = false;
@@ -968,6 +977,13 @@ public:
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
         return transaction_kind_ != TransactionKind::None;
+    }
+
+    void execute_independent_admitted_unit() {
+        require(transaction_kind_ == TransactionKind::Materialization,
+                "independent work was not interleaved with a materialization transfer");
+        ++independent_admitted_units;
+        timeline.push_back("independent-execution");
     }
 
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
@@ -1131,6 +1147,7 @@ public:
     bool malform_private_checkpoint_identity                = false;
     bool reverse_pressure_results                           = false;
     bool progress_in_progress_once                          = false;
+    std::uint32_t delayed_transfer_units                     = 0;
     bool finish_fail_next                                   = false;
     bool finish_release                                     = false;
     bool finish_with_rewrite                                = false;
@@ -1151,6 +1168,7 @@ public:
     std::uint64_t finish_calls                = 0;
     std::uint64_t abort_calls                 = 0;
     std::uint64_t skipped_captures            = 0;
+    std::uint64_t independent_admitted_units  = 0;
     std::size_t pressure_target_count_peak    = 0;
     std::uint32_t finish_frontier             = 16;
     std::uint32_t started_source_id           = 0;
@@ -1161,6 +1179,7 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<std::string_view> timeline;
 
 private:
     void advance_revision() noexcept {
@@ -3391,6 +3410,55 @@ void test_shortlist_collision_requires_program_exact_verification() {
             "shortlist collision bypassed Program exact identity verification");
 }
 
+void test_delayed_transfer_timeline_settles_before_abort_or_adoption() {
+    // This is intentionally host-only.  The concrete State/KV transfer tests remain CUDA-gated,
+    // but this trace exercises the Engine/Program ownership rule that was previously untested
+    // when no GPU or artifact was available: an already admitted independent lane may execute
+    // while a sealed materialization is waiting, whereas the selected lane is not adopted until
+    // the producer event has settled.
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const ActiveRequest independent = start_active(manager, program, 11, make_base(11), 1);
+    program.timeline.clear();
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{22}, make_base(22), 2);
+    require(inspection.choice && inspection.choice->destination().value != independent.lane.value,
+            "delayed transfer did not reserve an independent destination lane");
+    program.delayed_transfer_units = 2;
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{22}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "delayed transfer was not sealed by ResourceManager");
+
+    std::atomic<bool> cancelled{false};
+    auto progress = manager.progress_context_transaction(program, {&cancelled});
+    require(std::holds_alternative<ContextTransactionInProgress>(progress) &&
+                manager.context_transaction_kind().has_value(),
+            "incomplete transfer was adopted before its producer event settled");
+    program.execute_independent_admitted_unit();
+
+    cancelled.store(true, std::memory_order_release);
+    auto cancellation_progress = manager.progress_context_transaction(program, {&cancelled});
+    require(std::holds_alternative<ContextTransactionInProgress>(cancellation_progress),
+            "cancellation released a delayed transfer before settlement");
+    program.execute_independent_admitted_unit();
+
+    auto terminal = manager.progress_context_transaction(program, {&cancelled});
+    const auto& aborted = std::get<FakeManager::MaterializationOutcome>(terminal);
+    require(aborted.status == ContextTransactionStatus::Aborted && !aborted.activation &&
+                !manager.context_transaction_kind() && !program.has_context_transaction(),
+            "cancelled delayed transfer published a partial activation or leaked its transaction");
+    require(program.independent_admitted_units == 2 &&
+                program.timeline == std::vector<std::string_view>{
+                                        "transfer-pending", "independent-execution",
+                                        "transfer-pending", "independent-execution",
+                                        "transfer-settled"},
+            "timeline does not prove independent execution between delayed transfer boundaries");
+    require(manager.lane_state(independent.lane) == ninfer::runtime::LogicalLaneState::Active &&
+                manager.lane_state(LaneId{1}) == ninfer::runtime::LogicalLaneState::Free,
+            "cancelled delayed transfer did not restore complete logical accounting");
+}
+
 } // namespace
 
 int main() {
@@ -3466,6 +3534,8 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("delayed transfer timeline and settlement",
+             test_delayed_transfer_timeline_settles_before_abort_or_adoption);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

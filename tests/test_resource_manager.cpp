@@ -485,6 +485,31 @@ struct FakeSharedPrefixPublication {
     FakeSharedPrefixSummary summary;
 };
 
+struct FakeSharedPrefixPersistenceMetadata {
+    ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::None;
+    std::uint32_t structural_origins         = 0;
+    std::uint8_t structural_role             = 0;
+    bool ssd_eligible                        = false;
+    std::optional<std::uint32_t> first_volatile_token;
+};
+
+struct FakeValidatedSharedPrefixImport {
+    FakeSharedPrefixSummary imported_summary;
+    FakeSharedPrefixPersistenceMetadata imported_metadata;
+    std::uint32_t content_key = 0;
+    bool valid                = true;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return valid; }
+
+    [[nodiscard]] const FakeSharedPrefixSummary& summary() const noexcept {
+        return imported_summary;
+    }
+
+    [[nodiscard]] const FakeSharedPrefixPersistenceMetadata& metadata() const noexcept {
+        return imported_metadata;
+    }
+};
+
 struct FakeActiveCaptureResult {
     ContextTransactionStatus status     = ContextTransactionStatus::Aborted;
     bool capacity_preparation_committed = false;
@@ -506,6 +531,7 @@ struct FakeCaptureAssessment {
     std::uint32_t structural_origins                = 0;
     std::uint8_t structural_role                    = 0;
     bool ssd_eligible                               = false;
+    std::optional<std::uint32_t> first_volatile_token;
     PrefillWork protected_rebuild_work;
     std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};
@@ -1157,6 +1183,27 @@ public:
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
 
+    [[nodiscard]] bool
+    shared_prefix_matches(const FakeValidatedSharedPrefixImport& imported,
+                          const FakeSharedPrefixHandle& resident) const noexcept {
+        return imported.content_key == resident.content_key;
+    }
+
+    [[nodiscard]] FakeSharedPrefixPublication
+    adopt_shared_prefix(const FakeValidatedSharedPrefixImport& imported) {
+        ++shared_import_adoptions;
+        FakeSharedPrefixHandle handle;
+        handle.id          = next_shared_id_++;
+        handle.content_key = imported.content_key;
+        return {.handle = std::move(handle), .summary = imported.summary()};
+    }
+
+    [[nodiscard]] FakeReleaseResult
+    release_shared_prefix(FakeSharedPrefixHandle&& shared) noexcept {
+        released_shared_prefixes.push_back(shared.id);
+        return FakeReleaseResult{.status = ConsumeStatus::Consumed};
+    }
+
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
@@ -1218,6 +1265,8 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<std::uint32_t> released_shared_prefixes;
+    std::uint64_t shared_import_adoptions = 0;
     std::vector<std::string_view> timeline;
 
 private:
@@ -1797,31 +1846,33 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
 }
 
 struct FakePackage {
-    using Program                    = FakeProgram;
-    using PreparedPrompt             = FakePreparedPrompt;
-    using RequestBasePlan            = FakeRequestBasePlan;
-    using AdmissionCandidate         = FakeAdmissionCandidate;
-    using ResourcePlan               = FakeResourcePlan;
-    using PersistentBackfillProof    = FakePersistentBackfillProof;
-    using SequenceHandle             = FakeSequenceHandle;
-    using ContinuationHandle         = FakeContinuationHandle;
-    using SharedPrefixHandle         = FakeSharedPrefixHandle;
-    using CaptureOffer               = FakeCaptureOffer;
-    using ContinuationSummary        = FakeContinuationSummary;
-    using SharedPrefixSummary        = FakeSharedPrefixSummary;
-    using CaptureAssessment          = FakeCaptureAssessment;
-    using CapturePressurePlan        = FakeResourcePlan;
-    using ActiveCaptureResult        = FakeActiveCaptureResult;
-    using ContextTransactionProgress = FakeContextTransactionProgress;
-    using MaterializationResult      = FakeMaterializationResult;
-    using StartResult                = FakeStartResult;
-    using FinishResult               = FakeFinishResult;
-    using AbortResult                = FakeAbortResult;
-    using PressureTargetHandle       = FakePressureTargetHandle;
-    using AssessedPressureTarget     = FakeAssessedPressureTarget;
-    using CommitResult               = FakeCommitResult;
-    using DiscardResult              = FakeDiscardResult;
-    using CacheSessionKey            = FakeCacheSessionKey;
+    using Program                         = FakeProgram;
+    using PreparedPrompt                  = FakePreparedPrompt;
+    using RequestBasePlan                 = FakeRequestBasePlan;
+    using AdmissionCandidate              = FakeAdmissionCandidate;
+    using ResourcePlan                    = FakeResourcePlan;
+    using PersistentBackfillProof         = FakePersistentBackfillProof;
+    using SequenceHandle                  = FakeSequenceHandle;
+    using ContinuationHandle              = FakeContinuationHandle;
+    using SharedPrefixHandle              = FakeSharedPrefixHandle;
+    using ValidatedSharedPrefixImport     = FakeValidatedSharedPrefixImport;
+    using SharedPrefixPersistenceMetadata = FakeSharedPrefixPersistenceMetadata;
+    using CaptureOffer                    = FakeCaptureOffer;
+    using ContinuationSummary             = FakeContinuationSummary;
+    using SharedPrefixSummary             = FakeSharedPrefixSummary;
+    using CaptureAssessment               = FakeCaptureAssessment;
+    using CapturePressurePlan             = FakeResourcePlan;
+    using ActiveCaptureResult             = FakeActiveCaptureResult;
+    using ContextTransactionProgress      = FakeContextTransactionProgress;
+    using MaterializationResult           = FakeMaterializationResult;
+    using StartResult                     = FakeStartResult;
+    using FinishResult                    = FakeFinishResult;
+    using AbortResult                     = FakeAbortResult;
+    using PressureTargetHandle            = FakePressureTargetHandle;
+    using AssessedPressureTarget          = FakeAssessedPressureTarget;
+    using CommitResult                    = FakeCommitResult;
+    using DiscardResult                   = FakeDiscardResult;
+    using CacheSessionKey                 = FakeCacheSessionKey;
 };
 
 using FakeManager           = ninfer::runtime::ResourceManager<FakePackage>;
@@ -3229,6 +3280,68 @@ void test_shared_republication_replaces_catalog_metadata_with_owner() {
             "shared catalog replacement retained immutable metadata from the prior physical owner");
 }
 
+void test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity() {
+    FakeManager manager = make_manager(1, 2, 2);
+    FakeProgram program;
+    const auto imported = [](std::uint32_t content, std::uint32_t origins, std::uint8_t role,
+                             std::optional<std::uint32_t> cutoff = std::nullopt) {
+        return FakeValidatedSharedPrefixImport{
+            .imported_summary =
+                FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(content, 64)},
+            .imported_metadata =
+                FakeSharedPrefixPersistenceMetadata{
+                    .evidence             = ninfer::SharedCandidateEvidence::EngineStructural,
+                    .structural_origins   = origins,
+                    .structural_role      = role,
+                    .ssd_eligible         = true,
+                    .first_volatile_token = cutoff,
+                },
+            .content_key = content,
+        };
+    };
+
+    const auto first        = imported(501, 0x02, 1, 96);
+    const auto first_result = manager.adopt_imported_shared(program, first);
+    require(first_result.disposition == FakeManager::SharedImportDisposition::Published &&
+                first_result.slot == 0 && program.shared_import_adoptions == 1,
+            "first shared import was not published into a vacant shared cell");
+
+    const auto richer    = imported(501, 0x08, 2, 80);
+    const auto coalesced = manager.adopt_imported_shared(program, richer);
+    const auto merged    = manager.shared_catalog_metadata(0);
+    require(coalesced.disposition == FakeManager::SharedImportDisposition::Coalesced &&
+                coalesced.slot == 0 && program.shared_import_adoptions == 1 &&
+                merged.structural_origins == 0x0a && merged.structural_role == 2 &&
+                merged.first_volatile_token == 80,
+            "repeated shared import duplicated its semantic owner or lost cumulative provenance");
+
+    std::atomic<bool> cancelled{true};
+    const auto cancelled_import = imported(502, 0x08, 2);
+    const auto cancelled_result = manager.adopt_imported_shared(
+        program, cancelled_import, CancellationFlagView{.flag = &cancelled});
+    require(cancelled_result.disposition == FakeManager::SharedImportDisposition::Cancelled &&
+                program.shared_import_adoptions == 1,
+            "cancelled shared import reserved physical ownership");
+
+    cancelled.store(false);
+    const auto second_result = manager.adopt_imported_shared(program, cancelled_import);
+    require(second_result.disposition == FakeManager::SharedImportDisposition::Published &&
+                second_result.slot == 1 && program.shared_import_adoptions == 2,
+            "second exact shared owner was not published independently");
+
+    const auto overflow = imported(503, 0x08, 2);
+    bool rejected       = false;
+    try {
+        (void)manager.adopt_imported_shared(program, overflow);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected && program.shared_import_adoptions == 2 &&
+                manager.shared_catalog_metadata(0).state ==
+                    FakeManager::SharedCatalogState::Catalogued &&
+                manager.shared_catalog_metadata(1).state ==
+                    FakeManager::SharedCatalogState::Catalogued,
+            "shared catalog capacity failure changed a valid owner or reserved Program state");
+}
+
 void test_exact_shared_capture_merges_richer_structural_metadata() {
     FakeManager manager = make_manager(1, 2, 1);
     FakeProgram program;
@@ -3859,6 +3972,8 @@ int main() {
              test_shared_capture_publishes_immutable_structural_metadata);
     run_test("shared capture republication metadata",
              test_shared_republication_replaces_catalog_metadata_with_owner);
+    run_test("shared snapshot transactional adoption",
+             test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity);
     run_test("exact shared capture metadata merge",
              test_exact_shared_capture_merges_richer_structural_metadata);
     run_test("shared capture multi-owner pressure",

@@ -96,6 +96,9 @@ struct RetainedSessionSnapshot {
     std::size_t transfer_bytes = 0;
     std::uint32_t tokens       = 0;
     std::string session_digest;
+    // Shared-prefix exports use this carrier too. For those records this is the SHA-256 digest
+    // of the exact semantic prefix identity; private NINFSES1 v3 writers leave it empty.
+    std::string content_digest;
     // Set only by begin_save_continuation(). Consumers must invoke this before reading bytes.
     // It waits for the producer event (not unrelated device work), then assembles `bytes` from
     // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
@@ -106,6 +109,21 @@ struct RetainedSessionSnapshot {
     // Internal lifetime settlement for pending CUDA work.  Consumers never need to invoke it.
     std::function<void()> settle_transfer;
     // An Engine-owned bounded-writer reservation, acquired before staging allocation.
+};
+
+// Policy provenance attached to a complete shared-prefix owner. It is separate from
+// PrefixIdentity: coincident roles/origins describe one semantic owner and never make a second
+// physical cache entry. `first_volatile_token` is cumulative; a durable frontier must be strictly
+// before it when present.
+struct SharedPrefixPersistenceMetadata {
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+    std::uint32_t structural_origins = 0;
+    std::uint8_t structural_role     = 0;
+    bool ssd_eligible                = false;
+    std::optional<std::uint32_t> first_volatile_token;
+
+    [[nodiscard]] friend bool operator==(const SharedPrefixPersistenceMetadata&,
+                                         const SharedPrefixPersistenceMetadata&) noexcept = default;
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
@@ -783,6 +801,7 @@ struct CaptureAssessment {
     std::uint32_t structural_origins        = 0;
     std::uint8_t structural_role            = 0;
     bool ssd_eligible                       = false;
+    std::optional<std::uint32_t> first_volatile_token;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<runtime::CheckpointRecoveryAlternativeWork> projected_recovery_work;
@@ -800,6 +819,42 @@ template <class Variant>
 struct SharedPrefixPublication {
     SharedPrefixHandle<Variant> handle;
     SharedPrefixSummary summary;
+};
+
+// A checksum-verified, compatibility-checked shared snapshot held entirely in immutable Host
+// storage. Parsing and all bounded-length checks precede any Program physical reservation.
+template <class Variant>
+class ValidatedSharedPrefixImport {
+public:
+    ValidatedSharedPrefixImport() noexcept                                         = default;
+    ValidatedSharedPrefixImport(ValidatedSharedPrefixImport&&) noexcept            = default;
+    ValidatedSharedPrefixImport& operator=(ValidatedSharedPrefixImport&&) noexcept = default;
+
+    ValidatedSharedPrefixImport(const ValidatedSharedPrefixImport&)            = delete;
+    ValidatedSharedPrefixImport& operator=(const ValidatedSharedPrefixImport&) = delete;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return implementation_ != nullptr; }
+
+    [[nodiscard]] const SharedPrefixSummary& summary() const noexcept { return summary_; }
+
+    [[nodiscard]] const SharedPrefixPersistenceMetadata& metadata() const noexcept {
+        return metadata_;
+    }
+
+    [[nodiscard]] std::string_view content_digest() const noexcept { return content_digest_; }
+
+private:
+    std::shared_ptr<const void> implementation_;
+    // A validated payload is sealed to the exact Program lifetime which interpreted its private
+    // State/KV geometry. Retaining the token prevents allocator address reuse from impersonating
+    // a destroyed parsing Program.
+    std::shared_ptr<const void> validating_program_;
+    SharedPrefixSummary summary_;
+    SharedPrefixPersistenceMetadata metadata_;
+    std::string content_digest_;
+
+    friend class Program<Variant>;
+    friend struct detail::RuntimeContractAccess<Variant>;
 };
 
 struct MaterializationVictimResult;
@@ -1050,6 +1105,25 @@ public:
     // it into the transfer stats the context-cache transactions cannot observe.
     [[nodiscard]] SessionSnapshotTraffic session_snapshot_traffic() const noexcept;
 
+    // Complete shared-owner persistence. Export reuses the private snapshot's bounded transfer
+    // carrier/source-pin lifetime but writes a distinct NINFSHR1 v1 envelope. Parsing performs
+    // checksum, length, identity and compatibility checks without reserving State/KV; adoption
+    // seals the Host plan into a shared owner and never allocates a private continuation slot.
+    [[nodiscard]] RetainedSessionSnapshot begin_export_shared_prefix(
+        const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
+        const SharedPrefixPersistenceMetadata& metadata,
+        const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
+    [[nodiscard]] RetainedSessionSnapshot
+    export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
+                         const SharedPrefixPersistenceMetadata& metadata);
+    [[nodiscard]] ValidatedSharedPrefixImport<Variant>
+    parse_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+                        const std::function<void()>& cancellation_checkpoint = {}) const;
+    [[nodiscard]] bool shared_prefix_matches(const ValidatedSharedPrefixImport<Variant>& imported,
+                                             const SharedPrefixHandle<Variant>& resident) const;
+    [[nodiscard]] SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported);
+
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
@@ -1058,8 +1132,10 @@ public:
     void reset_memory_peaks() noexcept;
 
 private:
-    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
+    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl,
+                     std::shared_ptr<const void> shared_import_identity) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
+    std::shared_ptr<const void> shared_import_identity_;
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
@@ -1071,6 +1147,22 @@ namespace detail {
 
 template <class Variant>
 struct RuntimeContractAccess {
+    [[nodiscard]] static ValidatedSharedPrefixImport<Variant>
+    make_shared_import(std::shared_ptr<const void> implementation, SharedPrefixSummary summary,
+                       SharedPrefixPersistenceMetadata metadata, std::string content_digest) {
+        ValidatedSharedPrefixImport<Variant> out;
+        out.implementation_ = std::move(implementation);
+        out.summary_        = std::move(summary);
+        out.metadata_       = std::move(metadata);
+        out.content_digest_ = std::move(content_digest);
+        return out;
+    }
+
+    [[nodiscard]] static const std::shared_ptr<const void>&
+    implementation(const ValidatedSharedPrefixImport<Variant>& imported) noexcept {
+        return imported.implementation_;
+    }
+
     [[nodiscard]] static SequenceHandle<Variant>
     make_sequence(const void* owner, runtime::LaneId lane, std::uint64_t epoch) noexcept {
         SequenceHandle<Variant> out;

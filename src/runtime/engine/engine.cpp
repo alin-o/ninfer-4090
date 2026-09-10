@@ -8,8 +8,10 @@
 #include "runtime/engine/auto_save_writer.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/shared_snapshot_test_access.h"
 #include "targets/registry.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -729,6 +731,158 @@ void Engine::reset_memory_peaks() noexcept {
             }
         },
         impl_->core);
+}
+
+std::pair<std::uint32_t, targets::qwen3_6::RetainedSessionSnapshot>
+runtime::testing::SharedSnapshotTestAccess::export_first_durable(Engine& engine) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::uint32_t capacity =
+        engine.impl_->options.context_cache.max_shared_prefixes.value_or(0);
+    std::string rejections;
+    for (std::uint32_t slot = 0; slot < capacity; ++slot) {
+        try {
+            return {slot, export_slot(engine, slot)};
+        } catch (const std::invalid_argument& error) {
+            if (!rejections.empty()) { rejections += "; "; }
+            rejections += "slot " + std::to_string(slot) + ": " + error.what();
+        }
+    }
+    throw std::invalid_argument("Engine has no durable shared prefix" +
+                                (rejections.empty() ? std::string{} : ": " + rejections));
+}
+
+targets::qwen3_6::RetainedSessionSnapshot
+runtime::testing::SharedSnapshotTestAccess::export_slot(Engine& engine, std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
+            if constexpr (requires { core->begin_export_shared_prefix(slot, binding); }) {
+                return core->begin_export_shared_prefix(slot, binding);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+runtime::testing::SharedSnapshotImportObservation
+runtime::testing::SharedSnapshotTestAccess::import(Engine& engine,
+                                                   std::span<const std::uint8_t> bytes) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> SharedSnapshotImportObservation {
+            if constexpr (requires {
+                              core->import_shared_prefix(bytes, binding);
+                              core->shared_prefix_slot_summary(std::uint32_t{});
+                          }) {
+                const auto result  = core->import_shared_prefix(bytes, binding);
+                const auto summary = core->shared_prefix_slot_summary(result.slot);
+                if (!summary) {
+                    throw std::logic_error("shared import result has no catalogued summary");
+                }
+                return {.disposition      = static_cast<std::uint32_t>(result.disposition),
+                        .slot             = result.slot,
+                        .frontier         = summary->checkpoint.ref.frontier,
+                        .main_frontier    = summary->checkpoint.required_kv.main_frontier,
+                        .backend_frontier = summary->checkpoint.required_kv.backend_frontier,
+                        .state_residency  = summary->checkpoint.state_residency};
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+std::uint32_t
+runtime::testing::SharedSnapshotTestAccess::import_cancelled(Engine& engine,
+                                                             std::span<const std::uint8_t> bytes) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    std::atomic<bool> cancelled{true};
+    return std::visit(
+        [&](auto& core) -> std::uint32_t {
+            if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
+                try {
+                    const auto result = core->import_shared_prefix(
+                        bytes, binding, runtime::CancellationFlagView{.flag = &cancelled});
+                    return static_cast<std::uint32_t>(result.disposition);
+                } catch (const RequestError& error) {
+                    if (error.kind() == RequestErrorKind::Cancelled) { return 2U; }
+                    throw;
+                }
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+runtime::testing::SealedSharedSnapshotTestImport
+runtime::testing::SharedSnapshotTestAccess::parse(Engine& engine,
+                                                  std::span<const std::uint8_t> bytes) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> SealedSharedSnapshotTestImport {
+            if constexpr (requires { core->parse_shared_prefix_for_test(bytes, binding); }) {
+                auto parsed  = core->parse_shared_prefix_for_test(bytes, binding);
+                using Import = std::remove_cvref_t<decltype(parsed)>;
+                SealedSharedSnapshotTestImport out;
+                out.storage_ = std::make_shared<Import>(std::move(parsed));
+                out.type_    = &typeid(Import);
+                return out;
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::import_validated(
+    Engine& engine, const SealedSharedSnapshotTestImport& imported) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    if (!imported.storage_ || imported.type_ == nullptr) {
+        throw std::invalid_argument("sealed shared snapshot test import is empty");
+    }
+    std::visit(
+        [&](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                using Core = typename CoreState::element_type;
+                if constexpr (requires { typename Core::ValidatedSharedPrefixImport; }) {
+                    using Import = typename Core::ValidatedSharedPrefixImport;
+                    if (*imported.type_ != typeid(Import)) {
+                        throw std::invalid_argument("sealed shared snapshot target family differs");
+                    }
+                    (void)core->adopt_validated_shared_prefix_for_test(
+                        *std::static_pointer_cast<Import>(imported.storage_));
+                } else {
+                    throw std::logic_error("shared snapshots require a generation Engine");
+                }
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellation(
+    Engine& engine, std::span<const std::uint8_t> bytes, std::atomic<bool>& cancellation) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> std::uint32_t {
+            if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
+                const auto result = core->import_shared_prefix(
+                    bytes, binding, runtime::CancellationFlagView{.flag = &cancellation});
+                return static_cast<std::uint32_t>(result.disposition);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
 }
 
 } // namespace ninfer

@@ -365,14 +365,16 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix) {
-                auto group = std::find_if(base->shared_candidates.begin(), base->shared_candidates.end(),
-                                          [&](const CaptureGroup& value) {
-                                              return value.frontier == opportunity.frontier;
-                                          });
+                auto group =
+                    std::find_if(base->shared_candidates.begin(), base->shared_candidates.end(),
+                                 [&](const CaptureGroup& value) {
+                                     return value.frontier == opportunity.frontier;
+                                 });
                 if (group != base->shared_candidates.end()) {
                     group->structural_origins |= opportunity.structural_origins;
-                    group->structural_role = opportunity.structural_role;
-                    group->ssd_eligible = group->ssd_eligible || opportunity.ssd_eligible;
+                    group->structural_role      = opportunity.structural_role;
+                    group->ssd_eligible         = group->ssd_eligible || opportunity.ssd_eligible;
+                    group->first_volatile_token = base->context_cache.first_volatile_token;
                 }
             }
         }
@@ -1273,7 +1275,8 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
             if (selected->structural_role != qwen3_6::SharedPrefixRole::Transient) {
                 existing->structural_role = selected->structural_role;
             }
-            existing->ssd_eligible = selected->ssd_eligible;
+            existing->ssd_eligible         = selected->ssd_eligible;
+            existing->first_volatile_token = selected->first_volatile_token;
         }
     }
     plan.shared_candidates.clear();

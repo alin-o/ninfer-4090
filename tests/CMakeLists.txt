@@ -140,6 +140,8 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
           targets/qwen3_6_27b/test_context_transfer_failure.cu
   LIBRARIES ninfer_engine CUDA::cudart CUDA::cuda_driver)
+target_include_directories(ninfer_qwen3_6_27b_prefix_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp

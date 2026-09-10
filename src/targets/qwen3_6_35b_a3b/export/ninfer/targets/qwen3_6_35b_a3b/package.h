@@ -95,6 +95,8 @@ struct Package {
     using SequenceHandle             = qwen3_6::SequenceHandle<detail::Variant>;
     using ContinuationHandle         = qwen3_6::ContinuationHandle<detail::Variant>;
     using SharedPrefixHandle         = qwen3_6::SharedPrefixHandle<detail::Variant>;
+    using ValidatedSharedPrefixImport     = qwen3_6::ValidatedSharedPrefixImport<detail::Variant>;
+    using SharedPrefixPersistenceMetadata = qwen3_6::SharedPrefixPersistenceMetadata;
     using CaptureOffer               = qwen3_6::CaptureOffer<detail::Variant>;
     using CacheSessionKey            = qwen3_6::PreparedSessionKey;
     using ContinuationSummary        = qwen3_6::ContinuationSummary;

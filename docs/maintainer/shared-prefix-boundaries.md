@@ -33,3 +33,7 @@ The repository-local provenance artifact is
 `docs/maintainer/port-reference/ninfer-boundary-port-reference-manifest.json`.
 It records the upstream source revision and hashes; tests use local fixtures and
 do not require an upstream checkout.
+
+Complete durable export/import of an eligible shared owner is specified separately in
+[Complete shared-prefix snapshot format](shared-prefix-snapshot.md). Boundary classification stays
+in Frontend; the physical State/KV codec stays in Program.

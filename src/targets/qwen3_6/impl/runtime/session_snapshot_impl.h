@@ -589,10 +589,14 @@ ProgramImplCore::begin_save_continuation(const ContinuationHandle& continuation,
                            snapshot_traffic_.backend_kv_d2h_bytes);
     }
     // Keep the producer event with the immutable host payload. The Engine's bounded writer
-    // waits for it off the execution worker, while later transfer-stream work remains ordered
-    // after these source reads before any source can be reused.
+    // waits for it off the execution worker.  Crucially, make the execution stream depend on
+    // that event before returning the source slots to the cache: an eviction may immediately
+    // recycle a StateImage/KV page, and a later kernel must not overwrite it while this D2H
+    // read is still in flight.  This is a stream dependency, not a device-wide synchronize.
+    // Later transfer-stream users are already ordered by stream FIFO.
     auto completion = std::make_shared<CudaCompletionEvent>(device);
     completion->record(device.transfer_stream);
+    completion->wait(device.stream);
     snapshot.await_transfer = [this, completion] {
         device.bind_to_current_thread();
         completion->synchronize();

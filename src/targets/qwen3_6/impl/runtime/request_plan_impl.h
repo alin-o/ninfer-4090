@@ -554,30 +554,6 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         }
     }
 
-    // A Host-backed checkpoint is a retained cache owner, even when this request would otherwise
-    // consume its private lineage.  H2D materialization creates a second replica; consuming the
-    // source immediately afterwards promotes that replica to mutable state and releases the Host
-    // extent before pressure can reclaim the duplicate Device copy.  Retaining the source makes
-    // the active request fork from the restored prefix, so the Host backing remains available
-    // until its catalogued owner is actually released.
-    if (source != nullptr && plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
-        const StateImageHandle selected =
-            selected_state(*source, plan->reuse, plan->selected_checkpoint);
-        const bool state_backed_by_host =
-            state_store->residency(selected) == StateReplicaResidency::HostOnly ||
-            state_store->residency(selected) == StateReplicaResidency::Both;
-        const bool text_backed_by_host =
-            source->kv && host_kv_prefix_bytes(*text_kv_addresses, source->kv->text,
-                                                plan->reuse_base) != 0;
-        const bool backend_backed_by_host =
-            source->kv && source->kv->backend && backend_kv_addresses &&
-            host_kv_prefix_bytes(*backend_kv_addresses, *source->kv->backend,
-                                 backend_frontier_at(speculative_backend, plan->reuse_base)) != 0;
-        if (state_backed_by_host || text_backed_by_host || backend_backed_by_host) {
-            plan->source_mode = runtime::PrivateSourceMode::Retain;
-        }
-    }
-
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::PrivateEndpoint && source != nullptr &&

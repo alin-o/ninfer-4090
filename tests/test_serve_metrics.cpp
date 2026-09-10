@@ -31,13 +31,13 @@ std::map<std::string, double> parse(const std::string& body) {
 GenerationOutcome outcome(int prompt, std::uint32_t cached, int completion, double prefill_s,
                           double decode_s, std::uint64_t drafted, std::uint64_t accepted) {
     GenerationOutcome out;
-    out.prompt_tokens                        = prompt;
-    out.completion_tokens                    = completion;
-    out.metrics.prefix_cache_hit_tokens      = cached;
-    out.metrics.prefill_seconds              = prefill_s;
-    out.metrics.decode_seconds               = decode_s;
-    out.metrics.speculative_draft_tokens     = drafted;
-    out.metrics.speculative_accepted_tokens  = accepted;
+    out.prompt_tokens                       = prompt;
+    out.completion_tokens                   = completion;
+    out.metrics.prefix_cache_hit_tokens     = cached;
+    out.metrics.prefill_seconds             = prefill_s;
+    out.metrics.decode_seconds              = decode_s;
+    out.metrics.speculative_draft_tokens    = drafted;
+    out.metrics.speculative_accepted_tokens = accepted;
     return out;
 }
 
@@ -57,13 +57,13 @@ int main() {
     failures += check(empty.at("ninfer:requests_total") == 0.0, "requests start at zero");
     failures += check(empty.at("llamacpp:requests_processing") == 0.0, "idle processing");
     failures += check(empty.at("llamacpp:requests_deferred") == 0.0, "idle deferred");
-    failures += check(empty.at("ninfer:auto_save_queued_jobs") == 0.0,
-                      "auto-save queue starts empty");
+    failures +=
+        check(empty.at("ninfer:auto_save_queued_jobs") == 0.0, "auto-save queue starts empty");
     failures += check(empty.at("ninfer:auto_save_reserved_jobs") == 0.0 &&
                           empty.at("ninfer:auto_save_reserved_bytes") == 0.0,
                       "auto-save reservations start empty");
-    failures += check(empty.at("ninfer:auto_save_in_flight_jobs") == 0.0,
-                      "auto-save writer starts idle");
+    failures +=
+        check(empty.at("ninfer:auto_save_in_flight_jobs") == 0.0, "auto-save writer starts idle");
 
     // Two in-flight requests against one execution lane: FIFO order says the
     // older one processes and the newer one is deferred.
@@ -94,34 +94,58 @@ int main() {
     failures += check(warm.prompt_tokens == 1200 && warm.cached_tokens == 900,
                       "last completed after warm request");
 
-    live.computed_prefill_tokens = 1300;
-    live.prefill_seconds_total   = 0.6;
-    live.committed_decode_tokens = 300;
-    live.decode_seconds_total    = 6.0;
-    live.auto_save_queued_jobs = 2;
-    live.auto_save_queued_bytes = 4096;
-    live.auto_save_in_flight_jobs = 1;
-    live.auto_save_in_flight_bytes = 1024;
-    live.auto_save_reserved_jobs = 3;
-    live.auto_save_reserved_bytes = 8192;
-    live.auto_save_rejected_jobs = 3;
-    const auto values = parse(metrics.render(1, live));
+    live.computed_prefill_tokens                            = 1300;
+    live.prefill_seconds_total                              = 0.6;
+    live.committed_decode_tokens                            = 300;
+    live.decode_seconds_total                               = 6.0;
+    live.auto_save_queued_jobs                              = 2;
+    live.auto_save_queued_bytes                             = 4096;
+    live.auto_save_in_flight_jobs                           = 1;
+    live.auto_save_in_flight_bytes                          = 1024;
+    live.auto_save_reserved_jobs                            = 3;
+    live.auto_save_reserved_bytes                           = 8192;
+    live.auto_save_rejected_jobs                            = 3;
+    live.session_publications_explicit_total                = 4;
+    live.session_publications_initial_prefix_total          = 2;
+    live.session_supersessions_total                        = 3;
+    live.session_late_publications_rejected_total           = 1;
+    live.reclaimed_device_main_kv_pages_total               = 17;
+    live.reclaimed_host_kv_bytes_total                      = 8192;
+    live.context_cache_owners[ninfer::context_cache_owner_metric_index(
+        ninfer::ContextCacheMetricRole::ConversationHead,
+        ninfer::ContextCacheMetricPlacement::Device, ninfer::ContextCacheMetricPin::Unpinned,
+        ninfer::ContextCacheMetricIdentity::InitialPrefix)] = 1;
+    const auto values                                       = parse(metrics.render(1, live));
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "live prefill tokens");
     failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "live prefill seconds");
     failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "live decode tokens");
-    failures += check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0,
-                      "live decode seconds");
+    failures +=
+        check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0, "live decode seconds");
     failures += check(values.at("ninfer:requests_total") == 2.0, "request count");
     failures += check(values.at("ninfer:prefix_cache_hit_tokens_total") == 900.0, "cache hits");
     failures += check(values.at("ninfer:draft_tokens_total") == 450.0, "draft tokens");
     failures += check(values.at("ninfer:draft_accepted_tokens_total") == 225.0, "accepted tokens");
-    failures += check(values.at("ninfer:auto_save_queued_bytes") == 4096.0,
-                      "auto-save queue bytes");
+    failures +=
+        check(values.at("ninfer:auto_save_queued_bytes") == 4096.0, "auto-save queue bytes");
     failures += check(values.at("ninfer:auto_save_reserved_jobs") == 3.0 &&
                           values.at("ninfer:auto_save_reserved_bytes") == 8192.0,
                       "auto-save reservation gauges");
-    failures += check(values.at("ninfer:auto_save_in_flight_jobs") == 1.0,
-                      "auto-save active writer jobs");
+    failures +=
+        check(values.at("ninfer:auto_save_in_flight_jobs") == 1.0, "auto-save active writer jobs");
+    failures += check(
+        values.at("ninfer:session_publications_total{identity=\"explicit\"}") == 4.0 &&
+            values.at("ninfer:session_publications_total{identity=\"initial_prefix\"}") == 2.0 &&
+            values.at("ninfer:session_supersessions_total") == 3.0 &&
+            values.at("ninfer:session_late_publications_rejected_total") == 1.0,
+        "bounded session identity and supersession metrics");
+    failures += check(values.at("ninfer:context_cache_reclaimed_capacity_total{tier=\"device\","
+                                "resource=\"main_kv_pages\"}") == 17.0 &&
+                          values.at("ninfer:context_cache_reclaimed_capacity_total{tier=\"host\","
+                                    "resource=\"kv_bytes\"}") == 8192.0,
+                      "Program-projected reclaimed-capacity metrics");
+    failures += check(values.at("ninfer:context_cache_owners{role=\"conversation_head\",placement="
+                                "\"device\",pin=\"unpinned\",identity=\"initial_prefix\"}") == 1.0,
+                      "bounded role/placement/pin/identity owner metric");
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));

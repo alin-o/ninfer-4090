@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -186,7 +187,7 @@ struct EngineOptions {
     std::size_t auto_save_queue_bytes  = 0;
     // Optional observer for auto-save outcomes; called on the writer thread.
     std::function<void(const SlotAutoSaveEvent&)> auto_save_listener;
-    KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -700,6 +701,13 @@ struct MaterializationDiagnostics {
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
     bool selected_maximal_fallback           = false;
+    // Exact unique removals projected by Program for the selected complete pressure target.
+    // Zero is meaningful, including deletion of a logical alias whose backing remains shared.
+    std::uint32_t reclaimed_device_state_slots      = 0;
+    std::uint32_t reclaimed_device_main_kv_pages    = 0;
+    std::uint32_t reclaimed_device_backend_kv_pages = 0;
+    std::uint32_t reclaimed_host_state_slots        = 0;
+    std::size_t reclaimed_host_kv_bytes             = 0;
 
     /**
      * The most reusable candidate the search actually ASSESSED, with what the cost model
@@ -830,6 +838,53 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+enum class ContextCacheMetricRole : std::uint8_t {
+    Harness,
+    Project,
+    ConversationHead,
+    Transient,
+    Count,
+};
+
+enum class ContextCacheMetricPlacement : std::uint8_t {
+    Device,
+    Host,
+    Both,
+    Count,
+};
+
+enum class ContextCacheMetricPin : std::uint8_t {
+    Unpinned,
+    Pinned,
+    Count,
+};
+
+enum class ContextCacheMetricIdentity : std::uint8_t {
+    None,
+    Explicit,
+    InitialPrefix,
+    Count,
+};
+
+inline constexpr std::size_t kContextCacheOwnerMetricCount =
+    static_cast<std::size_t>(ContextCacheMetricRole::Count) *
+    static_cast<std::size_t>(ContextCacheMetricPlacement::Count) *
+    static_cast<std::size_t>(ContextCacheMetricPin::Count) *
+    static_cast<std::size_t>(ContextCacheMetricIdentity::Count);
+
+[[nodiscard]] inline constexpr std::size_t
+context_cache_owner_metric_index(ContextCacheMetricRole role, ContextCacheMetricPlacement placement,
+                                 ContextCacheMetricPin pin,
+                                 ContextCacheMetricIdentity identity) noexcept {
+    return (((static_cast<std::size_t>(role) *
+                  static_cast<std::size_t>(ContextCacheMetricPlacement::Count) +
+              static_cast<std::size_t>(placement)) *
+                 static_cast<std::size_t>(ContextCacheMetricPin::Count) +
+             static_cast<std::size_t>(pin)) *
+                static_cast<std::size_t>(ContextCacheMetricIdentity::Count) +
+            static_cast<std::size_t>(identity));
+}
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -914,17 +969,29 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+    // Bounded logical-owner gauges. Placement is the checkpoint State placement reported by
+    // Program; `pin` means an active edge or transaction claim protects the logical owner.
+    std::array<std::uint32_t, kContextCacheOwnerMetricCount> context_cache_owners{};
+    std::uint64_t session_publications_explicit_total       = 0;
+    std::uint64_t session_publications_initial_prefix_total = 0;
+    std::uint64_t session_supersessions_total               = 0;
+    std::uint64_t session_late_publications_rejected_total  = 0;
+    std::uint64_t reclaimed_device_state_slots_total        = 0;
+    std::uint64_t reclaimed_device_main_kv_pages_total      = 0;
+    std::uint64_t reclaimed_device_backend_kv_pages_total   = 0;
+    std::uint64_t reclaimed_host_state_slots_total          = 0;
+    std::uint64_t reclaimed_host_kv_bytes_total             = 0;
     // Auto-save work retained outside the scheduler. These are current gauges, sampled without
     // taking the Engine execution lock, so metrics remain available while a writer is blocked.
-    std::uint32_t auto_save_queued_jobs = 0;
-    std::uint64_t auto_save_queued_bytes = 0;
-    std::uint32_t auto_save_in_flight_jobs = 0;
+    std::uint32_t auto_save_queued_jobs     = 0;
+    std::uint64_t auto_save_queued_bytes    = 0;
+    std::uint32_t auto_save_in_flight_jobs  = 0;
     std::uint64_t auto_save_in_flight_bytes = 0;
     // Complete queue reservations, including producer backing/source pins retained after the
     // writer finishes until Program-side retirement at an Engine unit boundary.
-    std::uint32_t auto_save_reserved_jobs = 0;
+    std::uint32_t auto_save_reserved_jobs  = 0;
     std::uint64_t auto_save_reserved_bytes = 0;
-    std::uint64_t auto_save_rejected_jobs = 0;
+    std::uint64_t auto_save_rejected_jobs  = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -985,10 +1052,10 @@ struct SlotCheckpoint {
 // treat it as opaque and may pass it back as a slot-operation precondition. checkpoints lists
 // the retained turn checkpoints (oldest first) a diverging prompt can restore from.
 struct SlotState {
-    bool processing              = false;
-    bool retained                = false;
-    std::uint32_t prompt_tokens  = 0;
-    std::uint32_t cached_tokens  = 0;
+    bool processing             = false;
+    bool retained               = false;
+    std::uint32_t prompt_tokens = 0;
+    std::uint32_t cached_tokens = 0;
     std::string session_digest;
     std::vector<SlotCheckpoint> checkpoints;
 };

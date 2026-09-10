@@ -68,6 +68,47 @@ constexpr std::array<std::pair<std::string_view, TokenId>, 7> kConfigOnlyTokens 
     {"<|audio_pad|>", 248076},
 }};
 
+std::optional<PreparedSessionKey>
+initial_prefix_session_key(std::span<const ChatRole> roles,
+                           std::span<const std::optional<std::uint32_t>> message_boundaries,
+                           std::span<const TokenId> tokens, bool has_media) {
+    // Ported source semantics: without an explicit identity, hash the exact rendered token prefix
+    // before the first Assistant message that follows a User message. A system/project harness by
+    // itself is deliberately insufficient, and media is excluded until its cache-lineage contract
+    // has equivalent source evidence.
+    if (has_media || message_boundaries.size() != roles.size() + 1U) { return std::nullopt; }
+    bool saw_user = false;
+    std::optional<std::uint32_t> frontier;
+    for (std::size_t index = 0; index < roles.size(); ++index) {
+        saw_user = saw_user || roles[index] == ChatRole::User;
+        if (saw_user && roles[index] == ChatRole::Assistant) {
+            frontier = message_boundaries[index];
+            break;
+        }
+    }
+    if (!frontier || *frontier == 0 || *frontier > tokens.size()) { return std::nullopt; }
+
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (const TokenId token : tokens.first(*frontier)) {
+        const auto value = static_cast<std::uint32_t>(token);
+        for (unsigned shift = 0; shift != 32; shift += 8) {
+            digest ^= static_cast<std::uint8_t>(value >> shift);
+            digest *= 1099511628211ULL;
+        }
+    }
+    constexpr char digits[] = "0123456789abcdef";
+    PreparedSessionKey key;
+    key.identity_kind                = runtime::SessionIdentityKind::InitialPrefix;
+    constexpr std::string_view label = "initial_prefix:";
+    key.size                         = static_cast<std::uint16_t>(label.size() + 16U);
+    std::copy(label.begin(), label.end(), key.bytes.begin());
+    for (std::size_t index = 0; index < 16U; ++index) {
+        const unsigned shift            = static_cast<unsigned>((15U - index) * 4U);
+        key.bytes[label.size() + index] = digits[(digest >> shift) & 0xFU];
+    }
+    return key;
+}
+
 Json parse_resource_json(std::string_view bytes, std::string_view name) {
     try {
         Json result = Json::parse(bytes);
@@ -703,7 +744,7 @@ PreparedContextCache prepare_context_cache(
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier,
     std::span<const fi::EncodedChat::StructuralBoundary> structural_boundaries = {},
-    std::optional<std::uint32_t> first_volatile_token = std::nullopt) {
+    std::optional<std::uint32_t> first_volatile_token                          = std::nullopt) {
     constexpr std::size_t kMaximumExplicitMarkers = 4U;
     if (hints.markers.size() > kMaximumExplicitMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
@@ -720,7 +761,8 @@ PreparedContextCache prepare_context_cache(
         PreparedSessionKey key;
         key.size = static_cast<std::uint16_t>(hints.session_key->size());
         std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
-        out.session_key = key;
+        key.identity_kind = runtime::SessionIdentityKind::Explicit;
+        out.session_key   = key;
     }
     switch (hints.retention) {
     case CacheRetentionHint::Default:
@@ -870,23 +912,28 @@ PreparedContextCache prepare_context_cache(
         // are not SSD candidates until a media-aware persistence policy exists.
         const bool eligible = vision_items.empty() &&
                               (!first_volatile_token || *source.frontier < *first_volatile_token);
-        PreparedStructuralCheckpoint checkpoint{.frontier = *source.frontier,
-                                                 .origins = source.origins,
-                                                 .role = SharedPrefixRole::Transient,
-                                                 .ssd_eligible = eligible};
-        auto existing = std::find_if(out.structural_checkpoints.begin(), out.structural_checkpoints.end(),
-                                     [&](const auto& item) { return item.frontier == checkpoint.frontier; });
-        if (existing == out.structural_checkpoints.end()) { out.structural_checkpoints.push_back(checkpoint); }
-        else { existing->origins |= checkpoint.origins; existing->ssd_eligible |= checkpoint.ssd_eligible; }
+        PreparedStructuralCheckpoint checkpoint{.frontier     = *source.frontier,
+                                                .origins      = source.origins,
+                                                .role         = SharedPrefixRole::Transient,
+                                                .ssd_eligible = eligible};
+        auto existing =
+            std::find_if(out.structural_checkpoints.begin(), out.structural_checkpoints.end(),
+                         [&](const auto& item) { return item.frontier == checkpoint.frontier; });
+        if (existing == out.structural_checkpoints.end()) {
+            out.structural_checkpoints.push_back(checkpoint);
+        } else {
+            existing->origins |= checkpoint.origins;
+            existing->ssd_eligible |= checkpoint.ssd_eligible;
+        }
         if (hints.allow_engine_automatic_shared_prefixes) {
             add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
                             SharedCandidateEvidence::EngineStructural, *source.frontier,
                             engine_order++);
-            auto opportunity = std::find_if(out.opportunities.rbegin(), out.opportunities.rend(),
-                                            [&](const auto& value) {
-                                                return value.kind == PromptCacheMarkerKind::SharedStablePrefix &&
-                                                       value.frontier == *source.frontier;
-                                            });
+            auto opportunity = std::find_if(
+                out.opportunities.rbegin(), out.opportunities.rend(), [&](const auto& value) {
+                    return value.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                           value.frontier == *source.frontier;
+                });
             if (opportunity != out.opportunities.rend()) {
                 opportunity->structural_origins |= source.origins;
                 opportunity->ssd_eligible = eligible;
@@ -894,20 +941,21 @@ PreparedContextCache prepare_context_cache(
         }
     }
     std::uint32_t project_frontier = 0;
-    bool has_project_frontier = false;
+    bool has_project_frontier      = false;
     for (const auto& checkpoint : out.structural_checkpoints) {
         if ((checkpoint.origins & SharedPrefixProjectContext) != 0) {
-            project_frontier = std::max(project_frontier, checkpoint.frontier);
+            project_frontier     = std::max(project_frontier, checkpoint.frontier);
             has_project_frontier = true;
         }
     }
     // A bounded initial-user envelope starts at rendered/token frontier zero. It cannot be a
     // capture itself, but it remains a real project delimiter for selecting its instruction
     // descendant as the project anchor.
-    has_project_frontier = has_project_frontier || std::any_of(
-        structural_boundaries.begin(), structural_boundaries.end(), [](const auto& source) {
-            return (source.origins & SharedPrefixProjectContext) != 0;
-        });
+    has_project_frontier =
+        has_project_frontier ||
+        std::any_of(
+            structural_boundaries.begin(), structural_boundaries.end(),
+            [](const auto& source) { return (source.origins & SharedPrefixProjectContext) != 0; });
     // Port the bounded upstream selection: only the deepest stable anchor on each side of a
     // project boundary is retained. Without a project, select the deepest stable harness
     // (preferring a cache-marker anchor when present).
@@ -953,8 +1001,8 @@ PreparedContextCache prepare_context_cache(
     // and project anchors may be considered by a future SSD policy; all other structural
     // observations remain transient even when they precede the volatility cutoff.
     for (auto& checkpoint : out.structural_checkpoints) {
-        checkpoint.ssd_eligible = checkpoint.ssd_eligible &&
-                                  checkpoint.role != SharedPrefixRole::Transient;
+        checkpoint.ssd_eligible =
+            checkpoint.ssd_eligible && checkpoint.role != SharedPrefixRole::Transient;
     }
     for (auto& opportunity : out.opportunities) {
         for (const auto& checkpoint : out.structural_checkpoints) {
@@ -962,7 +1010,7 @@ PreparedContextCache prepare_context_cache(
                 opportunity.frontier == checkpoint.frontier) {
                 opportunity.structural_origins |= checkpoint.origins;
                 opportunity.structural_role = checkpoint.role;
-                opportunity.ssd_eligible = checkpoint.ssd_eligible;
+                opportunity.ssd_eligible    = checkpoint.ssd_eligible;
             }
         }
     }
@@ -1466,9 +1514,10 @@ PreparedContextCache FrontendTestAccess::structural_diagnostics(
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start              = Clock::now();
-    const PromptOptions options   = input.options;
-    ContextCacheHints cache_hints = std::move(input.context_cache);
+    const auto start                             = Clock::now();
+    const PromptOptions options                  = input.options;
+    ContextCacheHints cache_hints                = std::move(input.context_cache);
+    const CacheRetentionHint requested_retention = cache_hints.retention;
     if (cache_hints.markers.size() > 4U) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
@@ -1542,10 +1591,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
-        message_boundaries = std::move(processed.message_boundaries);
-        cache_boundaries   = std::move(processed.cache_boundaries);
+        message_boundaries    = std::move(processed.message_boundaries);
+        cache_boundaries      = std::move(processed.cache_boundaries);
         structural_boundaries = std::move(processed.structural_boundaries);
-        first_volatile_token = processed.first_volatile_token;
+        first_volatile_token  = processed.first_volatile_token;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
@@ -1562,18 +1611,28 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
-        message_boundaries = std::move(encoded.message_boundaries);
-        cache_boundaries   = std::move(encoded.cache_boundaries);
+        message_boundaries    = std::move(encoded.message_boundaries);
+        cache_boundaries      = std::move(encoded.cache_boundaries);
         structural_boundaries = std::move(encoded.structural_boundaries);
-        first_volatile_token = encoded.first_volatile_token;
+        first_volatile_token  = encoded.first_volatile_token;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
-    result.context_cache     = prepare_context_cache(
+    const std::optional<PreparedSessionKey> inferred_session =
+        cache_hints.session_key ? std::nullopt
+                                : initial_prefix_session_key(message_roles, message_boundaries,
+                                                             result.token_ids, has_media);
+    result.context_cache = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()), structural_boundaries, first_volatile_token);
+    if (inferred_session) {
+        result.context_cache.session_key = inferred_session;
+        if (requested_retention == CacheRetentionHint::Default) {
+            result.context_cache.retention = runtime::RetentionClass::LiveSession;
+        }
+    }
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();

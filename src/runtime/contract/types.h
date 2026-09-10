@@ -357,6 +357,15 @@ enum class RetentionClass : std::uint8_t {
     Disposable,
 };
 
+// Logical conversation identity provenance. Explicit protocol/session identity and the
+// content-derived fallback intentionally occupy separate namespaces: the fallback is only a
+// cache-lineage heuristic and must never alias an explicit binding with the same bytes.
+enum class SessionIdentityKind : std::uint8_t {
+    None,
+    Explicit,
+    InitialPrefix,
+};
+
 enum class LogicalOwnerKind : std::uint8_t {
     PrivateContinuation,
     SharedPrefix,
@@ -537,6 +546,21 @@ struct PressurePhysicalGuidance {
     std::uint64_t normalized_residual_q20   = 0;
 };
 
+// Program-projected unique physical objects removed by a complete pressure target. Aliases,
+// active owners and transfer pins are resolved before these values leave Program; ResourceManager
+// must not recreate allocator accounting from logical owner counts.
+struct UniquePhysicalReclamation {
+    std::uint32_t device_state_slots      = 0;
+    std::uint32_t device_main_kv_pages    = 0;
+    std::uint32_t device_backend_kv_pages = 0;
+    std::uint32_t host_state_slots        = 0;
+    std::size_t host_kv_bytes             = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const UniquePhysicalReclamation&,
+               const UniquePhysicalReclamation&) noexcept = default;
+};
+
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
 // until the next session operation.  The common planner folds them immediately into owning values.
 struct PressureTargetGuidance {
@@ -556,6 +580,7 @@ struct PressureTargetAssessment {
         MaterializationPhysicalStatus::StructuralInvalid;
     PrivateSourceMode source_mode = PrivateSourceMode::ConsumeToActive;
     MaterializationMachineWork machine_work;
+    UniquePhysicalReclamation unique_reclamation;
     std::span<const PressureOwnerOutcome> owner_outcomes;
     std::span<const PressureCheckpointRecoveryImpact> checkpoint_impacts;
     PlanningCandidateId candidate;

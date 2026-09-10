@@ -209,6 +209,7 @@ struct ResourceCandidateState {
     // rewrites demand to the selected post-pressure peak, so regenerating an outcome from that
     // rewritten demand would compare it against a different problem at seal time.
     detail::PhysicalResources identity_pressure_deficit;
+    runtime::UniquePhysicalReclamation unique_reclamation;
     // A structurally valid pressure target can still be blocked by Host extent geometry even when
     // aggregate free bytes are sufficient. Keep the blocked allocation work explicit so a child
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
@@ -915,16 +916,18 @@ private:
         std::vector<DeviceKVPageHandle> backend_restore_destinations;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
-        bool state_restored                 = false;
-        bool transfer_submitted             = false;
-        std::uint8_t transfer_timer_mask    = 0;
-        bool prefix_tail_submitted          = false;
-        bool retained_tail_backup_submitted = false;
-        bool prefix_forks_ready             = false;
-        bool source_prepared                = false;
-        bool cancel_pending                 = false;
-        bool prepared                       = false;
-        bool terminal                       = false;
+        runtime::UniquePhysicalReclamation committed_reclamation;
+        bool state_restored                           = false;
+        bool transfer_submitted                       = false;
+        std::uint8_t transfer_timer_mask              = 0;
+        bool prefix_tail_submitted                    = false;
+        bool retained_tail_backup_submitted           = false;
+        bool prefix_forks_ready                       = false;
+        bool source_prepared                          = false;
+        bool cancel_pending                           = false;
+        bool submitted_snapshot_cancellation_observed = false;
+        bool prepared                                 = false;
+        bool terminal                                 = false;
     };
 
     std::uint64_t next_materialization_id_ = 1;
@@ -960,6 +963,7 @@ private:
         std::vector<runtime::ContextTransferRequirement> transfer_requirements;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
+        runtime::UniquePhysicalReclamation committed_reclamation;
         std::vector<std::uint32_t> victim_indices;
         std::vector<std::uint64_t> victim_generations;
         std::vector<MaterializationTransaction::PressureWork> pressure;
@@ -1074,6 +1078,8 @@ private:
     [[nodiscard]] detail::PhysicalResources
     resident_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    void observe_physical_reclamation(detail::PhysicalResources before,
+                                      runtime::UniquePhysicalReclamation& total) const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,

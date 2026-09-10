@@ -619,7 +619,14 @@ public:
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
-        diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
+        diagnostics.best_reuse_prompt_tokens     = best_offered_reuse(candidates);
+        diagnostics.reclaimed_device_state_slots = incumbent.unique_reclamation.device_state_slots;
+        diagnostics.reclaimed_device_main_kv_pages =
+            incumbent.unique_reclamation.device_main_kv_pages;
+        diagnostics.reclaimed_device_backend_kv_pages =
+            incumbent.unique_reclamation.device_backend_kv_pages;
+        diagnostics.reclaimed_host_state_slots = incumbent.unique_reclamation.host_state_slots;
+        diagnostics.reclaimed_host_kv_bytes    = incumbent.unique_reclamation.host_kv_bytes;
 
         Result result;
         result.plan                = std::move(*sealed);
@@ -703,6 +710,7 @@ private:
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
         std::uint32_t degradation_units = 0;
         bool root_maximal               = false;
+        UniquePhysicalReclamation unique_reclamation;
     };
 
     struct IdentityRoot {
@@ -1022,8 +1030,9 @@ private:
                     }
                     return outcomes;
                 }(),
-            .degradation_units = assessment.degradation_units,
-            .root_maximal      = assessment.root_maximal,
+            .degradation_units  = assessment.degradation_units,
+            .root_maximal       = assessment.root_maximal,
+            .unique_reclamation = assessment.unique_reclamation,
         };
     }
 

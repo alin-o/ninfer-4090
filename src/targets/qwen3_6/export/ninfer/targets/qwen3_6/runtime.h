@@ -82,7 +82,7 @@ struct RetainedSessionSnapshot {
     void release_storage() noexcept {
         bytes.clear();
         bytes.shrink_to_fit();
-        await_transfer = {};
+        await_transfer  = {};
         settle_transfer = {};
         queue_reservation.reset();
     }
@@ -809,6 +809,9 @@ template <class Variant>
 struct ActiveCaptureResult {
     runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
     bool capacity_preparation_committed      = false;
+    // Program-observed unique physical capacity actually released before this settlement. This
+    // can be nonzero for Aborted when cancellation arrives after an irreversible pressure step.
+    runtime::UniquePhysicalReclamation committed_reclamation;
     ContinuationSummary active_summary;
     std::optional<SharedPrefixPublication<Variant>> shared;
     std::vector<MaterializationVictimResult> victims;
@@ -848,6 +851,9 @@ struct MaterializationSharedSourceResult {
 template <class Variant>
 struct MaterializationResult {
     runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
+    // Unlike the planner projection, this is the committed subset observed at physical mutation
+    // boundaries and is therefore authoritative for both Published and partial Aborted outcomes.
+    runtime::UniquePhysicalReclamation committed_reclamation;
     std::optional<StartResult<Variant>> published;
     std::optional<MaterializationSourceResult> source;
     std::optional<MaterializationSharedSourceResult> shared_source;

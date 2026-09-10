@@ -128,6 +128,20 @@ NINFER_PREFIX_REAL_SCENARIO=pressure-resume \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+The calibration comparison and constrained four-request fallback are direct scenario invocations
+so their stdout (including fixture hashes) remains available:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=cache-fixture-equivalence \
+NINFER_REPORT_CACHE_FIXTURE_HASHES=1 \
+  build/tests/ninfer_qwen3_6_27b_prefix_real_test
+
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=four-request-root-fallback \
+  build/tests/ninfer_qwen3_6_27b_prefix_real_test
+```
+
 The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
 score tile, overlapping target suffixes, and repeated-window State/KV isolation:
 

@@ -92,6 +92,15 @@ state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-t
 session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. The DFlash
 backend is not supported.
 
+An explicit Engine `session_key` is the authoritative conversation identity. When it is absent,
+the Frontend may label a text-only multi-turn chat with a separate `initial_prefix` lineage: the
+hash covers the exact rendered token prefix before the first assistant message that follows a user
+message, including that first user lineage. A common system/developer harness alone is never enough,
+and single-turn, media, or structurally ambiguous input receives no inferred identity. This is only a
+candidate lookup heuristic; Program still verifies the complete token, position, mode, State, and KV
+identity. Explicit keys always take precedence, even if their bytes resemble the internal
+`initial_prefix:` label.
+
 When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
 about 147 MiB per entry (format version 2; a snapshot with an empty ring stays version 1,
 which binaries without ring support keep reading). The restored ring lets a later
@@ -107,6 +116,10 @@ save. Sessions never saved or restored have no binding and are not spilled; an e
 `slot auto-save file=... n_saved=...`. `/metrics` reports pending queue, active writer, rejected
 reservation, and total reserved job/byte series separately. The reserved gauges remain nonzero
 while completed producer backing or source pins await retirement at an Engine unit boundary.
+Each accepted snapshot reservation includes the exact serialized metadata, complete State image,
+Main KV and selected-backend KV payload, plus an equally sized pinned staging image. A full job or
+byte quota rejects the spill before D2H submission and does not retain source pins or partial
+buffers.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
@@ -886,6 +899,17 @@ counters as interval deltas; `occupancy` and `last_selection` are end-of-interva
 request-owned and appear only on the corresponding `request_done` event.
 `pressure.searches` counts plans accepted into Program resource transactions, including a transaction that later ends in
 request-local abort; committed victim counters likewise report the resulting stable cache changes.
+
+The Prometheus endpoint additionally publishes session publication counters split by the bounded
+`identity="explicit|initial_prefix"` label, supersession and late-publication rejection counters,
+and `ninfer:context_cache_owners` gauges. Owner labels are fixed enums:
+`role="harness|project|conversation_head|transient"`,
+`placement="device|host|both"`, `pin="unpinned|pinned"`, and
+`identity="none|explicit|initial_prefix"`. Here `pin` means a logical active edge or transaction
+claim, not a CUDA host-memory attribute. A current conversation head is preferred on Device but is
+not permanently pinned once unclaimed. `ninfer:context_cache_reclaimed_capacity_total` reports the
+Program-projected unique State-slot, KV-page, or Host-byte capacity actually removed by committed
+pressure outcomes. Deleting a shared alias can therefore produce an observable zero increment.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five

@@ -3793,6 +3793,13 @@ bool ProgramImplCore::compose_pressure_candidate(
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
+    details.unique_reclamation               = runtime::UniquePhysicalReclamation{
+                      .device_state_slots      = removed.device.state_slots,
+                      .device_main_kv_pages    = removed.device.main_kv_pages,
+                      .device_backend_kv_pages = removed.device.backend_kv_pages,
+                      .host_state_slots        = removed.host.state_slots,
+                      .host_kv_bytes           = removed.host.kv_bytes,
+    };
 
     if (projection->source_state_fork_required &&
         details.state_fork_required != *projection->source_state_fork_required) {
@@ -5892,9 +5899,14 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     if (transaction_ptr == nullptr || transaction_ptr->terminal) {
         throw std::logic_error("Program has no progressable context transaction");
     }
-    MaterializationTransaction& transaction = *transaction_ptr;
-    PressureTransition& pressure_transition = transaction.pressure_transition;
-    const auto collect_pressure_operations  = [&](MaterializationTransaction::PressureWork& work) {
+    MaterializationTransaction& transaction  = *transaction_ptr;
+    PressureTransition& pressure_transition  = transaction.pressure_transition;
+    const auto observe_committed_reclamation = [&](auto&& operation) {
+        const detail::PhysicalResources before = physical_occupancy();
+        operation();
+        observe_physical_reclamation(before, transaction.committed_reclamation);
+    };
+    const auto collect_pressure_operations = [&](MaterializationTransaction::PressureWork& work) {
         if (work.spill_pages > std::numeric_limits<std::uint64_t>::max() -
                                    transaction.operations.pressure_spill_pages) {
             transaction.operations.pressure_spill_pages = std::numeric_limits<std::uint64_t>::max();
@@ -6000,6 +6012,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         release_materialization_staging(transaction);
         transaction.terminal      = true;
         out.status                = runtime::ContextTransactionStatus::Aborted;
+        out.committed_reclamation = transaction.committed_reclamation;
         out.transfer_observations = std::move(transaction.transfer_observations);
         out.operations            = transaction.operations;
         complete_source_acknowledgement(false);
@@ -6008,7 +6021,15 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_shared_victim_acknowledgement();
     };
 
-    if (cancellation.requested()) { transaction.cancel_pending = true; }
+    if (cancellation.requested()) {
+        transaction.cancel_pending = true;
+        if (!transaction.submitted_snapshot_cancellation_observed &&
+            !snapshot_source_retirements_.empty() &&
+            runtime::testing::snapshot_transfer_gate() != nullptr) {
+            runtime::testing::note_materialization_submitted_cancellation();
+            transaction.submitted_snapshot_cancellation_observed = true;
+        }
+    }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
         // An eviction auto-save may still be reading an otherwise releasable victim on the
@@ -6049,8 +6070,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
                     throw std::logic_error("shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                detail::PhysicalResources released;
+                observe_committed_reclamation([&] {
+                    released =
+                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                });
                 if (released != resident) {
                     throw std::logic_error("shared pressure eviction acknowledgement is invalid");
                 }
@@ -6064,14 +6088,15 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 };
                 transaction.shared_victim_released[position] = true;
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
             }
         }
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
-                const PhysicalReleaseResult released =
-                    release_materialization_victim(transaction, position);
+                PhysicalReleaseResult released;
+                observe_committed_reclamation(
+                    [&] { released = release_materialization_victim(transaction, position); });
                 if (released.status != runtime::ConsumeStatus::Consumed ||
                     released.delta.added != detail::PhysicalResources{} ||
                     work.option.effect.added != detail::PhysicalResources{}) {
@@ -6082,7 +6107,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 work.mutation_published = true;
                 evict_private_result(transaction.pressure_results[position]);
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     SequenceState& victim = continuation_states[work.continuation_index];
                     retain_private_result(transaction.pressure_results[position], victim);
@@ -6233,7 +6258,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.completed) { continue; }
-            publish_pressure_work(work);
+            observe_committed_reclamation([&] { publish_pressure_work(work); });
             collect_pressure_operations(work);
             const std::uint32_t index = transaction.shared_victim_indices[position];
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
@@ -6250,7 +6275,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.completed) { continue; }
-            publish_pressure_work(work);
+            observe_committed_reclamation([&] { publish_pressure_work(work); });
             collect_pressure_operations(work);
             retain_private_result(transaction.pressure_results[position],
                                   continuation_states[work.continuation_index]);
@@ -6342,6 +6367,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     }
     transaction.terminal      = true;
     out.status                = runtime::ContextTransactionStatus::Published;
+    out.committed_reclamation = transaction.committed_reclamation;
     out.transfer_observations = std::move(transaction.transfer_observations);
     out.operations            = transaction.operations;
     complete_source_acknowledgement(true);
@@ -6862,6 +6888,38 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
     }
     if (host_kv_arena) { out.host.kv_bytes = host_kv_arena->occupied_bytes(); }
     return out;
+}
+
+void ProgramImplCore::observe_physical_reclamation(
+    detail::PhysicalResources before, runtime::UniquePhysicalReclamation& total) const noexcept {
+    const detail::PhysicalResources after = physical_occupancy();
+    const auto add_u32 = [](std::uint32_t& destination, std::uint32_t value) noexcept {
+        destination = value > std::numeric_limits<std::uint32_t>::max() - destination
+                          ? std::numeric_limits<std::uint32_t>::max()
+                          : destination + value;
+    };
+    const auto add_size = [](std::size_t& destination, std::size_t value) noexcept {
+        destination = value > std::numeric_limits<std::size_t>::max() - destination
+                          ? std::numeric_limits<std::size_t>::max()
+                          : destination + value;
+    };
+    add_u32(total.device_state_slots, before.device.state_slots > after.device.state_slots
+                                          ? before.device.state_slots - after.device.state_slots
+                                          : 0U);
+    add_u32(total.device_main_kv_pages,
+            before.device.main_kv_pages > after.device.main_kv_pages
+                ? before.device.main_kv_pages - after.device.main_kv_pages
+                : 0U);
+    add_u32(total.device_backend_kv_pages,
+            before.device.backend_kv_pages > after.device.backend_kv_pages
+                ? before.device.backend_kv_pages - after.device.backend_kv_pages
+                : 0U);
+    add_u32(total.host_state_slots, before.host.state_slots > after.host.state_slots
+                                        ? before.host.state_slots - after.host.state_slots
+                                        : 0U);
+    add_size(total.host_kv_bytes, before.host.kv_bytes > after.host.kv_bytes
+                                      ? before.host.kv_bytes - after.host.kv_bytes
+                                      : 0U);
 }
 
 detail::PhysicalResources
@@ -8107,8 +8165,10 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
                                                  SharedPrefixSlotRole::ReservedReplacement)) {
                 throw std::logic_error("shared capture replacement is not strictly releasable");
             }
+            const detail::PhysicalResources before  = physical_occupancy();
             const detail::PhysicalResources removed = release_shared_prefix_state_strict(
                 *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement);
+            observe_physical_reclamation(before, transaction.committed_reclamation);
             if (removed != transaction.capacity_preparation_removed) {
                 throw std::logic_error("shared capture preparation release changed");
             }
@@ -8375,6 +8435,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         state_store->retain_checkpoint_reference(transaction.source_state);
     }
     if (transaction.publish_private) {
+        const detail::PhysicalResources before = physical_occupancy();
         if (transaction.recycles_private_state) {
             if (!sequence.rewrite_state ||
                 *sequence.rewrite_state != transaction.destination_state ||
@@ -8389,6 +8450,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
                                              transaction.private_replacement));
+        observe_physical_reclamation(before, transaction.committed_reclamation);
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {
@@ -8424,6 +8486,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     ActiveCaptureResult out;
     out.status                         = runtime::ContextTransactionStatus::Published;
     out.capacity_preparation_committed = transaction.replacement_removed;
+    out.committed_reclamation          = transaction.committed_reclamation;
     if (transaction.publish_private) {
         populate_continuation_summary(sequence, transaction.active_summary);
         out.active_summary = std::move(transaction.active_summary);
@@ -8479,8 +8542,13 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction_ptr == nullptr) {
         throw std::logic_error("Program has no active capture transaction");
     }
-    ActiveCaptureTransaction& transaction   = *transaction_ptr;
-    PressureTransition& pressure_transition = transaction.pressure_transition;
+    ActiveCaptureTransaction& transaction    = *transaction_ptr;
+    PressureTransition& pressure_transition  = transaction.pressure_transition;
+    const auto observe_committed_reclamation = [&](auto&& operation) {
+        const detail::PhysicalResources before = physical_occupancy();
+        operation();
+        observe_physical_reclamation(before, transaction.committed_reclamation);
+    };
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
     }
@@ -8510,6 +8578,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         ActiveCaptureResult out;
         out.status                         = runtime::ContextTransactionStatus::Aborted;
         out.capacity_preparation_committed = transaction.replacement_removed;
+        out.committed_reclamation          = transaction.committed_reclamation;
         out.victims                        = std::move(transaction.pressure_results);
         out.shared_victims                 = std::move(transaction.shared_pressure_results);
         out.transfer_observations          = std::move(transaction.transfer_observations);
@@ -8572,8 +8641,11 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     throw std::logic_error(
                         "capture shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                detail::PhysicalResources released;
+                observe_committed_reclamation([&] {
+                    released =
+                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                });
                 if (released != resident ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("capture shared pressure eviction changed");
@@ -8587,7 +8659,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                 };
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     transaction.shared_pressure_results[position] =
                         MaterializationSharedVictimResult{
@@ -8616,7 +8688,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 }
                 const detail::PhysicalResources resident =
                     resident_resources(continuation_states[index]);
-                release_continuation_slot_strict(index);
+                observe_committed_reclamation([&] { release_continuation_slot_strict(index); });
                 work.committed_delta                   = detail::PhysicalDelta{.removed = resident};
                 work.completed                         = true;
                 work.mutation_published                = true;
@@ -8626,7 +8698,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                 };
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     transaction.pressure_results[position] = MaterializationVictimResult{
                         .owner              = transaction.pressure_results[position].owner,
@@ -8733,7 +8805,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work = transaction.shared_pressure[position];
             if (!work.completed) {
-                publish_pressure_work(work);
+                observe_committed_reclamation([&] { publish_pressure_work(work); });
                 collect_spill(work);
                 transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
                     .owner              = transaction.shared_pressure_results[position].owner,
@@ -8747,7 +8819,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             auto& work = transaction.pressure[position];
             if (!work.completed) {
-                publish_pressure_work(work);
+                observe_committed_reclamation([&] { publish_pressure_work(work); });
                 collect_spill(work);
                 transaction.pressure_results[position] = MaterializationVictimResult{
                     .owner              = transaction.pressure_results[position].owner,

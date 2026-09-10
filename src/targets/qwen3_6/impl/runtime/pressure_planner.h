@@ -1135,6 +1135,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         .physical_status       = status,
         .source_mode           = projected->source_mode,
         .machine_work          = machine_work,
+        .unique_reclamation    = projected->unique_reclamation,
         .owner_outcomes        = assessment_outcomes,
         .checkpoint_impacts    = {},
         .candidate             = candidate_ids[node.candidate_index],

@@ -15,6 +15,29 @@ struct ContextTransferTestGate {
     cudaError_t (*enqueue)(void* context, cudaStream_t stream) noexcept = nullptr;
 };
 
+// Exact producer-side Host footprint for the most recent retained-session snapshot attempt.
+// `resident_bytes` includes the complete pinned staging image and the complete pageable assembly
+// image that coexist while the bounded writer consumes the completed transfer.
+struct SnapshotHostAccounting {
+    std::size_t metadata_bytes   = 0;
+    std::size_t state_bytes      = 0;
+    std::size_t main_kv_bytes    = 0;
+    std::size_t backend_kv_bytes = 0;
+    std::size_t transfer_bytes   = 0;
+    std::size_t staging_bytes    = 0;
+    std::size_t resident_bytes   = 0;
+};
+
+struct SnapshotShutdownCleanup {
+    std::uint64_t observations         = 0;
+    std::uint64_t catalog_owners       = 0;
+    std::uint64_t device_state_slots   = 0;
+    std::uint64_t host_state_slots     = 0;
+    std::uint64_t device_main_kv_pages = 0;
+    std::uint64_t device_backend_pages = 0;
+    std::uint64_t host_kv_bytes        = 0;
+};
+
 void install_snapshot_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_snapshot_transfer_gate() noexcept;
 [[nodiscard]] const ContextTransferTestGate* snapshot_transfer_gate() noexcept;
@@ -27,6 +50,12 @@ void note_snapshot_transfer_backing_released(std::size_t backing_bytes) noexcept
 [[nodiscard]] std::uint64_t snapshot_transfer_live_settlements() noexcept;
 [[nodiscard]] std::uint64_t snapshot_transfer_live_backing_bytes() noexcept;
 [[nodiscard]] std::uint64_t snapshot_transfer_pinned_sources() noexcept;
+void note_snapshot_host_accounting(SnapshotHostAccounting accounting) noexcept;
+[[nodiscard]] SnapshotHostAccounting snapshot_host_accounting() noexcept;
+void note_materialization_submitted_cancellation() noexcept;
+[[nodiscard]] std::uint64_t materialization_submitted_cancellations() noexcept;
+void note_snapshot_shutdown_cleanup(SnapshotShutdownCleanup cleanup) noexcept;
+[[nodiscard]] SnapshotShutdownCleanup snapshot_shutdown_cleanup() noexcept;
 
 void install_active_capture_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_active_capture_transfer_gate() noexcept;

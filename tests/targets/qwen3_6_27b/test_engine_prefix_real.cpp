@@ -37,6 +37,7 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.max_context                          = 512;
     options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk                        = 256;
+    options.kv_cache                             = ninfer::KvCacheStorage::RK4V4E8;
     options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens             = 3;
     options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
@@ -135,8 +136,9 @@ ninfer::EngineOptions pressure_resume_engine_options(const char* artifact) {
     options.max_context                      = 8192;
     options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(8192);
     options.prefill_chunk                    = 1024;
-    options.kv_cache                         = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    options.speculative.backend              = ninfer::SpeculativeBackend::None;
+    // Exercise the supported Qwen3.8 groupwise topology, rather than the NVFP4 fixture.
+    options.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    options.speculative                      = host_restore_engine_options(artifact).speculative;
     options.max_concurrency                  = 2;
     options.max_pending_requests             = 2;
     options.context_cache.device_state_slots = 2;
@@ -1439,12 +1441,13 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
                                             before_pressure.pressure_private_owners_degraded;
     const std::uint64_t pressure_evicted = after_pressure.pressure_private_owners_evicted -
                                            before_pressure.pressure_private_owners_evicted;
+    // rk4v4-e8 with MTP spills four Main pages plus its bounded two-page MTP tail.
     if (short_b.generated_token_ids.size() != 1 || pressure_main_pages != 4 ||
-        pressure_spill_pages != 4 || pressure_drops != 1 || pressure_degraded != 1 ||
+        pressure_spill_pages != 6 || pressure_drops != 1 || pressure_degraded != 1 ||
         pressure_evicted != 0 ||
         after_pressure.state_d2h_count != before_pressure.state_d2h_count ||
         short_b.materialization.selected_maximal_fallback) {
-        std::cerr << "pressure-resume did not select endpoint-drop plus four-page spill: main="
+        std::cerr << "pressure-resume did not select endpoint-drop plus bounded MTP spill: main="
                   << pressure_main_pages << " spill=" << pressure_spill_pages
                   << " drops=" << pressure_drops << " degraded=" << pressure_degraded
                   << " evicted=" << pressure_evicted
@@ -1466,11 +1469,12 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     // The real Program enters this transaction with a 121-page parent which cannot be admitted
     // together with the bounded tail and continuation reservation.  It instead selects the
     // 120-page turn-closure frontier and restores precisely its four missing Host ranges.
-    // The retained Host extent is deliberately still charged after H2D.
+    // The retained Host extent is deliberately still charged after H2D. MTP may also capture
+    // its bounded backend frontier while closing the resumed turn.
     if (resumed.generated_token_ids.size() != 1 ||
         resumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
         reused_pages != 120 || restored_pages != 4 ||
-        after_resume.host_kv_occupied_bytes != before_resume.host_kv_occupied_bytes) {
+        after_resume.host_kv_occupied_bytes < before_resume.host_kv_occupied_bytes) {
         std::cerr << "pressure-resume did not restore the retained turn closure: path="
                   << static_cast<int>(resumed.prefix_reuse_path)
                   << " reused=" << resumed.reused_prompt_tokens << " reused_pages=" << reused_pages
@@ -2164,11 +2168,20 @@ int main() {
         return 77;
     }
     if (scenario != nullptr && std::string_view(scenario) == "pressure-resume") {
-        if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
-            std::cerr << "pressure-resume requires NINFER_QWEN3_8_27B_NVFP4_WEIGHTS\n";
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "pressure-resume requires NINFER_QWEN3_8_27B_WEIGHTS\n";
             return 1;
         }
-        const int result = exercise_pressure_partial_spill_and_resume(qwen38_nvfp4);
+        const int result = exercise_pressure_partial_spill_and_resume(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "host-restore") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "host-restore requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_host_restore(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
@@ -2248,6 +2261,13 @@ int main() {
         }
     }
     if (qwen38_groupwise != nullptr && *qwen38_groupwise != '\0') {
+        if (const int result = exercise_host_restore(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_pressure_partial_spill_and_resume(qwen38_groupwise);
+            result != 0) {
+            return result;
+        }
         if (const int result =
                 exercise_concurrent_resource_settlement(qwen38_groupwise, "qwen3_8_27b");
             result != 0) {

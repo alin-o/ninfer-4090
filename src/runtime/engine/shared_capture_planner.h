@@ -73,6 +73,7 @@ public:
         std::uint32_t stable_scenario_ordinal = 0;
         std::uint32_t stable_target_ordinal   = 0;
         std::uint32_t targets_evaluated       = 0;
+        UniquePhysicalReclamation unique_reclamation;
     };
 
     SharedCapturePlanner() : target_ledger_(kTargetBudget + 1U) {
@@ -134,6 +135,7 @@ public:
                         .stable_target       = assessment.stable_target_ordinal,
                         .degradation_units   = assessment.degradation_units,
                         .dropped_checkpoints = assessment.dropped_checkpoints,
+                        .unique_reclamation  = assessment.unique_reclamation,
                         .owner_outcomes      = std::vector<PressureOwnerOutcome>(
                             assessment.owner_outcomes.begin(), assessment.owner_outcomes.end()),
                         .checkpoint_outcomes =
@@ -196,6 +198,7 @@ public:
             .stable_scenario_ordinal = input.stable_scenario_ordinal,
             .stable_target_ordinal   = incumbent->stable_target,
             .targets_evaluated       = targets_evaluated,
+            .unique_reclamation      = incumbent->unique_reclamation,
         };
     }
 
@@ -233,6 +236,7 @@ private:
         std::uint32_t stable_target       = 0;
         std::uint32_t degradation_units   = 0;
         std::uint32_t dropped_checkpoints = 0;
+        UniquePhysicalReclamation unique_reclamation;
         std::vector<PressureOwnerOutcome> owner_outcomes;
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
     };

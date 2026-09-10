@@ -524,6 +524,17 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     if (transfer_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
         throw std::overflow_error("session snapshot double residency overflows host accounting");
     }
+    if (runtime::testing::snapshot_transfer_gate() != nullptr) {
+        runtime::testing::note_snapshot_host_accounting(runtime::testing::SnapshotHostAccounting{
+            .metadata_bytes   = header_bytes,
+            .state_bytes      = state_bytes,
+            .main_kv_bytes    = text_bytes,
+            .backend_kv_bytes = backend_bytes,
+            .transfer_bytes   = transfer_bytes,
+            .staging_bytes    = transfer_bytes,
+            .resident_bytes   = transfer_bytes * 2U,
+        });
+    }
 
     // Reserve the complete bounded writer footprint before allocating pinned backing or
     // submitting D2H.  A full queue therefore drops an involuntary spill without placing work

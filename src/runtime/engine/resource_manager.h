@@ -331,10 +331,13 @@ public:
                         private_has_active_edge(index.slot)) {
                         continue;
                     }
-                    const bool retain =
-                        entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key ||
-                                          !base.context_cache().update_session_index);
+                    // A published conversation head remains the atomic rollback point until a
+                    // newer request finishes and wins publication ordering. Even the matching
+                    // session must therefore fork/retain it while active; consuming it would
+                    // make cancellation erase the last successful head before a replacement
+                    // exists. It is an ordinary unpinned pressure candidate again after the
+                    // active edge is released.
+                    const bool retain = entry.session.has_value();
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -836,6 +839,7 @@ public:
             .structural_origins   = selected->scenario.assessment.structural_origins,
             .structural_role      = selected->scenario.assessment.structural_role,
             .ssd_eligible         = selected->scenario.assessment.ssd_eligible,
+            .unique_reclamation   = selected->plan.unique_reclamation,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
             const auto owner_record =
@@ -1114,6 +1118,21 @@ public:
             context_stats_.pressure_maximal_fallback_selections;
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
+        out.session_publications_explicit_total =
+            context_stats_.session_publications_explicit_total;
+        out.session_publications_initial_prefix_total =
+            context_stats_.session_publications_initial_prefix_total;
+        out.session_supersessions_total = context_stats_.session_supersessions_total;
+        out.session_late_publications_rejected_total =
+            context_stats_.session_late_publications_rejected_total;
+        out.reclaimed_device_state_slots_total = context_stats_.reclaimed_device_state_slots_total;
+        out.reclaimed_device_main_kv_pages_total =
+            context_stats_.reclaimed_device_main_kv_pages_total;
+        out.reclaimed_device_backend_kv_pages_total =
+            context_stats_.reclaimed_device_backend_kv_pages_total;
+        out.reclaimed_host_state_slots_total = context_stats_.reclaimed_host_state_slots_total;
+        out.reclaimed_host_kv_bytes_total    = context_stats_.reclaimed_host_kv_bytes_total;
+        out.context_cache_owners.fill(0);
 
         const auto usage                     = program.physical_usage();
         out.device_state_occupied_slots      = usage.device_state_slots;
@@ -1130,6 +1149,71 @@ public:
         out.shared_active_references = shared_references > std::numeric_limits<std::uint32_t>::max()
                                            ? std::numeric_limits<std::uint32_t>::max()
                                            : static_cast<std::uint32_t>(shared_references);
+
+        const auto placement = [](ReplicaResidency residency) {
+            switch (residency) {
+            case ReplicaResidency::DeviceOnly:
+                return ContextCacheMetricPlacement::Device;
+            case ReplicaResidency::HostOnly:
+                return ContextCacheMetricPlacement::Host;
+            case ReplicaResidency::Both:
+                return ContextCacheMetricPlacement::Both;
+            }
+            return ContextCacheMetricPlacement::Device;
+        };
+        const auto increment_owner =
+            [&](ContextCacheMetricRole role, ContextCacheMetricPlacement owner_placement,
+                ContextCacheMetricPin pin, ContextCacheMetricIdentity identity) {
+                std::uint32_t& value = out.context_cache_owners[context_cache_owner_metric_index(
+                    role, owner_placement, pin, identity)];
+                if (value != std::numeric_limits<std::uint32_t>::max()) { ++value; }
+            };
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if ((entry.state != CatalogState::Catalogued && entry.state != CatalogState::Claimed) ||
+                !entry.handle) {
+                continue;
+            }
+            const auto* checkpoint = entry.summary.endpoint ? &*entry.summary.endpoint : nullptr;
+            if (entry.summary.rewrite &&
+                (checkpoint == nullptr ||
+                 entry.summary.rewrite->ref.frontier > checkpoint->ref.frontier)) {
+                checkpoint = &*entry.summary.rewrite;
+            }
+            for (const auto& anchor : entry.summary.long_anchors) {
+                if (checkpoint == nullptr || anchor.ref.frontier > checkpoint->ref.frontier) {
+                    checkpoint = &anchor;
+                }
+            }
+            if (checkpoint == nullptr) { continue; }
+            const bool pinned =
+                entry.state == CatalogState::Claimed || private_has_active_edge(slot);
+            increment_owner(entry.session ? ContextCacheMetricRole::ConversationHead
+                                          : ContextCacheMetricRole::Transient,
+                            placement(checkpoint->state_residency),
+                            pinned ? ContextCacheMetricPin::Pinned
+                                   : ContextCacheMetricPin::Unpinned,
+                            entry.session ? metric_identity_kind(*entry.session)
+                                          : ContextCacheMetricIdentity::None);
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if ((entry.state != SharedCatalogState::Catalogued &&
+                 entry.state != SharedCatalogState::Claimed) ||
+                !entry.handle) {
+                continue;
+            }
+            const ContextCacheMetricRole role =
+                entry.structural_role >= 2U   ? ContextCacheMetricRole::Project
+                : entry.structural_role == 1U ? ContextCacheMetricRole::Harness
+                                              : ContextCacheMetricRole::Transient;
+            const bool pinned = entry.state == SharedCatalogState::Claimed ||
+                                entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0;
+            increment_owner(role, placement(entry.summary.checkpoint.state_residency),
+                            pinned ? ContextCacheMetricPin::Pinned
+                                   : ContextCacheMetricPin::Unpinned,
+                            ContextCacheMetricIdentity::None);
+        }
     }
 
     [[nodiscard]] CatalogState catalog_state(std::uint32_t slot) const noexcept {
@@ -1378,6 +1462,7 @@ private:
         std::uint32_t structural_origins        = 0;
         std::uint8_t structural_role            = 0;
         bool ssd_eligible                       = false;
+        UniquePhysicalReclamation unique_reclamation;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -1463,6 +1548,31 @@ private:
 
     static void saturating_increment(std::uint64_t& value) noexcept {
         if (value != std::numeric_limits<std::uint64_t>::max()) { ++value; }
+    }
+
+    static void saturating_add(std::uint64_t& value, std::uint64_t add) noexcept {
+        value = add > std::numeric_limits<std::uint64_t>::max() - value
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : value + add;
+    }
+
+    [[nodiscard]] static SessionIdentityKind
+    session_identity_kind(const CacheSessionKey& key) noexcept {
+        if constexpr (requires { key.identity_kind; }) { return key.identity_kind; }
+        return SessionIdentityKind::Explicit;
+    }
+
+    [[nodiscard]] static ContextCacheMetricIdentity
+    metric_identity_kind(const CacheSessionKey& key) noexcept {
+        switch (session_identity_kind(key)) {
+        case SessionIdentityKind::InitialPrefix:
+            return ContextCacheMetricIdentity::InitialPrefix;
+        case SessionIdentityKind::Explicit:
+            return ContextCacheMetricIdentity::Explicit;
+        case SessionIdentityKind::None:
+            return ContextCacheMetricIdentity::None;
+        }
+        return ContextCacheMetricIdentity::None;
     }
 
     static constexpr std::size_t kDemandWindowCapacity = 32U;
@@ -2542,6 +2652,28 @@ private:
         }
     }
 
+    void observe_committed_reclamation(const MaterializationDiagnostics& diagnostics) noexcept {
+        observe_committed_reclamation(UniquePhysicalReclamation{
+            .device_state_slots      = diagnostics.reclaimed_device_state_slots,
+            .device_main_kv_pages    = diagnostics.reclaimed_device_main_kv_pages,
+            .device_backend_kv_pages = diagnostics.reclaimed_device_backend_kv_pages,
+            .host_state_slots        = diagnostics.reclaimed_host_state_slots,
+            .host_kv_bytes           = diagnostics.reclaimed_host_kv_bytes,
+        });
+    }
+
+    void observe_committed_reclamation(const UniquePhysicalReclamation& reclamation) noexcept {
+        saturating_add(context_stats_.reclaimed_device_state_slots_total,
+                       reclamation.device_state_slots);
+        saturating_add(context_stats_.reclaimed_device_main_kv_pages_total,
+                       reclamation.device_main_kv_pages);
+        saturating_add(context_stats_.reclaimed_device_backend_kv_pages_total,
+                       reclamation.device_backend_kv_pages);
+        saturating_add(context_stats_.reclaimed_host_state_slots_total,
+                       reclamation.host_state_slots);
+        saturating_add(context_stats_.reclaimed_host_kv_bytes_total, reclamation.host_kv_bytes);
+    }
+
     [[nodiscard]] RetentionObservation*
     resolve_observation(const PolicyObservationKey& key) noexcept {
         if (!key.shared) {
@@ -3009,6 +3141,7 @@ private:
         }
 
         if (published) { observe_selected_hit(*record); }
+        if (published) { observe_committed_reclamation(record->diagnostics); }
         for (const OwnerClaim& claim : record->private_claims) {
             apply_private_action(claim, published, private_result_for(claim));
         }
@@ -3233,6 +3366,7 @@ private:
         for (const OwnerClaim& claim : record->shared_claims) {
             apply_shared_action(claim, published, shared_result_for(claim));
         }
+        if (published) { observe_committed_reclamation(record->unique_reclamation); }
         if (result.status == ContextTransactionStatus::Aborted) {
             if (record->publication_slot != kInvalidCatalogSlot) {
                 SharedCatalogEntry& publication = shared_catalog_[record->publication_slot];
@@ -3410,7 +3544,10 @@ private:
         SessionIndexEntry& entry = session_index_[cell];
         std::optional<SessionIndexEntry> previous;
         if (entry.state == SessionIndexState::Occupied) {
-            if (entry.publication_order > publication_order) { return false; }
+            if (entry.publication_order > publication_order) {
+                saturating_increment(context_stats_.session_late_publications_rejected_total);
+                return false;
+            }
             if (entry.publication_order == publication_order) {
                 if (entry.slot != slot || entry.owner_id != owner_id) {
                     throw std::logic_error("equal publication order names two continuations");
@@ -3429,7 +3566,13 @@ private:
             .publication_order = publication_order,
         };
         if (previous && (previous->slot != slot || previous->owner_id != owner_id)) {
+            saturating_increment(context_stats_.session_supersessions_total);
             demote_replaced_session(*previous, slot, owner_id);
+        }
+        if (session_identity_kind(key) == SessionIdentityKind::InitialPrefix) {
+            saturating_increment(context_stats_.session_publications_initial_prefix_total);
+        } else {
+            saturating_increment(context_stats_.session_publications_explicit_total);
         }
         return true;
     }
@@ -3441,8 +3584,8 @@ private:
             return;
         }
         CatalogEntry& prior = catalog_[previous.slot];
-        if (prior.state != CatalogState::Catalogued || !prior.handle ||
-            prior.id != previous.owner_id || prior.revision != previous.revision) {
+        if ((prior.state != CatalogState::Catalogued && prior.state != CatalogState::Claimed) ||
+            !prior.handle || prior.id != previous.owner_id || prior.revision != previous.revision) {
             return;
         }
         prior.session.reset();

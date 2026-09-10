@@ -3793,6 +3793,13 @@ bool ProgramImplCore::compose_pressure_candidate(
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
+    details.unique_reclamation               = runtime::UniquePhysicalReclamation{
+                      .device_state_slots      = removed.device.state_slots,
+                      .device_main_kv_pages    = removed.device.main_kv_pages,
+                      .device_backend_kv_pages = removed.device.backend_kv_pages,
+                      .host_state_slots        = removed.host.state_slots,
+                      .host_kv_bytes           = removed.host.kv_bytes,
+    };
 
     if (projection->source_state_fork_required &&
         details.state_fork_required != *projection->source_state_fork_required) {
@@ -6008,7 +6015,15 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_shared_victim_acknowledgement();
     };
 
-    if (cancellation.requested()) { transaction.cancel_pending = true; }
+    if (cancellation.requested()) {
+        transaction.cancel_pending = true;
+        if (!transaction.submitted_snapshot_cancellation_observed &&
+            !snapshot_source_retirements_.empty() &&
+            runtime::testing::snapshot_transfer_gate() != nullptr) {
+            runtime::testing::note_materialization_submitted_cancellation();
+            transaction.submitted_snapshot_cancellation_observed = true;
+        }
+    }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
         // An eviction auto-save may still be reading an otherwise releasable victim on the

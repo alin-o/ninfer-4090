@@ -9,8 +9,7 @@ namespace {
 
 void append_counter(std::string& out, const char* name, std::uint64_t value) {
     char line[160];
-    std::snprintf(line, sizeof(line), "%s %llu\n", name,
-                  static_cast<unsigned long long>(value));
+    std::snprintf(line, sizeof(line), "%s %llu\n", name, static_cast<unsigned long long>(value));
     out += line;
 }
 
@@ -18,6 +17,62 @@ void append_counter(std::string& out, const char* name, double value) {
     char line[160];
     std::snprintf(line, sizeof(line), "%s %.6f\n", name, value);
     out += line;
+}
+
+constexpr const char* cache_role_name(ContextCacheMetricRole role) {
+    switch (role) {
+    case ContextCacheMetricRole::Harness:
+        return "harness";
+    case ContextCacheMetricRole::Project:
+        return "project";
+    case ContextCacheMetricRole::ConversationHead:
+        return "conversation_head";
+    case ContextCacheMetricRole::Transient:
+        return "transient";
+    case ContextCacheMetricRole::Count:
+        break;
+    }
+    return "unknown";
+}
+
+constexpr const char* cache_placement_name(ContextCacheMetricPlacement placement) {
+    switch (placement) {
+    case ContextCacheMetricPlacement::Device:
+        return "device";
+    case ContextCacheMetricPlacement::Host:
+        return "host";
+    case ContextCacheMetricPlacement::Both:
+        return "both";
+    case ContextCacheMetricPlacement::Count:
+        break;
+    }
+    return "unknown";
+}
+
+constexpr const char* cache_pin_name(ContextCacheMetricPin pin) {
+    switch (pin) {
+    case ContextCacheMetricPin::Unpinned:
+        return "unpinned";
+    case ContextCacheMetricPin::Pinned:
+        return "pinned";
+    case ContextCacheMetricPin::Count:
+        break;
+    }
+    return "unknown";
+}
+
+constexpr const char* cache_identity_name(ContextCacheMetricIdentity identity) {
+    switch (identity) {
+    case ContextCacheMetricIdentity::None:
+        return "none";
+    case ContextCacheMetricIdentity::Explicit:
+        return "explicit";
+    case ContextCacheMetricIdentity::InitialPrefix:
+        return "initial_prefix";
+    case ContextCacheMetricIdentity::Count:
+        break;
+    }
+    return "unknown";
 }
 
 } // namespace
@@ -40,9 +95,8 @@ std::vector<std::pair<std::uint64_t, int>> ServeMetrics::active_snapshot() const
 void ServeMetrics::record(const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
     const std::uint64_t cached = m.prefix_cache_hit_tokens;
-    const std::uint64_t prompt = outcome.prompt_tokens > 0
-                                     ? static_cast<std::uint64_t>(outcome.prompt_tokens)
-                                     : 0;
+    const std::uint64_t prompt =
+        outcome.prompt_tokens > 0 ? static_cast<std::uint64_t>(outcome.prompt_tokens) : 0;
 
     const std::lock_guard<std::mutex> lock(mutex_);
     requests_total_ += 1;
@@ -87,6 +141,60 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    static_cast<std::uint64_t>(live.auto_save_reserved_jobs));
     append_counter(out, "ninfer:auto_save_reserved_bytes", live.auto_save_reserved_bytes);
     append_counter(out, "ninfer:auto_save_rejected_jobs_total", live.auto_save_rejected_jobs);
+    append_counter(out, "ninfer:session_publications_total{identity=\"explicit\"}",
+                   live.session_publications_explicit_total);
+    append_counter(out, "ninfer:session_publications_total{identity=\"initial_prefix\"}",
+                   live.session_publications_initial_prefix_total);
+    append_counter(out, "ninfer:session_supersessions_total", live.session_supersessions_total);
+    append_counter(out, "ninfer:session_late_publications_rejected_total",
+                   live.session_late_publications_rejected_total);
+    append_counter(
+        out,
+        "ninfer:context_cache_reclaimed_capacity_total{tier=\"device\",resource=\"state_slots\"}",
+        live.reclaimed_device_state_slots_total);
+    append_counter(
+        out,
+        "ninfer:context_cache_reclaimed_capacity_total{tier=\"device\",resource=\"main_kv_pages\"}",
+        live.reclaimed_device_main_kv_pages_total);
+    append_counter(out,
+                   "ninfer:context_cache_reclaimed_capacity_total{tier=\"device\",resource="
+                   "\"backend_kv_pages\"}",
+                   live.reclaimed_device_backend_kv_pages_total);
+    append_counter(
+        out,
+        "ninfer:context_cache_reclaimed_capacity_total{tier=\"host\",resource=\"state_slots\"}",
+        live.reclaimed_host_state_slots_total);
+    append_counter(
+        out, "ninfer:context_cache_reclaimed_capacity_total{tier=\"host\",resource=\"kv_bytes\"}",
+        live.reclaimed_host_kv_bytes_total);
+    for (std::uint8_t raw_role = 0;
+         raw_role < static_cast<std::uint8_t>(ContextCacheMetricRole::Count); ++raw_role) {
+        const auto role = static_cast<ContextCacheMetricRole>(raw_role);
+        for (std::uint8_t raw_placement = 0;
+             raw_placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
+             ++raw_placement) {
+            const auto placement = static_cast<ContextCacheMetricPlacement>(raw_placement);
+            for (std::uint8_t raw_pin = 0;
+                 raw_pin < static_cast<std::uint8_t>(ContextCacheMetricPin::Count); ++raw_pin) {
+                const auto pin = static_cast<ContextCacheMetricPin>(raw_pin);
+                for (std::uint8_t raw_identity = 0;
+                     raw_identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
+                     ++raw_identity) {
+                    const auto identity = static_cast<ContextCacheMetricIdentity>(raw_identity);
+                    char name[240];
+                    std::snprintf(name, sizeof(name),
+                                  "ninfer:context_cache_owners{role=\"%s\",placement=\"%s\",pin=\"%"
+                                  "s\",identity=\"%s\"}",
+                                  cache_role_name(role), cache_placement_name(placement),
+                                  cache_pin_name(pin), cache_identity_name(identity));
+                    append_counter(out, name,
+                                   static_cast<std::uint64_t>(
+                                       live.context_cache_owners[context_cache_owner_metric_index(
+                                           role, placement, pin, identity)]));
+                }
+            }
+        }
+    }
     return out;
 }
 

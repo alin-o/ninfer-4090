@@ -6,6 +6,7 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/context_transfer_test_gate.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/resource_manager.h"
 #include "runtime/engine/scheduler.h"
@@ -2083,6 +2084,24 @@ private:
         materializing_.reset();
         instance_.program->fail_all_cleanup();
         resources_.clear_after_program_cleanup();
+        if (runtime::testing::snapshot_transfer_gate() != nullptr) {
+            RuntimeStats cleanup;
+            resources_.populate_runtime_stats(*instance_.program, cleanup);
+            std::uint64_t catalog_owners = 0;
+            for (const std::uint32_t owners : cleanup.context_cache_owners) {
+                catalog_owners += owners;
+            }
+            runtime::testing::note_snapshot_shutdown_cleanup(
+                runtime::testing::SnapshotShutdownCleanup{
+                    .observations         = 1,
+                    .catalog_owners       = catalog_owners,
+                    .device_state_slots   = cleanup.device_state_occupied_slots,
+                    .host_state_slots     = cleanup.host_state_occupied_slots,
+                    .device_main_kv_pages = cleanup.device_main_kv_occupied_pages,
+                    .device_backend_pages = cleanup.device_backend_kv_occupied_pages,
+                    .host_kv_bytes        = cleanup.host_kv_occupied_bytes,
+                });
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 complete_error(slots_[lane], error);

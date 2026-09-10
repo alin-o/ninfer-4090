@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -445,7 +446,6 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
     if (restored.generated_token_ids.size() != 2 ||
         restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
         restored.reused_prompt_tokens == 0 ||
-        (groupwise_backing && restored.slot != retained.slot) ||
         after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
         after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
         after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
@@ -472,9 +472,10 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
                   << " kv=" << after_restore.host_kv_occupied_bytes << '\n';
         return 1;
     }
-    // The consuming restore now owns the original catalog cell.  Keep it catalogued through
-    // pressure so production must retain its Host replica while reclaiming only duplicate Device
-    // residency; there is no stale source owner acting as a backing keeper.
+    // Keep the restored head catalogued through pressure so production must retain its Host
+    // replica while reclaiming only duplicate Device residency. Atomic head replacement can keep
+    // the demoted source in a separate RecentPrivate cell, and both owners may alias unchanged
+    // backing.
     const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
     if (before_duplicate_pressure.host_kv_occupied_bytes == 0) {
         std::cerr << "consuming Host restore released its backing before pressure\n";
@@ -488,14 +489,14 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
     if (duplicate_removed.generated_token_ids.size() != 1 ||
         after_duplicate_pressure.pressure_private_owners_degraded <=
             before_duplicate_pressure.pressure_private_owners_degraded ||
-        // The resumed request advanced each component by one partial page.  Its newly published
-        // endpoint therefore needs exactly one new Host State and one Main/MTP page backup; any
-        // larger delta would recopy unchanged Host-backed prefix pages or State.
-        after_duplicate_pressure.state_d2h_count != before_duplicate_pressure.state_d2h_count + 1 ||
+        // The restored State image already has a Host replica, while its fork boundary and mutable
+        // tail own two Device-only Main/MTP pages. The older Host-backed pages remain aliases:
+        // copying any State or more than these exact KV deltas would recopy unchanged backing.
+        after_duplicate_pressure.state_d2h_count != before_duplicate_pressure.state_d2h_count ||
         after_duplicate_pressure.main_kv_d2h_pages !=
-            before_duplicate_pressure.main_kv_d2h_pages + 1 ||
+            before_duplicate_pressure.main_kv_d2h_pages + 2 ||
         after_duplicate_pressure.backend_kv_d2h_pages !=
-            before_duplicate_pressure.backend_kv_d2h_pages + 1 ||
+            before_duplicate_pressure.backend_kv_d2h_pages + 2 ||
         after_duplicate_pressure.host_state_occupied_slots == 0 ||
         after_duplicate_pressure.host_kv_occupied_bytes == 0) {
         std::cerr << "Host-backed duplicate pressure recopied unchanged backing or lost quota: "
@@ -1427,6 +1428,18 @@ ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     return options;
 }
 
+std::uint64_t token_fixture_hash(std::span<const ninfer::TokenId> tokens) {
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (const ninfer::TokenId token : tokens) {
+        const auto value = static_cast<std::uint32_t>(token);
+        for (unsigned shift = 0; shift != 32; shift += 8) {
+            digest ^= static_cast<std::uint8_t>(value >> shift);
+            digest *= 1099511628211ULL;
+        }
+    }
+    return digest;
+}
+
 class ControlledSnapshotTransferGate {
 public:
     explicit ControlledSnapshotTransferGate(bool active_capture = false)
@@ -1689,8 +1702,11 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
     // complete pinned backing; begin_save_continuation enforces capacity == transfer_bytes.
     if (!wait_until([&] {
             const ninfer::RuntimeStats stats = engine.runtime_stats();
-            return stats.auto_save_reserved_jobs == 1 && stats.auto_save_reserved_bytes != 0 &&
-                   stats.backend_kv_d2h_pages != 0;
+            const auto accounting            = ninfer::runtime::testing::snapshot_host_accounting();
+            return stats.auto_save_reserved_jobs == 1 && accounting.resident_bytes != 0 &&
+                   stats.backend_kv_d2h_pages != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0;
         })) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         cancel_capture.store(true, std::memory_order_release);
@@ -1702,6 +1718,40 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
                   << stats.auto_save_reserved_jobs << '/' << stats.auto_save_reserved_bytes
                   << " backend_pages=" << stats.backend_kv_d2h_pages << '\n';
         return 1;
+    }
+    const ninfer::RuntimeStats pending_snapshot = engine.runtime_stats();
+    const auto accounting = ninfer::runtime::testing::snapshot_host_accounting();
+    if (accounting.metadata_bytes == 0 || accounting.state_bytes == 0 ||
+        accounting.main_kv_bytes == 0 || accounting.backend_kv_bytes == 0 ||
+        accounting.transfer_bytes != accounting.metadata_bytes + accounting.state_bytes +
+                                         accounting.main_kv_bytes + accounting.backend_kv_bytes ||
+        accounting.staging_bytes != accounting.transfer_bytes ||
+        accounting.resident_bytes != accounting.transfer_bytes + accounting.staging_bytes ||
+        pending_snapshot.auto_save_reserved_bytes != accounting.resident_bytes ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() !=
+            accounting.staging_bytes) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "snapshot Host assembly accounting is not exact: metadata="
+                  << accounting.metadata_bytes << " state=" << accounting.state_bytes
+                  << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " transfer=" << accounting.transfer_bytes
+                  << " staging=" << accounting.staging_bytes
+                  << " resident=" << accounting.resident_bytes
+                  << " reserved=" << pending_snapshot.auto_save_reserved_bytes << '\n';
+        return 1;
+    }
+    if (std::getenv("NINFER_REPORT_SNAPSHOT_ACCOUNTING") != nullptr) {
+        std::cout << "snapshot_host_accounting metadata=" << accounting.metadata_bytes
+                  << " state=" << accounting.state_bytes << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " transfer=" << accounting.transfer_bytes
+                  << " staging=" << accounting.staging_bytes
+                  << " resident=" << accounting.resident_bytes << '\n';
     }
     const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
     if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; })) {
@@ -1723,6 +1773,31 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
     }
 
     cancel_capture.store(true, std::memory_order_release);
+    if (!wait_until([&] {
+            return ninfer::runtime::testing::materialization_submitted_cancellations() == 1;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "Program did not observe cancellation after snapshot offload scheduling\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats cancelled_pending = engine.runtime_stats();
+    if (!gate.pending() ||
+        cancelled_pending.context_cache_owners[ninfer::context_cache_owner_metric_index(
+            ninfer::ContextCacheMetricRole::Transient, ninfer::ContextCacheMetricPlacement::Device,
+            ninfer::ContextCacheMetricPin::Pinned, ninfer::ContextCacheMetricIdentity::None)] ==
+            0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "cancelled materialization lost its logical claim or physical source pins "
+                     "before settlement\n";
+        return 1;
+    }
     gate.release();
     const ninfer::GenerationResult cancelled = capture.get();
     cancel_independent.store(true, std::memory_order_release);
@@ -1736,7 +1811,15 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
             return writer_failures.load(std::memory_order_acquire) == 1 &&
                    stats.auto_save_reserved_jobs == 0 && stats.auto_save_reserved_bytes == 0 &&
                    stats.auto_save_queued_jobs == 0 && stats.auto_save_in_flight_jobs == 0 &&
-                   stats.capture_pending_requests == 0 && stats.materializing_requests == 0;
+                   stats.capture_pending_requests == 0 && stats.materializing_requests == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_settlements() == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0 &&
+                   stats.context_cache_owners[ninfer::context_cache_owner_metric_index(
+                       ninfer::ContextCacheMetricRole::Transient,
+                       ninfer::ContextCacheMetricPlacement::Device,
+                       ninfer::ContextCacheMetricPin::Pinned,
+                       ninfer::ContextCacheMetricIdentity::None)] == 0;
         })) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "cancelled/failed spill leaked terminal accounting: reserved="
@@ -1753,6 +1836,299 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
         std::cerr << "Engine did not remain usable after gated capture settlement\n";
         return 1;
     }
+    return 0;
+}
+
+int exercise_snapshot_quota_rejection(const char* artifact) {
+    ninfer::EngineOptions options                = engine_options(artifact);
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.pending_timeout_ms                   = 120000;
+    options.enable_vision                        = false;
+    options.auto_save_evicted                    = true;
+    options.auto_save_queue_jobs                 = 1;
+    options.auto_save_queue_bytes                = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-snapshot-quota-rejection";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } directory_guard{directory};
+
+    const auto prompt = [](std::string text) {
+        ninfer::PromptInput value;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        value.messages.push_back(std::move(user));
+        value.options.enable_thinking = false;
+        value.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return value;
+    };
+    const ninfer::GenerationResult victim = engine.generate(
+        engine.prepare(prompt("Retain the quota rejection victim.")), fixed_output(1));
+    if (victim.slot < 0 || victim.session_digest.empty()) {
+        std::cerr << "snapshot quota fixture did not retain its victim\n";
+        return 1;
+    }
+    (void)engine.save_slot(static_cast<std::uint32_t>(victim.slot),
+                           (directory / "victim.bin").string(), victim.session_digest);
+
+    ControlledSnapshotTransferGate gate;
+    const ninfer::GenerationResult replacement = engine.generate(
+        engine.prepare(prompt("Evict the victim with a deliberately undersized Host quota.")),
+        fixed_output(1));
+    const auto accounting               = ninfer::runtime::testing::snapshot_host_accounting();
+    const ninfer::RuntimeStats rejected = engine.runtime_stats();
+    if (replacement.generated_token_ids.size() != 1 || accounting.metadata_bytes == 0 ||
+        accounting.state_bytes == 0 || accounting.main_kv_bytes == 0 ||
+        accounting.backend_kv_bytes == 0 ||
+        accounting.transfer_bytes != accounting.metadata_bytes + accounting.state_bytes +
+                                         accounting.main_kv_bytes + accounting.backend_kv_bytes ||
+        accounting.staging_bytes != accounting.transfer_bytes ||
+        accounting.resident_bytes != accounting.transfer_bytes + accounting.staging_bytes ||
+        accounting.resident_bytes <= 1 || rejected.auto_save_rejected_jobs != 1 ||
+        rejected.auto_save_reserved_jobs != 0 || rejected.auto_save_reserved_bytes != 0 ||
+        rejected.auto_save_queued_jobs != 0 || rejected.auto_save_in_flight_jobs != 0 ||
+        rejected.materializing_requests != 0 || rejected.capture_pending_requests != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_gate_waits() != 0 || gate.pending() ||
+        ninfer::runtime::testing::snapshot_transfer_live_settlements() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0) {
+        std::cerr << "snapshot quota rejection did not preserve exact accounting/cleanup: "
+                  << "metadata=" << accounting.metadata_bytes << " state=" << accounting.state_bytes
+                  << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " resident=" << accounting.resident_bytes
+                  << " rejected=" << rejected.auto_save_rejected_jobs
+                  << " reserved=" << rejected.auto_save_reserved_jobs << '/'
+                  << rejected.auto_save_reserved_bytes
+                  << " waits=" << ninfer::runtime::testing::snapshot_transfer_gate_waits()
+                  << " pins=" << ninfer::runtime::testing::snapshot_transfer_pinned_sources()
+                  << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult after = engine.generate(
+        engine.prepare_tokens({248045, 846, 198, 9013, 248046, 198}), fixed_output(1, false));
+    if (!engine.healthy() || after.generated_token_ids.size() != 1) {
+        std::cerr << "Engine did not remain usable after snapshot quota rejection\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_cache_fixture_equivalence(const char* artifact) {
+    const auto initial_input = [](std::string session_key) {
+        std::string text;
+        text.reserve(6U * 300U);
+        for (std::uint32_t index = 0; index < 300; ++index) { text += "alpha "; }
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = std::move(session_key);
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+    const auto continuation_input = [&initial_input](std::string session_key,
+                                                     const ninfer::GenerationResult& initial) {
+        ninfer::PromptInput input = initial_input(std::move(session_key));
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = initial.reasoning;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = initial.content, .media = {}});
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+        input.messages.push_back(std::move(user));
+        return input;
+    };
+    ninfer::PromptInput reference_continuation;
+    std::vector<ninfer::TokenId> initial_tokens;
+    std::vector<ninfer::TokenId> device_tokens;
+    std::uint64_t device_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        // Atomic publication retains the successful head until its replacement completes. Give
+        // this Device-only comparison a second State slot so exact reuse can fork without
+        // pressure selecting a feasible Root execution instead.
+        options.context_cache.device_state_slots = 2;
+        ninfer::Engine engine(std::move(options));
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(initial_input("host-restore-real")), fixed_output(5));
+        initial_tokens         = initial.generated_token_ids;
+        reference_continuation = continuation_input("host-restore-real", initial);
+        const ninfer::GenerationResult device =
+            engine.generate(engine.prepare(reference_continuation), fixed_output(2));
+        if (initial_tokens.size() != 5 || device.generated_token_ids.size() != 2 ||
+            device.reused_prompt_tokens == 0 ||
+            device.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+            std::cerr << "Device fixture did not use its exact retained checkpoint: initial="
+                      << initial_tokens.size() << " output=" << device.generated_token_ids.size()
+                      << " reused=" << device.reused_prompt_tokens
+                      << " path=" << static_cast<int>(device.prefix_reuse_path) << '\n';
+            return 1;
+        }
+        device_tokens = device.generated_token_ids;
+        device_hash   = token_fixture_hash(device_tokens);
+    }
+
+    std::uint64_t disabled_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        options.context_cache         = ninfer::ContextCacheOptions{.enabled = false};
+        ninfer::Engine engine(std::move(options));
+        ninfer::PromptInput disabled_input       = reference_continuation;
+        disabled_input.context_cache.session_key = "cache-fixture-disabled";
+        const ninfer::GenerationResult disabled =
+            engine.generate(engine.prepare(std::move(disabled_input)), fixed_output(2, false));
+        disabled_hash = token_fixture_hash(disabled.generated_token_ids);
+        if (disabled.generated_token_ids != device_tokens || disabled.reused_prompt_tokens != 0 ||
+            disabled.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+            std::cerr << "disabled-cache fixture diverged from Device reuse: hashes="
+                      << disabled_hash << '/' << device_hash << '\n';
+            return 1;
+        }
+    }
+
+    std::uint64_t host_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        ninfer::Engine engine(std::move(options));
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(initial_input("host-restore-real")), fixed_output(5));
+        if (initial.generated_token_ids != initial_tokens) {
+            std::cerr << "Host fixture initial deterministic boundary changed\n";
+            return 1;
+        }
+        ninfer::PromptInput host_continuation    = continuation_input("host-restore-real", initial);
+        ninfer::PromptInput pressure_input       = host_continuation;
+        pressure_input.context_cache.session_key = "cache-fixture-pressure";
+        const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+        const ninfer::GenerationResult pressure =
+            engine.generate(engine.prepare(std::move(pressure_input)), fixed_output(2, false));
+        const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+        if (pressure.generated_token_ids.size() != 2 ||
+            after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
+            after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
+            after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
+            std::cerr << "Host fixture did not demote its exact checkpoint\n";
+            return 1;
+        }
+        const ninfer::GenerationResult host =
+            engine.generate(engine.prepare(std::move(host_continuation)), fixed_output(2));
+        const ninfer::RuntimeStats after_host = engine.runtime_stats();
+        host_hash                             = token_fixture_hash(host.generated_token_ids);
+        if (host.generated_token_ids != device_tokens || host.reused_prompt_tokens == 0 ||
+            host.prefix_reuse_path == ninfer::PrefixReusePath::Root ||
+            after_host.state_h2d_count <= after_pressure.state_h2d_count ||
+            after_host.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+            after_host.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
+            std::cerr << "Host fixture diverged from Device/disabled reference: hashes="
+                      << host_hash << '/' << device_hash << '/' << disabled_hash << '\n';
+            return 1;
+        }
+    }
+    if (std::getenv("NINFER_REPORT_CACHE_FIXTURE_HASHES") != nullptr) {
+        std::cout << "cache_fixture_hash disabled=" << disabled_hash << " device=" << device_hash
+                  << " host=" << host_hash << '\n';
+    }
+    return 0;
+}
+
+int exercise_target_cache_calibration(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 128000;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::automatic();
+    options.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    options.max_concurrency                  = 4;
+    options.max_pending_requests             = 4;
+    options.enable_vision                    = false;
+    options.context_cache                    = {};
+    options.context_cache.device_state_slots = 4;
+    ninfer::Engine engine(std::move(options));
+
+    const ninfer::EngineOptions& effective = engine.options();
+    const ninfer::MemorySummary memory     = engine.memory_summary();
+    const ninfer::LoadSummary load         = engine.load_summary();
+    if (effective.max_context != 128000 || effective.max_concurrency != 4 ||
+        effective.kv_capacity.mode != ninfer::KvCapacityMode::Automatic ||
+        effective.kv_cache != ninfer::KvCacheStorage::RK4V4E8 ||
+        effective.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
+        effective.speculative.draft_tokens != 3 ||
+        effective.speculative.proposal_head != ninfer::ProposalHead::Optimized ||
+        effective.context_cache.device_state_slots != 4 ||
+        effective.context_cache.host_state_slots != 8 ||
+        effective.context_cache.host_kv_capacity_bytes != (8ULL << 30) ||
+        effective.context_cache.max_private_continuations != 8 ||
+        effective.context_cache.max_shared_prefixes != 4 ||
+        effective.context_cache.max_long_anchors_per_continuation != 2 ||
+        memory.kv_capacity_mode != ninfer::KvCapacityMode::Automatic || memory.kv_capacity == 0 ||
+        memory.kv_capacity >= 4U * 128000U || memory.host_state_capacity_slots != 8 ||
+        memory.host_kv_capacity_bytes != (8ULL << 30) || memory.gdn_state_bytes == 0) {
+        std::cerr << "target cache calibration resolved an unexpected workload profile: context="
+                  << effective.max_context << " concurrency=" << effective.max_concurrency
+                  << " kv_mode=" << static_cast<int>(effective.kv_capacity.mode)
+                  << " kv_storage=" << static_cast<int>(effective.kv_cache)
+                  << " device_state=" << effective.context_cache.device_state_slots.value_or(0)
+                  << " host_state=" << effective.context_cache.host_state_slots
+                  << " host_kv=" << effective.context_cache.host_kv_capacity_bytes
+                  << " private=" << effective.context_cache.max_private_continuations.value_or(0)
+                  << " shared=" << effective.context_cache.max_shared_prefixes.value_or(0)
+                  << " anchors="
+                  << effective.context_cache.max_long_anchors_per_continuation.value_or(0)
+                  << " resolved_kv=" << memory.kv_capacity
+                  << " resolved_host_state=" << memory.host_state_capacity_slots
+                  << " resolved_host_kv=" << memory.host_kv_capacity_bytes
+                  << " gdn=" << memory.gdn_state_bytes << '\n';
+        return 1;
+    }
+    std::cout << "target_cache_calibration"
+              << " max_context=" << memory.max_context << " kv_capacity=" << memory.kv_capacity
+              << " kv_page_groups=" << memory.kv_capacity_page_groups
+              << " kv_max_page_groups=" << memory.kv_capacity_max_page_groups
+              << " gdn_state=" << memory.gdn_state_bytes
+              << " device_state_active=4 device_state_cache=4 device_state_total=8"
+              << " host_state_slots=" << memory.host_state_capacity_slots
+              << " host_kv=" << memory.host_kv_capacity_bytes
+              << " weights=" << memory.weights.capacity_bytes
+              << " sequence=" << memory.sequence.capacity_bytes
+              << " workspace=" << memory.workspace.capacity_bytes
+              << " minimum_runtime=" << memory.minimum_runtime_reservation_bytes
+              << " runtime=" << memory.runtime_reservation_bytes
+              << " available_after_weights=" << memory.available_after_weights_bytes
+              << " available_after_startup=" << memory.available_after_startup_bytes
+              << " headroom=" << memory.kv_capacity_headroom_bytes
+              << " slack=" << memory.planned_slack_bytes << " transfer_cost="
+              << ninfer::context_cost_preset_source_name(load.context_cost.transfer_source)
+              << " prefill_cost="
+              << ninfer::context_cost_preset_source_name(load.context_cost.prefill_source) << '\n';
     return 0;
 }
 
@@ -2240,11 +2616,23 @@ int exercise_pending_snapshot_shutdown(const char* artifact) {
 
     gate.release();
     shutdown.get();
+    const auto shutdown_cleanup = ninfer::runtime::testing::snapshot_shutdown_cleanup();
     if (gate.pending() || ninfer::runtime::testing::snapshot_transfer_live_settlements() != 0 ||
         ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 ||
         ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0 ||
+        shutdown_cleanup.observations != 1 || shutdown_cleanup.catalog_owners != 0 ||
+        shutdown_cleanup.device_state_slots != 0 || shutdown_cleanup.host_state_slots != 0 ||
+        shutdown_cleanup.device_main_kv_pages != 0 || shutdown_cleanup.device_backend_pages != 0 ||
+        shutdown_cleanup.host_kv_bytes != 0 ||
         writer_failures.load(std::memory_order_acquire) != 0) {
-        std::cerr << "Engine teardown did not completely retire snapshot backing/source pins\n";
+        std::cerr << "Engine teardown did not completely retire snapshot/catalog ownership: "
+                  << "cleanup=" << shutdown_cleanup.observations << '/'
+                  << shutdown_cleanup.catalog_owners
+                  << " state=" << shutdown_cleanup.device_state_slots << '/'
+                  << shutdown_cleanup.host_state_slots
+                  << " kv=" << shutdown_cleanup.device_main_kv_pages << '/'
+                  << shutdown_cleanup.device_backend_pages << '/' << shutdown_cleanup.host_kv_bytes
+                  << '\n';
         return 1;
     }
     return 0;
@@ -3141,6 +3529,33 @@ int main() {
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
+    if (scenario != nullptr && std::string_view(scenario) == "snapshot-quota-rejection") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "snapshot-quota-rejection requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_snapshot_quota_rejection(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "cache-fixture-equivalence") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "cache-fixture-equivalence requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_cache_fixture_equivalence(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "target-cache-calibration") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "target-cache-calibration requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_target_cache_calibration(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
     if (scenario != nullptr && std::string_view(scenario) == "delayed-active-capture") {
         if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
             std::cerr << "delayed-active-capture requires NINFER_QWEN3_8_27B_WEIGHTS\n";
@@ -3280,6 +3695,12 @@ int main() {
             return result;
         }
         if (const int result = exercise_delayed_spill_lifecycle(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_snapshot_quota_rejection(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_cache_fixture_equivalence(qwen38_groupwise); result != 0) {
             return result;
         }
         if (const int result = exercise_delayed_active_capture_lifecycle(qwen38_groupwise);

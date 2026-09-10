@@ -94,6 +94,7 @@ inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheS
 struct PreparedSessionKey {
     std::uint16_t size = 0;
     std::array<char, kPreparedSessionKeyCapacity> bytes{};
+    runtime::SessionIdentityKind identity_kind = runtime::SessionIdentityKind::None;
 
     [[nodiscard]] std::string_view view() const noexcept { return {bytes.data(), size}; }
 
@@ -111,25 +112,25 @@ struct PreparedCacheOpportunity {
     // Immutable classification attached to the one shared semantic owner.
     std::uint32_t structural_origins = 0;
     SharedPrefixRole structural_role = SharedPrefixRole::Transient;
-    bool ssd_eligible = false;
+    bool ssd_eligible                = false;
 
     [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
                                          PreparedCacheOpportunity) noexcept = default;
 };
 
 enum SharedPrefixOrigin : std::uint32_t {
-    SharedPrefixSystemEnd = 1U << 0U,
-    SharedPrefixCacheMarker = 1U << 1U,
-    SharedPrefixInstructionsEnd = 1U << 2U,
-    SharedPrefixProjectContext = 1U << 3U,
+    SharedPrefixSystemEnd        = 1U << 0U,
+    SharedPrefixCacheMarker      = 1U << 1U,
+    SharedPrefixInstructionsEnd  = 1U << 2U,
+    SharedPrefixProjectContext   = 1U << 3U,
     SharedPrefixVolatilityCutoff = 1U << 4U,
 };
 
 struct PreparedStructuralCheckpoint {
     std::uint32_t frontier = 0;
-    std::uint32_t origins = 0;
-    SharedPrefixRole role = SharedPrefixRole::Transient;
-    bool ssd_eligible = false;
+    std::uint32_t origins  = 0;
+    SharedPrefixRole role  = SharedPrefixRole::Transient;
+    bool ssd_eligible      = false;
 };
 
 struct PreparedContextCache {
@@ -142,7 +143,7 @@ struct PreparedContextCache {
     std::uint32_t structural_boundaries_accepted = 0;
     // Exact token boundaries at frontier zero are recognized but cannot be captured.
     // Keep them separate from byte-to-token mapping failures.
-    std::uint32_t structural_boundaries_noncapturable = 0;
+    std::uint32_t structural_boundaries_noncapturable              = 0;
     std::uint32_t structural_boundaries_skipped_not_token_boundary = 0;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;

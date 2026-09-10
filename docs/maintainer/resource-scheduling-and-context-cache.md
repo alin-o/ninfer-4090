@@ -856,6 +856,18 @@ separately. `auto_save_reserved_{jobs,bytes}` cover every accepted reservation t
 Program-side source-pin retirement, including the interval after writer completion, and therefore
 may remain nonzero after both the queued and active-writer gauges reach zero.
 
+The exact single-job byte charge is
+
+```text
+transfer = serialized metadata + complete StateImage + Main KV + selected-backend KV
+resident = transfer-sized pinned staging + transfer-sized assembly/output image
+```
+
+The jobs and bytes quotas reserve `resident` before any CUDA copy or source pin is submitted. Quota
+rejection therefore has no pending producer event, partial assembly, Program source pin, or catalog
+claim. Engine shutdown first settles any submitted CUDA producer and then clears Program physical
+ownership before ResourceManager clears its logical catalogs.
+
 ### 9.4 Commit
 
 Commit 发布：
@@ -912,11 +924,19 @@ Placement 只在 admission、capture、finish 或显式 inactive release 的 res
 
 SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Program 不读取 SessionKey。
 
+显式 SessionKey 是 authoritative identity。Frontend 只有在缺少显式 key、没有 media，且能识别“第一个 user
+之后的第一个 assistant”时，才可从该 assistant 之前的完整 rendered token prefix 推导单独标记的
+`InitialPrefix` lineage。单独相同的 harness 不产生 lineage；缺少可证明的 conversational lineage 时不推导。
+该 key 只是 shortlist heuristic，不能越过 Program exact identity validation，也不能覆盖显式 binding。
+
 每个可更新 SessionIndex 的请求取得单调 `publication_order`：
 
 - 新结果只有 order 更大时才能替换当前 binding；
 - 较旧请求晚完成时成为 anonymous cache 或按 policy 释放；
-- matching private source 可以在合法时 consume-to-active；
+- 当前成功 conversation head 在 replacement 完整发布前保持 binding 和 rollback point；replacement 成功后才
+  原子替换 binding，并把旧 head 降为普通 `RecentPrivate` owner；
+- active edge 与 transaction claim 保护使用中的旧 head，但 current-head 身份本身不是永久 pin；
+- 无 claim 的 head 可被 maximal-root correctness fallback 降级或删除；
 - shared source 始终保持 immutable；
 - abort 只能恢复自己仍持有 exact claim 的 former binding。
 
@@ -982,10 +1002,12 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 12. Root 加释放全部 unprotected inactive cache 是 bounded search 之外的 correctness fallback。
 13. Planner 成本模型只排序可行 targets，不参与物理正确性。
 14. Session binding 只接受更大的 publication order。
-15. Retention 或 capture 失败必须退化为 skip/release，使 active lane 有有限终态。
-16. Shared publication 必须严格优于 private-only baseline；单个 demand 对嵌套 prefixes 只能贡献一次最大
+15. 当前 conversation head 只能在完整 replacement 成功发布后被 supersede；head 身份本身不提供永久物理
+    pin。
+16. Retention 或 capture 失败必须退化为 skip/release，使 active lane 有有限终态。
+17. Shared publication 必须严格优于 private-only baseline；单个 demand 对嵌套 prefixes 只能贡献一次最大
     saving。
-17. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
+18. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
     证明完整物理终态。
 
 ---

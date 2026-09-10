@@ -22,6 +22,11 @@ namespace {
 
 using ninfer::PrefixReusePath;
 using ninfer::RuntimeStats;
+using ninfer::ContextCacheMetricIdentity;
+using ninfer::ContextCacheMetricPin;
+using ninfer::ContextCacheMetricPlacement;
+using ninfer::ContextCacheMetricRole;
+using ninfer::context_cache_owner_metric_index;
 using ninfer::runtime::CancellationFlagView;
 using ninfer::runtime::CheckpointKind;
 using ninfer::runtime::CheckpointRecoveryAlternativeWork;
@@ -46,6 +51,8 @@ using ninfer::runtime::ProgramResourceRevision;
 using ninfer::runtime::Readiness;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::RetentionClass;
+using ninfer::runtime::SessionIdentityKind;
+using ninfer::runtime::UniquePhysicalReclamation;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
@@ -99,7 +106,8 @@ struct FakePreparedPrompt {
 };
 
 struct FakeCacheSessionKey {
-    std::uint32_t value = 0;
+    std::uint32_t value               = 0;
+    SessionIdentityKind identity_kind = SessionIdentityKind::Explicit;
 
     [[nodiscard]] std::string_view view() const noexcept {
         return {reinterpret_cast<const char*>(&value), sizeof(value)};
@@ -1184,6 +1192,7 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+    UniquePhysicalReclamation target_reclamation;
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -1609,14 +1618,15 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         digest ^= target.candidate_index;
     }
     ninfer::runtime::PressureTargetAssessment assessment{
-        .physical_status       = program_->target_feasible(selected)
-                                     ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
-                                     : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
-        .source_mode           = candidate.source_mode,
-        .machine_work          = machine,
-        .owner_outcomes        = assessment_outcomes_,
-        .checkpoint_impacts    = assessment_impacts_,
-        .candidate             = candidate_ids_[target.candidate_index],
+        .physical_status    = program_->target_feasible(selected)
+                                  ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
+                                  : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
+        .source_mode        = candidate.source_mode,
+        .machine_work       = machine,
+        .unique_reclamation = identity ? UniquePhysicalReclamation{} : program_->target_reclamation,
+        .owner_outcomes     = assessment_outcomes_,
+        .checkpoint_impacts = assessment_impacts_,
+        .candidate          = candidate_ids_[target.candidate_index],
         .stable_target_ordinal = target.stable_ordinal,
         .degradation_units     = degradation_units,
         .dropped_checkpoints   = dropped,
@@ -2634,6 +2644,42 @@ void test_session_publication_order_controls_tied_source() {
                 manager.catalog_state(1) == FakeManager::CatalogState::Catalogued &&
                 manager.catalog_state(2) == FakeManager::CatalogState::Catalogued,
             "session replacement did not retain its old binding as anonymous cache");
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.session_publications_explicit_total == 2 &&
+                stats.session_supersessions_total == 1 &&
+                stats.session_late_publications_rejected_total == 1 &&
+                stats.context_cache_owners[context_cache_owner_metric_index(
+                    ContextCacheMetricRole::ConversationHead, ContextCacheMetricPlacement::Device,
+                    ContextCacheMetricPin::Unpinned, ContextCacheMetricIdentity::Explicit)] == 1,
+            "session publication/supersession or current-head gauges are inconsistent");
+}
+
+void test_cancelled_replacement_preserves_successful_head_until_atomic_publish() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    const FakeRequestBasePlan base = make_base(42, session, RetentionClass::LiveSession, true);
+    const ActiveRequest head       = start_active(manager, program, 42, base, 1);
+    (void)finish_active(manager, program, head, 16);
+
+    const ActiveRequest cancelled = start_active(manager, program, 42, base, 2);
+    require(program.started_source_id == head.sequence.id &&
+                program.started_source_mode == PrivateSourceMode::Retain,
+            "matching current head was consumed before replacement completion");
+    (void)manager.abort(program, cancelled.lane, cancelled.sequence);
+
+    const ActiveRequest replacement = start_active(manager, program, 42, base, 3);
+    require(program.started_source_id == head.sequence.id &&
+                program.started_source_mode == PrivateSourceMode::Retain,
+            "cancelled replacement lost the last successful session head");
+    (void)finish_active(manager, program, replacement, 16);
+
+    const ActiveRequest repeated = start_active(manager, program, 42, base, 4);
+    require(program.started_source_id == replacement.sequence.id &&
+                program.started_source_mode == PrivateSourceMode::Retain,
+            "complete replacement was not published atomically as the repeated head");
+    (void)manager.abort(program, repeated.lane, repeated.sequence);
 }
 
 void test_canonical_pressure_starts_with_disposable_owner() {
@@ -3182,12 +3228,16 @@ void test_shared_capture_combines_two_pressure_owners() {
     const ActiveRequest active           = start_active(manager, program, 43, shared_request, 3);
     program.required_pressure_actions    = 2;
     program.pressure_action_immediate_ns = 0;
-    program.capture_assessment           = FakeCaptureAssessment{
-                  .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
-                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                  .protected_rebuild_work = PrefillWork{.tokens = 64},
-                  .publishes_shared       = true,
-                  .physically_feasible    = false,
+    program.target_reclamation           = UniquePhysicalReclamation{
+                  .device_state_slots   = 2,
+                  .device_main_kv_pages = 11,
+    };
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
     };
 
     const auto reserved =
@@ -3201,9 +3251,11 @@ void test_shared_capture_combines_two_pressure_owners() {
             "shared capture did not publish the selected two-owner target");
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
-    require(stats.shared_active_references == 1,
-            "shared capture publication did not retain the active owner reference");
+    require(stats.shared_active_references == 1 && stats.reclaimed_device_state_slots_total == 2 &&
+                stats.reclaimed_device_main_kv_pages_total == 11,
+            "shared capture publication lost its active reference or physical reclamation");
     program.required_pressure_actions = 0;
+    program.target_reclamation        = {};
     (void)finish_active(manager, program, active);
 }
 
@@ -3503,6 +3555,43 @@ void test_backfill_proof_and_stats_follow_program_revision() {
             "runtime physical gauges did not come directly from Program");
 }
 
+void test_program_projected_unique_reclamation_is_observable() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest victim = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, victim);
+
+    program.required_pressure_actions = 1;
+    program.target_reclamation        = UniquePhysicalReclamation{
+               .device_state_slots      = 1,
+               .device_main_kv_pages    = 7,
+               .device_backend_kv_pages = 3,
+               .host_state_slots        = 1,
+               .host_kv_bytes           = 4096,
+    };
+    const ActiveRequest replacement = start_active(manager, program, 62, make_base(62), 2);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.reclaimed_device_state_slots_total == 1 &&
+                stats.reclaimed_device_main_kv_pages_total == 7 &&
+                stats.reclaimed_device_backend_kv_pages_total == 3 &&
+                stats.reclaimed_host_state_slots_total == 1 &&
+                stats.reclaimed_host_kv_bytes_total == 4096,
+            "Program-projected unique reclamation was not published after adoption");
+    (void)finish_active(manager, program, replacement);
+
+    // A logical alias may be selected for deletion while Program projects zero unique backing.
+    // Zero must remain observable; ResourceManager must not infer pages from owner count/depth.
+    program.target_reclamation = {};
+    const ActiveRequest alias  = start_active(manager, program, 63, make_base(63), 3);
+    RuntimeStats after_alias;
+    manager.populate_runtime_stats(program, after_alias);
+    require(after_alias.reclaimed_device_main_kv_pages_total == 7 &&
+                after_alias.reclaimed_device_state_slots_total == 1,
+            "zero-page alias deletion was inflated by logical ResourceManager accounting");
+    (void)finish_active(manager, program, alias);
+}
+
 void test_shortlist_collision_requires_program_exact_verification() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3512,6 +3601,32 @@ void test_shortlist_collision_requires_program_exact_verification() {
     auto collision = manager.inspect(program, FakePreparedPrompt{99}, make_base(55), 2);
     require(collision.choice && collision.choice->summary().reusable_prompt_tokens == 0,
             "shortlist collision bypassed Program exact identity verification");
+}
+
+void test_inferred_lineage_never_bypasses_exact_prefix_verification() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const FakeCacheSessionKey inferred{.value         = 77,
+                                       .identity_kind = SessionIdentityKind::InitialPrefix};
+    const ActiveRequest seed =
+        start_active(manager, program, 55, make_base(55, inferred, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.session_publications_initial_prefix_total == 1 &&
+                stats.context_cache_owners[context_cache_owner_metric_index(
+                    ContextCacheMetricRole::ConversationHead, ContextCacheMetricPlacement::Device,
+                    ContextCacheMetricPin::Unpinned, ContextCacheMetricIdentity::InitialPrefix)] ==
+                    1,
+            "initial_prefix publication was not separately labelled");
+
+    // Same inferred initial exchange can name unrelated later branches. The shortlist collision
+    // reaches Program, but exact identity mismatch must reduce this to root rather than reusing
+    // another branch's State/KV.
+    auto branch = manager.inspect(program, FakePreparedPrompt{99},
+                                  make_base(55, inferred, RetentionClass::LiveSession), 2);
+    require(branch.choice && branch.choice->summary().reusable_prompt_tokens == 0,
+            "initial_prefix lineage bypassed Program exact identity verification");
 }
 
 void test_delayed_transfer_timeline_settles_before_abort_or_adoption() {
@@ -3607,6 +3722,8 @@ int main() {
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
+    run_test("cancelled atomic session replacement",
+             test_cancelled_replacement_preserves_successful_head_until_atomic_publish);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
              test_pressure_tries_every_preserving_alternative_before_eviction);
@@ -3652,8 +3769,12 @@ int main() {
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
+    run_test("Program-projected unique reclamation",
+             test_program_projected_unique_reclamation_is_observable);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("inferred lineage exact verification",
+             test_inferred_lineage_never_bypasses_exact_prefix_verification);
     run_test("delayed transfer timeline and settlement",
              test_delayed_transfer_timeline_settles_before_abort_or_adoption);
     if (failures != 0) { return 1; }

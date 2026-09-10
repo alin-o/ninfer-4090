@@ -2,12 +2,14 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "runtime/engine/context_transfer_test_gate.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -43,6 +45,13 @@ namespace {
 
 constexpr char kSessionSnapshotMagic[8]         = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
 constexpr std::uint32_t kSessionSnapshotVersion = 3;
+constexpr char kSharedSnapshotMagic[8]          = {'N', 'I', 'N', 'F', 'S', 'H', 'R', '1'};
+constexpr std::uint32_t kSharedSnapshotVersion  = 1;
+constexpr std::size_t kSharedChecksumBytes      = 32;
+constexpr std::size_t kSharedEnvelopeHeaderBytes =
+    sizeof(kSharedSnapshotMagic) + sizeof(std::uint32_t) + 2U * sizeof(std::uint64_t) +
+    kSharedChecksumBytes;
+constexpr std::uint32_t kSharedIdentitySchema = 1;
 
 constexpr std::uint32_t kKvFlagPackedV   = 1U << 0;
 constexpr std::uint32_t kKvFlagRotateK   = 1U << 1;
@@ -120,6 +129,13 @@ void write_vector(SnapshotWriter& writer, const std::vector<T>& values) {
     static_assert(std::is_trivially_copyable_v<T>);
     writer.pod<std::uint64_t>(values.size());
     writer.bytes(values.data(), values.size() * sizeof(T));
+}
+
+template <class T>
+void write_span(SnapshotWriter& writer, std::span<const T> values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    writer.pod<std::uint64_t>(values.size());
+    writer.bytes(values.data(), values.size_bytes());
 }
 
 template <class T>
@@ -210,6 +226,153 @@ struct SnapshotSession {
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
 };
+
+struct SharedSnapshotConfig {
+    SnapshotConfig physical;
+    std::uint32_t max_context     = 0;
+    std::uint32_t token_domain    = 0;
+    std::uint32_t proposal_head   = 0;
+    std::uint32_t identity_schema = 0;
+    std::uint32_t identity_tag    = 0;
+};
+
+struct SharedSnapshotBoundary {
+    std::uint32_t frontier         = 0;
+    std::uint32_t backend_frontier = 0;
+    std::int32_t rope_delta        = 0;
+    std::uint8_t tail_hidden_valid = 0;
+    runtime::PrefillWork rebuild_work;
+    std::uint32_t text_pages    = 0;
+    std::uint32_t backend_pages = 0;
+};
+
+struct SharedImportBacking {
+    std::vector<std::uint8_t> storage;
+    std::shared_ptr<const PreparedCaptureIdentity> identity;
+    SharedSnapshotBoundary boundary;
+    std::size_t state_offset   = 0;
+    std::size_t text_offset    = 0;
+    std::size_t backend_offset = 0;
+};
+
+void write_config(SnapshotWriter& writer, const SnapshotConfig& config);
+SnapshotConfig read_config(SnapshotReader& reader);
+
+void write_shared_config(SnapshotWriter& writer, const SharedSnapshotConfig& config) {
+    write_config(writer, config.physical);
+    writer.pod(config.max_context);
+    writer.pod(config.token_domain);
+    writer.pod(config.proposal_head);
+    writer.pod(config.identity_schema);
+    writer.pod(config.identity_tag);
+}
+
+SharedSnapshotConfig read_shared_config(SnapshotReader& reader) {
+    SharedSnapshotConfig config;
+    config.physical        = read_config(reader);
+    config.max_context     = reader.pod<std::uint32_t>();
+    config.token_domain    = reader.pod<std::uint32_t>();
+    config.proposal_head   = reader.pod<std::uint32_t>();
+    config.identity_schema = reader.pod<std::uint32_t>();
+    config.identity_tag    = reader.pod<std::uint32_t>();
+    return config;
+}
+
+void write_shared_boundary(SnapshotWriter& writer, const SharedSnapshotBoundary& boundary) {
+    writer.pod(boundary.frontier);
+    writer.pod(boundary.backend_frontier);
+    writer.pod(boundary.rope_delta);
+    writer.pod(boundary.tail_hidden_valid);
+    writer.pod(boundary.rebuild_work);
+    writer.pod(boundary.text_pages);
+    writer.pod(boundary.backend_pages);
+}
+
+SharedSnapshotBoundary read_shared_boundary(SnapshotReader& reader) {
+    SharedSnapshotBoundary boundary;
+    boundary.frontier          = reader.pod<std::uint32_t>();
+    boundary.backend_frontier  = reader.pod<std::uint32_t>();
+    boundary.rope_delta        = reader.pod<std::int32_t>();
+    boundary.tail_hidden_valid = reader.pod<std::uint8_t>();
+    boundary.rebuild_work      = reader.pod<runtime::PrefillWork>();
+    boundary.text_pages        = reader.pod<std::uint32_t>();
+    boundary.backend_pages     = reader.pod<std::uint32_t>();
+    return boundary;
+}
+
+void validate_durable_metadata(const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
+                               std::uint32_t frontier) {
+    constexpr std::uint32_t classified_origins =
+        qwen3_6::SharedPrefixSystemEnd | qwen3_6::SharedPrefixCacheMarker |
+        qwen3_6::SharedPrefixInstructionsEnd | qwen3_6::SharedPrefixProjectContext;
+    if (!metadata.ssd_eligible || metadata.structural_role == 0 ||
+        metadata.structural_role > static_cast<std::uint8_t>(qwen3_6::SharedPrefixRole::Project) ||
+        (metadata.structural_origins & classified_origins) == 0 ||
+        !has_shared_candidate_evidence(metadata.evidence,
+                                       SharedCandidateEvidence::EngineStructural) ||
+        (metadata.first_volatile_token && frontier >= *metadata.first_volatile_token)) {
+        throw std::invalid_argument(
+            "shared snapshot candidate is volatile or lacks durable structural provenance "
+            "(eligible=" +
+            std::to_string(metadata.ssd_eligible) +
+            ", role=" + std::to_string(metadata.structural_role) +
+            ", origins=" + std::to_string(metadata.structural_origins) +
+            ", evidence=" + std::to_string(static_cast<std::uint8_t>(metadata.evidence)) +
+            ", frontier=" + std::to_string(frontier) + ", cutoff=" +
+            (metadata.first_volatile_token ? std::to_string(*metadata.first_volatile_token)
+                                           : std::string("none")) +
+            ")");
+    }
+}
+
+std::size_t checked_snapshot_sum(std::size_t left, std::size_t right) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        throw std::overflow_error("shared snapshot size overflows host accounting");
+    }
+    return left + right;
+}
+
+std::size_t checked_snapshot_product(std::size_t left, std::size_t right) {
+    if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+        throw std::overflow_error("shared snapshot size overflows host accounting");
+    }
+    return left * right;
+}
+
+std::size_t shared_snapshot_max_bytes(std::uint32_t capacity, std::size_t state_bytes,
+                                      std::size_t text_page_stride,
+                                      std::size_t backend_page_stride) {
+    constexpr std::size_t binding_bytes = sizeof(std::uint32_t) + 4096U;
+    constexpr std::size_t config_bytes  = 6U * sizeof(std::uint32_t) + sizeof(std::uint64_t) +
+                                         sizeof(std::uint32_t) + sizeof(std::uint64_t) +
+                                         sizeof(std::uint32_t) + sizeof(std::uint64_t) +
+                                         5U * sizeof(std::uint32_t);
+    constexpr std::size_t boundary_bytes = 3U * sizeof(std::uint32_t) + sizeof(std::uint8_t) +
+                                           sizeof(runtime::PrefillWork) +
+                                           2U * sizeof(std::uint32_t);
+    constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
+                                             3U * sizeof(std::uint8_t) + sizeof(std::uint32_t);
+    constexpr std::size_t identity_fixed_bytes = 6U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
+    constexpr std::size_t identity_bytes_per_token =
+        sizeof(TokenId) + sizeof(std::uint8_t) + 3U * sizeof(std::int32_t) + sizeof(std::uint32_t);
+    constexpr std::size_t identity_directory_bytes =
+        kSharedChecksumBytes + 3U * sizeof(std::uint64_t);
+
+    std::size_t maximum = kSharedEnvelopeHeaderBytes;
+    maximum             = checked_snapshot_sum(maximum, binding_bytes);
+    maximum             = checked_snapshot_sum(maximum, config_bytes);
+    maximum             = checked_snapshot_sum(maximum, boundary_bytes);
+    maximum             = checked_snapshot_sum(maximum, provenance_bytes);
+    maximum             = checked_snapshot_sum(maximum, identity_directory_bytes);
+    maximum             = checked_snapshot_sum(maximum, identity_fixed_bytes);
+    maximum =
+        checked_snapshot_sum(maximum, checked_snapshot_product(capacity, identity_bytes_per_token));
+    maximum                 = checked_snapshot_sum(maximum, state_bytes);
+    const std::size_t pages = kv_pages_for_frontier(capacity);
+    maximum = checked_snapshot_sum(maximum, checked_snapshot_product(pages, text_page_stride));
+    maximum = checked_snapshot_sum(maximum, checked_snapshot_product(pages, backend_page_stride));
+    return maximum;
+}
 
 void write_config(SnapshotWriter& writer, const SnapshotConfig& config) {
     writer.pod(config.kv_dtype);
@@ -1187,6 +1350,735 @@ ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::ui
             if (image) { (void)state_store->release(*image); }
         }
         if (slot_index) { release_continuation_slot_best_effort(*slot_index); }
+        throw;
+    }
+}
+
+qwen3_6::RetainedSessionSnapshot
+ProgramImplCore::export_shared_prefix(const SharedPrefixHandle& handle,
+                                      std::string_view model_binding,
+                                      const qwen3_6::SharedPrefixPersistenceMetadata& metadata) {
+    qwen3_6::RetainedSessionSnapshot snapshot =
+        begin_export_shared_prefix(handle, model_binding, metadata);
+    if (snapshot.await_transfer) { snapshot.await_transfer(snapshot.bytes); }
+    retire_ready_snapshot_sources();
+    snapshot.await_transfer = {};
+    return snapshot;
+}
+
+qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
+    const SharedPrefixHandle& handle, std::string_view model_binding,
+    const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
+    const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
+    if (!valid_shared_prefix(handle)) {
+        throw std::invalid_argument("shared snapshot source is not catalogued");
+    }
+    if (model_binding.size() > 4096) {
+        throw std::invalid_argument("shared snapshot model binding is too long");
+    }
+    if (pending_transaction_ || has_context_transaction()) {
+        throw std::logic_error("cannot export a shared prefix during a resource transaction");
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("shared snapshot does not support the DFlash backend");
+    }
+
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(handle)];
+    if (!shared.kv || !shared.identity || !shared.identity->backing || shared.frontier == 0 ||
+        shared.identity->shortlist_key.frontier != shared.frontier ||
+        shared.identity->ledger().size() != shared.frontier || !state_store->valid(shared.state) ||
+        state_store->residency(shared.state) == StateReplicaResidency::None) {
+        throw std::logic_error("shared snapshot source is incomplete");
+    }
+    validate_durable_metadata(metadata, shared.frontier);
+    const auto* identity = shared.identity->prefix_identity();
+    if (identity == nullptr || identity->size() < shared.frontier) {
+        throw std::logic_error("shared snapshot exact identity is incomplete");
+    }
+    if (!identity->vision_items().empty()) {
+        throw std::invalid_argument("shared snapshot media persistence is not supported");
+    }
+
+    const DeviceKVPagePool& text_pool    = text_kv_pages->physical_pool();
+    const HostKVPageLayout text_layout   = plan_host_kv_page_layout(text_pool.geometry());
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    std::optional<HostKVPageLayout> backend_layout;
+    if (backend != nullptr) {
+        backend_layout = plan_host_kv_page_layout(backend->page_pool().geometry());
+    }
+    if ((backend != nullptr) != shared.kv->backend.has_value()) {
+        throw std::logic_error("shared snapshot backend KV ownership is inconsistent");
+    }
+    const std::uint32_t text_committed = text_kv_addresses->committed_frontier(shared.kv->text);
+    const std::uint32_t backend_committed =
+        shared.kv->backend ? backend_kv_addresses->committed_frontier(*shared.kv->backend) : 0U;
+    const bool backend_coverage =
+        shared.kv->backend
+            ? backend_committed >= shared.backend_frontier && backend_committed <= shared.frontier
+            : backend_committed == 0;
+    if (text_committed != shared.frontier || !backend_coverage) {
+        throw std::logic_error("shared snapshot KV frontiers do not match the boundary (Main=" +
+                               std::to_string(text_committed) + "/" +
+                               std::to_string(shared.frontier) +
+                               ", backend=" + std::to_string(backend_committed) + "/" +
+                               std::to_string(shared.backend_frontier) + ")");
+    }
+
+    SharedSnapshotConfig config;
+    config.physical.kv_dtype       = static_cast<std::uint32_t>(kv_dtype);
+    config.physical.kv_quant_group = kv_quant_group;
+    config.physical.kv_flags =
+        (kv_packed_v ? kKvFlagPackedV : 0U) | (kv_rotate_k ? kKvFlagRotateK : 0U) |
+        (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
+        (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+    config.physical.speculative_backend = static_cast<std::uint32_t>(speculative_backend);
+    config.physical.draft_window        = draft_window;
+    config.physical.page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
+    config.physical.state_image_bytes   = state_images->host_layout().image_bytes;
+    config.physical.text_plane_count    = static_cast<std::uint32_t>(text_pool.plane_count());
+    config.physical.text_page_stride    = text_layout.page_stride;
+    if (backend != nullptr) {
+        config.physical.backend_plane_count =
+            static_cast<std::uint32_t>(backend->page_pool().plane_count());
+        config.physical.backend_page_stride = backend_layout->page_stride;
+    }
+    config.max_context     = capacity;
+    config.token_domain    = TextConfig::token_domain;
+    config.proposal_head   = static_cast<std::uint32_t>(proposal_head);
+    config.identity_schema = kSharedIdentitySchema;
+    config.identity_tag    = shared.identity->shortlist_key.identity_tag;
+
+    SharedSnapshotBoundary boundary;
+    boundary.frontier          = shared.frontier;
+    boundary.backend_frontier  = shared.backend_frontier;
+    boundary.rope_delta        = shared.rope_delta;
+    boundary.tail_hidden_valid = shared.tail_hidden_valid ? 1U : 0U;
+    boundary.rebuild_work      = validated_rebuild_work(shared.rebuild_work, shared.frontier);
+    boundary.text_pages        = kv_pages_for_frontier(shared.frontier);
+    boundary.backend_pages     = kv_pages_for_frontier(shared.backend_frontier);
+    if (boundary.text_pages == 0 ||
+        boundary.text_pages > text_kv_addresses->mapped_pages(shared.kv->text) ||
+        (shared.kv->backend &&
+         boundary.backend_pages > backend_kv_addresses->mapped_pages(*shared.kv->backend))) {
+        throw std::logic_error("shared snapshot KV coverage is incomplete");
+    }
+
+    std::vector<std::uint8_t> identity_bytes;
+    SnapshotWriter identity_writer(identity_bytes);
+    write_span(identity_writer, shared.identity->ledger());
+    write_span(identity_writer,
+               std::span<const std::uint8_t>(identity->token_types()).first(shared.frontier));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        write_span(
+            identity_writer,
+            std::span<const std::int32_t>(identity->position_axis(axis)).first(shared.frontier));
+    }
+    write_vision_items(identity_writer, {});
+    const auto& rewrite_frontiers = identity->rewrite_execution_frontiers();
+    const auto rewrite_end =
+        std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), shared.frontier);
+    write_span(identity_writer,
+               std::span<const std::uint32_t>(rewrite_frontiers.begin(), rewrite_end));
+    const auto identity_digest = frontend_internal::sha256(identity_bytes);
+
+    qwen3_6::RetainedSessionSnapshot snapshot;
+    snapshot.tokens         = shared.frontier;
+    snapshot.session_digest = ledger_prefix_digest(shared.identity->ledger());
+    snapshot.content_digest = frontend_internal::sha256_hex(identity_digest);
+    SnapshotWriter writer(snapshot.bytes);
+    writer.bytes(kSharedSnapshotMagic, sizeof(kSharedSnapshotMagic));
+    writer.pod(kSharedSnapshotVersion);
+    const std::size_t total_size_offset = snapshot.bytes.size();
+    writer.pod<std::uint64_t>(0);
+    const std::size_t payload_size_offset = snapshot.bytes.size();
+    writer.pod<std::uint64_t>(0);
+    const std::size_t checksum_offset = snapshot.bytes.size();
+    std::array<std::uint8_t, kSharedChecksumBytes> empty_checksum{};
+    writer.bytes(empty_checksum.data(), empty_checksum.size());
+    if (snapshot.bytes.size() != kSharedEnvelopeHeaderBytes) {
+        throw std::logic_error("shared snapshot envelope geometry changed");
+    }
+
+    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(model_binding.size()));
+    writer.bytes(model_binding.data(), model_binding.size());
+    write_shared_config(writer, config);
+    write_shared_boundary(writer, boundary);
+    writer.pod<std::uint8_t>(static_cast<std::uint8_t>(metadata.evidence));
+    writer.pod(metadata.structural_origins);
+    writer.pod(metadata.structural_role);
+    writer.pod<std::uint8_t>(metadata.ssd_eligible ? 1U : 0U);
+    writer.pod<std::uint8_t>(metadata.first_volatile_token ? 1U : 0U);
+    writer.pod<std::uint32_t>(metadata.first_volatile_token.value_or(0));
+    writer.bytes(identity_digest.data(), identity_digest.size());
+    writer.pod(shared.identity->shortlist_key.digests[0]);
+    writer.pod(shared.identity->shortlist_key.digests[1]);
+    writer.pod<std::uint64_t>(identity_bytes.size());
+    writer.bytes(identity_bytes.data(), identity_bytes.size());
+
+    const std::size_t state_bytes = state_images->host_layout().image_bytes;
+    const std::size_t text_bytes =
+        static_cast<std::size_t>(boundary.text_pages) * text_layout.page_stride;
+    const std::size_t backend_bytes =
+        static_cast<std::size_t>(boundary.backend_pages) * config.physical.backend_page_stride;
+    std::size_t transfer_bytes = checked_snapshot_sum(snapshot.bytes.size(), state_bytes);
+    transfer_bytes             = checked_snapshot_sum(transfer_bytes, text_bytes);
+    transfer_bytes             = checked_snapshot_sum(transfer_bytes, backend_bytes);
+    if (transfer_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
+        throw std::overflow_error("shared snapshot double residency overflows host accounting");
+    }
+    const std::uint64_t total_u64   = transfer_bytes;
+    const std::uint64_t payload_u64 = transfer_bytes - kSharedEnvelopeHeaderBytes;
+    std::memcpy(snapshot.bytes.data() + total_size_offset, &total_u64, sizeof(total_u64));
+    std::memcpy(snapshot.bytes.data() + payload_size_offset, &payload_u64, sizeof(payload_u64));
+
+    if (reserve) {
+        snapshot.queue_reservation = reserve(transfer_bytes * 2U);
+        if (!snapshot.queue_reservation) { return {}; }
+    }
+    snapshot.bytes.reserve(transfer_bytes);
+    if (snapshot.bytes.capacity() != transfer_bytes) {
+        throw std::runtime_error("shared snapshot assembly capacity exceeds its Host reservation");
+    }
+    const std::size_t state_offset   = writer.reserve_payload(state_bytes);
+    const std::size_t text_offset    = writer.reserve_payload(text_bytes);
+    const std::size_t backend_offset = writer.reserve_payload(backend_bytes);
+    auto transfer_backing            = std::make_shared<PinnedHostBuffer>(transfer_bytes);
+    std::memcpy(transfer_backing->data(), snapshot.bytes.data(), transfer_bytes);
+
+    struct SharedTransferSettlement {
+        DeviceContext* device = nullptr;
+        std::shared_ptr<PinnedHostBuffer> backing;
+        std::shared_ptr<CudaCompletionEvent> completion;
+        std::shared_ptr<CudaCompletionEvent> producer;
+        std::shared_ptr<void> queue_reservation;
+        StateImageStore* states = nullptr;
+        std::vector<StateImageHandle> state_sources;
+        std::vector<std::pair<LogicalKVPageStore*, LogicalKVPageHandle>> kv_sources;
+        bool submitted = false;
+        bool recorded  = false;
+        std::exception_ptr failure;
+        std::once_flag settlement;
+        bool retired = false;
+
+        void settle() noexcept {
+            std::call_once(settlement, [&] {
+                if (!submitted || !device || !completion) { return; }
+                try {
+                    device->bind_to_current_thread();
+                    if (!recorded) {
+                        completion->record(device->transfer_stream);
+                        recorded = true;
+                    }
+                    completion->synchronize();
+                } catch (...) { failure = std::current_exception(); }
+            });
+        }
+
+        void retire() noexcept {
+            if (retired) { return; }
+            settle();
+            try {
+                for (const StateImageHandle source : state_sources) {
+                    states->unpin_snapshot_source(source);
+                }
+                for (const auto& [store, source] : kv_sources) { store->unpin_source(source); }
+            } catch (...) {}
+            state_sources.clear();
+            kv_sources.clear();
+            retired = true;
+        }
+
+        ~SharedTransferSettlement() { retire(); }
+    };
+
+    auto pending               = std::make_shared<SharedTransferSettlement>();
+    pending->device            = &device;
+    pending->backing           = transfer_backing;
+    pending->completion        = std::make_shared<CudaCompletionEvent>(device);
+    pending->producer          = std::make_shared<CudaCompletionEvent>(device);
+    pending->queue_reservation = snapshot.queue_reservation;
+    pending->states            = state_store.get();
+    pending->producer->record(device.stream);
+    pending->producer->wait(device.transfer_stream);
+    auto* base = static_cast<std::uint8_t*>(transfer_backing->data());
+
+    if (state_store->residency(shared.state) == StateReplicaResidency::HostOnly) {
+        const auto view = state_store->host_view(shared.state);
+        std::memcpy(base + state_offset, view.data, state_bytes);
+    } else {
+        state_store->pin_snapshot_source(shared.state);
+        pending->state_sources.push_back(shared.state);
+        pending->submitted = true;
+        state_images->copy_to_host(
+            state_store->physical_slot(shared.state),
+            qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(base + state_offset),
+                                        &state_images->host_layout()},
+            device.transfer_stream);
+        ++snapshot_traffic_.state_d2h_count;
+        snapshot_traffic_.state_d2h_bytes += state_bytes;
+    }
+
+    const auto copy_pages = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                const DeviceKVPagePool& pool, KVAddressSpaceHandle address,
+                                std::uint32_t count, const HostKVPageLayout& layout,
+                                std::size_t offset, std::uint64_t& d2h_pages,
+                                std::uint64_t& d2h_bytes) {
+        std::vector<DeviceKVPageHandle> run;
+        run.reserve(count);
+        std::uint32_t run_begin = 0;
+        const auto flush        = [&] {
+            if (run.empty()) { return; }
+            pending->submitted = true;
+            pool.copy_to_host(
+                run,
+                reinterpret_cast<std::byte*>(
+                    base + offset + static_cast<std::size_t>(run_begin) * layout.page_stride),
+                layout, device.transfer_stream);
+            d2h_pages += run.size();
+            d2h_bytes += run.size() * layout.page_stride;
+            run.clear();
+        };
+        for (std::uint32_t page = 0; page < count; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (pages.device_resident(logical)) {
+                if (!pages.can_pin_source(logical)) {
+                    throw std::logic_error("shared snapshot KV source is not immutable");
+                }
+                pages.pin_source(logical);
+                pending->kv_sources.emplace_back(&pages, logical);
+                if (run.empty()) { run_begin = page; }
+                run.push_back(pages.physical(logical));
+                continue;
+            }
+            flush();
+            if (!pages.host_replica_current(logical) || !host_kv_extents) {
+                throw std::logic_error("shared snapshot KV page has no current replica");
+            }
+            const HostKVPageReplica& replica     = pages.host_replica(logical);
+            const HostKVAllocationConstView view = host_kv_extents->view(replica.extent);
+            if (view.layout().page_stride != layout.page_stride ||
+                replica.page_offset >= view.page_count()) {
+                throw std::logic_error("shared snapshot Host KV geometry is inconsistent");
+            }
+            std::memcpy(base + offset + static_cast<std::size_t>(page) * layout.page_stride,
+                        view.data() +
+                            static_cast<std::size_t>(replica.page_offset) * layout.page_stride,
+                        layout.page_stride);
+        }
+        flush();
+    };
+    copy_pages(*text_kv_addresses, *text_kv_pages, text_pool, shared.kv->text, boundary.text_pages,
+               text_layout, text_offset, snapshot_traffic_.main_kv_d2h_pages,
+               snapshot_traffic_.main_kv_d2h_bytes);
+    if (shared.kv->backend) {
+        copy_pages(*backend_kv_addresses, *backend_kv_pages, backend->page_pool(),
+                   *shared.kv->backend, boundary.backend_pages, *backend_layout, backend_offset,
+                   snapshot_traffic_.backend_kv_d2h_pages, snapshot_traffic_.backend_kv_d2h_bytes);
+    }
+    if (pending->submitted) {
+        pending->completion->record(device.transfer_stream);
+        pending->recorded = true;
+    }
+    snapshot.transfer_bytes = transfer_bytes;
+    snapshot.bytes.clear();
+    snapshot.bytes.shrink_to_fit();
+    snapshot.await_transfer = [pending, transfer_bytes, checksum_offset](auto& bytes) {
+        pending->settle();
+        if (pending->failure) { std::rethrow_exception(pending->failure); }
+        bytes.resize(transfer_bytes);
+        std::memcpy(bytes.data(), pending->backing->data(), transfer_bytes);
+        const auto checksum = frontend_internal::sha256(
+            std::span<const std::uint8_t>(bytes).subspan(kSharedEnvelopeHeaderBytes));
+        std::memcpy(bytes.data() + checksum_offset, checksum.data(), checksum.size());
+    };
+    snapshot.settle_transfer = [pending] { pending->settle(); };
+    snapshot_source_retirements_.push_back(SnapshotSourceRetirement{
+        .ready  = [pending] { return !pending->submitted || pending->completion->ready(); },
+        .retire = [pending] { pending->retire(); },
+    });
+    return snapshot;
+}
+
+qwen3_6::ValidatedSharedPrefixImport<Variant>
+ProgramImplCore::parse_shared_prefix(std::span<const std::uint8_t> snapshot,
+                                     std::string_view model_binding,
+                                     const std::function<void()>& cancellation_checkpoint) const {
+    if (snapshot.size() < kSharedEnvelopeHeaderBytes) {
+        throw std::invalid_argument("shared snapshot is truncated");
+    }
+    SnapshotReader envelope(snapshot);
+    char magic[sizeof(kSharedSnapshotMagic)]{};
+    envelope.bytes(magic, sizeof(magic));
+    if (std::memcmp(magic, kSharedSnapshotMagic, sizeof(magic)) != 0) {
+        throw std::invalid_argument("file is not a shared snapshot");
+    }
+    if (envelope.pod<std::uint32_t>() != kSharedSnapshotVersion) {
+        throw std::invalid_argument("shared snapshot version is unsupported");
+    }
+    const std::uint64_t total_size   = envelope.pod<std::uint64_t>();
+    const std::uint64_t payload_size = envelope.pod<std::uint64_t>();
+    std::array<std::uint8_t, kSharedChecksumBytes> expected_checksum{};
+    envelope.bytes(expected_checksum.data(), expected_checksum.size());
+    if (total_size != snapshot.size() ||
+        payload_size != snapshot.size() - kSharedEnvelopeHeaderBytes) {
+        throw std::invalid_argument("shared snapshot envelope lengths are inconsistent");
+    }
+    const DeviceKVPagePool& text_pool    = text_kv_pages->physical_pool();
+    const HostKVPageLayout text_layout   = plan_host_kv_page_layout(text_pool.geometry());
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    std::optional<HostKVPageLayout> backend_layout;
+    if (backend != nullptr) {
+        backend_layout = plan_host_kv_page_layout(backend->page_pool().geometry());
+    }
+    const std::size_t maximum_size = shared_snapshot_max_bytes(
+        capacity, state_images->host_layout().image_bytes, text_layout.page_stride,
+        backend_layout ? backend_layout->page_stride : 0U);
+    if (snapshot.size() > maximum_size) {
+        throw std::invalid_argument("shared snapshot exceeds the configured geometry bound");
+    }
+    if (cancellation_checkpoint) { cancellation_checkpoint(); }
+    const auto actual_checksum = frontend_internal::sha256(
+        snapshot.subspan(kSharedEnvelopeHeaderBytes), cancellation_checkpoint);
+    if (actual_checksum != expected_checksum) {
+        throw std::invalid_argument("shared snapshot payload checksum does not match");
+    }
+
+    SnapshotReader reader(snapshot.subspan(kSharedEnvelopeHeaderBytes));
+    const std::uint32_t binding_size = reader.pod<std::uint32_t>();
+    if (binding_size > 4096U) {
+        throw std::invalid_argument("shared snapshot model binding is too long");
+    }
+    std::string binding(binding_size, '\0');
+    reader.bytes(binding.data(), binding.size());
+    if (binding != model_binding) {
+        throw std::invalid_argument("shared snapshot was saved for a different model");
+    }
+
+    const SharedSnapshotConfig config = read_shared_config(reader);
+    const std::uint32_t expected_flags =
+        (kv_packed_v ? kKvFlagPackedV : 0U) | (kv_rotate_k ? kKvFlagRotateK : 0U) |
+        (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
+        (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+    const std::uint32_t backend_planes =
+        backend ? static_cast<std::uint32_t>(backend->page_pool().plane_count()) : 0U;
+    const std::uint64_t backend_stride = backend ? backend_layout->page_stride : 0U;
+    if (config.physical.kv_dtype != static_cast<std::uint32_t>(kv_dtype) ||
+        config.physical.kv_quant_group != kv_quant_group ||
+        config.physical.kv_flags != expected_flags ||
+        config.physical.speculative_backend != static_cast<std::uint32_t>(speculative_backend) ||
+        config.physical.draft_window != draft_window ||
+        config.physical.page_size != static_cast<std::uint32_t>(kPagedKVPageSize) ||
+        config.physical.state_image_bytes != state_images->host_layout().image_bytes ||
+        config.physical.text_plane_count != static_cast<std::uint32_t>(text_pool.plane_count()) ||
+        config.physical.text_page_stride != text_layout.page_stride ||
+        config.physical.backend_plane_count != backend_planes ||
+        config.physical.backend_page_stride != backend_stride || config.max_context != capacity ||
+        config.token_domain != TextConfig::token_domain ||
+        config.proposal_head != static_cast<std::uint32_t>(proposal_head) ||
+        config.identity_schema != kSharedIdentitySchema ||
+        config.identity_tag != capture_identity_tag(speculative_backend, proposal_head, kv_dtype)) {
+        throw std::invalid_argument("shared snapshot execution configuration does not match");
+    }
+
+    const SharedSnapshotBoundary boundary = read_shared_boundary(reader);
+    if (boundary.frontier == 0 || boundary.frontier > capacity ||
+        boundary.rebuild_work.tokens != boundary.frontier ||
+        boundary.text_pages != kv_pages_for_frontier(boundary.frontier) ||
+        boundary.backend_pages != kv_pages_for_frontier(boundary.backend_frontier) ||
+        (speculative_backend == SpeculativeBackend::Mtp
+             ? boundary.backend_frontier + 1U != boundary.frontier
+             : boundary.backend_frontier != 0) ||
+        (backend == nullptr && boundary.backend_pages != 0)) {
+        throw std::invalid_argument("shared snapshot boundary frontiers are inconsistent");
+    }
+    qwen3_6::SharedPrefixPersistenceMetadata metadata;
+    metadata.evidence           = static_cast<SharedCandidateEvidence>(reader.pod<std::uint8_t>());
+    metadata.structural_origins = reader.pod<std::uint32_t>();
+    metadata.structural_role    = reader.pod<std::uint8_t>();
+    metadata.ssd_eligible       = reader.pod<std::uint8_t>() != 0;
+    const bool has_cutoff       = reader.pod<std::uint8_t>() != 0;
+    const std::uint32_t cutoff  = reader.pod<std::uint32_t>();
+    if (has_cutoff) { metadata.first_volatile_token = cutoff; }
+    validate_durable_metadata(metadata, boundary.frontier);
+
+    std::array<std::uint8_t, kSharedChecksumBytes> expected_identity_digest{};
+    reader.bytes(expected_identity_digest.data(), expected_identity_digest.size());
+    const std::array<std::uint64_t, 2> expected_shortlist{reader.pod<std::uint64_t>(),
+                                                          reader.pod<std::uint64_t>()};
+    const std::uint64_t identity_size = reader.pod<std::uint64_t>();
+    const std::size_t fixed_payload   = checked_snapshot_sum(
+        state_images->host_layout().image_bytes,
+        checked_snapshot_sum(static_cast<std::size_t>(boundary.text_pages) *
+                                   text_layout.page_stride,
+                               static_cast<std::size_t>(boundary.backend_pages) * backend_stride));
+    if (identity_size > reader.remaining() || fixed_payload > reader.remaining() - identity_size ||
+        reader.remaining() - identity_size != fixed_payload) {
+        throw std::invalid_argument("shared snapshot payload lengths are inconsistent");
+    }
+    const std::uint8_t* identity_payload = reader.payload(static_cast<std::size_t>(identity_size));
+    const auto actual_identity_digest    = frontend_internal::sha256(
+        std::span<const std::uint8_t>(identity_payload, static_cast<std::size_t>(identity_size)),
+        cancellation_checkpoint);
+    if (actual_identity_digest != expected_identity_digest) {
+        throw std::invalid_argument("shared snapshot identity digest does not match");
+    }
+
+    SnapshotReader identity_reader(
+        std::span<const std::uint8_t>(identity_payload, static_cast<std::size_t>(identity_size)));
+    std::vector<TokenId> ledger =
+        read_vector<TokenId>(identity_reader, boundary.frontier, "shared ledger");
+    std::vector<std::uint8_t> token_types =
+        read_vector<std::uint8_t>(identity_reader, boundary.frontier, "shared token type");
+    std::array<std::vector<std::int32_t>, 3> positions;
+    for (auto& axis : positions) {
+        axis = read_vector<std::int32_t>(identity_reader, boundary.frontier, "shared position");
+    }
+    std::vector<VisionItem> vision_items = read_vision_items(identity_reader, boundary.frontier);
+    std::vector<std::uint32_t> rewrite_frontiers =
+        read_vector<std::uint32_t>(identity_reader, boundary.frontier, "shared rewrite frontier");
+    if (identity_reader.remaining() != 0 || ledger.size() != boundary.frontier ||
+        token_types.size() != boundary.frontier || positions[0].size() != boundary.frontier ||
+        positions[1].size() != boundary.frontier || positions[2].size() != boundary.frontier ||
+        !vision_items.empty()) {
+        throw std::invalid_argument("shared snapshot exact identity is inconsistent");
+    }
+    for (const TokenId token : ledger) {
+        if (token < 0 || token >= TextConfig::token_domain) {
+            throw std::invalid_argument("shared snapshot token is out of domain");
+        }
+    }
+    auto capture_backing    = std::make_shared<PreparedCaptureBacking>();
+    capture_backing->ledger = ledger;
+    capture_backing->prefix_identity.restore(std::move(token_types), std::move(positions), {},
+                                             std::move(rewrite_frontiers));
+    PreparedPromptData prompt;
+    prompt.token_ids   = ledger;
+    prompt.token_types = capture_backing->prefix_identity.token_types();
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const auto& values = capture_backing->prefix_identity.position_axis(axis);
+        prompt.positions.insert(prompt.positions.end(), values.begin(), values.end());
+    }
+    prompt.identity.rewrite_execution_frontiers =
+        capture_backing->prefix_identity.rewrite_execution_frontiers();
+    PrefixShortlistDigests digests;
+    digests.assign(prompt);
+    if (digests.at(boundary.frontier) != expected_shortlist) {
+        throw std::invalid_argument("shared snapshot shortlist digest does not match its identity");
+    }
+    const PrefixShortlistKey shortlist{
+        .digests      = expected_shortlist,
+        .frontier     = boundary.frontier,
+        .identity_tag = config.identity_tag,
+    };
+    auto capture_identity = std::make_shared<PreparedCaptureIdentity>(PreparedCaptureIdentity{
+        .backing       = std::move(capture_backing),
+        .shortlist_key = shortlist,
+        .rebuild_work  = boundary.rebuild_work,
+    });
+
+    auto backing = std::make_shared<SharedImportBacking>();
+    backing->storage.assign(snapshot.begin(), snapshot.end());
+    backing->identity                         = std::move(capture_identity);
+    backing->boundary                         = boundary;
+    const std::size_t consumed_before_payload = snapshot.size() - reader.remaining();
+    backing->state_offset                     = consumed_before_payload;
+    backing->text_offset =
+        checked_snapshot_sum(backing->state_offset, state_images->host_layout().image_bytes);
+    backing->backend_offset =
+        checked_snapshot_sum(backing->text_offset, static_cast<std::size_t>(boundary.text_pages) *
+                                                       text_layout.page_stride);
+    (void)reader.payload(state_images->host_layout().image_bytes);
+    (void)reader.payload(static_cast<std::size_t>(boundary.text_pages) * text_layout.page_stride);
+    (void)reader.payload(static_cast<std::size_t>(boundary.backend_pages) * backend_stride);
+    if (reader.remaining() != 0) {
+        throw std::invalid_argument("shared snapshot has trailing bytes");
+    }
+
+    qwen3_6::SharedPrefixSummary summary{
+        .checkpoint =
+            {
+                .ref             = {.kind     = runtime::CheckpointKind::SharedStablePrefix,
+                                    .frontier = boundary.frontier},
+                .scope           = runtime::CheckpointScope::Shared,
+                .shortlist_key   = shortlist,
+                .state_residency = runtime::ReplicaResidency::HostOnly,
+                .required_kv     = {.main_frontier    = boundary.frontier,
+                                    .backend_frontier = boundary.backend_frontier,
+                                    .main_pages       = boundary.text_pages,
+                                    .backend_pages    = boundary.backend_pages},
+                .rebuild_work    = boundary.rebuild_work,
+            },
+        .active_references = 0,
+    };
+    return ContractAccess::make_shared_import(
+        std::static_pointer_cast<const void>(backing), summary, metadata,
+        frontend_internal::sha256_hex(actual_identity_digest));
+}
+
+bool ProgramImplCore::shared_prefix_matches(
+    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+    const SharedPrefixHandle& resident) const {
+    if (!imported || !valid_shared_prefix(resident)) { return false; }
+    const auto backing = std::static_pointer_cast<const SharedImportBacking>(
+        ContractAccess::implementation(imported));
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(resident)];
+    return backing && backing->identity && shared.identity &&
+           backing->identity->shortlist_key == shared.identity->shortlist_key &&
+           backing->identity->prefix_equals(*shared.identity);
+}
+
+qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
+    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported) {
+    if (!imported) { throw std::invalid_argument("shared import plan is empty"); }
+    if (pending_transaction_ || has_context_transaction()) {
+        throw std::logic_error("cannot adopt a shared prefix during a resource transaction");
+    }
+    validate_durable_metadata(imported.metadata(), imported.summary().checkpoint.ref.frontier);
+    const auto backing = std::static_pointer_cast<const SharedImportBacking>(
+        ContractAccess::implementation(imported));
+    if (!backing || !backing->identity || backing->boundary.frontier == 0 ||
+        backing->identity->shortlist_key != imported.summary().checkpoint.shortlist_key) {
+        throw std::logic_error("validated shared import changed before adoption");
+    }
+
+    std::optional<std::uint32_t> shared_index;
+    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) {
+            shared_prefix_slots[index].role = SharedPrefixSlotRole::ReservedCapture;
+            shared_index                    = index;
+            break;
+        }
+    }
+    if (!shared_index) {
+        throw std::invalid_argument("shared snapshot does not fit the shared-prefix catalog");
+    }
+
+    const StateImageHostLayout& state_layout = state_images->host_layout();
+    const HostKVPageLayout text_layout =
+        plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    std::optional<HostKVPageLayout> backend_layout;
+    if (backend != nullptr) {
+        backend_layout = plan_host_kv_page_layout(backend->page_pool().geometry());
+    }
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> text_address;
+    std::optional<KVAddressSpaceHandle> backend_address;
+    bool shared_populated = false;
+    try {
+        state = state_store->adopt_host_image(qwen3_6::HostStateImageConstView{
+            reinterpret_cast<const std::byte*>(backing->storage.data() + backing->state_offset),
+            &state_layout});
+        if (!state) {
+            throw std::invalid_argument("shared snapshot does not fit the Host State capacity");
+        }
+
+        std::optional<std::int32_t> free_row;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (requests[lane].lifecycle == Lifecycle::Empty &&
+                active_continuations[lane] == continuation_capacity) {
+                free_row = static_cast<std::int32_t>(lane);
+                break;
+            }
+        }
+        if (!free_row) {
+            throw std::invalid_argument("shared snapshot adoption requires an idle execution lane");
+        }
+        if (!host_kv_extents) {
+            throw std::invalid_argument("shared snapshot adoption requires Host KV capacity");
+        }
+        const auto build_address = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                       const HostKVPageLayout& layout, std::uint32_t frontier,
+                                       const std::uint8_t* payload) {
+            std::optional<KVAddressSpaceHandle> address = addresses.create_inactive();
+            if (!address) {
+                throw std::invalid_argument("shared snapshot does not fit the KV address capacity");
+            }
+            try {
+                const std::uint32_t count = kv_pages_for_frontier(frontier);
+                addresses.activate(*address, count, *free_row);
+                addresses.materialize_to_tokens(*address, frontier, device.stream);
+                addresses.commit_frontier(*address, frontier);
+                std::vector<DeviceKVPageHandle> destinations;
+                std::vector<LogicalKVPageHandle> logical;
+                destinations.reserve(count);
+                logical.reserve(count);
+                for (std::uint32_t page = 0; page < count; ++page) {
+                    destinations.push_back(addresses.physical_page(*address, page));
+                    logical.push_back(addresses.logical_page(*address, page));
+                }
+                pages.physical_pool().copy_from_host(reinterpret_cast<const std::byte*>(payload),
+                                                     layout, destinations, device.stream);
+                device.synchronize();
+                addresses.deactivate(*address);
+                std::optional<HostKVExtentReservation> host =
+                    host_kv_extents->prepare(pages, logical);
+                if (!host) {
+                    throw std::invalid_argument(
+                        "shared snapshot does not fit the Host KV capacity");
+                }
+                HostKVAllocationView destination = host_kv_extents->writable_view(*host);
+                std::memcpy(destination.data(), payload,
+                            static_cast<std::size_t>(count) * layout.page_stride);
+                (void)host_kv_extents->publish(std::move(*host));
+                addresses.set_checkpoint_requirement(*address, frontier);
+                return *address;
+            } catch (...) {
+                if (addresses.active(*address)) { addresses.deactivate(*address); }
+                (void)addresses.release(*address);
+                (void)host_kv_extents->release_unreferenced();
+                throw;
+            }
+        };
+        text_address = build_address(*text_kv_addresses, *text_kv_pages, text_layout,
+                                     backing->boundary.frontier,
+                                     backing->storage.data() + backing->text_offset);
+        if (backing->boundary.backend_frontier != 0) {
+            backend_address = build_address(*backend_kv_addresses, *backend_kv_pages,
+                                            *backend_layout, backing->boundary.backend_frontier,
+                                            backing->storage.data() + backing->backend_offset);
+        }
+
+        SharedPrefixState& shared = shared_prefix_states[*shared_index];
+        state_store->retain_checkpoint_reference(*state);
+        shared.state    = *state;
+        shared.kv       = SequenceKVBundle{.text = *text_address, .backend = backend_address};
+        shared.identity = backing->identity;
+        shared.frontier = backing->boundary.frontier;
+        shared.backend_frontier                    = backing->boundary.backend_frontier;
+        shared.rope_delta                          = backing->boundary.rope_delta;
+        shared.tail_hidden_valid                   = backing->boundary.tail_hidden_valid != 0;
+        shared.rebuild_work                        = backing->boundary.rebuild_work;
+        shared.active_references                   = 0;
+        shared_populated                           = true;
+        const qwen3_6::SharedPrefixSummary summary = shared_prefix_summary(shared);
+        if (summary != imported.summary()) {
+            throw std::logic_error("shared snapshot summary changed during sealed adoption");
+        }
+        shared_prefix_slots[*shared_index].role = SharedPrefixSlotRole::Catalogued;
+        state.reset();
+        text_address.reset();
+        backend_address.reset();
+        advance_resource_revision();
+        return {.handle = ContractAccess::make_shared_prefix(
+                    this, *shared_index, shared_prefix_slots[*shared_index].generation),
+                .summary = summary};
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        if (shared_populated) {
+            shared_prefix_states[*shared_index] = {};
+            if (state) { state_store->release_checkpoint_reference(*state); }
+        }
+        if (backend_address) { (void)backend_kv_addresses->release(*backend_address); }
+        if (text_address) { (void)text_kv_addresses->release(*text_address); }
+        if (state) { (void)state_store->release(*state); }
+        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        if (*shared_index < shared_prefix_capacity &&
+            shared_prefix_slots[*shared_index].role == SharedPrefixSlotRole::ReservedCapture) {
+            shared_prefix_slots[*shared_index].role = SharedPrefixSlotRole::Free;
+        }
         throw;
     }
 }

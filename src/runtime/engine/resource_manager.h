@@ -66,18 +66,20 @@ struct CheckpointObservation {
 template <class Package>
 class ResourceManager {
 public:
-    using Program                 = typename Package::Program;
-    using PreparedPrompt          = typename Package::PreparedPrompt;
-    using RequestBasePlan         = typename Package::RequestBasePlan;
-    using AdmissionCandidate      = typename Package::AdmissionCandidate;
-    using ResourcePlan            = typename Package::ResourcePlan;
-    using PersistentBackfillProof = typename Package::PersistentBackfillProof;
-    using SequenceHandle          = typename Package::SequenceHandle;
-    using ContinuationHandle      = typename Package::ContinuationHandle;
-    using SharedPrefixHandle      = typename Package::SharedPrefixHandle;
-    using CaptureOffer            = typename Package::CaptureOffer;
-    using ContinuationSummary     = typename Package::ContinuationSummary;
-    using SharedPrefixSummary     = typename Package::SharedPrefixSummary;
+    using Program                         = typename Package::Program;
+    using PreparedPrompt                  = typename Package::PreparedPrompt;
+    using RequestBasePlan                 = typename Package::RequestBasePlan;
+    using AdmissionCandidate              = typename Package::AdmissionCandidate;
+    using ResourcePlan                    = typename Package::ResourcePlan;
+    using PersistentBackfillProof         = typename Package::PersistentBackfillProof;
+    using SequenceHandle                  = typename Package::SequenceHandle;
+    using ContinuationHandle              = typename Package::ContinuationHandle;
+    using SharedPrefixHandle              = typename Package::SharedPrefixHandle;
+    using ValidatedSharedPrefixImport     = typename Package::ValidatedSharedPrefixImport;
+    using SharedPrefixPersistenceMetadata = typename Package::SharedPrefixPersistenceMetadata;
+    using CaptureOffer                    = typename Package::CaptureOffer;
+    using ContinuationSummary             = typename Package::ContinuationSummary;
+    using SharedPrefixSummary             = typename Package::SharedPrefixSummary;
     using PrefixShortlistKey =
         std::remove_cvref_t<decltype(std::declval<SharedPrefixSummary>().checkpoint.shortlist_key)>;
     using CaptureAssessment                 = typename Package::CaptureAssessment;
@@ -846,6 +848,7 @@ public:
             .structural_origins   = selected->scenario.assessment.structural_origins,
             .structural_role      = selected->scenario.assessment.structural_role,
             .ssd_eligible         = selected->scenario.assessment.ssd_eligible,
+            .first_volatile_token = selected->scenario.assessment.first_volatile_token,
         };
         for (const PressureOwnerOutcome& outcome : selected->plan.owner_outcomes) {
             const auto owner_record =
@@ -1231,18 +1234,131 @@ public:
     // cache catalog.
     struct SharedCatalogMetadata {
         SharedCatalogState state         = SharedCatalogState::Vacant;
+        SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
         std::uint32_t structural_origins = 0;
         std::uint8_t structural_role     = 0;
         bool ssd_eligible                = false;
+        std::optional<std::uint32_t> first_volatile_token;
     };
 
     [[nodiscard]] SharedCatalogMetadata shared_catalog_metadata(std::uint32_t slot) const noexcept {
         if (slot >= shared_catalog_count_) { return {}; }
         const SharedCatalogEntry& entry = shared_catalog_[slot];
-        return {.state              = entry.state,
-                .structural_origins = entry.structural_origins,
-                .structural_role    = entry.structural_role,
-                .ssd_eligible       = entry.ssd_eligible};
+        return {.state                = entry.state,
+                .evidence             = entry.evidence,
+                .structural_origins   = entry.structural_origins,
+                .structural_role      = entry.structural_role,
+                .ssd_eligible         = entry.ssd_eligible,
+                .first_volatile_token = entry.first_volatile_token};
+    }
+
+    struct SharedCatalogSlotView {
+        SharedCatalogMetadata metadata;
+        SharedPrefixSummary summary;
+        const SharedPrefixHandle* handle = nullptr;
+    };
+
+    [[nodiscard]] std::uint32_t shared_catalog_capacity() const noexcept {
+        return shared_catalog_count_;
+    }
+
+    [[nodiscard]] SharedCatalogSlotView shared_catalog_slot(std::uint32_t slot) const noexcept {
+        if (slot >= shared_catalog_count_) { return {}; }
+        const SharedCatalogEntry& entry = shared_catalog_[slot];
+        return {.metadata = shared_catalog_metadata(slot),
+                .summary  = entry.summary,
+                .handle   = entry.handle ? &*entry.handle : nullptr};
+    }
+
+    enum class SharedImportDisposition : std::uint8_t { Published, Coalesced, Cancelled };
+
+    struct SharedImportAdoptionResult {
+        SharedImportDisposition disposition = SharedImportDisposition::Cancelled;
+        std::uint32_t slot                  = kInvalidCatalogSlot;
+    };
+
+    // Transactional adoption of a Program-validated Host import. Exact semantic coalescing is
+    // delegated back to Program; policy metadata is merged onto the one existing owner. A new
+    // physical owner is created only after a vacant logical shared cell is proven, and no private
+    // catalog cell participates in this path.
+    [[nodiscard]] SharedImportAdoptionResult
+    adopt_imported_shared(Program& program, const ValidatedSharedPrefixImport& imported,
+                          CancellationFlagView cancellation = {}) {
+        if (!std::holds_alternative<std::monostate>(transaction_)) {
+            throw std::logic_error("shared snapshot adoption requires a settled resource catalog");
+        }
+        if (!imported || !valid_shared_prefix_summary(imported.summary()) ||
+            imported.summary().active_references != 0) {
+            throw std::invalid_argument("shared snapshot import plan is invalid");
+        }
+        if (cancellation.requested()) {
+            return {.disposition = SharedImportDisposition::Cancelled};
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                entry.summary.checkpoint.shortlist_key !=
+                    imported.summary().checkpoint.shortlist_key ||
+                !program.shared_prefix_matches(imported, *entry.handle)) {
+                continue;
+            }
+            merge_shared_metadata(entry, imported.metadata());
+            return {.disposition = SharedImportDisposition::Coalesced, .slot = slot};
+        }
+        std::uint32_t slot = kInvalidCatalogSlot;
+        for (std::uint32_t candidate = 0; candidate < shared_catalog_count_; ++candidate) {
+            const SharedCatalogEntry& entry = shared_catalog_[candidate];
+            if (entry.state == SharedCatalogState::Vacant && !entry.handle) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot == kInvalidCatalogSlot) {
+            throw std::invalid_argument("shared snapshot does not fit the shared catalog");
+        }
+
+        auto publication               = program.adopt_shared_prefix(imported);
+        const auto release_publication = [&]() {
+            auto released = program.release_shared_prefix(std::move(publication.handle));
+            if (released.status != ConsumeStatus::Consumed) {
+                throw std::logic_error("failed shared import could not release its physical owner");
+            }
+        };
+        if (!valid_shared_prefix_summary(publication.summary) ||
+            publication.summary != imported.summary() ||
+            publication.summary.active_references != 0) {
+            release_publication();
+            throw std::logic_error("Program returned an invalid shared snapshot publication");
+        }
+        if (cancellation.requested()) {
+            release_publication();
+            return {.disposition = SharedImportDisposition::Cancelled};
+        }
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        if (entry.state != SharedCatalogState::Vacant || entry.handle) {
+            release_publication();
+            throw std::logic_error("shared catalog changed during sealed import adoption");
+        }
+        entry.state = SharedCatalogState::Catalogued;
+        entry.id    = next_shared_prefix_id_++;
+        if (entry.id == 0) { entry.id = next_shared_prefix_id_++; }
+        entry.summary = publication.summary;
+        entry.handle.emplace(std::move(publication.handle));
+        entry.observation = RetentionObservation{.retention_class = RetentionClass::SharedStable};
+        merge_shared_metadata(entry, imported.metadata());
+        entry.explicit_credit = has_shared_candidate_evidence(
+                                    entry.evidence, SharedCandidateEvidence::ExplicitBoundary) ||
+                                has_shared_candidate_evidence(
+                                    entry.evidence, SharedCandidateEvidence::RequestedAutomatic);
+        entry.credit_expiry_epoch =
+            entry.explicit_credit
+                ? (demand_epoch_ > std::numeric_limits<std::uint64_t>::max() - kDemandWindowCapacity
+                       ? std::numeric_limits<std::uint64_t>::max()
+                       : demand_epoch_ + kDemandWindowCapacity)
+                : 0;
+        advance_revision(entry.revision);
+        rebuild_prefix_index();
+        return {.disposition = SharedImportDisposition::Published, .slot = slot};
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
@@ -1393,14 +1509,33 @@ private:
         std::uint32_t structural_origins  = 0;
         std::uint8_t structural_role      = 0;
         bool ssd_eligible                 = false;
+        SharedCandidateEvidence evidence  = SharedCandidateEvidence::None;
+        std::optional<std::uint32_t> first_volatile_token;
     };
 
     static void merge_shared_metadata(SharedCatalogEntry& entry,
-                                      const CaptureAssessment& candidate) noexcept {
+                                      const SharedPrefixPersistenceMetadata& candidate) noexcept {
         entry.structural_origins |= candidate.structural_origins;
+        entry.evidence |= candidate.evidence;
         // Role ordering is durability ordered: Transient < Harness < Project.
         entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
         entry.ssd_eligible    = entry.ssd_eligible || candidate.ssd_eligible;
+        if (candidate.first_volatile_token) {
+            entry.first_volatile_token =
+                entry.first_volatile_token
+                    ? std::min(*entry.first_volatile_token, *candidate.first_volatile_token)
+                    : candidate.first_volatile_token;
+        }
+    }
+
+    static void merge_shared_metadata(SharedCatalogEntry& entry,
+                                      const CaptureAssessment& candidate) noexcept {
+        merge_shared_metadata(entry, SharedPrefixPersistenceMetadata{
+                                         .evidence             = candidate.shared_evidence,
+                                         .structural_origins   = candidate.structural_origins,
+                                         .structural_role      = candidate.structural_role,
+                                         .ssd_eligible         = candidate.ssd_eligible,
+                                         .first_volatile_token = candidate.first_volatile_token});
     }
 
     enum class SessionIndexState : std::uint8_t {
@@ -1468,6 +1603,7 @@ private:
         std::uint32_t structural_origins        = 0;
         std::uint8_t structural_role            = 0;
         bool ssd_eligible                       = false;
+        std::optional<std::uint32_t> first_volatile_token;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -1844,6 +1980,8 @@ private:
         entry.structural_origins  = 0;
         entry.structural_role     = 0;
         entry.ssd_eligible        = false;
+        entry.evidence            = SharedCandidateEvidence::None;
+        entry.first_volatile_token.reset();
         advance_revision(entry.revision);
     }
 
@@ -3410,9 +3548,11 @@ private:
                            ? std::numeric_limits<std::uint64_t>::max()
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
-            publication.structural_origins = record->structural_origins;
-            publication.structural_role    = record->structural_role;
-            publication.ssd_eligible       = record->ssd_eligible;
+            publication.structural_origins   = record->structural_origins;
+            publication.structural_role      = record->structural_role;
+            publication.ssd_eligible         = record->ssd_eligible;
+            publication.evidence             = record->shared_evidence;
+            publication.first_volatile_token = record->first_volatile_token;
             advance_revision(publication.revision);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));

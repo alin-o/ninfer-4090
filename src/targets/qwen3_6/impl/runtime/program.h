@@ -106,6 +106,7 @@ struct CaptureGroup {
     std::uint32_t structural_origins          = 0;
     qwen3_6::SharedPrefixRole structural_role = qwen3_6::SharedPrefixRole::Transient;
     bool ssd_eligible                         = false;
+    std::optional<std::uint32_t> first_volatile_token;
 };
 
 enum class MtpBridgeMode : std::uint8_t {
@@ -726,6 +727,21 @@ public:
                             const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
                                                           std::string_view model_binding);
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot begin_export_shared_prefix(
+        const SharedPrefixHandle& shared, std::string_view model_binding,
+        const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
+        const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
+    export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
+                         const qwen3_6::SharedPrefixPersistenceMetadata& metadata);
+    [[nodiscard]] qwen3_6::ValidatedSharedPrefixImport<Variant>
+    parse_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+                        const std::function<void()>& cancellation_checkpoint = {}) const;
+    [[nodiscard]] bool
+    shared_prefix_matches(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+                          const SharedPrefixHandle& resident) const;
+    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported);
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;

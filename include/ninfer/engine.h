@@ -11,6 +11,10 @@
 
 namespace ninfer {
 
+namespace runtime::testing {
+struct SharedSnapshotTestAccess;
+}
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -132,6 +136,8 @@ public:
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;
+
+    friend struct runtime::testing::SharedSnapshotTestAccess;
 };
 
 } // namespace ninfer

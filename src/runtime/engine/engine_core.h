@@ -356,6 +356,67 @@ public:
         return {tokens, std::move(digest)};
     }
 
+    // Stable Engine boundary for the durable shared catalog. Filesystem workers own bytes only;
+    // these calls select logical owners under the execution lock and leave all codec/State/KV
+    // work in Program. They intentionally do not address or evict private session slots.
+    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot begin_export_shared_prefix(
+        std::uint32_t slot, std::string_view model_binding,
+        const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {}) {
+        std::scoped_lock lock(execution_mutex_);
+        if (instance_.program->has_context_transaction()) {
+            throw RequestError(RequestErrorKind::Overloaded,
+                               "shared catalog is busy with a resource transaction");
+        }
+        const auto view = resources_.shared_catalog_slot(slot);
+        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            view.handle == nullptr) {
+            throw std::invalid_argument("shared catalog slot holds no prefix");
+        }
+        return instance_.program->begin_export_shared_prefix(
+            *view.handle, model_binding,
+            targets::qwen3_6::SharedPrefixPersistenceMetadata{
+                .evidence             = view.metadata.evidence,
+                .structural_origins   = view.metadata.structural_origins,
+                .structural_role      = view.metadata.structural_role,
+                .ssd_eligible         = view.metadata.ssd_eligible,
+                .first_volatile_token = view.metadata.first_volatile_token},
+            reserve);
+    }
+
+    [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult
+    import_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+                         runtime::CancellationFlagView cancellation = {}) {
+        std::scoped_lock lock(execution_mutex_);
+        if (!context_cache_enabled_) {
+            throw std::invalid_argument("shared snapshot import requires the context cache");
+        }
+        if (instance_.program->has_context_transaction() || materializing_) {
+            throw RequestError(RequestErrorKind::Overloaded,
+                               "shared catalog is busy with a resource transaction");
+        }
+        const auto checkpoint = [&] {
+            if (cancellation.requested()) {
+                throw RequestError(RequestErrorKind::Cancelled,
+                                   "shared snapshot import was cancelled");
+            }
+        };
+        auto imported = instance_.program->parse_shared_prefix(snapshot, model_binding, checkpoint);
+        auto result = resources_.adopt_imported_shared(*instance_.program, imported, cancellation);
+        publish_runtime_stats();
+        return result;
+    }
+
+    [[nodiscard]] std::optional<typename Package::SharedPrefixSummary>
+    shared_prefix_slot_summary(std::uint32_t slot) const {
+        std::scoped_lock lock(execution_mutex_);
+        const auto view = resources_.shared_catalog_slot(slot);
+        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            view.handle == nullptr) {
+            return std::nullopt;
+        }
+        return view.summary;
+    }
+
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);

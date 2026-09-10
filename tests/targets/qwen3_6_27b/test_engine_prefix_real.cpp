@@ -1,5 +1,8 @@
 #include "ninfer/engine.h"
+#include "runtime/contract/types.h"
 #include "runtime/engine/context_transfer_test_gate.h"
+#include "runtime/engine/shared_snapshot_test_access.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -7,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -88,6 +92,27 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 1;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+ninfer::EngineOptions shared_snapshot_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                    = 128;
+    options.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                  = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 2;
+    options.context_cache.host_state_slots   = 2;
+    options.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 2;
     options.context_cache.max_long_anchors_per_continuation = 0;
     return options;
 }
@@ -1426,6 +1451,61 @@ ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
+}
+
+constexpr std::size_t kSharedSnapshotHeaderBytes    = 60;
+constexpr std::size_t kSharedSnapshotChecksumOffset = 28;
+
+template <class T>
+T snapshot_pod(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+        throw std::runtime_error("shared snapshot test fixture is truncated");
+    }
+    T value{};
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+
+template <class T>
+void set_snapshot_pod(std::vector<std::uint8_t>& bytes, std::size_t offset, T value) {
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+        throw std::runtime_error("shared snapshot test fixture is truncated");
+    }
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+void refresh_shared_snapshot_checksum(std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() < kSharedSnapshotHeaderBytes) {
+        throw std::runtime_error("shared snapshot test fixture has no envelope");
+    }
+    const auto checksum = ninfer::targets::qwen3_6::frontend_internal::sha256(
+        std::span<const std::uint8_t>(bytes).subspan(kSharedSnapshotHeaderBytes));
+    std::memcpy(bytes.data() + kSharedSnapshotChecksumOffset, checksum.data(), checksum.size());
+}
+
+ninfer::PromptInput shared_snapshot_prompt() {
+    ninfer::PromptInput input;
+    constexpr std::string_view marker = "=== CACHE_BREAKPOINT ===";
+    std::string stable;
+    for (std::uint32_t index = 0; index < 700; ++index) { stable += "stable "; }
+    stable += "\n=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>";
+    const std::size_t marker_end = stable.find(marker) + marker.size();
+    input.messages.push_back(
+        ninfer::ChatMessage{.role  = ninfer::ChatRole::System,
+                            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                       .text = stable + "\nCurrent working directory: x"}}});
+    input.messages.push_back(ninfer::ChatMessage{
+        .role  = ninfer::ChatRole::User,
+        .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Reply yes."}}});
+    input.options.enable_thinking = false;
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .kind                      = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence                  = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+        .leading_instruction_bytes = static_cast<std::uint32_t>(marker_end + 1U),
+    });
+    input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    return input;
 }
 
 std::uint64_t token_fixture_hash(std::span<const ninfer::TokenId> tokens) {
@@ -3569,6 +3649,212 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
     return 0;
 }
 
+int exercise_shared_snapshot_round_trip(const char* artifact) {
+    using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
+
+    std::vector<std::uint8_t> bytes;
+    std::vector<ninfer::TokenId> expected_tokens;
+    {
+        ninfer::Engine source(shared_snapshot_engine_options(artifact));
+        if (source.count_tokens(shared_snapshot_prompt()) + 3U > source.options().max_context) {
+            std::cerr << "shared snapshot fixture exceeds its bounded context\n";
+            return 1;
+        }
+        const ninfer::GenerationResult generated =
+            source.generate(source.prepare(shared_snapshot_prompt()), fixed_output(3));
+        if (generated.generated_token_ids.size() != 3) {
+            std::cerr << "shared snapshot source did not complete deterministic generation\n";
+            return 1;
+        }
+        expected_tokens = generated.generated_token_ids;
+        std::pair<std::uint32_t, ninfer::targets::qwen3_6::RetainedSessionSnapshot> exported;
+        try {
+            exported = Access::export_first_durable(source);
+        } catch (const std::invalid_argument& error) {
+            const ninfer::RuntimeStats stats = source.runtime_stats();
+            std::cerr << "shared snapshot source had no durable owner: " << error.what()
+                      << " captures=" << stats.active_captures_completed
+                      << " aborted=" << stats.active_captures_aborted
+                      << " pressure_shared=" << stats.pressure_shared_owners_evicted << '\n';
+            return 1;
+        }
+        auto& [slot, snapshot] = exported;
+        (void)slot;
+        if (!snapshot.await_transfer) {
+            std::cerr << "shared snapshot export did not publish a bounded transfer\n";
+            return 1;
+        }
+        snapshot.await_transfer(snapshot.bytes);
+        if (snapshot.bytes.size() < kSharedSnapshotHeaderBytes ||
+            std::string_view(reinterpret_cast<const char*>(snapshot.bytes.data()), 8) !=
+                "NINFSHR1") {
+            std::cerr << "shared snapshot export produced an invalid envelope\n";
+            return 1;
+        }
+        bytes = std::move(snapshot.bytes);
+        snapshot.release_storage();
+    }
+
+    {
+        ninfer::EngineOptions insufficient          = shared_snapshot_engine_options(artifact);
+        insufficient.context_cache.host_state_slots = 0;
+        insufficient.context_cache.host_kv_capacity_bytes = 0;
+        ninfer::Engine engine(std::move(insufficient));
+        bool rejected = false;
+        try {
+            (void)Access::import(engine, bytes);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        const ninfer::RuntimeStats after = engine.runtime_stats();
+        if (!rejected || after.host_state_occupied_slots != 0 ||
+            after.host_kv_occupied_bytes != 0) {
+            std::cerr << "shared snapshot capacity failure changed Host accounting: state="
+                      << after.host_state_occupied_slots << " kv=" << after.host_kv_occupied_bytes
+                      << '\n';
+            return 1;
+        }
+    }
+
+    ninfer::Engine target(shared_snapshot_engine_options(artifact));
+    if (Access::import_cancelled(target, bytes) != 2U) {
+        std::cerr << "shared snapshot cancellation was not terminal before adoption\n";
+        return 1;
+    }
+    const auto imported = Access::import(target, bytes);
+    if (imported.disposition != 0U || imported.frontier == 0 ||
+        imported.main_frontier != imported.frontier ||
+        imported.backend_frontier + 1U != imported.frontier ||
+        imported.state_residency != ninfer::runtime::ReplicaResidency::HostOnly) {
+        std::cerr << "shared snapshot import lost its State/KV boundary: disposition="
+                  << imported.disposition << " frontier=" << imported.frontier
+                  << " main=" << imported.main_frontier << " backend=" << imported.backend_frontier
+                  << '\n';
+        return 1;
+    }
+    const auto repeated = Access::import(target, bytes);
+    if (repeated.disposition != 1U || repeated.slot != imported.slot ||
+        repeated.frontier != imported.frontier) {
+        std::cerr << "repeated shared snapshot import did not coalesce exactly\n";
+        return 1;
+    }
+
+    const auto expect_rejected = [&](std::span<const std::uint8_t> candidate,
+                                     std::string_view label) {
+        try {
+            (void)Access::import(target, candidate);
+        } catch (const std::invalid_argument&) { return true; }
+        std::cerr << "shared snapshot " << label << " input was accepted\n";
+        return false;
+    };
+
+    bytes.back() ^= 0x1U;
+    const bool corrupt_rejected = expect_rejected(bytes, "corrupt");
+    bytes.back() ^= 0x1U;
+    if (!corrupt_rejected ||
+        !expect_rejected(std::span<const std::uint8_t>(bytes).first(bytes.size() - 1U),
+                         "truncated")) {
+        return 1;
+    }
+    bytes.push_back(0);
+    const bool trailing_rejected = expect_rejected(bytes, "trailing");
+    bytes.pop_back();
+    if (!trailing_rejected) { return 1; }
+
+    const std::uint32_t binding_size = snapshot_pod<std::uint32_t>(bytes, 60);
+    if (binding_size == 0 || 64U + binding_size > bytes.size()) {
+        std::cerr << "shared snapshot test could not locate the model binding\n";
+        return 1;
+    }
+    bytes[64] ^= 0x1U;
+    refresh_shared_snapshot_checksum(bytes);
+    const bool model_rejected = expect_rejected(bytes, "wrong-model");
+    bytes[64] ^= 0x1U;
+    refresh_shared_snapshot_checksum(bytes);
+    if (!model_rejected) { return 1; }
+
+    constexpr std::size_t snapshot_config_bytes    = 56;
+    constexpr std::size_t shared_config_tail_bytes = 20;
+    const std::size_t config_offset                = 64U + binding_size;
+    const std::size_t identity_tag_offset          = config_offset + snapshot_config_bytes + 16U;
+    const std::uint32_t identity_tag = snapshot_pod<std::uint32_t>(bytes, identity_tag_offset);
+    set_snapshot_pod(bytes, identity_tag_offset, identity_tag ^ 1U);
+    refresh_shared_snapshot_checksum(bytes);
+    const bool config_rejected = expect_rejected(bytes, "wrong-config");
+    set_snapshot_pod(bytes, identity_tag_offset, identity_tag);
+    refresh_shared_snapshot_checksum(bytes);
+    if (!config_rejected) { return 1; }
+
+    constexpr std::size_t boundary_bytes = 3U * sizeof(std::uint32_t) + sizeof(std::uint8_t) +
+                                           sizeof(ninfer::runtime::PrefillWork) +
+                                           2U * sizeof(std::uint32_t);
+    constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
+                                             3U * sizeof(std::uint8_t) + sizeof(std::uint32_t);
+    const std::size_t identity_size_offset = config_offset + snapshot_config_bytes +
+                                             shared_config_tail_bytes + boundary_bytes +
+                                             provenance_bytes + 32U + 2U * sizeof(std::uint64_t);
+    const std::uint64_t identity_size = snapshot_pod<std::uint64_t>(bytes, identity_size_offset);
+    const std::size_t identity_offset = identity_size_offset + sizeof(std::uint64_t);
+    if (identity_size <= sizeof(std::uint64_t) || identity_offset > bytes.size() ||
+        identity_size > bytes.size() - identity_offset) {
+        std::cerr << "shared snapshot test could not locate the exact prefix identity\n";
+        return 1;
+    }
+    bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+    refresh_shared_snapshot_checksum(bytes);
+    const bool identity_rejected = expect_rejected(bytes, "wrong-prefix");
+    bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+    refresh_shared_snapshot_checksum(bytes);
+    if (!identity_rejected) { return 1; }
+
+    std::array<std::uint8_t, kSharedSnapshotHeaderBytes> original_header{};
+    std::memcpy(original_header.data(), bytes.data(), original_header.size());
+    const std::size_t original_size      = bytes.size();
+    const std::uint64_t text_page_stride = snapshot_pod<std::uint64_t>(bytes, config_offset + 36U);
+    const std::uint64_t backend_page_stride =
+        snapshot_pod<std::uint64_t>(bytes, config_offset + 48U);
+    if (text_page_stride > std::numeric_limits<std::size_t>::max() - backend_page_stride - 16384U) {
+        std::cerr << "shared snapshot test page geometry is not representable\n";
+        return 1;
+    }
+    const std::size_t oversized_padding =
+        static_cast<std::size_t>(text_page_stride + backend_page_stride) + 16384U;
+    bytes.resize(original_size + oversized_padding, 0);
+    set_snapshot_pod<std::uint64_t>(bytes, 12, bytes.size());
+    set_snapshot_pod<std::uint64_t>(bytes, 20, bytes.size() - kSharedSnapshotHeaderBytes);
+    refresh_shared_snapshot_checksum(bytes);
+    bool oversized_rejected = false;
+    try {
+        (void)Access::import(target, bytes);
+    } catch (const std::invalid_argument&) { oversized_rejected = true; }
+    bytes.resize(original_size);
+    std::memcpy(bytes.data(), original_header.data(), original_header.size());
+    if (!oversized_rejected) {
+        std::cerr << "shared snapshot oversized input was accepted\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult continued =
+        target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
+    if (continued.generated_token_ids != expected_tokens ||
+        continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        continued.reused_prompt_tokens != imported.frontier) {
+        std::cerr << "shared snapshot continuation diverged: path="
+                  << static_cast<int>(continued.prefix_reuse_path)
+                  << " reused=" << continued.reused_prompt_tokens
+                  << " expected=" << imported.frontier << '\n';
+        return 1;
+    }
+
+    auto round_trip = Access::export_slot(target, imported.slot);
+    round_trip.await_transfer(round_trip.bytes);
+    const bool exact_round_trip = round_trip.bytes == bytes;
+    round_trip.release_storage();
+    if (!exact_round_trip) {
+        std::cerr << "shared snapshot State/Main/MTP payload did not round-trip exactly\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -3652,6 +3938,15 @@ int main() {
             return 1;
         }
         const int result = exercise_host_restore(qwen38_groupwise, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-snapshot") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-snapshot requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

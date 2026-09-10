@@ -634,6 +634,42 @@ SessionSnapshotTraffic Program<Variant>::session_snapshot_traffic() const noexce
 }
 
 template <>
+RetainedSessionSnapshot Program<Variant>::begin_export_shared_prefix(
+    const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
+    const SharedPrefixPersistenceMetadata& metadata,
+    const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
+    return impl_->begin_export_shared_prefix(shared, model_binding, metadata, reserve);
+}
+
+template <>
+RetainedSessionSnapshot
+Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared,
+                                       std::string_view model_binding,
+                                       const SharedPrefixPersistenceMetadata& metadata) {
+    return impl_->export_shared_prefix(shared, model_binding, metadata);
+}
+
+template <>
+ValidatedSharedPrefixImport<Variant>
+Program<Variant>::parse_shared_prefix(std::span<const std::uint8_t> snapshot,
+                                      std::string_view model_binding,
+                                      const std::function<void()>& cancellation_checkpoint) const {
+    return impl_->parse_shared_prefix(snapshot, model_binding, cancellation_checkpoint);
+}
+
+template <>
+bool Program<Variant>::shared_prefix_matches(const ValidatedSharedPrefixImport<Variant>& imported,
+                                             const SharedPrefixHandle<Variant>& resident) const {
+    return impl_->shared_prefix_matches(imported, resident);
+}
+
+template <>
+SharedPrefixPublication<Variant>
+Program<Variant>::adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported) {
+    return impl_->adopt_shared_prefix(imported);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

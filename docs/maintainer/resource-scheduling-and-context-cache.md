@@ -852,7 +852,9 @@ submission assembly image or the post-event pageable output. The normal `save_co
 settles that callback for synchronous callers. The Engine auto-save writer instead owns the wait,
 so enqueuing an already bounded spill does not block the execution worker or create another
 resource owner. Its public queue gauges exclude the active writer; active bytes are reported
-separately.
+separately. `auto_save_reserved_{jobs,bytes}` cover every accepted reservation through actual
+Program-side source-pin retirement, including the interval after writer completion, and therefore
+may remain nonzero after both the queued and active-writer gauges reach zero.
 
 ### 9.4 Commit
 

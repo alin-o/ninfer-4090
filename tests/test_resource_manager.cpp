@@ -1,4 +1,6 @@
 #include "runtime/engine/resource_manager.h"
+#include "runtime/engine/scheduler.h"
+#include "runtime/generation/generation_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -290,6 +293,24 @@ struct FakeSequenceHandle {
     std::uint32_t id = 0;
 
     friend bool operator==(FakeSequenceHandle, FakeSequenceHandle) = default;
+};
+
+struct FakeScheduledOutput {
+    [[nodiscard]] std::uint32_t
+    model_token_budget_remaining(std::uint32_t remaining) const noexcept {
+        return remaining;
+    }
+};
+
+struct FakeScheduledRequest {
+    using SequenceHandle = FakeSequenceHandle;
+
+    [[nodiscard]] bool is_decode_ready() const noexcept { return true; }
+
+    bool capture_pending = false;
+    std::optional<ninfer::runtime::GenerationBudget> budget;
+    std::optional<FakeSequenceHandle> sequence;
+    FakeScheduledOutput output;
 };
 
 struct FakeCaptureOffer {
@@ -979,9 +1000,11 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
-    void execute_independent_admitted_unit() {
+    void execute_scheduled_decode(std::span<const FakeSequenceHandle> members) {
         require(transaction_kind_ == TransactionKind::Materialization,
                 "independent work was not interleaved with a materialization transfer");
+        require(members.size() == 1 && members.front().id != 0,
+                "Scheduler did not supply the independent admitted sequence");
         ++independent_admitted_units;
         timeline.push_back("independent-execution");
     }
@@ -3443,6 +3466,18 @@ void test_delayed_transfer_timeline_settles_before_abort_or_adoption() {
     FakeProgram program;
     const ActiveRequest independent = start_active(manager, program, 11, make_base(11), 1);
     program.timeline.clear();
+    ninfer::runtime::Scheduler<FakeScheduledRequest> scheduler;
+    std::array<std::shared_ptr<FakeScheduledRequest>, ninfer::kMaximumConcurrency> slots{};
+    slots[independent.lane.value] = std::make_shared<FakeScheduledRequest>();
+    slots[independent.lane.value]->budget.emplace(8, ninfer::FinishReason::OutputLimit);
+    slots[independent.lane.value]->sequence = independent.sequence;
+    const auto execute_engine_unit = [&] {
+        const auto membership = scheduler.build_round_membership(slots, 2);
+        require(scheduler.choose_execution(!membership.empty(), false, false) ==
+                    ninfer::runtime::Scheduler<FakeScheduledRequest>::ExecutionAction::Decode,
+                "Engine Scheduler did not select admitted independent decode work");
+        program.execute_scheduled_decode(membership.sequence_span());
+    };
 
     auto inspection = manager.inspect(program, FakePreparedPrompt{22}, make_base(22), 2);
     require(inspection.choice && inspection.choice->destination().value != independent.lane.value,
@@ -3458,13 +3493,13 @@ void test_delayed_transfer_timeline_settles_before_abort_or_adoption() {
     require(std::holds_alternative<ContextTransactionInProgress>(progress) &&
                 manager.context_transaction_kind().has_value(),
             "incomplete transfer was adopted before its producer event settled");
-    program.execute_independent_admitted_unit();
+    execute_engine_unit();
 
     cancelled.store(true, std::memory_order_release);
     auto cancellation_progress = manager.progress_context_transaction(program, {&cancelled});
     require(std::holds_alternative<ContextTransactionInProgress>(cancellation_progress),
             "cancellation released a delayed transfer before settlement");
-    program.execute_independent_admitted_unit();
+    execute_engine_unit();
 
     auto terminal = manager.progress_context_transaction(program, {&cancelled});
     const auto& aborted = std::get<FakeManager::MaterializationOutcome>(terminal);

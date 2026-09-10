@@ -5,20 +5,16 @@
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/auto_save_writer.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "runtime/engine/slot_spill_guard.h"
 #include "targets/registry.h"
 
 #include <chrono>
-#include <atomic>
-#include <condition_variable>
 #include <cstdio>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -276,6 +272,9 @@ public:
             },
             active);
         if (options.auto_save_evicted) {
+            auto_save_writer = std::make_unique<runtime::AutoSaveWriter>(
+                options.auto_save_queue_jobs, options.auto_save_queue_bytes,
+                options.auto_save_listener, write_snapshot_file);
             std::visit(
                 [&](auto& constructed_core) {
                     if constexpr (requires {
@@ -290,9 +289,9 @@ public:
                             slot_model_binding(load),
                             [this](std::string path,
                                    targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
-                                enqueue_write(std::move(path), std::move(snapshot));
+                                auto_save_writer->enqueue(std::move(path), std::move(snapshot));
                             },
-                            [this](std::size_t bytes) { return reserve_write(bytes); });
+                            [this](std::size_t bytes) { return auto_save_writer->reserve(bytes); });
                     }
                 },
                 core);
@@ -304,62 +303,19 @@ public:
         device.bind_to_current_thread_noexcept();
         // Auto-save snapshots retain producer events that reference the Program's device
         // context. Drain their bounded Host consumer before destroying the Engine core.
-        stop_writer();
+        if (auto_save_writer) { auto_save_writer->stop(); }
         core.emplace<std::monostate>();
+        auto_save_writer.reset();
         try {
             device.synchronize();
         } catch (...) {}
-    }
-
-    // Auto-save writer: eviction spills enqueue (path, snapshot) here; one background thread
-    // publishes each file with the same write-then-rename discipline as an explicit save.
-    struct PendingWrite {
-        std::string path;
-        targets::qwen3_6::RetainedSessionSnapshot snapshot;
-    };
-
-    void enqueue_write(std::string path, targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
-        std::unique_lock lock(writer_mutex);
-        // begin_save_continuation has reserved the immutable pinned image, but has intentionally
-        // not assembled pageable file bytes yet. Its eventual byte count is carried by the
-        // transfer backing and is materialized by the bounded writer below.
-        const std::size_t bytes = snapshot.transfer_bytes;
-        // This callback is invoked while the Engine owns its resource transaction. Never wait
-        // there: a full writer queue is an intentional best-effort spill drop, not a reason to
-        // stall unrelated admitted execution or to retain an unbounded pinned host image.
-        if (!snapshot.queue_reservation) { return; }
-        if (!writer.joinable()) {
-            writer = std::thread([this] { writer_loop(); });
-        }
-        pending_writes.push_back(PendingWrite{std::move(path), std::move(snapshot)});
-        queued_write_bytes += bytes;
-        lock.unlock();
-        writer_cv.notify_one();
-    }
-
-    [[nodiscard]] std::shared_ptr<void> reserve_write(std::size_t bytes) {
-        std::unique_lock lock(writer_mutex);
-        if (reserved_write_jobs >= options.auto_save_queue_jobs ||
-            bytes > options.auto_save_queue_bytes - reserved_write_bytes) {
-            ++rejected_write_jobs;
-            return {};
-        }
-        ++reserved_write_jobs;
-        reserved_write_bytes += bytes;
-        return std::shared_ptr<void>(this, [this, bytes](void*) noexcept {
-            std::scoped_lock release_lock(writer_mutex);
-            --reserved_write_jobs;
-            reserved_write_bytes -= bytes;
-            writer_cv.notify_all();
-        });
     }
 
     // Blocks until every enqueued auto-save has been published. Explicit slot operations call
     // this before touching files so a pending write can never be read stale or interleave with
     // a client save of the same path.
     void drain_writes() {
-        std::unique_lock lock(writer_mutex);
-        writer_cv.wait(lock, [this] { return pending_writes.empty() && !write_in_flight; });
+        if (auto_save_writer) { auto_save_writer->drain(); }
     }
 
     EngineOptions options;
@@ -368,101 +324,10 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
-
-    mutable std::mutex writer_mutex;
-    std::condition_variable writer_cv;
-    std::deque<PendingWrite> pending_writes;
-    std::size_t queued_write_bytes    = 0;
-    std::size_t reserved_write_bytes  = 0;
-    std::uint32_t reserved_write_jobs = 0;
-    bool write_in_flight              = false;
-    bool writer_stop                  = false;
-    std::thread writer;
-    SlotSpillGuard spill_guard;
-    std::atomic<std::uint64_t> in_flight_write_bytes{0};
-    std::atomic<std::uint64_t> rejected_write_jobs{0};
+    std::unique_ptr<runtime::AutoSaveWriter> auto_save_writer;
 
     [[nodiscard]] RuntimeStats with_auto_save_stats(RuntimeStats stats) const noexcept {
-        std::lock_guard lock(writer_mutex);
-        // Report the resident footprint, not only one image's transfer payload.  Every queued
-        // or active producer owns pinned D2H backing plus the pageable assembly allowance.
-        const auto resident_bytes = [](std::uint64_t payload) noexcept {
-            return payload > std::numeric_limits<std::uint64_t>::max() / 2U
-                       ? std::numeric_limits<std::uint64_t>::max()
-                       : payload * 2U;
-        };
-        stats.auto_save_queued_jobs     = static_cast<std::uint32_t>(pending_writes.size());
-        stats.auto_save_queued_bytes    = resident_bytes(queued_write_bytes);
-        stats.auto_save_in_flight_bytes = resident_bytes(
-            in_flight_write_bytes.load(std::memory_order_relaxed));
-        stats.auto_save_rejected_jobs   = rejected_write_jobs.load(std::memory_order_relaxed);
-        return stats;
-    }
-
-private:
-    void writer_loop() {
-        std::unique_lock lock(writer_mutex);
-        while (true) {
-            writer_cv.wait(lock, [this] { return writer_stop || !pending_writes.empty(); });
-            if (pending_writes.empty()) { break; }
-            PendingWrite item = std::move(pending_writes.front());
-            pending_writes.pop_front();
-            queued_write_bytes -= item.snapshot.transfer_bytes;
-            write_in_flight = true;
-            in_flight_write_bytes.store(item.snapshot.transfer_bytes, std::memory_order_relaxed);
-            lock.unlock();
-
-            SlotAutoSaveEvent event;
-            event.path         = item.path;
-            event.tokens       = item.snapshot.tokens;
-            event.bytes        = item.snapshot.transfer_bytes;
-            const auto started = std::chrono::steady_clock::now();
-            try {
-                if (item.snapshot.await_transfer) {
-                    item.snapshot.await_transfer(item.snapshot.bytes);
-                }
-                if (const std::optional<std::uint32_t> deeper =
-                        spill_guard.blocks(item.path, item.snapshot.tokens)) {
-                    // A stale copy of the session must not roll the file back (D3).
-                    event.skipped_behind_tokens = deeper;
-                } else {
-                    write_snapshot_file(item.path, item.snapshot.bytes);
-                    spill_guard.note_spilled(item.path, item.snapshot.tokens);
-                }
-            } catch (const std::exception& error) { event.error = error.what(); } catch (...) {
-                event.error = "unknown auto-save failure";
-            }
-            event.seconds =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            if (options.auto_save_listener) {
-                try {
-                    options.auto_save_listener(event);
-                } catch (...) {}
-            }
-
-            lock.lock();
-            in_flight_write_bytes.store(0, std::memory_order_relaxed);
-            write_in_flight = false;
-            writer_cv.notify_all();
-            // Destroy both backing images before their reservation.  This must happen without
-            // writer_mutex_: the reservation deleter takes that mutex to publish capacity.
-            lock.unlock();
-            item.snapshot.release_storage();
-            lock.lock();
-        }
-    }
-
-    void stop_writer() noexcept {
-        {
-            std::scoped_lock lock(writer_mutex);
-            writer_stop = true;
-        }
-        writer_cv.notify_all();
-        if (writer.joinable()) {
-            try {
-                writer.join();
-            } catch (...) {}
-        }
+        return auto_save_writer ? auto_save_writer->populate_stats(std::move(stats)) : stats;
     }
 
 public:
@@ -774,7 +639,9 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
         impl_->core);
 
     Impl::write_snapshot_file(path, snapshot.bytes);
-    impl_->spill_guard.note_authoritative(path, snapshot.tokens);
+    if (impl_->auto_save_writer) {
+        impl_->auto_save_writer->note_authoritative(path, snapshot.tokens);
+    }
 
     SlotSaveResult result;
     result.tokens         = snapshot.tokens;
@@ -813,7 +680,9 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
         },
         impl_->core);
 
-    impl_->spill_guard.note_authoritative(path, restored.first);
+    if (impl_->auto_save_writer) {
+        impl_->auto_save_writer->note_authoritative(path, restored.first);
+    }
 
     SlotRestoreResult result;
     result.tokens         = restored.first;

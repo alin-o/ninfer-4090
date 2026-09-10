@@ -8740,7 +8740,9 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (has_pressure() && pressure_transition.phase != PressureTransitionPhase::Committed) {
         throw std::logic_error("capture pressure transition did not reach a stable phase");
     }
-    if (transaction.cancel_pending) { return abort(); }
+    // A prepared capture may already own transfer-stream work. Cancellation is adopted below,
+    // after context_completion_ is ready, so abort_active_capture cannot release a live State
+    // destination, KV snapshot reservation, or source pin.
     if (!transaction.prepared) {
         if (transaction.cancel_pending) { return abort(); }
         try {

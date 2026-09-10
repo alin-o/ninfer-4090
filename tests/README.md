@@ -33,6 +33,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
   Serve-owned failure severity and exclusion of arbitrary client error text from operational
   records;
+- `test_auto_save_writer.cpp` — bounded snapshot-consumer queue, delayed/failed completion,
+  cancellation and shutdown settlement, plus queued/active/reserved accounting lifetime;
 - `test_http_error_handler.cpp` — protocol-shaped payload-limit errors and application-error
   preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v13 reports;

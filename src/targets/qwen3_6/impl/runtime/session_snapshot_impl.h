@@ -686,15 +686,13 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
                            backend_kv_offset, snapshot_traffic_.backend_kv_d2h_pages,
                            snapshot_traffic_.backend_kv_d2h_bytes);
     }
-    // Keep the producer event with the immutable host payload. The Engine's bounded writer
-    // waits for it off the execution worker.  Crucially, make the execution stream depend on
-    // that event before returning the source slots to the cache: an eviction may immediately
-    // recycle a StateImage/KV page, and a later kernel must not overwrite it while this D2H
-    // read is still in flight.  This is a stream dependency, not a device-wide synchronize.
+    // Keep the completion event with the immutable host payload. The Engine's bounded writer
+    // waits for it off the execution worker. Source pins and the Program-owned retirement list
+    // prevent conflicting mutation/reuse until the event settles; do not feed this event back
+    // into device.stream, because that stream also carries already admitted independent work.
     // Later transfer-stream users are already ordered by stream FIFO.
     pending->completion->record(device.transfer_stream);
     pending->recorded = true;
-    pending->completion->wait(device.stream);
     if (snapshot.bytes.size() != transfer_bytes) {
         throw std::logic_error("session snapshot payload sizing changed after reservation");
     }

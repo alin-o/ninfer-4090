@@ -100,6 +100,8 @@ struct RetainedSessionSnapshot {
     // It waits for the producer event (not unrelated device work), then assembles `bytes` from
     // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
     // submits immutable CUDA ranges and never lets a Host worker mutate its stores or catalog.
+    // Source pins gate conflicting mutation/reuse; the completion event is never inserted into
+    // the global execution stream, so already admitted independent model work remains runnable.
     std::function<void(std::vector<std::uint8_t>&)> await_transfer;
     // Internal lifetime settlement for pending CUDA work.  Consumers never need to invoke it.
     std::function<void()> settle_transfer;

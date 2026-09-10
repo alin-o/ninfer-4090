@@ -59,6 +59,11 @@ int main() {
     failures += check(empty.at("llamacpp:requests_deferred") == 0.0, "idle deferred");
     failures += check(empty.at("ninfer:auto_save_queued_jobs") == 0.0,
                       "auto-save queue starts empty");
+    failures += check(empty.at("ninfer:auto_save_reserved_jobs") == 0.0 &&
+                          empty.at("ninfer:auto_save_reserved_bytes") == 0.0,
+                      "auto-save reservations start empty");
+    failures += check(empty.at("ninfer:auto_save_in_flight_jobs") == 0.0,
+                      "auto-save writer starts idle");
 
     // Two in-flight requests against one execution lane: FIFO order says the
     // older one processes and the newer one is deferred.
@@ -95,7 +100,10 @@ int main() {
     live.decode_seconds_total    = 6.0;
     live.auto_save_queued_jobs = 2;
     live.auto_save_queued_bytes = 4096;
+    live.auto_save_in_flight_jobs = 1;
     live.auto_save_in_flight_bytes = 1024;
+    live.auto_save_reserved_jobs = 3;
+    live.auto_save_reserved_bytes = 8192;
     live.auto_save_rejected_jobs = 3;
     const auto values = parse(metrics.render(1, live));
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "live prefill tokens");
@@ -109,6 +117,11 @@ int main() {
     failures += check(values.at("ninfer:draft_accepted_tokens_total") == 225.0, "accepted tokens");
     failures += check(values.at("ninfer:auto_save_queued_bytes") == 4096.0,
                       "auto-save queue bytes");
+    failures += check(values.at("ninfer:auto_save_reserved_jobs") == 3.0 &&
+                          values.at("ninfer:auto_save_reserved_bytes") == 8192.0,
+                      "auto-save reservation gauges");
+    failures += check(values.at("ninfer:auto_save_in_flight_jobs") == 1.0,
+                      "auto-save active writer jobs");
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));

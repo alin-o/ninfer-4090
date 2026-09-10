@@ -918,7 +918,12 @@ struct RuntimeStats {
     // taking the Engine execution lock, so metrics remain available while a writer is blocked.
     std::uint32_t auto_save_queued_jobs = 0;
     std::uint64_t auto_save_queued_bytes = 0;
+    std::uint32_t auto_save_in_flight_jobs = 0;
     std::uint64_t auto_save_in_flight_bytes = 0;
+    // Complete queue reservations, including producer backing/source pins retained after the
+    // writer finishes until Program-side retirement at an Engine unit boundary.
+    std::uint32_t auto_save_reserved_jobs = 0;
+    std::uint64_t auto_save_reserved_bytes = 0;
     std::uint64_t auto_save_rejected_jobs = 0;
 };
 

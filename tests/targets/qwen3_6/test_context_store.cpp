@@ -8,11 +8,14 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <new>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -115,6 +118,65 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto reused = images.reserve_reset(device.stream);
     expect(reused.has_value() && *reused != *source, "state descriptor reuse advances generation");
     expect(images.release(*reused), "reused state image releases");
+
+    // Hold the transfer stream at a deterministic producer boundary. An unrelated execution
+    // stream unit must complete while the immutable D2H source remains pinned; conflicting
+    // release/reuse remains refused until the delayed transfer is explicitly settled.
+    const auto delayed_source = images.reserve_reset(device.stream);
+    expect(delayed_source.has_value(), "delayed State transfer source allocation");
+    device.synchronize();
+    images.freeze(*delayed_source);
+    struct TransferGate {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+    } gate;
+    int* independent_marker = nullptr;
+    cudaEvent_t independent_done = nullptr;
+    CUDA_CHECK(cudaMalloc(&independent_marker, sizeof(*independent_marker)));
+    CUDA_CHECK(cudaEventCreateWithFlags(&independent_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaLaunchHostFunc(
+        device.transfer_stream,
+        [](void* opaque) {
+            auto& callback_gate = *static_cast<TransferGate*>(opaque);
+            callback_gate.entered.store(true, std::memory_order_release);
+            while (!callback_gate.release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        },
+        &gate));
+    auto delayed_transfer =
+        images.begin_device_to_host(*delayed_source, device.transfer_stream);
+    expect(delayed_transfer.has_value() && images.source_pins(*delayed_source) == 1,
+           "delayed State transfer did not pin its immutable source");
+    expect(!images.release(*delayed_source),
+           "dependent source release bypassed delayed transfer settlement");
+    CUDA_CHECK(
+        cudaMemsetAsync(independent_marker, 0x5a, sizeof(*independent_marker), device.stream));
+    CUDA_CHECK(cudaEventRecord(independent_done, device.stream));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!gate.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    bool independent_progress = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const cudaError_t status = cudaEventQuery(independent_done);
+        if (status == cudaSuccess) {
+            independent_progress = true;
+            break;
+        }
+        if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        std::this_thread::yield();
+    }
+    expect(gate.entered.load(std::memory_order_acquire) && independent_progress,
+           "independent execution did not progress during delayed State D2H");
+    gate.release.store(true, std::memory_order_release);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    images.abort_transfer(std::move(*delayed_transfer));
+    expect(images.source_pins(*delayed_source) == 0 && images.release(*delayed_source),
+           "failed/cancelled delayed State transfer did not clean pins and storage");
+    CUDA_CHECK(cudaEventDestroy(independent_done));
+    CUDA_CHECK(cudaFree(independent_marker));
 
     const auto host_source = images.reserve_reset(device.stream);
     expect(host_source.has_value(), "Host state source allocation");

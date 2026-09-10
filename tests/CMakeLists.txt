@@ -68,6 +68,11 @@ ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
+ninfer_add_test(ninfer_auto_save_writer_test
+  SOURCES test_auto_save_writer.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_auto_save_writer_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
@@ -389,4 +394,3 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
-

@@ -80,7 +80,12 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "ninfer:auto_save_queued_jobs",
                    static_cast<std::uint64_t>(live.auto_save_queued_jobs));
     append_counter(out, "ninfer:auto_save_queued_bytes", live.auto_save_queued_bytes);
+    append_counter(out, "ninfer:auto_save_in_flight_jobs",
+                   static_cast<std::uint64_t>(live.auto_save_in_flight_jobs));
     append_counter(out, "ninfer:auto_save_in_flight_bytes", live.auto_save_in_flight_bytes);
+    append_counter(out, "ninfer:auto_save_reserved_jobs",
+                   static_cast<std::uint64_t>(live.auto_save_reserved_jobs));
+    append_counter(out, "ninfer:auto_save_reserved_bytes", live.auto_save_reserved_bytes);
     append_counter(out, "ninfer:auto_save_rejected_jobs_total", live.auto_save_rejected_jobs);
     return out;
 }

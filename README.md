@@ -290,7 +290,9 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   `llamacpp:requests_processing`, `llamacpp:requests_deferred`), so existing scrapers read this
   server without changes. Prompt tokens count only computed prefill; prefix-cache hits are
   excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
-  hits, and MTP draft/acceptance totals.
+  hits, MTP draft/acceptance totals, and bounded auto-save queued, active-writer, reserved and
+  rejected work. Reserved jobs/bytes remain visible until Program-side source-pin retirement,
+  even when both the pending queue and active writer are empty.
 - **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
   slots report their request's prompt and reused-prefix sizes, idle retained slots report the
   resident session's depth and its identifying `session_digest`. Truthful per-slot attribution

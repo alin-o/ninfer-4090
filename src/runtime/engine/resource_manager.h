@@ -430,9 +430,6 @@ public:
         }
         validate_choice(choice, resource_revision);
         MaterializationRecord record = take_materialization_record(choice);
-        // Fork-local, and order-critical: the observer reads the record's claim spans, so it
-        // must run before upstream moves the record into the open transaction.
-        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<MaterializationRecord>(std::move(record));
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
@@ -446,6 +443,11 @@ public:
             return cancellation.requested() ? MaterializationReserveResult::Aborted
                                             : MaterializationReserveResult::Stale;
         }
+        // A spill pins immutable source ranges until its transfer-stream producer event settles.
+        // It must be started only after Program has accepted this exact topology: starting it
+        // while planning can turn a feasible pressure eviction into an unreleaseable source.
+        // reserve_materialization only opens the transaction; no physical mutation has run yet.
+        observe_planned_evictions(open.private_claims);
         observe_planner_diagnostics(open.diagnostics);
         return MaterializationReserveResult::Reserved;
     }
@@ -534,7 +536,7 @@ public:
         CaptureAssessment candidate =
             program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
         const SharedPrefixHandle* exact_shared = nullptr;
-        std::uint32_t exact_shared_slot = kInvalidCatalogSlot;
+        std::uint32_t exact_shared_slot        = kInvalidCatalogSlot;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!index.shared || !valid_prefix_index_entry(index) ||
@@ -543,7 +545,7 @@ public:
                 }
                 SharedCatalogEntry& entry = shared_catalog_[index.slot];
                 if (program.shared_capture_matches(offer, *entry.handle)) {
-                    exact_shared = &*entry.handle;
+                    exact_shared      = &*entry.handle;
                     exact_shared_slot = index.slot;
                     break;
                 }
@@ -915,8 +917,6 @@ public:
             throw std::logic_error("selected shared replacement changed before reservation");
         }
 
-        // Fork-local, and order-critical: see the materialization path above.
-        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<ActiveCaptureRecord>(std::move(record));
         ActiveCaptureRecord& open = std::get<ActiveCaptureRecord>(transaction_);
         reserve_logical_active_capture(open);
@@ -929,6 +929,12 @@ public:
             transaction_.template emplace<std::monostate>();
             return ActiveCaptureReserveResult::Skipped;
         }
+        // An eviction observer may start an asynchronous snapshot and pin the selected
+        // continuation's State/KV sources.  Notify it only after Program has accepted this exact
+        // physical topology and opened its pre-progress snapshot window.  Active capture then
+        // defers destructive pressure at progress boundaries until those pins settle, just like
+        // materialization.
+        observe_planned_evictions(open.private_claims);
         return ActiveCaptureReserveResult::Reserved;
     }
 
@@ -1134,19 +1140,19 @@ public:
     // admission or physical placement; later Host/SSD policy can consume it without a second
     // cache catalog.
     struct SharedCatalogMetadata {
-        SharedCatalogState state = SharedCatalogState::Vacant;
+        SharedCatalogState state         = SharedCatalogState::Vacant;
         std::uint32_t structural_origins = 0;
-        std::uint8_t structural_role = 0;
-        bool ssd_eligible = false;
+        std::uint8_t structural_role     = 0;
+        bool ssd_eligible                = false;
     };
 
     [[nodiscard]] SharedCatalogMetadata shared_catalog_metadata(std::uint32_t slot) const noexcept {
         if (slot >= shared_catalog_count_) { return {}; }
         const SharedCatalogEntry& entry = shared_catalog_[slot];
-        return {.state = entry.state,
+        return {.state              = entry.state,
                 .structural_origins = entry.structural_origins,
-                .structural_role = entry.structural_role,
-                .ssd_eligible = entry.ssd_eligible};
+                .structural_role    = entry.structural_role,
+                .ssd_eligible       = entry.ssd_eligible};
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
@@ -1159,10 +1165,10 @@ public:
     // evictions so a bound session can be spilled to disk before its state is destroyed.
 
     struct CatalogSlotView {
-        CatalogState state              = CatalogState::Vacant;
-        std::uint64_t id                = 0;
-        std::uint64_t revision          = 0;
-        std::uint32_t active_references = 0;
+        CatalogState state               = CatalogState::Vacant;
+        std::uint64_t id                 = 0;
+        std::uint64_t revision           = 0;
+        std::uint32_t active_references  = 0;
         const ContinuationHandle* handle = nullptr;
     };
 
@@ -1213,9 +1219,7 @@ public:
     // Surrenders one idle catalogued continuation: the caller releases the returned handle at
     // the Program and the cell becomes vacant.
     [[nodiscard]] ContinuationHandle take_catalogued(std::uint32_t slot) {
-        if (slot >= catalog_count_) {
-            throw std::invalid_argument("catalog slot is out of range");
-        }
+        if (slot >= catalog_count_) { throw std::invalid_argument("catalog slot is out of range"); }
         CatalogEntry& entry = catalog_[slot];
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -1296,9 +1300,9 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
-        std::uint32_t structural_origins = 0;
-        std::uint8_t structural_role = 0;
-        bool ssd_eligible = false;
+        std::uint32_t structural_origins  = 0;
+        std::uint8_t structural_role      = 0;
+        bool ssd_eligible                 = false;
     };
 
     static void merge_shared_metadata(SharedCatalogEntry& entry,
@@ -1306,7 +1310,7 @@ private:
         entry.structural_origins |= candidate.structural_origins;
         // Role ordering is durability ordered: Transient < Harness < Project.
         entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
-        entry.ssd_eligible = entry.ssd_eligible || candidate.ssd_eligible;
+        entry.ssd_eligible    = entry.ssd_eligible || candidate.ssd_eligible;
     }
 
     enum class SessionIndexState : std::uint8_t {
@@ -1371,9 +1375,9 @@ private:
         std::uint64_t replacement_id            = 0;
         std::uint64_t replacement_revision      = 0;
         SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
-        std::uint32_t structural_origins = 0;
-        std::uint8_t structural_role = 0;
-        bool ssd_eligible = false;
+        std::uint32_t structural_origins        = 0;
+        std::uint8_t structural_role            = 0;
+        bool ssd_eligible                       = false;
         std::vector<OwnerClaim> private_claims;
         std::vector<OwnerClaim> shared_claims;
     };
@@ -3278,8 +3282,8 @@ private:
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
             publication.structural_origins = record->structural_origins;
-            publication.structural_role = record->structural_role;
-            publication.ssd_eligible = record->ssd_eligible;
+            publication.structural_role    = record->structural_role;
+            publication.ssd_eligible       = record->ssd_eligible;
             advance_revision(publication.revision);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));

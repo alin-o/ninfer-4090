@@ -180,6 +180,10 @@ struct EngineOptions {
     // not covered). The device snapshot runs on the eviction path; the file write runs on a
     // background writer thread. Explicit erase never auto-saves.
     bool auto_save_evicted = false;
+    // The eviction writer is deliberately bounded: a slow filesystem must not retain an
+    // unbounded set of pinned checkpoint images. Zero selects the conservative defaults.
+    std::uint32_t auto_save_queue_jobs = 0;
+    std::size_t auto_save_queue_bytes  = 0;
     // Optional observer for auto-save outcomes; called on the writer thread.
     std::function<void(const SlotAutoSaveEvent&)> auto_save_listener;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
@@ -910,6 +914,17 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+    // Auto-save work retained outside the scheduler. These are current gauges, sampled without
+    // taking the Engine execution lock, so metrics remain available while a writer is blocked.
+    std::uint32_t auto_save_queued_jobs = 0;
+    std::uint64_t auto_save_queued_bytes = 0;
+    std::uint32_t auto_save_in_flight_jobs = 0;
+    std::uint64_t auto_save_in_flight_bytes = 0;
+    // Complete queue reservations, including producer backing/source pins retained after the
+    // writer finishes until Program-side retirement at an Engine unit boundary.
+    std::uint32_t auto_save_reserved_jobs = 0;
+    std::uint64_t auto_save_reserved_bytes = 0;
+    std::uint64_t auto_save_rejected_jobs = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

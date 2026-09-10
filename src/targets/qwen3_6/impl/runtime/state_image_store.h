@@ -206,6 +206,32 @@ public:
         return require(handle).source_pins;
     }
 
+    // A snapshot reader holds this capability until its producer event settles.  It is
+    // intentionally separate from replica-transfer reservations: persistence reads an
+    // existing immutable image into caller-owned backing and publishes no store replica.
+    [[nodiscard]] bool can_pin_snapshot_source(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.role == StateImageRole::CheckpointImmutable && object.device_slot.has_value() &&
+               !object.destination_pinned &&
+               object.source_pins != std::numeric_limits<std::uint32_t>::max();
+    }
+
+    void pin_snapshot_source(StateImageHandle handle) {
+        if (!can_pin_snapshot_source(handle)) {
+            throw std::logic_error("StateImage snapshot source is not stable");
+        }
+        ++require(handle).source_pins;
+    }
+
+    void unpin_snapshot_source(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.source_pins == 0) {
+            throw std::logic_error("StateImage snapshot source is not pinned");
+        }
+        --object.source_pins;
+    }
+
     [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const {
         return require(handle).checkpoint_references;
     }

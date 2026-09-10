@@ -829,6 +829,33 @@ release 或 victim eviction 通过绝对 `ResourceResult` 报告。
 同一时间至多一个 global resource transition。既有 active execution 只有在使用自身既有 reservation、
 且不触碰 transaction mappings 时才能与 transfer 交错。
 
+### 9.3.1 Transfer lifetime and Host consumers
+
+Program owns every transfer reservation, producer event, source pin and destination pin.  A
+transfer is prepared from immutable ranges, enqueued on `DeviceContext::transfer_stream`, and is
+published or aborted only by the Engine worker at a later unit boundary after its completion event
+is ready.  A cancellation records `cancel_pending`; it does not release either pin while CUDA can
+still read or write the range.  Shutdown and exceptional cleanup settle the transfer stream before
+releasing its reservations.
+
+An SSD/checksum/assembly consumer may receive only a completed immutable Host buffer and must use
+a bounded queue with byte accounting.  Such workers may checksum or assemble their private output,
+but must not mutate Program State/KV stores, ResourceManager catalogs, reservations, or replica
+publication.  Their result is adopted by the Engine at a unit boundary.  Full queues use the
+request's existing deadline/backpressure path; they are never an unbounded alternate cache or an
+admission path.
+
+`Program::begin_save_continuation` follows the same rule for an eviction spill: it returns an
+opaque snapshot whose `await_transfer` producer-event callback must run before a Host worker reads
+`bytes`.  Its queue reservation covers two complete images: pinned D2H backing plus either the
+submission assembly image or the post-event pageable output. The normal `save_continuation` API
+settles that callback for synchronous callers. The Engine auto-save writer instead owns the wait,
+so enqueuing an already bounded spill does not block the execution worker or create another
+resource owner. Its public queue gauges exclude the active writer; active bytes are reported
+separately. `auto_save_reserved_{jobs,bytes}` cover every accepted reservation through actual
+Program-side source-pin retirement, including the interval after writer completion, and therefore
+may remain nonzero after both the queued and active-writer gauges reach zero.
+
 ### 9.4 Commit
 
 Commit 发布：

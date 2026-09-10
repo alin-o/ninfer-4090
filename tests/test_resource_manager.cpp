@@ -1,4 +1,6 @@
 #include "runtime/engine/resource_manager.h"
+#include "runtime/engine/scheduler.h"
+#include "runtime/generation/generation_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -290,6 +293,24 @@ struct FakeSequenceHandle {
     std::uint32_t id = 0;
 
     friend bool operator==(FakeSequenceHandle, FakeSequenceHandle) = default;
+};
+
+struct FakeScheduledOutput {
+    [[nodiscard]] std::uint32_t
+    model_token_budget_remaining(std::uint32_t remaining) const noexcept {
+        return remaining;
+    }
+};
+
+struct FakeScheduledRequest {
+    using SequenceHandle = FakeSequenceHandle;
+
+    [[nodiscard]] bool is_decode_ready() const noexcept { return true; }
+
+    bool capture_pending = false;
+    std::optional<ninfer::runtime::GenerationBudget> budget;
+    std::optional<FakeSequenceHandle> sequence;
+    FakeScheduledOutput output;
 };
 
 struct FakeCaptureOffer {
@@ -793,6 +814,14 @@ public:
     progress_context_transaction(CancellationFlagView cancellation) {
         require(transaction_kind_ != TransactionKind::None,
                 "fake Program has no context transaction");
+        // Deterministic producer-event delay.  It holds this transaction at an Engine boundary
+        // without requiring CUDA, so the regression can prove that adoption waits for a complete
+        // immutable image while unrelated admitted work remains runnable.
+        if (delayed_transfer_units != 0) {
+            --delayed_transfer_units;
+            timeline.push_back("transfer-pending");
+            return ContextTransactionInProgress{};
+        }
         if (progress_in_progress_once) {
             progress_in_progress_once = false;
             return ContextTransactionInProgress{};
@@ -961,6 +990,7 @@ public:
     }
 
     void finalize_context_transaction() noexcept {
+        timeline.push_back("transfer-settled");
         transaction_kind_ = TransactionKind::None;
         pending_plan_.reset();
         pending_capture_publish_shared_ = false;
@@ -968,6 +998,15 @@ public:
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
         return transaction_kind_ != TransactionKind::None;
+    }
+
+    void execute_scheduled_decode(std::span<const FakeSequenceHandle> members) {
+        require(transaction_kind_ == TransactionKind::Materialization,
+                "independent work was not interleaved with a materialization transfer");
+        require(members.size() == 1 && members.front().id != 0,
+                "Scheduler did not supply the independent admitted sequence");
+        ++independent_admitted_units;
+        timeline.push_back("independent-execution");
     }
 
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
@@ -1121,25 +1160,27 @@ public:
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
     std::optional<std::uint64_t> required_action_id;
-    std::uint32_t pressure_assessment_delay_us    = 0;
-    std::uint64_t pressure_checkpoint_recovery_ns = 100;
-    bool require_evictions                        = false;
-    bool abort_start                              = false;
-    bool abort_progress                                     = false;
-    bool malform_last_private_victim                        = false;
-    bool malform_last_capture_private_victim                = false;
-    bool malform_private_checkpoint_identity                = false;
-    bool reverse_pressure_results                           = false;
-    bool progress_in_progress_once                          = false;
-    bool finish_fail_next                                   = false;
-    bool finish_release                                     = false;
-    bool finish_with_rewrite                                = false;
-    bool abort_capture_start                                = false;
-    bool report_shared_source_summary                       = false;
-    bool shared_capture_matches_result                      = false;
-    bool change_shared_source_residency_on_second_report    = false;
-    std::uint32_t reported_shared_active_references         = 0;
-    ContextTransactionStatus capture_status                 = ContextTransactionStatus::Published;
+    std::uint32_t pressure_assessment_delay_us           = 0;
+    std::uint64_t pressure_checkpoint_recovery_ns        = 100;
+    bool require_evictions                               = false;
+    bool private_pressure_eviction_only                  = false;
+    bool abort_start                                     = false;
+    bool abort_progress                                  = false;
+    bool malform_last_private_victim                     = false;
+    bool malform_last_capture_private_victim             = false;
+    bool malform_private_checkpoint_identity             = false;
+    bool reverse_pressure_results                        = false;
+    bool progress_in_progress_once                       = false;
+    std::uint32_t delayed_transfer_units                 = 0;
+    bool finish_fail_next                                = false;
+    bool finish_release                                  = false;
+    bool finish_with_rewrite                             = false;
+    bool abort_capture_start                             = false;
+    bool report_shared_source_summary                    = false;
+    bool shared_capture_matches_result                   = false;
+    bool change_shared_source_residency_on_second_report = false;
+    std::uint32_t reported_shared_active_references      = 0;
+    ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
@@ -1151,6 +1192,7 @@ public:
     std::uint64_t finish_calls                = 0;
     std::uint64_t abort_calls                 = 0;
     std::uint64_t skipped_captures            = 0;
+    std::uint64_t independent_admitted_units  = 0;
     std::size_t pressure_target_count_peak    = 0;
     std::uint32_t finish_frontier             = 16;
     std::uint32_t started_source_id           = 0;
@@ -1161,6 +1203,7 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<std::string_view> timeline;
 
 private:
     void advance_revision() noexcept {
@@ -1252,22 +1295,27 @@ FakePressurePlanningSession::decisions_for(std::uint32_t selected_candidate,
 
     std::vector<FakeTargetDecision> decisions;
     if (!owner.shared) {
-        for (std::uint32_t index = 0; index < program_->private_pressure_alternatives; ++index) {
-            decisions.push_back(FakeTargetDecision{
-                .id = 1000U + owner.private_handle->id + 10000U * static_cast<std::uint64_t>(index),
-                .immediate_ns      = program_->pressure_action_immediate_ns,
-                .degradation_units = program_->pressure_action_degradation_units,
-            });
-        }
-        if (program_->include_cumulative_private_target) {
-            decisions.push_back(FakeTargetDecision{
-                .id                  = 5000U + owner.private_handle->id,
-                .degradation_units   = 2,
-                .dropped_checkpoints = 1,
-            });
+        if (!program_->private_pressure_eviction_only) {
+            for (std::uint32_t index = 0; index < program_->private_pressure_alternatives;
+                 ++index) {
+                decisions.push_back(FakeTargetDecision{
+                    .id = 1000U + owner.private_handle->id +
+                          10000U * static_cast<std::uint64_t>(index),
+                    .immediate_ns      = program_->pressure_action_immediate_ns,
+                    .degradation_units = program_->pressure_action_degradation_units,
+                });
+            }
+            if (program_->include_cumulative_private_target) {
+                decisions.push_back(FakeTargetDecision{
+                    .id                  = 5000U + owner.private_handle->id,
+                    .degradation_units   = 2,
+                    .dropped_checkpoints = 1,
+                });
+            }
         }
         decisions.push_back(FakeTargetDecision{
             .id                  = 2000U + owner.private_handle->id,
+            .immediate_ns        = program_->pressure_action_immediate_ns,
             .degradation_units   = 4,
             .dropped_checkpoints = 1,
             .evicts_continuation = true,
@@ -2435,6 +2483,29 @@ void test_committed_victim_survives_transaction_abort() {
             "committed victim eviction was incorrectly rolled back with request-local abort");
 }
 
+void test_eviction_observer_runs_after_physical_reservation() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 10, make_base(10), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(manager, program, 20, make_base(20), 2);
+    (void)finish_active(manager, program, second);
+
+    bool observed = false;
+    manager.set_eviction_observer([&](std::uint32_t, const FakeContinuationHandle&) {
+        observed = true;
+        require(program.has_context_transaction(),
+                "eviction observer ran before Program reserved the physical topology");
+    });
+    auto inspection = manager.inspect(program, FakePreparedPrompt{30}, make_base(30), 3);
+    require(inspection.choice.has_value(), "observer ordering fixture did not require eviction");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{30}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "observer ordering fixture could not reserve materialization");
+    require(observed, "eviction observer was not notified for the selected victim");
+}
+
 void test_uncommitted_pressure_acknowledgement_is_not_degradation() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3136,6 +3207,58 @@ void test_shared_capture_combines_two_pressure_owners() {
     (void)finish_active(manager, program, active);
 }
 
+void test_capture_eviction_observer_runs_after_physical_reservation() {
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    const ActiveRequest victim = start_active(
+        manager, program, 51, make_base(51, std::nullopt, RetentionClass::Disposable), 1);
+    (void)finish_active(manager, program, victim);
+
+    FakeRequestBasePlan request = make_base(52);
+    request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest active              = start_active(manager, program, 52, request, 2);
+    program.required_pressure_actions       = 1;
+    program.private_pressure_eviction_only  = true;
+    program.pressure_action_immediate_ns    = 0;
+    program.pressure_checkpoint_recovery_ns = 0;
+    program.capture_assessment              = FakeCaptureAssessment{
+                     .shortlist_key          = FakeShortlistKey{.digest = 52, .frontier = 64},
+                     .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                     .protected_rebuild_work = PrefillWork{.tokens = 64, .attention_pairs = 1'000'000},
+                     .publishes_shared       = true,
+                     .physically_feasible    = false,
+    };
+
+    bool observed = false;
+    manager.set_eviction_observer([&](std::uint32_t, const FakeContinuationHandle&) {
+        observed = true;
+        require(program.has_context_transaction(),
+                "capture eviction observer ran before Program reserved physical pressure");
+    });
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 19}, 100, {});
+    if (reserved != FakeManager::ActiveCaptureReserveResult::Reserved) {
+        std::cerr << "capture observer diagnostics: assessments="
+                  << program.pressure_target_assessments
+                  << " peak=" << program.pressure_target_count_peak
+                  << " skipped=" << program.skipped_captures << '\n';
+    }
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "capture observer fixture could not reserve pressure");
+    require(observed, "capture pressure did not notify its eviction observer");
+    const auto progress = manager.progress_context_transaction(program, {});
+    require(std::get<FakeManager::ActiveCaptureOutcome>(progress).status ==
+                ContextTransactionStatus::Published,
+            "capture observer fixture did not publish after reservation");
+    program.required_pressure_actions      = 0;
+    program.private_pressure_eviction_only = false;
+    (void)finish_active(manager, program, active);
+}
+
 void test_aborted_shared_capture_start_rolls_back_logical_claims() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -3391,6 +3514,67 @@ void test_shortlist_collision_requires_program_exact_verification() {
             "shortlist collision bypassed Program exact identity verification");
 }
 
+void test_delayed_transfer_timeline_settles_before_abort_or_adoption() {
+    // This is intentionally host-only.  The concrete State/KV transfer tests remain CUDA-gated,
+    // but this trace exercises the Engine/Program ownership rule that was previously untested
+    // when no GPU or artifact was available: an already admitted independent lane may execute
+    // while a sealed materialization is waiting, whereas the selected lane is not adopted until
+    // the producer event has settled.
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const ActiveRequest independent = start_active(manager, program, 11, make_base(11), 1);
+    program.timeline.clear();
+    ninfer::runtime::Scheduler<FakeScheduledRequest> scheduler;
+    std::array<std::shared_ptr<FakeScheduledRequest>, ninfer::kMaximumConcurrency> slots{};
+    slots[independent.lane.value] = std::make_shared<FakeScheduledRequest>();
+    slots[independent.lane.value]->budget.emplace(8, ninfer::FinishReason::OutputLimit);
+    slots[independent.lane.value]->sequence = independent.sequence;
+    const auto execute_engine_unit          = [&] {
+        const auto membership = scheduler.build_round_membership(slots, 2);
+        require(scheduler.choose_execution(!membership.empty(), false, false) ==
+                             ninfer::runtime::Scheduler<FakeScheduledRequest>::ExecutionAction::Decode,
+                         "Engine Scheduler did not select admitted independent decode work");
+        program.execute_scheduled_decode(membership.sequence_span());
+    };
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{22}, make_base(22), 2);
+    require(inspection.choice && inspection.choice->destination().value != independent.lane.value,
+            "delayed transfer did not reserve an independent destination lane");
+    program.delayed_transfer_units = 2;
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{22}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "delayed transfer was not sealed by ResourceManager");
+
+    std::atomic<bool> cancelled{false};
+    auto progress = manager.progress_context_transaction(program, {&cancelled});
+    require(std::holds_alternative<ContextTransactionInProgress>(progress) &&
+                manager.context_transaction_kind().has_value(),
+            "incomplete transfer was adopted before its producer event settled");
+    execute_engine_unit();
+
+    cancelled.store(true, std::memory_order_release);
+    auto cancellation_progress = manager.progress_context_transaction(program, {&cancelled});
+    require(std::holds_alternative<ContextTransactionInProgress>(cancellation_progress),
+            "cancellation released a delayed transfer before settlement");
+    execute_engine_unit();
+
+    auto terminal       = manager.progress_context_transaction(program, {&cancelled});
+    const auto& aborted = std::get<FakeManager::MaterializationOutcome>(terminal);
+    require(aborted.status == ContextTransactionStatus::Aborted && !aborted.activation &&
+                !manager.context_transaction_kind() && !program.has_context_transaction(),
+            "cancelled delayed transfer published a partial activation or leaked its transaction");
+    require(program.independent_admitted_units == 2 &&
+                program.timeline ==
+                    std::vector<std::string_view>{"transfer-pending", "independent-execution",
+                                                  "transfer-pending", "independent-execution",
+                                                  "transfer-settled"},
+            "timeline does not prove independent execution between delayed transfer boundaries");
+    require(manager.lane_state(independent.lane) == ninfer::runtime::LogicalLaneState::Active &&
+                manager.lane_state(LaneId{1}) == ninfer::runtime::LogicalLaneState::Free,
+            "cancelled delayed transfer did not restore complete logical accounting");
+}
+
 } // namespace
 
 int main() {
@@ -3415,6 +3599,8 @@ int main() {
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
+    run_test("eviction observer reservation ordering",
+             test_eviction_observer_runs_after_physical_reservation);
     run_test("uncommitted pressure acknowledgement",
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
     run_test("aborted source is not a hit",
@@ -3454,6 +3640,8 @@ int main() {
              test_exact_shared_capture_merges_richer_structural_metadata);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("capture eviction observer physical reservation",
+             test_capture_eviction_observer_runs_after_physical_reservation);
     run_test("aborted shared capture logical rollback",
              test_aborted_shared_capture_start_rolls_back_logical_claims);
     run_test("validate complete capture result before adoption",
@@ -3466,6 +3654,8 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("delayed transfer timeline and settlement",
+             test_delayed_transfer_timeline_settles_before_abort_or_adoption);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

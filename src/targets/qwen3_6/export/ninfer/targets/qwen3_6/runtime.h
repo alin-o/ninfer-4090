@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <memory>
 #include <optional>
@@ -55,9 +56,56 @@ struct GraphExecutionProfile {
 // byte layout is a target-private format; callers treat it as opaque and durable only across
 // processes serving the identical model and KV configuration.
 struct RetainedSessionSnapshot {
+    RetainedSessionSnapshot()                                              = default;
+    RetainedSessionSnapshot(const RetainedSessionSnapshot&)                = delete;
+    RetainedSessionSnapshot& operator=(const RetainedSessionSnapshot&)     = delete;
+    RetainedSessionSnapshot(RetainedSessionSnapshot&&) noexcept            = default;
+    RetainedSessionSnapshot& operator=(RetainedSessionSnapshot&&) noexcept = default;
+
+    ~RetainedSessionSnapshot() noexcept {
+        // A discarded pending snapshot must not release pinned D2H backing while CUDA still
+        // owns it.  This is deliberately independent of the consumer callback.
+        if (settle_transfer) {
+            try {
+                settle_transfer();
+            } catch (...) {}
+        }
+        // The queue reservation covers both the pinned producer image and the pageable
+        // assembly image.  Release those owners before returning the capacity; member
+        // destruction alone runs in reverse declaration order and would otherwise return
+        // queue capacity while `bytes` and the pinned backing captured by the callbacks live.
+        release_storage();
+    }
+
+    // Consumer-side terminal release.  It is separate so a queue owner can release capacity
+    // outside its accounting mutex after publication.
+    void release_storage() noexcept {
+        bytes.clear();
+        bytes.shrink_to_fit();
+        await_transfer = {};
+        settle_transfer = {};
+        queue_reservation.reset();
+    }
+
+    // Keep the reservation first so ordinary reverse-order destruction drops the byte/callback
+    // owners before it.  The destructor above also makes that ordering explicit for moves.
+    std::shared_ptr<void> queue_reservation;
     std::vector<std::uint8_t> bytes;
-    std::uint32_t tokens = 0;
+    // Exact pinned transfer reservation, available before the first D2H copy. Pending
+    // snapshots keep `bytes` empty and retain this accounting size through completion.
+    std::size_t transfer_bytes = 0;
+    std::uint32_t tokens       = 0;
     std::string session_digest;
+    // Set only by begin_save_continuation(). Consumers must invoke this before reading bytes.
+    // It waits for the producer event (not unrelated device work), then assembles `bytes` from
+    // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
+    // submits immutable CUDA ranges and never lets a Host worker mutate its stores or catalog.
+    // Source pins gate conflicting mutation/reuse; the completion event is never inserted into
+    // the global execution stream, so already admitted independent model work remains runnable.
+    std::function<void(std::vector<std::uint8_t>&)> await_transfer;
+    // Internal lifetime settlement for pending CUDA work.  Consumers never need to invoke it.
+    std::function<void()> settle_transfer;
+    // An Engine-owned bounded-writer reservation, acquired before staging allocation.
 };
 
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
@@ -732,9 +780,9 @@ struct CaptureAssessment {
     std::shared_ptr<detail::CaptureAssessmentImpl> implementation;
     PrefixShortlistKey shortlist_key;
     SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
-    std::uint32_t structural_origins = 0;
-    std::uint8_t structural_role = 0;
-    bool ssd_eligible = false;
+    std::uint32_t structural_origins        = 0;
+    std::uint8_t structural_role            = 0;
+    bool ssd_eligible                       = false;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<runtime::CheckpointRecoveryAlternativeWork> projected_recovery_work;
@@ -979,6 +1027,13 @@ public:
     [[nodiscard]] RetainedSessionSnapshot
     save_continuation(const ContinuationHandle<Variant>& continuation,
                       std::string_view model_binding);
+    // Queues immutable continuation copies on the transfer stream. The returned bytes may be
+    // consumed only after RetainedSessionSnapshot::await_transfer has completed. Pending
+    // snapshots expose their exact pinned reservation in `transfer_bytes`.
+    [[nodiscard]] RetainedSessionSnapshot
+    begin_save_continuation(const ContinuationHandle<Variant>& continuation,
+                            std::string_view model_binding,
+                            const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] ContinuationHandle<Variant>
     restore_continuation(std::span<const std::uint8_t> snapshot, std::string_view model_binding);
     // Reuse metadata of one catalogued continuation, as the Engine catalog consumes it when it

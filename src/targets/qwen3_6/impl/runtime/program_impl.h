@@ -4,6 +4,7 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "runtime/engine/context_transfer_test_gate.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -1032,6 +1033,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    settle_snapshot_sources();
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
@@ -4526,6 +4528,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -6008,6 +6011,21 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     if (cancellation.requested()) { transaction.cancel_pending = true; }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
+        // An eviction auto-save may still be reading an otherwise releasable victim on the
+        // transfer stream.  Keep the transaction sealed until the worker can retire those
+        // source pins; unrelated admitted lanes remain runnable between progress boundaries.
+        // Preflight already proved every selected victim releasable before the observer ran, so
+        // retry only while this bounded handoff is outstanding and preserve the strict check
+        // below for every other topology change.
+        if (!snapshot_source_retirements_.empty()) {
+            for (std::size_t position = 0; position < transaction.victim_count; ++position) {
+                if (transaction.pressure[position].option.evicts_continuation &&
+                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
+            }
+        }
         if (transaction.cancel_pending) {
             abort_transaction();
             return out;
@@ -6335,6 +6353,12 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    // Source pins are Program capabilities.  The Host writer may wait for and consume its
+    // private image, but only this worker boundary mutates State/KV ownership.
+    retire_ready_snapshot_sources();
+    // After this point pressure work is allowed to mutate/release selected victims.  A snapshot
+    // may only be sealed in the reservation window above.
+    snapshot_save_window_ = false;
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress<Variant> {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {
@@ -6374,6 +6398,27 @@ void ProgramImplCore::finalize_context_transaction() noexcept {
         },
         context_transaction_);
     if (terminal) { context_transaction_.emplace<std::monostate>(); }
+}
+
+void ProgramImplCore::retire_ready_snapshot_sources() {
+    auto retirement = snapshot_source_retirements_.begin();
+    while (retirement != snapshot_source_retirements_.end()) {
+        if (!retirement->ready()) {
+            ++retirement;
+            continue;
+        }
+        retirement->retire();
+        retirement = snapshot_source_retirements_.erase(retirement);
+    }
+}
+
+void ProgramImplCore::settle_snapshot_sources() noexcept {
+    for (SnapshotSourceRetirement& retirement : snapshot_source_retirements_) {
+        try {
+            retirement.retire();
+        } catch (...) {}
+    }
+    snapshot_source_retirements_.clear();
 }
 
 bool ProgramImplCore::has_context_transaction() const noexcept {
@@ -7938,6 +7983,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         transaction.transfer_enqueue_pending = assessment.needs_transfer;
         advance_resource_revision();
         context_transaction_.emplace<ActiveCaptureTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -8187,6 +8233,14 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
             1U << context_resource_index(runtime::ContextResourceClass::BackendKV);
         ++transaction.operations.partial_tail_cow_pages;
     }
+    if (const auto* gate = runtime::testing::active_capture_transfer_gate(); gate != nullptr) {
+        if (gate->enqueue == nullptr) {
+            throw std::logic_error("active capture transfer test gate has no enqueue hook");
+        }
+        cuda_check(gate->enqueue(gate->context, device.transfer_stream),
+                   "enqueue active capture transfer test delay", __FILE__, __LINE__);
+        runtime::testing::note_active_capture_transfer_gate_wait();
+    }
     context_completion_.record(device.transfer_stream);
     transaction.transfer_enqueue_pending = false;
     transaction.transfer_submitted       = true;
@@ -8430,6 +8484,17 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
     }
+    if (cancellation.requested() && !transaction.cancel_pending) {
+        // The lifecycle regression observes cancellation only after the real State transfer has
+        // been submitted and its capability still owns the pinned source/destination. This is
+        // deliberately earlier than settlement and publication, which remain event-gated below.
+        if (transaction.transfer_submitted && transaction.state_snapshot &&
+            transaction.state_snapshot->valid() &&
+            runtime::testing::active_capture_transfer_gate() != nullptr) {
+            runtime::testing::note_active_capture_submitted_cancellation();
+        }
+        transaction.cancel_pending = true;
+    }
     const auto abort = [&]() -> ActiveCaptureResult {
         abort_active_capture(transaction);
         if (transaction.lane < max_concurrency && requests[transaction.lane].prefill) {
@@ -8472,7 +8537,24 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        if (cancellation.requested()) { return abort(); }
+        // The Engine may have sealed an eviction snapshot after this capture topology was
+        // reserved.  Its immutable sources remain pinned until the transfer event settles.  Do
+        // not mistake that bounded handoff for a topology violation: retain the transaction and
+        // let independent admitted lanes execute between progress boundaries.  Preflight proved
+        // each victim releasable before the observer ran; strict validation below still catches
+        // every unrelated ownership change.
+        if (!snapshot_source_retirements_.empty()) {
+            for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
+                const auto& work = transaction.pressure[position];
+                if (work.option.evicts_continuation &&
+                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
+                    ActiveCaptureResult out;
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
+            }
+        }
+        if (transaction.cancel_pending) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -8695,9 +8777,11 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (has_pressure() && pressure_transition.phase != PressureTransitionPhase::Committed) {
         throw std::logic_error("capture pressure transition did not reach a stable phase");
     }
-    if (cancellation.requested()) { return abort(); }
+    // A prepared capture may already own transfer-stream work. Cancellation is adopted below,
+    // after context_completion_ is ready, so abort_active_capture cannot release a live State
+    // destination, KV snapshot reservation, or source pin.
     if (!transaction.prepared) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             prepare_active_capture(transaction);
         } catch (...) {
@@ -8707,7 +8791,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
     }
     if (transaction.transfer_enqueue_pending) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
@@ -8763,7 +8847,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
         transaction.transfer_submitted = false;
     }
-    if (cancellation.requested()) { return abort(); }
+    if (transaction.cancel_pending) { return abort(); }
     return publish_active_capture(transaction);
 }
 
@@ -9251,6 +9335,10 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     const bool valid               = !has_context_transaction() && !pending_transaction_ &&
                        valid_continuation(continuation) && !materialization_pins(index, generation);
     if (!valid) { return out; }
+    // Direct destructive callers have no open context transaction through which to revisit an
+    // asynchronous eviction spill.  Settle that bounded handoff here; materialization pressure
+    // instead defers at progress boundaries so unrelated admitted lanes remain runnable.
+    if (!snapshot_source_retirements_.empty()) { settle_snapshot_sources(); }
     try {
         if (!can_release_continuation_slot_strict(index)) { return out; }
     } catch (...) { return out; }
@@ -9328,6 +9416,7 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 
 void ProgramImplCore::fail_all_cleanup() noexcept {
     pending_transaction_.reset();
+    settle_snapshot_sources();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);

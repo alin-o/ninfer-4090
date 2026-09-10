@@ -5,19 +5,16 @@
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/auto_save_writer.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
-#include "runtime/engine/slot_spill_guard.h"
 #include "targets/registry.h"
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -50,6 +47,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+    if (options.auto_save_queue_jobs == 0) { options.auto_save_queue_jobs = 2; }
+    if (options.auto_save_queue_bytes == 0) { options.auto_save_queue_bytes = 1ULL << 30U; }
+    if (options.auto_save_queue_bytes == 0) {
+        throw std::invalid_argument("auto-save queue byte capacity must be nonzero");
     }
 
     ContextCacheOptions& cache      = options.context_cache;
@@ -270,6 +272,9 @@ public:
             },
             active);
         if (options.auto_save_evicted) {
+            auto_save_writer = std::make_unique<runtime::AutoSaveWriter>(
+                options.auto_save_queue_jobs, options.auto_save_queue_bytes,
+                options.auto_save_listener, write_snapshot_file);
             std::visit(
                 [&](auto& constructed_core) {
                     if constexpr (requires {
@@ -277,14 +282,16 @@ public:
                                           std::string(),
                                           std::function<void(
                                               std::string,
-                                              targets::qwen3_6::RetainedSessionSnapshot&&)>());
+                                              targets::qwen3_6::RetainedSessionSnapshot&&)>(),
+                                          std::function<std::shared_ptr<void>(std::size_t)>());
                                   }) {
                         constructed_core->set_eviction_sink(
                             slot_model_binding(load),
                             [this](std::string path,
                                    targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
-                                enqueue_write(std::move(path), std::move(snapshot));
-                            });
+                                auto_save_writer->enqueue(std::move(path), std::move(snapshot));
+                            },
+                            [this](std::size_t bytes) { return auto_save_writer->reserve(bytes); });
                     }
                 },
                 core);
@@ -294,34 +301,21 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        // Auto-save snapshots retain producer events that reference the Program's device
+        // context. Drain their bounded Host consumer before destroying the Engine core.
+        if (auto_save_writer) { auto_save_writer->stop(); }
         core.emplace<std::monostate>();
-        stop_writer();
+        auto_save_writer.reset();
         try {
             device.synchronize();
         } catch (...) {}
-    }
-
-    // Auto-save writer: eviction spills enqueue (path, snapshot) here; one background thread
-    // publishes each file with the same write-then-rename discipline as an explicit save.
-    struct PendingWrite {
-        std::string path;
-        targets::qwen3_6::RetainedSessionSnapshot snapshot;
-    };
-
-    void enqueue_write(std::string path, targets::qwen3_6::RetainedSessionSnapshot&& snapshot) {
-        std::unique_lock lock(writer_mutex);
-        if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back(PendingWrite{std::move(path), std::move(snapshot)});
-        lock.unlock();
-        writer_cv.notify_one();
     }
 
     // Blocks until every enqueued auto-save has been published. Explicit slot operations call
     // this before touching files so a pending write can never be read stale or interleave with
     // a client save of the same path.
     void drain_writes() {
-        std::unique_lock lock(writer_mutex);
-        writer_cv.wait(lock, [this] { return pending_writes.empty() && !write_in_flight; });
+        if (auto_save_writer) { auto_save_writer->drain(); }
     }
 
     EngineOptions options;
@@ -330,70 +324,10 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    std::unique_ptr<runtime::AutoSaveWriter> auto_save_writer;
 
-    std::mutex writer_mutex;
-    std::condition_variable writer_cv;
-    std::deque<PendingWrite> pending_writes;
-    bool write_in_flight = false;
-    bool writer_stop     = false;
-    std::thread writer;
-    SlotSpillGuard spill_guard;
-
-private:
-    void writer_loop() {
-        std::unique_lock lock(writer_mutex);
-        while (true) {
-            writer_cv.wait(lock, [this] { return writer_stop || !pending_writes.empty(); });
-            if (pending_writes.empty()) { break; }
-            PendingWrite item = std::move(pending_writes.front());
-            pending_writes.pop_front();
-            write_in_flight = true;
-            lock.unlock();
-
-            SlotAutoSaveEvent event;
-            event.path         = item.path;
-            event.tokens       = item.snapshot.tokens;
-            event.bytes        = item.snapshot.bytes.size();
-            const auto started = std::chrono::steady_clock::now();
-            try {
-                if (const std::optional<std::uint32_t> deeper =
-                        spill_guard.blocks(item.path, item.snapshot.tokens)) {
-                    // A stale copy of the session must not roll the file back (D3).
-                    event.skipped_behind_tokens = deeper;
-                } else {
-                    write_snapshot_file(item.path, item.snapshot.bytes);
-                    spill_guard.note_spilled(item.path, item.snapshot.tokens);
-                }
-            } catch (const std::exception& error) {
-                event.error = error.what();
-            } catch (...) {
-                event.error = "unknown auto-save failure";
-            }
-            event.seconds =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            if (options.auto_save_listener) {
-                try {
-                    options.auto_save_listener(event);
-                } catch (...) {}
-            }
-
-            lock.lock();
-            write_in_flight = false;
-            writer_cv.notify_all();
-        }
-    }
-
-    void stop_writer() noexcept {
-        {
-            std::scoped_lock lock(writer_mutex);
-            writer_stop = true;
-        }
-        writer_cv.notify_all();
-        if (writer.joinable()) {
-            try {
-                writer.join();
-            } catch (...) {}
-        }
+    [[nodiscard]] RuntimeStats with_auto_save_stats(RuntimeStats stats) const noexcept {
+        return auto_save_writer ? auto_save_writer->populate_stats(std::move(stats)) : stats;
     }
 
 public:
@@ -646,7 +580,7 @@ bool Engine::healthy() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    return impl_->with_auto_save_stats(std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -655,7 +589,7 @@ RuntimeStats Engine::runtime_stats() const {
                 return core->runtime_stats();
             }
         },
-        impl_->core);
+        impl_->core));
 }
 
 // Write-then-rename keeps a torn write from ever shadowing a good snapshot at `path`. The
@@ -691,11 +625,12 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
     const auto started = std::chrono::steady_clock::now();
     // A pending auto-save of the same path must not land after this explicit save.
     impl_->drain_writes();
-    const std::string binding = slot_model_binding(impl_->load);
+    const std::string binding                          = slot_model_binding(impl_->load);
     targets::qwen3_6::RetainedSessionSnapshot snapshot = std::visit(
         [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
-            if constexpr (requires { core->save_retained_lane(lane, binding, expected_digest,
-                                                              path); }) {
+            if constexpr (requires {
+                              core->save_retained_lane(lane, binding, expected_digest, path);
+                          }) {
                 return core->save_retained_lane(lane, binding, expected_digest, path);
             } else {
                 throw std::logic_error("session persistence requires a generation Engine");
@@ -704,13 +639,16 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
         impl_->core);
 
     Impl::write_snapshot_file(path, snapshot.bytes);
-    impl_->spill_guard.note_authoritative(path, snapshot.tokens);
+    if (impl_->auto_save_writer) {
+        impl_->auto_save_writer->note_authoritative(path, snapshot.tokens);
+    }
 
     SlotSaveResult result;
     result.tokens         = snapshot.tokens;
     result.bytes          = snapshot.bytes.size();
     result.session_digest = std::move(snapshot.session_digest);
-    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    result.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }
 
@@ -721,9 +659,7 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
     impl_->drain_writes();
 
     std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        throw std::invalid_argument("session snapshot file is unavailable");
-    }
+    if (!file.is_open()) { throw std::invalid_argument("session snapshot file is unavailable"); }
     const std::streamsize size = file.tellg();
     if (size <= 0) { throw std::invalid_argument("session snapshot file is empty"); }
     std::vector<std::uint8_t> snapshot(static_cast<std::size_t>(size));
@@ -733,7 +669,7 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
     file.close();
 
     const std::string binding = slot_model_binding(impl_->load);
-    auto restored = std::visit(
+    auto restored             = std::visit(
         [&](auto& core) -> std::pair<std::uint32_t, std::string> {
             const std::span<const std::uint8_t> bytes(snapshot.data(), snapshot.size());
             if constexpr (requires { core->restore_retained_lane(lane, bytes, binding, path); }) {
@@ -744,13 +680,16 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
         },
         impl_->core);
 
-    impl_->spill_guard.note_authoritative(path, restored.first);
+    if (impl_->auto_save_writer) {
+        impl_->auto_save_writer->note_authoritative(path, restored.first);
+    }
 
     SlotRestoreResult result;
     result.tokens         = restored.first;
     result.bytes          = snapshot.size();
     result.session_digest = std::move(restored.second);
-    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    result.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }
 

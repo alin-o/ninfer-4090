@@ -104,7 +104,9 @@ KV-pressure eviction) first spills the resident session back to that file, so th
 next restore recovers the session at its latest frontier instead of the last explicit
 save. Sessions never saved or restored have no binding and are not spilled; an explicit
 `erase` is a deletion request and never auto-saves. The console reports each spill as
-`slot auto-save file=... n_saved=...`.
+`slot auto-save file=... n_saved=...`. `/metrics` reports pending queue, active writer, rejected
+reservation, and total reserved job/byte series separately. The reserved gauges remain nonzero
+while completed producer backing or source pins await retirement at an Engine unit boundary.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.

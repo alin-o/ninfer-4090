@@ -26,6 +26,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -97,14 +98,14 @@ struct PreparedCaptureIdentity {
 struct CaptureGroup {
     std::shared_ptr<const PreparedCaptureIdentity> identity;
     std::optional<RewriteCheckpointKind> rewrite;
-    std::uint32_t frontier                  = 0;
-    std::uint32_t input_order               = 0;
-    bool shared                             = false;
-    bool long_anchor                        = false;
-    SharedCandidateEvidence shared_evidence = SharedCandidateEvidence::None;
-    std::uint32_t structural_origins = 0;
+    std::uint32_t frontier                    = 0;
+    std::uint32_t input_order                 = 0;
+    bool shared                               = false;
+    bool long_anchor                          = false;
+    SharedCandidateEvidence shared_evidence   = SharedCandidateEvidence::None;
+    std::uint32_t structural_origins          = 0;
     qwen3_6::SharedPrefixRole structural_role = qwen3_6::SharedPrefixRole::Transient;
-    bool ssd_eligible = false;
+    bool ssd_eligible                         = false;
 };
 
 enum class MtpBridgeMode : std::uint8_t {
@@ -434,6 +435,7 @@ struct SequenceState {
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
 };
+
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
     StateImageHandle state;
@@ -718,8 +720,12 @@ public:
     continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
+    begin_save_continuation(const ContinuationHandle& continuation, std::string_view model_binding,
+                            const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
                                                           std::string_view model_binding);
+
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;
     }
@@ -969,8 +975,12 @@ private:
         std::uint64_t recycled_state_epoch = 0;
         bool transfer_enqueue_pending      = false;
         bool transfer_submitted            = false;
-        std::uint8_t transfer_timer_mask   = 0;
-        bool published                     = false;
+        // Cancellation is adopted at a worker boundary, but an enqueued transfer retains pins
+        // until its completion event has settled.  This prevents an abort from recycling a
+        // source or destination that CUDA may still access.
+        bool cancel_pending              = false;
+        std::uint8_t transfer_timer_mask = 0;
+        bool published                   = false;
     };
 
     std::uint64_t next_capture_offer_id_ = 1;
@@ -978,6 +988,20 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
     ContextTransaction context_transaction_;
+
+    struct SnapshotSourceRetirement {
+        std::function<bool()> ready;
+        std::function<void()> retire;
+    };
+
+    std::vector<SnapshotSourceRetirement> snapshot_source_retirements_;
+    // Set only between context-transaction reservation and its first physical progress step.
+    // The Engine uses this interval to seal an involuntarily evicted continuation's immutable
+    // D2H snapshot after the topology is reserved but before any source can be mutated.
+    bool snapshot_save_window_ = false;
+
+    void retire_ready_snapshot_sources();
+    void settle_snapshot_sources() noexcept;
 
     [[nodiscard]] MaterializationResult
     progress_materialization_transaction(runtime::CancellationFlagView cancellation);

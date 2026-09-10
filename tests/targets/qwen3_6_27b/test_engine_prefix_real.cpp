@@ -1703,15 +1703,14 @@ int exercise_delayed_spill_lifecycle(const char* artifact) {
                   << " backend_pages=" << stats.backend_kv_d2h_pages << '\n';
         return 1;
     }
-    const std::uint32_t before = independent_sink.deltas.load(std::memory_order_acquire);
-    if (!wait_until(
-            [&] { return independent_sink.deltas.load(std::memory_order_acquire) > before; })) {
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; })) {
         cancel_capture.store(true, std::memory_order_release);
         cancel_independent.store(true, std::memory_order_release);
         gate.release();
         (void)capture.get();
         (void)independent.get();
-        std::cerr << "independent Engine/Program execution did not advance during snapshot D2H\n";
+        std::cerr << "no Engine/Program decode unit completed during snapshot D2H\n";
         return 1;
     }
     if (!gate.pending()) {
@@ -1855,15 +1854,14 @@ int exercise_delayed_active_capture_lifecycle(const char* artifact) {
                   << " prefill_tokens=" << diagnostics.computed_prefill_tokens << '\n';
         return 1;
     }
-    const std::uint32_t before = independent_sink.deltas.load(std::memory_order_acquire);
-    if (!wait_until(
-            [&] { return independent_sink.deltas.load(std::memory_order_acquire) > before; })) {
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; })) {
         cancel_capture.store(true, std::memory_order_release);
         cancel_independent.store(true, std::memory_order_release);
         gate.release();
         (void)capture.get();
         (void)independent.get();
-        std::cerr << "independent Program execution did not advance during active-capture D2H\n";
+        std::cerr << "no Engine/Program decode unit completed during active-capture D2H\n";
         return 1;
     }
     if (!gate.pending()) {
@@ -1876,6 +1874,33 @@ int exercise_delayed_active_capture_lifecycle(const char* artifact) {
     }
 
     cancel_capture.store(true, std::memory_order_release);
+    if (!wait_until([&] {
+            return ninfer::runtime::testing::active_capture_submitted_cancellations() == 1;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "Program did not observe cancellation of the submitted active capture\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats cancelled_pending = engine.runtime_stats();
+    if (!gate.pending() || cancelled_pending.capture_pending_requests != 1 ||
+        cancelled_pending.active_captures_completed != 0 ||
+        cancelled_pending.active_captures_aborted != 0 ||
+        cancelled_pending.host_state_occupied_slots == 0) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr
+            << "submitted capture released/published ownership before cancellation settlement: "
+            << "pending=" << cancelled_pending.capture_pending_requests
+            << " captures=" << cancelled_pending.active_captures_completed << '/'
+            << cancelled_pending.active_captures_aborted
+            << " host_state=" << cancelled_pending.host_state_occupied_slots << '\n';
+        return 1;
+    }
     gate.release();
     const ninfer::GenerationResult cancelled = capture.get();
     cancel_independent.store(true, std::memory_order_release);
@@ -1888,7 +1913,8 @@ int exercise_delayed_active_capture_lifecycle(const char* artifact) {
             const ninfer::RuntimeStats stats = engine.runtime_stats();
             return stats.running_requests == 0 && stats.materializing_requests == 0 &&
                    stats.capture_pending_requests == 0 && stats.terminal_pending_requests == 0 &&
-                   stats.device_state_occupied_slots == 0 && stats.host_state_occupied_slots == 0;
+                   stats.device_state_occupied_slots == 0 && stats.host_state_occupied_slots == 0 &&
+                   stats.active_captures_completed == 0 && stats.active_captures_aborted == 1;
         })) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "cancelled active capture leaked terminal ownership: running="
@@ -1896,7 +1922,9 @@ int exercise_delayed_active_capture_lifecycle(const char* artifact) {
                   << " capture=" << stats.capture_pending_requests
                   << " terminal=" << stats.terminal_pending_requests
                   << " state=" << stats.device_state_occupied_slots << '/'
-                  << stats.host_state_occupied_slots << '\n';
+                  << stats.host_state_occupied_slots
+                  << " captures=" << stats.active_captures_completed << '/'
+                  << stats.active_captures_aborted << '\n';
         return 1;
     }
     const ninfer::GenerationResult after =
@@ -2037,15 +2065,15 @@ int exercise_delayed_active_capture_pressure(const char* artifact) {
                   << " capture_reason=" << static_cast<int>(capture_result.finish_reason) << '\n';
         return 1;
     }
-    const std::uint32_t before = independent_sink.deltas.load(std::memory_order_acquire);
-    if (!wait_until(
-            [&] { return independent_sink.deltas.load(std::memory_order_acquire) > before; }) ||
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; }) ||
         !gate.pending()) {
         cancel_independent.store(true, std::memory_order_release);
         gate.release();
         (void)capture.get();
         (void)independent.get();
-        std::cerr << "independent execution did not advance during active-capture pressure spill\n";
+        std::cerr
+            << "no Engine/Program decode unit completed during active-capture pressure spill\n";
         return 1;
     }
 
@@ -2076,6 +2104,147 @@ int exercise_delayed_active_capture_pressure(const char* artifact) {
     }
     if (!engine.healthy() || writer_failures.load(std::memory_order_acquire) != 0) {
         std::cerr << "Engine or retained-session writer failed after active capture pressure\n";
+        return 1;
+    }
+    return 0;
+}
+
+// Engine::Impl must drain its bounded Host consumer before destroying Program/device state. This
+// scenario starts a real retained-session D2H, drops all request-side Engine owners, and destroys
+// the Engine while the CUDA completion remains gated. The test-only ownership observations are
+// emitted by PendingTransferSettlement at the same points where backing and source pins are
+// acquired/released; a synthetic writer callback cannot establish this lifetime.
+int exercise_pending_snapshot_shutdown(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 4;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.auto_save_evicted                = true;
+    options.auto_save_queue_jobs             = 1;
+    options.auto_save_queue_bytes            = 1ULL << 30;
+    options.context_cache.device_state_slots = 4;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 3;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    std::atomic<std::uint32_t> writer_failures{0};
+    options.auto_save_listener = [&](const ninfer::SlotAutoSaveEvent& event) {
+        if (!event.error.empty()) { writer_failures.fetch_add(1, std::memory_order_acq_rel); }
+    };
+    auto engine = std::make_unique<ninfer::Engine>(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-pending-snapshot-shutdown";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } directory_guard{directory};
+
+    const auto bound_prompt = [](std::string text) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind  = ninfer::MessagePartKind::Text,
+            .text  = std::move(text),
+            .media = {},
+        });
+        prompt.messages.push_back(std::move(user));
+        prompt.options.enable_thinking = false;
+        prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return prompt;
+    };
+    for (std::uint32_t index = 0; index < 2; ++index) {
+        const ninfer::GenerationResult victim = engine->generate(
+            engine->prepare(bound_prompt("Retain shutdown spill victim " + std::to_string(index))),
+            fixed_output(1));
+        if (victim.slot < 0 || victim.session_digest.empty()) {
+            std::cerr << "shutdown fixture did not retain victim " << index << '\n';
+            return 1;
+        }
+        (void)engine->save_slot(static_cast<std::uint32_t>(victim.slot),
+                                (directory / ("bound-" + std::to_string(index) + ".bin")).string(),
+                                victim.session_digest);
+    }
+
+    auto independent = engine->submit(engine->prepare_tokens({248045, 846, 198, 9041, 248046, 198}),
+                                      fixed_output(1000));
+    if (!wait_until([&] { return engine->runtime_stats().decode_rounds != 0; })) {
+        std::cerr << "shutdown fixture did not start independent model execution\n";
+        return 1;
+    }
+
+    ControlledSnapshotTransferGate gate;
+    auto pressure = engine->submit(
+        engine->prepare(bound_prompt("Force a retained snapshot during Engine shutdown.")),
+        fixed_output(1));
+    if (!wait_until([&] { return ninfer::runtime::testing::snapshot_transfer_gate_waits() == 1; },
+                    std::chrono::seconds(60)) ||
+        !wait_until([&] {
+            return ninfer::runtime::testing::snapshot_transfer_live_settlements() == 1 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0;
+        })) {
+        gate.release();
+        std::cerr << "shutdown fixture did not acquire real snapshot backing/source pins\n";
+        return 1;
+    }
+    const std::uint64_t backing_bytes =
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes();
+    const std::uint64_t pinned_sources =
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources();
+    if (!wait_until([&] { return engine->runtime_stats().auto_save_in_flight_jobs == 1; })) {
+        gate.release();
+        std::cerr << "shutdown fixture writer did not begin consuming the pending snapshot\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats pending = engine->runtime_stats();
+    if (!gate.pending() || pending.auto_save_reserved_jobs != 1 ||
+        pending.auto_save_reserved_bytes < backing_bytes || pending.auto_save_in_flight_jobs != 1) {
+        gate.release();
+        std::cerr << "shutdown fixture did not expose its pending bounded writer ownership: "
+                  << "reserved=" << pending.auto_save_reserved_jobs << '/'
+                  << pending.auto_save_reserved_bytes
+                  << " active=" << pending.auto_save_in_flight_jobs << " backing=" << backing_bytes
+                  << " pins=" << pinned_sources << '\n';
+        return 1;
+    }
+
+    // GenerationHandle keeps Engine::Impl alive. Drop both handles first so Engine is the sole
+    // owner, then destroy it on another thread while the writer is blocked on the CUDA event.
+    pressure      = {};
+    independent   = {};
+    auto shutdown = std::async(std::launch::async, [&] { engine.reset(); });
+    if (shutdown.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready ||
+        !gate.pending() || ninfer::runtime::testing::snapshot_transfer_live_settlements() != 1 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != backing_bytes ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != pinned_sources) {
+        gate.release();
+        shutdown.get();
+        std::cerr << "Engine teardown released pending snapshot ownership before settlement\n";
+        return 1;
+    }
+
+    gate.release();
+    shutdown.get();
+    if (gate.pending() || ninfer::runtime::testing::snapshot_transfer_live_settlements() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0 ||
+        writer_failures.load(std::memory_order_acquire) != 0) {
+        std::cerr << "Engine teardown did not completely retire snapshot backing/source pins\n";
         return 1;
     }
     return 0;
@@ -2991,6 +3160,15 @@ int main() {
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }
+    if (scenario != nullptr && std::string_view(scenario) == "pending-snapshot-shutdown") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "pending-snapshot-shutdown requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_pending_snapshot_shutdown(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
     if (scenario != nullptr && std::string_view(scenario) == "cuda-transfer-failure") {
         if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
             std::cerr << "cuda-transfer-failure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
@@ -3110,6 +3288,9 @@ int main() {
         }
         if (const int result = exercise_delayed_active_capture_pressure(qwen38_groupwise);
             result != 0) {
+            return result;
+        }
+        if (const int result = exercise_pending_snapshot_shutdown(qwen38_groupwise); result != 0) {
             return result;
         }
     }

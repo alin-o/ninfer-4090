@@ -569,7 +569,10 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
         bool recorded  = false;
         std::exception_ptr failure;
         std::once_flag event_settlement;
-        bool sources_retired = false;
+        bool sources_retired            = false;
+        bool test_ownership_observed    = false;
+        std::size_t test_backing_bytes  = 0;
+        std::size_t test_pinned_sources = 0;
 
         void settle_event() noexcept {
             std::call_once(event_settlement, [&] {
@@ -599,10 +602,19 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
                 for (const auto& [pages, source] : kv_sources) { pages->unpin_source(source); }
                 kv_sources.clear();
             } catch (...) {}
+            if (test_ownership_observed && test_pinned_sources != 0) {
+                runtime::testing::note_snapshot_transfer_pins_released(test_pinned_sources);
+                test_pinned_sources = 0;
+            }
             sources_retired = true;
         }
 
-        ~PendingTransferSettlement() { retire_sources(); }
+        ~PendingTransferSettlement() {
+            retire_sources();
+            if (test_ownership_observed) {
+                runtime::testing::note_snapshot_transfer_backing_released(test_backing_bytes);
+            }
+        }
     };
 
     auto pending               = std::make_shared<PendingTransferSettlement>();
@@ -706,6 +718,13 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
                            *sequence.kv->backend, session.backend_pages, *backend_layout,
                            backend_kv_offset, snapshot_traffic_.backend_kv_d2h_pages,
                            snapshot_traffic_.backend_kv_d2h_bytes);
+    }
+    if (runtime::testing::snapshot_transfer_gate() != nullptr && pending->submitted) {
+        pending->test_ownership_observed = true;
+        pending->test_backing_bytes      = transfer_backing->size();
+        pending->test_pinned_sources = pending->state_sources.size() + pending->kv_sources.size();
+        runtime::testing::note_snapshot_transfer_ownership_acquired(pending->test_backing_bytes,
+                                                                    pending->test_pinned_sources);
     }
     // Keep the completion event with the immutable host payload. The Engine's bounded writer
     // waits for it off the execution worker. Source pins and the Program-owned retirement list

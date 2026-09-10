@@ -8484,7 +8484,17 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
     }
-    if (cancellation.requested()) { transaction.cancel_pending = true; }
+    if (cancellation.requested() && !transaction.cancel_pending) {
+        // The lifecycle regression observes cancellation only after the real State transfer has
+        // been submitted and its capability still owns the pinned source/destination. This is
+        // deliberately earlier than settlement and publication, which remain event-gated below.
+        if (transaction.transfer_submitted && transaction.state_snapshot &&
+            transaction.state_snapshot->valid() &&
+            runtime::testing::active_capture_transfer_gate() != nullptr) {
+            runtime::testing::note_active_capture_submitted_cancellation();
+        }
+        transaction.cancel_pending = true;
+    }
     const auto abort = [&]() -> ActiveCaptureResult {
         abort_active_capture(transaction);
         if (transaction.lane < max_concurrency && requests[transaction.lane].prefill) {

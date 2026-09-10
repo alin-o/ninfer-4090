@@ -1,6 +1,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include "runtime/engine/context_transfer_test_gate.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -531,6 +533,17 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
         if (!snapshot.queue_reservation) { return {}; }
     }
 
+    // Allocate the complete assembly capacity once after the reservation succeeds.  Growing the
+    // three payload regions independently can retain geometric vector capacity above the final
+    // image size while the equally large pinned backing is live, violating the advertised Host
+    // bound.  A single exact reserve prevents intermediate payload reallocations.
+    snapshot.bytes.reserve(transfer_bytes);
+    if (snapshot.bytes.capacity() != transfer_bytes) {
+        // The supported libstdc++ implementation reserves exactly.  Refuse a conforming but
+        // over-allocating implementation rather than silently exceeding queue accounting.
+        throw std::runtime_error("session snapshot assembly capacity exceeds its Host reservation");
+    }
+
     // Size the payload after the reservation succeeds. CUDA must never receive the ordinary
     // vector storage as an asynchronous D2H destination.
     const std::size_t state_offset      = writer.reserve_payload(state_bytes);
@@ -604,6 +617,14 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     // release until completion settlement.
     pending->producer->record(device.stream);
     pending->producer->wait(device.transfer_stream);
+    if (const auto* gate = runtime::testing::snapshot_transfer_gate(); gate != nullptr) {
+        if (gate->enqueue == nullptr) {
+            throw std::logic_error("snapshot transfer test gate has no enqueue hook");
+        }
+        cuda_check(gate->enqueue(gate->context, device.transfer_stream),
+                   "enqueue snapshot transfer test delay", __FILE__, __LINE__);
+        runtime::testing::note_snapshot_transfer_gate_wait();
+    }
     for (std::size_t index = 0; index < unique_states.size(); ++index) {
         const StateImageHandle image  = unique_states[index];
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;

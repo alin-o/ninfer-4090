@@ -33,6 +33,7 @@ add_library(ninfer_core STATIC
   runtime/engine/admission_policy.cpp
   runtime/engine/context_cost.cpp
   runtime/engine/context_cost_defaults.cpp
+  runtime/engine/context_transfer_test_gate.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp)
 ninfer_internal_includes(ninfer_core)

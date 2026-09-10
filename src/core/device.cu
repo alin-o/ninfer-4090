@@ -123,7 +123,12 @@ int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; 
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
-void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+void DeviceContext::synchronize() const {
+    const cudaError_t status = cudaStreamSynchronize(stream);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamSynchronize failed", status));
+    }
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 
@@ -232,13 +237,15 @@ bool CudaCompletionEvent::ready() const {
     const cudaError_t status = cudaEventQuery(event_);
     if (status == cudaSuccess) { return true; }
     if (status == cudaErrorNotReady) { return false; }
-    CUDA_CHECK(status);
-    return false;
+    throw std::runtime_error(cuda_error_message("cudaEventQuery failed", status));
 }
 
 void CudaCompletionEvent::synchronize() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
-    CUDA_CHECK(cudaEventSynchronize(event_));
+    const cudaError_t status = cudaEventSynchronize(event_);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventSynchronize failed", status));
+    }
 }
 
 } // namespace ninfer

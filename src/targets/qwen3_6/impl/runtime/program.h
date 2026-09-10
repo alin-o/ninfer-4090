@@ -995,9 +995,9 @@ private:
     };
 
     std::vector<SnapshotSourceRetirement> snapshot_source_retirements_;
-    // Set only between materialization reservation and its first physical progress step.  The
-    // Engine uses this interval to seal an involuntarily evicted continuation's immutable D2H
-    // snapshot after the topology is reserved but before any source can be mutated.
+    // Set only between context-transaction reservation and its first physical progress step.
+    // The Engine uses this interval to seal an involuntarily evicted continuation's immutable
+    // D2H snapshot after the topology is reserved but before any source can be mutated.
     bool snapshot_save_window_ = false;
 
     void retire_ready_snapshot_sources();

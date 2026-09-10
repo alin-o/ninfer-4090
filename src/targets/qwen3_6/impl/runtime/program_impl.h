@@ -4,6 +4,7 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "runtime/engine/context_transfer_test_gate.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -7982,6 +7983,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         transaction.transfer_enqueue_pending = assessment.needs_transfer;
         advance_resource_revision();
         context_transaction_.emplace<ActiveCaptureTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -8230,6 +8232,14 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::BackendKV);
         ++transaction.operations.partial_tail_cow_pages;
+    }
+    if (const auto* gate = runtime::testing::active_capture_transfer_gate(); gate != nullptr) {
+        if (gate->enqueue == nullptr) {
+            throw std::logic_error("active capture transfer test gate has no enqueue hook");
+        }
+        cuda_check(gate->enqueue(gate->context, device.transfer_stream),
+                   "enqueue active capture transfer test delay", __FILE__, __LINE__);
+        runtime::testing::note_active_capture_transfer_gate_wait();
     }
     context_completion_.record(device.transfer_stream);
     transaction.transfer_enqueue_pending = false;
@@ -8517,6 +8527,23 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
+        // The Engine may have sealed an eviction snapshot after this capture topology was
+        // reserved.  Its immutable sources remain pinned until the transfer event settles.  Do
+        // not mistake that bounded handoff for a topology violation: retain the transaction and
+        // let independent admitted lanes execute between progress boundaries.  Preflight proved
+        // each victim releasable before the observer ran; strict validation below still catches
+        // every unrelated ownership change.
+        if (!snapshot_source_retirements_.empty()) {
+            for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
+                const auto& work = transaction.pressure[position];
+                if (work.option.evicts_continuation &&
+                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
+                    ActiveCaptureResult out;
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
+            }
+        }
         if (transaction.cancel_pending) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];

@@ -439,9 +439,22 @@ int exercise_host_restore(const char* artifact) {
                   << " kv=" << after_restore.host_kv_occupied_bytes << '\n';
         return 1;
     }
+    // The resumed request appends a bounded mutable MTP tail.  Remove that owner before the
+    // duplicate-pressure transaction so its newly-written pages cannot be mistaken for the
+    // restored checkpoint's unchanged Host-backed prefix.
+    if (restored.slot < 0 ||
+        engine.erase_slot(static_cast<std::uint32_t>(restored.slot), restored.session_digest) == 0) {
+        std::cerr << "Host restore fixture could not release its mutable continuation tail\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
+    if (before_duplicate_pressure.host_state_occupied_slots == 0 ||
+        before_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "releasing the mutable continuation tail released retained Host backing\n";
+        return 1;
+    }
     ninfer::PromptInput duplicate_pressure = retained_input();
     duplicate_pressure.context_cache.session_key = "host-restore-duplicate-pressure";
-    const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
     const ninfer::GenerationResult duplicate_removed =
         engine.generate(engine.prepare(std::move(duplicate_pressure)), options(1, false));
     const ninfer::RuntimeStats after_duplicate_pressure = engine.runtime_stats();
@@ -474,14 +487,15 @@ int exercise_host_restore(const char* artifact) {
         return 1;
     }
 
-    // These two catalogued owners are the final references in this isolated Engine.  Erasing
-    // them exercises production cleanup and proves the physical Host quota is released then,
-    // not at H2D or duplicate Device removal.
-    if (restored.slot < 0 || duplicate_removed.slot < 0 ||
-        engine.erase_slot(static_cast<std::uint32_t>(restored.slot), restored.session_digest) == 0 ||
-        engine.erase_slot(static_cast<std::uint32_t>(duplicate_removed.slot),
-                          duplicate_removed.session_digest) == 0) {
-        std::cerr << "Host backing cleanup fixture did not retain erasable catalogued owners\n";
+    // The unrelated no-reuse pressure request is not catalogued.  The original retained source
+    // is therefore the final Host-backing dependency; erasing it exercises production cleanup.
+    const std::uint32_t retained_released =
+        retained.slot < 0 ? 0 : engine.erase_slot(static_cast<std::uint32_t>(retained.slot),
+                                                   retained.session_digest);
+    if (retained_released == 0 || duplicate_removed.slot >= 0) {
+        std::cerr << "Host backing cleanup fixture did not retain its sole erasable owner: "
+                  << "retained=" << retained.slot << '/' << retained_released
+                  << " duplicate=" << duplicate_removed.slot << '\n';
         return 1;
     }
     const ninfer::RuntimeStats after_cleanup = engine.runtime_stats();

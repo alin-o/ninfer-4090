@@ -147,4 +147,16 @@ def test_tiered_cache_matrix_requires_complete_private_host_materialization() ->
                 "evidence": "shared-snapshot.log",
             }
         }
-    )["status"] == "PASS"
+    )["status"] == "UNVERIFIED"
+    assert host_row(
+        {
+            "host-restore": {
+                "status": "FAIL",
+                "evidence": "host-restore.log",
+            },
+            "shared-snapshot": {
+                "status": "PASS",
+                "evidence": "shared-snapshot.log",
+            },
+        }
+    )["status"] == "FAIL"

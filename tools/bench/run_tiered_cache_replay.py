@@ -28,8 +28,10 @@ from tools.bench.tiered_cache_replay import (
     compare_profile,
     expanded_fixture,
     freeze_material_improvement_threshold,
+    load_predecessor_calibration,
     load_manifest,
     pressure_fixture,
+    require_unchanged_frozen_threshold,
     request_measurement,
     sha256_file,
     validate_manifest,
@@ -42,6 +44,9 @@ from tools.ninfer_serve.openai_responses import responses_request
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPO_ROOT / "bench/fixtures/tiered_cache/manifest.json"
+DEFAULT_PREDECESSOR_CALIBRATION = (
+    REPO_ROOT / "bench/fixtures/tiered_cache/predecessor-calibration.json"
+)
 DEFAULT_SERVE = REPO_ROOT / "build-agent-verify/apps/ninfer-serve"
 DEFAULT_WEIGHTS = Path("/models/qwen3_8_27b.ninfer")
 REQUEST_LOG_SCHEMA = 20
@@ -1089,7 +1094,9 @@ def load_baseline_identity(path: Path, serve: Path) -> dict[str, Any]:
     }
 
 
-def load_validation_cases(path: Path | None, serve_sha256: str) -> dict[str, dict[str, Any]]:
+def load_validation_cases(
+    path: Path | None, serve_sha256: str | None
+) -> dict[str, dict[str, Any]]:
     if path is None:
         return {}
     try:
@@ -1100,7 +1107,7 @@ def load_validation_cases(path: Path | None, serve_sha256: str) -> dict[str, dic
         value.get("artifact_type"), value.get("schema_version")
     ) != ("ninfer_tiered_cache_validation_evidence", 1):
         raise ReplayError("unsupported tiered-cache validation evidence")
-    if value.get("serve_sha256") != serve_sha256:
+    if serve_sha256 is not None and value.get("serve_sha256") != serve_sha256:
         raise ReplayError("validation evidence was produced by a different current executable")
     cases = value.get("cases")
     if not isinstance(cases, dict):
@@ -1130,7 +1137,8 @@ def validation_status(
     missing = [name for name, case in zip(required, selected) if case is None]
     statuses = [str(case["status"]) for case in selected if case is not None]
     evidence = "; ".join(
-        f"{name}={case['status']} ({case.get('evidence', case.get('command', 'recorded'))})"
+        f"{name}={case['status']} ({case.get('evidence', case.get('command', 'recorded'))}; "
+        f"executable sha256={case.get('test_executable_sha256', 'unavailable')})"
         for name, case in zip(required, selected)
         if case is not None
     )
@@ -1142,25 +1150,6 @@ def validation_status(
     if statuses and all(status == "PASS" for status in statuses):
         return "PASS", evidence
     return "UNVERIFIED", evidence
-
-
-def alternative_validation_status(
-    cases: dict[str, dict[str, Any]], alternatives: Sequence[str]
-) -> tuple[str, str]:
-    selected = [(name, cases[name]) for name in alternatives if name in cases]
-    evidence = "; ".join(
-        f"{name}={case['status']} ({case.get('evidence', case.get('command', 'recorded'))})"
-        for name, case in selected
-    )
-    if any(case["status"] == "FAIL" for _, case in selected):
-        return "FAIL", evidence
-    if any(case["status"] == "PASS" for _, case in selected):
-        return "PASS", evidence
-    return (
-        "UNVERIFIED",
-        evidence
-        or "missing identified validation evidence: one of " + ", ".join(alternatives),
-    )
 
 
 def official_tokenizer_status(
@@ -1209,10 +1198,6 @@ def build_regression_matrix(
         status, evidence = validation_status(validation_cases, required)
         return {"status": status, "case": case, "evidence": evidence}
 
-    def external_alternative(case: str, alternatives: Sequence[str]) -> dict[str, str]:
-        status, evidence = alternative_validation_status(validation_cases, alternatives)
-        return {"status": status, "case": case, "evidence": evidence}
-
     return [
         boundary_replay
         or {
@@ -1250,9 +1235,9 @@ def build_regression_matrix(
             "intermediate prefix, parent infeasible, and prefix-only Host restore",
             ["pressure-resume"],
         ),
-        external_alternative(
+        external(
             "complete private State/Main/MTP Host materialization",
-            ["host-restore", "shared-snapshot"],
+            ["host-restore"],
         ),
         external(
             "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
@@ -1410,6 +1395,15 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
     ready_headroom = evidence["profile_evidence"]["device"]["ready_gpu_memory"].get(
         "free_headroom", "unavailable"
     )
+    validation_identity = evidence.get("validation_evidence_identity")
+    validation_identity_line = (
+        "- Required validation revision: "
+        f"`{validation_identity['source_revision']}` (descendant of the measured build); "
+        f"serve SHA-256 `{validation_identity['serve_sha256']}`; evidence SHA-256 "
+        f"`{validation_identity['sha256']}`."
+        if isinstance(validation_identity, dict)
+        else "- Required validation identity is embedded per case in the raw evidence."
+    )
     lines = [
         f"# Tiered cache production-profile replay ({evidence['date']})",
         "",
@@ -1436,10 +1430,21 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         f"- Existing-cache baseline revision: `{evidence['baseline']['source_revision']}`; "
         f"separate serve SHA-256: `{evidence['baseline']['serve_sha256']}`; build identity: "
         f"`{evidence['baseline']['build_identity_path']}`.",
+        validation_identity_line,
         "",
         "## Frozen threshold",
         "",
         f"Method: {evidence['threshold']['method']}",
+        "",
+        "Predecessor calibration: "
+        f"`{evidence['threshold']['predecessor_calibration']['source_report']}` at "
+        f"`{evidence['threshold']['predecessor_calibration']['source_commit']}`; complete-private "
+        "Host H2D effect-size reference "
+        f"{evidence['threshold']['calibration_effect_size_ms']:.3f} ms "
+        f"({evidence['threshold']['calibration_fraction'] * 100:.3f}% of the existing-cache "
+        "median).",
+        "The predecessor supplied exact State/Main/MTP bytes and its selected cost-model "
+        "coefficients; this effect-size floor is not reported as measured latency.",
         "",
         f"Required reduction: {evidence['threshold']['required_reduction_fraction'] * 100:.2f}%",
         "",
@@ -1532,7 +1537,9 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def reanalyze_evidence(path: Path) -> dict[str, Any]:
+def reanalyze_evidence(
+    path: Path, calibration_path: Path, validation_path: Path | None = None
+) -> dict[str, Any]:
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -1541,20 +1548,55 @@ def reanalyze_evidence(path: Path) -> dict[str, Any]:
     if (
         not isinstance(evidence, dict)
         or evidence.get("artifact_type") != EVIDENCE_TYPE
-        or evidence_version not in {2, EVIDENCE_VERSION}
+        or evidence_version not in {2, 3, EVIDENCE_VERSION}
     ):
         raise ReplayError("unsupported replay evidence identity")
     measurements = evidence.get("measurements")
-    threshold = evidence.get("threshold")
-    if not isinstance(measurements, dict) or not isinstance(threshold, dict):
-        raise ReplayError("replay evidence has no raw measurements or frozen threshold")
+    if not isinstance(measurements, dict):
+        raise ReplayError("replay evidence has no raw measurements")
+    recorded_threshold = evidence.get("threshold")
+    if not isinstance(recorded_threshold, dict):
+        raise ReplayError("replay evidence has no frozen threshold")
+    predecessor_calibration = load_predecessor_calibration(calibration_path)
+    threshold = freeze_material_improvement_threshold(
+        [
+            [row["external_ttft_ms"] for row in measurements["cold"]],
+            [row["external_ttft_ms"] for row in measurements["existing"]],
+        ],
+        predecessor_calibration,
+    )
+    require_unchanged_frozen_threshold(recorded_threshold, threshold)
     continuation = validate_measured_continuations(measurements)
     comparisons = {
         profile: compare_profile(measurements["existing"], measurements[profile], threshold)
         for profile in ("device", "host", "ssd")
     }
     embedded_cases = evidence.get("validation_cases")
-    if isinstance(embedded_cases, dict):
+    if validation_path is not None:
+        validation_cases = load_validation_cases(validation_path, None)
+        validation_document = json.loads(validation_path.read_text(encoding="utf-8"))
+        measured_revision = str(evidence["build"]["source_commit"])
+        validation_revision = str(validation_document.get("source_revision", ""))
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", measured_revision, validation_revision],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            raise ReplayError(
+                "replacement validation evidence is not from a descendant of the measured build"
+            )
+        evidence["validation_evidence_identity"] = {
+            "path": str(validation_path),
+            "sha256": sha256_file(validation_path),
+            "source_revision": validation_revision,
+            "serve_sha256": validation_document.get("serve_sha256"),
+            "relationship_to_measured_build": "descendant",
+        }
+        evidence["validation_evidence_path"] = str(validation_path)
+    elif isinstance(embedded_cases, dict):
         validation_cases = embedded_cases
     else:
         validation_path_value = evidence.get("validation_evidence_path")
@@ -1571,17 +1613,23 @@ def reanalyze_evidence(path: Path) -> dict[str, Any]:
         boundary_replay_status(measurements["boundary"], expected_boundaries),
     )
     evidence["comparisons"] = comparisons
+    evidence["threshold"] = threshold
     evidence["continuation_validation"] = continuation
     evidence["schema_version"] = EVIDENCE_VERSION
     evidence.pop("regression_matrix", None)
     evidence["required_regression_matrix"] = regression_matrix
     evidence["supplemental_evidence"] = build_supplemental_evidence(validation_cases)
     evidence["validation_cases"] = validation_cases
+    methodology = evidence.get("methodology")
+    if isinstance(methodology, dict):
+        methodology["predecessor_calibration_incorporated_during_derived_reanalysis"] = True
+        methodology["predecessor_calibration_changed_frozen_numeric_threshold"] = False
     evidence["verdict"] = campaign_verdict(comparisons, regression_matrix)
     evidence["configuration_decision"] = configuration_decision(
         comparisons, evidence["verdict"]["correctness"]
     )
     write_json(path, evidence)
+    write_json(path.with_name("threshold.json"), threshold)
     write_report(path.with_name("report.md"), evidence)
     return evidence
 
@@ -1596,6 +1644,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verify-source", action="store_true")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--predecessor-calibration",
+        type=Path,
+        default=DEFAULT_PREDECESSOR_CALIBRATION,
+        help="repository-local predecessor calibration used to freeze materiality",
+    )
     parser.add_argument("--serve", type=Path, default=DEFAULT_SERVE)
     parser.add_argument(
         "--baseline-serve",
@@ -1610,7 +1664,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--validation-evidence",
         type=Path,
-        help="optional executable-identified focused/canonical validation results",
+        help=(
+            "optional executable-identified focused/canonical validation results; when "
+            "reanalyzing, must be from a descendant of the measured build"
+        ),
     )
     parser.add_argument(
         "--weights",
@@ -1630,12 +1687,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    args.predecessor_calibration = args.predecessor_calibration.resolve()
+    if args.validation_evidence is not None:
+        args.validation_evidence = args.validation_evidence.resolve()
     if args.reanalyze_evidence is not None:
-        evidence = reanalyze_evidence(args.reanalyze_evidence.resolve())
+        evidence = reanalyze_evidence(
+            args.reanalyze_evidence.resolve(),
+            args.predecessor_calibration,
+            args.validation_evidence,
+        )
         print(args.reanalyze_evidence.resolve().parent)
         return campaign_exit_status(evidence["verdict"])
     args.manifest = args.manifest.resolve()
     check = validate_manifest(args.manifest, verify_source=args.verify_source)
+    predecessor_calibration = load_predecessor_calibration(args.predecessor_calibration)
+    check["predecessor_calibration_sha256"] = predecessor_calibration["sha256"]
     if args.check:
         print(json.dumps(check, indent=2, sort_keys=True))
         return 0
@@ -1647,8 +1713,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     args.baseline_serve = args.baseline_serve.resolve()
     args.baseline_build_identity = args.baseline_build_identity.resolve()
-    if args.validation_evidence is not None:
-        args.validation_evidence = args.validation_evidence.resolve()
     args.weights = args.weights.resolve()
     if not args.serve.is_file() or not os.access(args.serve, os.X_OK):
         raise ReplayError(f"ninfer-serve executable is unavailable: {args.serve}")
@@ -1690,7 +1754,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         [
             [row["external_ttft_ms"] for row in measurements["cold"]],
             [row["external_ttft_ms"] for row in measurements["existing"]],
-        ]
+        ],
+        predecessor_calibration,
     )
     # Persist the threshold before any optimized profile is run.
     write_json(output / "threshold.json", threshold)
@@ -1815,6 +1880,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "methodology": {
             "samples": args.samples,
             "threshold_frozen_before_optimized_trials": True,
+            "predecessor_calibration_consumed_before_optimized_trials": True,
             "raw_render_replay_is_protocol_separate": True,
             "profiles": [
                 "cold-current",

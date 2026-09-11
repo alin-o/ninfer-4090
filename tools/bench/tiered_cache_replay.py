@@ -13,7 +13,9 @@ from typing import Any, Iterable, Sequence
 MANIFEST_TYPE = "ninfer_tiered_cache_fixture_manifest"
 MANIFEST_VERSION = 1
 EVIDENCE_TYPE = "ninfer_tiered_cache_evidence"
-EVIDENCE_VERSION = 3
+EVIDENCE_VERSION = 4
+CALIBRATION_TYPE = "ninfer_tiered_cache_predecessor_calibration"
+CALIBRATION_VERSION = 1
 
 
 class ReplayError(RuntimeError):
@@ -186,13 +188,100 @@ def median_mad(values: Sequence[float]) -> tuple[float, float]:
     return median, mad
 
 
+def load_predecessor_calibration(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReplayError(f"cannot read predecessor calibration {path}: {error}") from error
+    if not isinstance(value, dict) or (
+        value.get("artifact_type"), value.get("schema_version")
+    ) != (CALIBRATION_TYPE, CALIBRATION_VERSION):
+        raise ReplayError("unsupported predecessor calibration identity")
+    provenance = value.get("provenance")
+    target = value.get("target")
+    snapshot = value.get("complete_private_host_snapshot")
+    cost = value.get("h2d_cost_reference")
+    if not all(isinstance(item, dict) for item in (provenance, target, snapshot, cost)):
+        raise ReplayError("predecessor calibration is missing required sections")
+    expected_target = {
+        "compute_capability": "8.9",
+        "model_id": "qwen3.8-27b",
+        "weights_id": "groupwise-int",
+        "kv_dtype": "rk4v4-e8",
+        "mtp_draft_tokens": 3,
+        "max_context": 128000,
+        "max_concurrency": 4,
+        "kv_capacity_mode": "auto",
+    }
+    mismatched = {
+        name: (target.get(name), expected)
+        for name, expected in expected_target.items()
+        if target.get(name) != expected
+    }
+    if mismatched:
+        raise ReplayError(f"predecessor calibration target differs: {mismatched}")
+    try:
+        components = [
+            int(snapshot.get(name, -1))
+            for name in ("state_bytes", "main_kv_bytes", "mtp_kv_bytes")
+        ]
+        payload_bytes = int(snapshot.get("physical_h2d_payload_bytes", -1))
+        copy_operations = int(snapshot.get("copy_operations", -1))
+    except (TypeError, ValueError) as error:
+        raise ReplayError("predecessor calibration private Host payload is malformed") from error
+    if any(component <= 0 for component in components) or sum(components) != payload_bytes:
+        raise ReplayError("predecessor calibration private Host payload is incomplete")
+    if copy_operations != len(components):
+        raise ReplayError("predecessor calibration copy-operation count is inconsistent")
+    try:
+        batch_ns = int(cost["batch_ns"])
+        operation_ns = int(cost["operation_ns"])
+        ns_per_byte_q32 = int(cost["ns_per_byte_q32"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReplayError("predecessor calibration H2D cost reference is malformed") from error
+    if min(batch_ns, operation_ns, ns_per_byte_q32) < 0:
+        raise ReplayError("predecessor calibration H2D costs must be nonnegative")
+    cost_source = cost.get("source_path")
+    cost_source_sha256 = cost.get("source_sha256")
+    if not isinstance(cost_source, str) or not isinstance(cost_source_sha256, str):
+        raise ReplayError("predecessor calibration has no H2D cost-source identity")
+    cost_source_path = Path(__file__).resolve().parents[2] / cost_source
+    if not cost_source_path.is_file() or sha256_file(cost_source_path) != cost_source_sha256:
+        raise ReplayError("predecessor calibration H2D cost-source identity changed")
+    source_report = provenance.get("source_report")
+    source_report_sha256 = provenance.get("source_report_sha256")
+    if not isinstance(source_report, str) or not isinstance(source_report_sha256, str):
+        raise ReplayError("predecessor calibration has no source-report identity")
+    report_path = Path(__file__).resolve().parents[2] / source_report
+    if not report_path.is_file() or sha256_file(report_path) != source_report_sha256:
+        raise ReplayError("predecessor calibration source-report identity changed")
+    bandwidth_ns = (ns_per_byte_q32 * payload_bytes + (1 << 32) - 1) >> 32
+    operation_limited_ns = batch_ns + copy_operations * operation_ns
+    reference_ns = max(bandwidth_ns, operation_limited_ns)
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        "source_commit": provenance.get("source_commit"),
+        "source_report": source_report,
+        "source_report_sha256": source_report_sha256,
+        "target": target,
+        "complete_private_host_snapshot": snapshot,
+        "h2d_cost_reference": cost,
+        "complete_private_host_h2d_reference_ms": reference_ns / 1.0e6,
+        "threshold_role": value.get("threshold_role"),
+    }
+
+
 def freeze_material_improvement_threshold(
-    baseline_groups: Iterable[Sequence[float]], *, floor: float = 0.10
+    baseline_groups: Iterable[Sequence[float]],
+    predecessor_calibration: dict[str, Any],
 ) -> dict[str, Any]:
     """Freeze a conservative reduction threshold before optimized trials are inspected.
 
-    Three relative MADs covers ordinary run-to-run noise without pretending a correctness run is a
-    performance result. The ten-percent floor prevents tiny, immaterial wins from passing.
+    Three relative MADs covers ordinary run-to-run noise.  The independently recorded predecessor
+    calibration supplies a dimensionally compatible minimum effect size: the net TTFT saving must
+    exceed one estimated complete private Host H2D materialization.  That estimate is not promoted
+    to a measured latency result.
     """
 
     groups = [list(group) for group in baseline_groups]
@@ -205,14 +294,41 @@ def freeze_material_improvement_threshold(
         relative_mad = mad / median if median > 0 else 0.0
         noise = max(noise, 3.0 * relative_mad)
         details.append({"median_ms": median, "mad_ms": mad, "relative_mad": relative_mad})
-    threshold = max(floor, noise)
+    reference_ms = float(predecessor_calibration["complete_private_host_h2d_reference_ms"])
+    comparison_baseline_ms = details[-1]["median_ms"]
+    if not math.isfinite(reference_ms) or reference_ms <= 0 or comparison_baseline_ms <= 0:
+        raise ReplayError("predecessor calibration has no usable materiality reference")
+    calibration_fraction = reference_ms / comparison_baseline_ms
+    threshold = max(calibration_fraction, noise)
     return {
-        "method": "max(10%, three times the largest baseline relative MAD)",
-        "floor_fraction": floor,
+        "method": (
+            "max(predecessor complete-private Host H2D effect size divided by the "
+            "existing-cache median, three times the largest baseline relative MAD)"
+        ),
+        "predecessor_calibration": predecessor_calibration,
+        "calibration_effect_size_ms": reference_ms,
+        "calibration_fraction": calibration_fraction,
         "noise_fraction": noise,
         "required_reduction_fraction": threshold,
         "baseline_groups": details,
     }
+
+
+def require_unchanged_frozen_threshold(
+    recorded: dict[str, Any], recomputed: dict[str, Any]
+) -> None:
+    try:
+        recorded_fraction = float(recorded["required_reduction_fraction"])
+        recomputed_fraction = float(recomputed["required_reduction_fraction"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReplayError("frozen material-improvement threshold is malformed") from error
+    if not math.isclose(
+        recorded_fraction, recomputed_fraction, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ReplayError(
+            "predecessor calibration changes the pre-optimized numeric threshold; rerun the "
+            "campaign instead of applying post-hoc comparisons"
+        )
 
 
 def request_measurement(

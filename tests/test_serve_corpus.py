@@ -36,14 +36,19 @@ from tools.bench.tiered_cache_replay import (
     compare_profile,
     expanded_fixture,
     freeze_material_improvement_threshold,
+    load_predecessor_calibration,
     pressure_fixture,
     request_measurement,
+    require_unchanged_frozen_threshold,
     sha256_file,
     validate_manifest,
 )
 
 
 TIERED_FIXTURES = Path("bench/fixtures/tiered_cache/manifest.json")
+TIERED_PREDECESSOR_CALIBRATION = Path(
+    "bench/fixtures/tiered_cache/predecessor-calibration.json"
+)
 
 
 def test_request_log_v20_identity_is_accepted() -> None:
@@ -187,11 +192,26 @@ def test_tiered_cache_fixture_provenance_and_protocol_split() -> None:
     assert all(item["max_output_tokens"] == 512 for item in pressured)
 
 
-def test_tiered_cache_threshold_is_frozen_from_baselines_only() -> None:
-    threshold = freeze_material_improvement_threshold([[100.0, 101.0, 99.0], [80.0, 82.0, 78.0]])
-    assert threshold["required_reduction_fraction"] == pytest.approx(0.10)
-    noisy = freeze_material_improvement_threshold([[100.0, 120.0, 80.0]])
+def test_tiered_cache_threshold_consumes_predecessor_calibration_and_baseline_noise() -> None:
+    calibration = load_predecessor_calibration(TIERED_PREDECESSOR_CALIBRATION)
+    assert calibration["source_commit"] == "69ef567748cc6b79604caeef64e4bb22309afdab"
+    assert calibration["complete_private_host_h2d_reference_ms"] == pytest.approx(7.809127)
+
+    threshold = freeze_material_improvement_threshold(
+        [[100.0, 101.0, 99.0], [80.0, 82.0, 78.0]], calibration
+    )
+    assert threshold["calibration_fraction"] == pytest.approx(7.809127 / 80.0)
+    assert threshold["required_reduction_fraction"] == pytest.approx(7.809127 / 80.0)
+    assert threshold["predecessor_calibration"]["sha256"] == calibration["sha256"]
+
+    noisy = freeze_material_improvement_threshold([[100.0, 120.0, 80.0]], calibration)
     assert noisy["required_reduction_fraction"] == pytest.approx(0.60)
+
+    require_unchanged_frozen_threshold(threshold, dict(threshold))
+    with pytest.raises(ReplayError, match="post-hoc comparisons"):
+        require_unchanged_frozen_threshold(
+            threshold, dict(threshold, required_reduction_fraction=0.5)
+        )
 
 
 def test_tiered_cache_measurement_preserves_tier_and_speculative_counters() -> None:
@@ -236,7 +256,10 @@ def test_tiered_cache_measurement_preserves_tier_and_speculative_counters() -> N
     comparison = compare_profile(
         [dict(row, external_ttft_ms=value) for value in (200.0, 202.0, 198.0)],
         [dict(row, external_ttft_ms=value) for value in (150.0, 151.0, 149.0)],
-        freeze_material_improvement_threshold([[200.0, 202.0, 198.0]]),
+        freeze_material_improvement_threshold(
+            [[200.0, 202.0, 198.0]],
+            load_predecessor_calibration(TIERED_PREDECESSOR_CALIBRATION),
+        ),
     )
     assert comparison["material_improvement"] is True
 

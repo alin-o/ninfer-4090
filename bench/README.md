@@ -52,11 +52,15 @@ The harness fixes `max-context=128000`, `max-concurrency=4`, `kv-capacity=auto`,
 MTP draft window 3, and the optimized draft head. It runs cache-disabled cold, current
 existing-cache from the separately built and hash-pinned recorded revision, Device, forced-Host,
 restart SSD, all serving-boundary, and four-way overlap arms. The current binary is never labeled as
-the recorded baseline. It writes the numeric material-improvement threshold before starting any
-optimized arm. The threshold is the larger of 10% and three times the largest relative MAD observed
-in the two baseline arms. Exit status 3 means the campaign completed but performance failed its
-frozen threshold or correctness remains failed/unverified; inspect the generated verdict instead of
-treating status 3 as a speed result alone.
+the recorded baseline. It loads the repository-local, identity-pinned predecessor calibration and
+writes the numeric material-improvement threshold before starting any optimized arm. The threshold
+is the larger of (a) the predecessor's complete private State/Main/MTP Host H2D work estimate,
+expressed as a fraction of the existing-cache median, and (b) three times the largest relative MAD
+observed in the two baseline arms. The predecessor supplied exact physical bytes and the cost model
+it selected; the derived H2D effect-size floor is not a measured latency claim. Exit status 3 means
+the campaign completed but performance failed its frozen threshold or correctness remains
+failed/unverified; inspect the generated verdict instead of treating status 3 as a speed result
+alone.
 
 Every output directory contains `threshold.json`, `evidence.json`, `report.md`, per-profile server
 logs, and the unabridged structured request/throughput JSONL. The server-start records are the
@@ -81,6 +85,10 @@ remains UNVERIFIED and gates target correctness, the performance claim, configur
 the overall verdict, and exit status. Supplemental official-tokenizer fixture lineage remains
 separately UNVERIFIED without an authorized identity-pinned local tokenizer artifact, but does not
 gate the target verdicts; the tools never download a tokenizer or model.
+
+The complete private Host row specifically requires the `host-restore` real-artifact scenario. A
+passing shared-snapshot scenario proves the shared-owner SSD codec/adoption path and rollback
+cleanup, but cannot substitute for private `PrivateTurnClosure` State/Main/MTP materialization.
 
 Derived verdict/report logic can be replayed without rerunning the model; raw measurements and the
 frozen threshold remain unchanged:

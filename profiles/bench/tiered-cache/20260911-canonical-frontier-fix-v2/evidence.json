@@ -2107,6 +2107,8 @@
     ]
   },
   "methodology": {
+    "predecessor_calibration_changed_frozen_numeric_threshold": false,
+    "predecessor_calibration_incorporated_during_derived_reanalysis": true,
     "profiles": [
       "cold-current",
       "existing-recorded-revision",
@@ -116735,7 +116737,7 @@
     },
     {
       "case": "unchanged prepared tokens and explicit/inferred boundary lineage",
-      "evidence": "frontend-boundary-token-lineage=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/frontend-boundary-token-lineage.log); openai-chat-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-chat-boundary.log); openai-responses-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-responses-boundary.log); anthropic-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/anthropic-boundary.log)",
+      "evidence": "frontend-boundary-token-lineage=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/frontend-boundary-token-lineage.log; executable sha256=6aca8302c032d9427526eff00818f558a51fdae6f1c8d1414aa0e9dc2dfe07b6); openai-chat-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/openai-chat-boundary.log; executable sha256=bdd57e243e26652c518133eae442910e13a11c57ce5d6cb467c2f0ede5cb4597); openai-responses-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/openai-responses-boundary.log; executable sha256=caeb113ba396d7dca3af40e9f25a961f677030f9b65ed90f85352a3136aaa8a8); anthropic-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/anthropic-boundary.log; executable sha256=463304f8c9db7b753baa45d22b3511eaedb3d5481756be8122bb4e8e46f8cf4b)",
       "status": "PASS"
     },
     {
@@ -116750,31 +116752,31 @@
     },
     {
       "case": "intermediate prefix, parent infeasible, and prefix-only Host restore",
-      "evidence": "pressure-resume=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pressure-resume.log)",
+      "evidence": "pressure-resume=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/pressure-resume.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5)",
       "status": "PASS"
     },
     {
       "case": "complete private State/Main/MTP Host materialization",
-      "evidence": "shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log)",
+      "evidence": "host-restore=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/host-restore.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5)",
       "status": "PASS"
     },
     {
       "case": "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
-      "evidence": "shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log)",
+      "evidence": "shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/shared-snapshot.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5)",
       "status": "PASS"
     },
     {
       "case": "four-request constrained pressure and independent progress",
-      "evidence": "four-request-root-fallback=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/four-request-root-fallback.log)",
+      "evidence": "four-request-root-fallback=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/four-request-root-fallback.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5)",
       "status": "PASS"
     },
     {
       "case": "delayed/failed transfers, shutdown, aliases, heads, and reclamation",
-      "evidence": "delayed-spill=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-spill.log); delayed-active-capture=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-active-capture.log); cuda-transfer-failure=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/cuda-transfer-failure.log); pending-snapshot-shutdown=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pending-snapshot-shutdown.log); resource-manager=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/resource-manager.log); durable-shared-prefix-catalog=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/durable-shared-prefix-catalog.log)",
+      "evidence": "delayed-spill=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/delayed-spill.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5); delayed-active-capture=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/delayed-active-capture.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5); cuda-transfer-failure=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/cuda-transfer-failure.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5); pending-snapshot-shutdown=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/pending-snapshot-shutdown.log; executable sha256=ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5); resource-manager=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/resource-manager.log; executable sha256=1258f02ae652a3079720abae2246e352c659cf795909c9d0b37adae21aa28c75); durable-shared-prefix-catalog=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/durable-shared-prefix-catalog.log; executable sha256=2e8ba5fd026d8a86909f4dbe349ba0048289d6e4e9fd5de79e6afb700ce2d765)",
       "status": "PASS"
     }
   ],
-  "schema_version": 3,
+  "schema_version": 4,
   "summaries": {
     "boundary": {
       "committed_decode_tokens": 74,
@@ -117609,9 +117611,45 @@
         "relative_mad": 0.001980738758840333
       }
     ],
-    "floor_fraction": 0.1,
-    "method": "max(10%, three times the largest baseline relative MAD)",
+    "calibration_effect_size_ms": 7.809127,
+    "calibration_fraction": 0.002142724921126725,
+    "method": "max(predecessor complete-private Host H2D effect size divided by the existing-cache median, three times the largest baseline relative MAD)",
     "noise_fraction": 0.42477135688547973,
+    "predecessor_calibration": {
+      "complete_private_host_h2d_reference_ms": 7.809127,
+      "complete_private_host_snapshot": {
+        "copy_operations": 3,
+        "main_kv_bytes": 4194304,
+        "mtp_kv_bytes": 262144,
+        "physical_h2d_payload_bytes": 312365056,
+        "state_bytes": 307908608
+      },
+      "h2d_cost_reference": {
+        "batch_ns": 50000,
+        "ns_per_byte_q32": 107374182,
+        "operation_ns": 12000,
+        "source": "generic-default selected by the predecessor calibration",
+        "source_path": "src/runtime/engine/context_cost_defaults.cpp",
+        "source_sha256": "34dc1681985a96413003b834521459d27c07d0b72dc5ee1a2c7218b3e7ecc4ef"
+      },
+      "path": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/bench/fixtures/tiered_cache/predecessor-calibration.json",
+      "sha256": "dcc8b6133be5e10c0420fa1e7c96cd185221edc14d26f649a0f2937b8571b17d",
+      "source_commit": "69ef567748cc6b79604caeef64e4bb22309afdab",
+      "source_report": "docs/maintainer/2026-09-10-qwen3.8-27b-context-cache-calibration.md",
+      "source_report_sha256": "1c84e30f145ec0d8df79115558ff980d4b6a35e6b49c6449595c290bdd4ea6e3",
+      "target": {
+        "compute_capability": "8.9",
+        "gpu": "NVIDIA GeForce RTX 4090",
+        "kv_capacity_mode": "auto",
+        "kv_dtype": "rk4v4-e8",
+        "max_concurrency": 4,
+        "max_context": 128000,
+        "model_id": "qwen3.8-27b",
+        "mtp_draft_tokens": 3,
+        "weights_id": "groupwise-int"
+      },
+      "threshold_role": "Require the observed net TTFT saving to exceed one complete private Host H2D materialization estimate; three baseline relative MADs may impose a larger threshold. This cost-model estimate is an effect-size floor, not a measured latency result."
+    },
     "required_reduction_fraction": 0.42477135688547973
   },
   "validation_cases": {
@@ -117619,7 +117657,7 @@
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_anthropic_schema_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/anthropic-boundary.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/anthropic-boundary.log",
       "returncode": 0,
       "status": "PASS",
       "test_executable_sha256": "463304f8c9db7b753baa45d22b3511eaedb3d5481756be8122bb4e8e46f8cf4b"
@@ -117628,61 +117666,70 @@
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/cuda-transfer-failure.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/cuda-transfer-failure.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "delayed-active-capture": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-active-capture.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/delayed-active-capture.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "delayed-spill": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-spill.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/delayed-spill.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "durable-shared-prefix-catalog": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_durable_shared_prefix_catalog_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/durable-shared-prefix-catalog.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/durable-shared-prefix-catalog.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "d8f06ca0fd9629b052b209ce635d262df92374bb10b428155e5686dd31e3e099"
+      "test_executable_sha256": "2e8ba5fd026d8a86909f4dbe349ba0048289d6e4e9fd5de79e6afb700ce2d765"
     },
     "four-request-root-fallback": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/four-request-root-fallback.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/four-request-root-fallback.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "frontend-boundary-token-lineage": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_frontend_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/frontend-boundary-token-lineage.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/frontend-boundary-token-lineage.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "67c4d894bcd3c32d9b89d7d0b2b6d50f0b1e98fb66d7ff60c5722290e546e86e"
+      "test_executable_sha256": "6aca8302c032d9427526eff00818f558a51fdae6f1c8d1414aa0e9dc2dfe07b6"
+    },
+    "host-restore": {
+      "command": [
+        "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
+      ],
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/host-restore.log",
+      "returncode": 0,
+      "status": "PASS",
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "openai-chat-boundary": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_openai_schema_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-chat-boundary.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/openai-chat-boundary.log",
       "returncode": 0,
       "status": "PASS",
       "test_executable_sha256": "bdd57e243e26652c518133eae442910e13a11c57ce5d6cb467c2f0ede5cb4597"
@@ -117691,7 +117738,7 @@
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_openai_responses_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-responses-boundary.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/openai-responses-boundary.log",
       "returncode": 0,
       "status": "PASS",
       "test_executable_sha256": "caeb113ba396d7dca3af40e9f25a961f677030f9b65ed90f85352a3136aaa8a8"
@@ -117700,25 +117747,25 @@
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pending-snapshot-shutdown.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/pending-snapshot-shutdown.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "pressure-resume": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pressure-resume.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/pressure-resume.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     },
     "resource-manager": {
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_resource_manager_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/resource-manager.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/resource-manager.log",
       "returncode": 0,
       "status": "PASS",
       "test_executable_sha256": "1258f02ae652a3079720abae2246e352c659cf795909c9d0b37adae21aa28c75"
@@ -117727,13 +117774,20 @@
       "command": [
         "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test"
       ],
-      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log",
+      "evidence": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing-logs/shared-snapshot.log",
       "returncode": 0,
       "status": "PASS",
-      "test_executable_sha256": "2f85659205725798291a3e5f6fbfd731f4bdbca1902ebe449ced6222d7799483"
+      "test_executable_sha256": "ce7574c49ddd8f3f325076e60586fd98d03c10d4ae0868ff243b8ea6d4b344d5"
     }
   },
-  "validation_evidence_path": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3.json",
+  "validation_evidence_identity": {
+    "path": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing.json",
+    "relationship_to_measured_build": "descendant",
+    "serve_sha256": "02d3113da57f716d2ac633da3da79eefa7bf692b9d9463672966b0a8891762f8",
+    "sha256": "8573d91e52c92127b342efa2d9d7b60b3291d5aeb530c6a6e88786d7a603f234",
+    "source_revision": "e42b22b7e841b675f39b017a2929f2b217f2cfb9"
+  },
+  "validation_evidence_path": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-testing.json",
   "verdict": {
     "correctness": "PASS",
     "overall": "PASS",

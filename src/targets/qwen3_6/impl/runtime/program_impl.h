@@ -11655,12 +11655,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers.begin(),
-                    staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
-                if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
-                    (!split_frontier || *rewrite_split < *split_frontier)) {
-                    split_frontier = *rewrite_split;
+                const auto execution_split                  = std::upper_bound(
+                    staged.prompt.prefill_execution_frontiers.begin(),
+                    staged.prompt.prefill_execution_frontiers.end(), staged.cursor);
+                if (execution_split != staged.prompt.prefill_execution_frontiers.end() &&
+                    (!split_frontier || *execution_split < *split_frontier)) {
+                    split_frontier = *execution_split;
                 }
                 schedule::PrefillChunkResult result;
                 timing.pause();

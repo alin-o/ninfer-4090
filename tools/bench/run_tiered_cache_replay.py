@@ -1234,6 +1234,10 @@ def build_regression_matrix(
             ["pressure-resume"],
         ),
         external(
+            "complete private State/Main/MTP Host materialization",
+            ["host-restore"],
+        ),
+        external(
             "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
             ["shared-snapshot"],
         ),

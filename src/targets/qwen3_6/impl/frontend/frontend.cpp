@@ -1640,12 +1640,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         checked_token_count(result.token_ids.size()), structural_boundaries, first_volatile_token);
     // A retained State image is numerically tied to the GDN chunk decomposition that produced
     // it. Make every interior cache opportunity an execution boundary even when this request
-    // disables reuse or policy declines the capture. Otherwise a cache-enabled request can split
-    // at an explicit/shared frontier while its cache-disabled cold control crosses the frontier in
-    // one chunk; both executions have identical tokens but can eventually choose different greedy
-    // tokens. The prompt endpoint is already a natural chunk boundary, and recording that
-    // redundant opportunity would make a later continuation appear structurally incompatible.
-    auto& execution_frontiers = result.identity.rewrite_execution_frontiers;
+    // disables reuse or policy declines the capture. These boundaries are request-local: a later
+    // chat envelope can expose a new structural opportunity inside tokens that were already
+    // decoded by the retained continuation, so they must not become durable prefix identity.
+    result.prefill_execution_frontiers = result.identity.rewrite_execution_frontiers;
+    auto& execution_frontiers          = result.prefill_execution_frontiers;
     execution_frontiers.reserve(execution_frontiers.size() +
                                 result.context_cache.opportunities.size() +
                                 (result.identity.rewrite_checkpoint ? 1U : 0U));
@@ -1658,9 +1657,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         }
     }
     std::sort(execution_frontiers.begin(), execution_frontiers.end());
-    execution_frontiers.erase(
-        std::unique(execution_frontiers.begin(), execution_frontiers.end()),
-        execution_frontiers.end());
+    execution_frontiers.erase(std::unique(execution_frontiers.begin(), execution_frontiers.end()),
+                              execution_frontiers.end());
     if (inferred_session) {
         result.context_cache.session_key = inferred_session;
         if (requested_retention == CacheRetentionHint::Default) {

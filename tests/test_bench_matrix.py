@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
+from tools.bench.run_tiered_cache_replay import build_regression_matrix
 
 
 def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
@@ -111,3 +112,31 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["decode_engine_tok_s_mean"] == 7.5
     assert row["spec_fallback_steps"] == 3
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"
+
+
+def test_tiered_cache_matrix_requires_complete_private_host_materialization() -> None:
+    continuation = {
+        "target_token_status": "PASS",
+        "comparisons": [],
+        "target_token_mismatches": [],
+        "speculative_counter_status": "PASS",
+        "speculative_counter_mismatches": [],
+    }
+
+    def host_row(cases: dict[str, dict[str, object]]) -> dict[str, str]:
+        rows = build_regression_matrix(continuation, cases)
+        return next(
+            row
+            for row in rows
+            if row["case"] == "complete private State/Main/MTP Host materialization"
+        )
+
+    assert host_row({})["status"] == "UNVERIFIED"
+    assert host_row(
+        {
+            "host-restore": {
+                "status": "PASS",
+                "evidence": "host-restore.log",
+            }
+        }
+    )["status"] == "PASS"

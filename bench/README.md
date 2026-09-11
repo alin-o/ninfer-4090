@@ -33,7 +33,8 @@ export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer
 python3 tools/bench/build_tiered_cache_baseline.py \
   --output-dir .local/tiered-cache-baseline-c7
 
-# Optional validation evidence. This records exact executable hashes and preserves skips.
+# Optional validation evidence. This records exact executable hashes, includes complete private
+# State/Main/MTP Host restoration, and preserves skips.
 python3 tools/bench/run_tiered_cache_validation.py \
   --serve build-agent-verify/apps/ninfer-serve \
   --weights "$NINFER_QWEN3_8_27B_WEIGHTS" \

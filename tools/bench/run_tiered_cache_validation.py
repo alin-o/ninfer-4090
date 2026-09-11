@@ -20,6 +20,7 @@ from tools.bench.tiered_cache_replay import sha256_file
 
 
 REAL_SCENARIOS = (
+    "host-restore",
     "pressure-resume",
     "shared-snapshot",
     "four-request-root-fallback",

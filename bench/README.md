@@ -10,6 +10,46 @@ The frozen request corpus for the separate black-box Serve TTFT tool is document
 [`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
 Engine directly.
 
+## Tiered shared-prefix replay
+
+`tools/bench/run_tiered_cache_replay.py` is the production-profile replay and measurement harness
+for the Qwen3.8-27B groupwise-int Device/Host/SSD cache. It uses public OpenAI Chat, OpenAI
+Responses, and Anthropic Messages endpoints and records the server's structured request log beside
+external first-output timestamps. The raw rendered fixture is deliberately hash-checked but never
+sent through a messages endpoint, which would apply the chat template twice.
+
+The committed fixture manifest records the authorized source corpus identities and contains only
+synthetic equivalent text. It does not import production text or llama.cpp token counts. Validate
+the local bundle, optionally checking the still-mounted source identities, with:
+
+```bash
+python3 tools/bench/run_tiered_cache_replay.py --check --verify-source
+```
+
+Run the target profile with at least three trials per arm:
+
+```bash
+export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer
+python3 tools/bench/run_tiered_cache_replay.py \
+  --serve build-agent-verify/apps/ninfer-serve \
+  --samples 3
+```
+
+The harness fixes `max-context=128000`, `max-concurrency=4`, `kv-capacity=auto`, RK4V4-E8 KV,
+MTP draft window 3, and the optimized draft head. It runs cache-disabled cold, current
+existing-cache, Device, forced-Host, restart SSD, all serving-boundary, and four-way overlap arms.
+It writes the numeric material-improvement threshold before starting any optimized arm. The
+threshold is the larger of 10% and three times the largest relative MAD observed in the two
+baseline arms. Exit status 3 means the campaign completed but one or more tier arms missed that
+pre-frozen threshold; it is measurement evidence, not a harness failure.
+
+Every output directory contains `threshold.json`, `evidence.json`, `report.md`, per-profile server
+logs, and the unabridged structured request/throughput JSONL. The server-start records are the
+authority for build/artifact/config identity, resolved capacity, quotas, GPU identity/headroom, and
+memory layout. Request and throughput records supply queue delay, TTFT, total/makespan/throughput,
+tier/frontier, evaluated/reused tokens, MTP counters, physical transfer costs, actual reclaimed
+capacity, occupancy, evictions, SSD I/O/checksum/adoption cost, and peak staging.
+
 ## Build
 
 ```bash

@@ -128,6 +128,13 @@ NINFER_PREFIX_REAL_SCENARIO=pressure-resume \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+`NINFER_PREFIX_REAL_SCENARIO=responses-host-continuation` exercises parsed `store:false`
+Responses with full conversation history and `preserve_thinking`, matching the production prompt
+semantics: the completed assistant response is retained in VRAM,
+offloaded with State/Main/MTP under pressure, then restored for the next user turn. It checks
+inferred head advancement, reuse through the assistant response (allowing the final pending token),
+and exact generated-token and MTP-counter agreement with a cold continuation.
+
 The calibration comparison and constrained four-request fallback are direct scenario invocations
 so their stdout (including fixture hashes) remains available:
 

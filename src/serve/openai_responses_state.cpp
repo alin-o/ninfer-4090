@@ -186,9 +186,11 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
             resolved.session_key = *response_id;
         }
         resolved.cache_hints.session_key = resolved.session_key;
+        // HTTP response storage does not control Engine checkpoint retention. A stateless
+        // full-history request can infer its conversation lineage in Frontend, and an unstored
+        // child can advance the inherited Engine head without changing the stored HTTP object.
         resolved.cache_hints.retention =
-            store_response ? CacheRetentionHint::LiveSession : CacheRetentionHint::Disposable;
-        resolved.cache_hints.update_session_index = store_response;
+            resolved.session_key ? CacheRetentionHint::LiveSession : CacheRetentionHint::Default;
     }
     return resolved;
 }

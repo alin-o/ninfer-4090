@@ -4,6 +4,8 @@
 #include "runtime/engine/context_transfer_test_gate.h"
 #include "runtime/engine/shared_snapshot_test_access.h"
 #include "serve/durable_shared_prefix_catalog.h"
+#include "serve/openai_responses.h"
+#include "serve/translate.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <cuda.h>
@@ -2093,6 +2095,143 @@ int exercise_snapshot_quota_rejection(const char* artifact) {
         std::cerr << "Engine did not remain usable after snapshot quota rejection\n";
         return 1;
     }
+    return 0;
+}
+
+int exercise_responses_host_continuation(const char* artifact) {
+    using Json = nlohmann::json;
+    using namespace ninfer::serve;
+    const auto prepare_input = [](const Json& history) {
+        OpenAIResponsesStore store(8, 1ULL << 20);
+        const auto request = parse_openai_responses_create_request(
+            Json{{"model", "qwen3.8"}, {"store", false}, {"input", history}}, RequestLimits{});
+        auto resolved =
+            resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", request.store);
+        auto input          = to_prompt_input(resolved.generation,
+                                              {.enable_thinking = false, .preserve_thinking = true}, {});
+        input.context_cache = std::move(resolved.cache_hints);
+        // Keep the serving execution boundaries identical in the cold and reused runs.
+        input.context_cache.automatic_private_anchors = 2;
+        return input;
+    };
+    std::string text;
+    for (std::uint32_t index = 0; index < 5000; ++index) { text += "alpha "; }
+    Json history = Json::array({Json{{"role", "user"}, {"content", "Remember this conversation."}},
+                                Json{{"role", "assistant"}, {"content", "I will continue it."}},
+                                Json{{"role", "user"}, {"content", text}}});
+    auto engine_config        = groupwise_host_restore_engine_options(artifact);
+    engine_config.max_context = 8192;
+    engine_config.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    engine_config.context_cache.device_state_slots        = 0;
+    engine_config.context_cache.host_state_slots          = 4;
+    engine_config.context_cache.max_private_continuations = 3;
+    ninfer::Engine engine(engine_config);
+    const auto settled_stats = [&engine] {
+        // generate() fulfills the result before the worker publishes its terminal stats/slots.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto stats = engine.runtime_stats();
+            if (stats.running_requests == 0 && stats.waiting_requests == 0 &&
+                stats.materializing_requests == 0) {
+                return stats;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("Response terminal statistics did not settle");
+    };
+    auto source_options                        = fixed_output(64);
+    source_options.stop.include_model_defaults = true;
+    const auto source = engine.generate(engine.prepare(prepare_input(history)), source_options);
+    const auto after_source = settled_stats();
+    const auto slots        = engine.slot_states();
+    const std::uint32_t completed_tokens =
+        source.prompt.prompt_tokens + static_cast<std::uint32_t>(source.generated_token_ids.size());
+    if (source.finish_reason != ninfer::FinishReason::StopToken ||
+        source.generated_token_ids.size() < 2 || source.slot < 0 ||
+        static_cast<std::size_t>(source.slot) >= slots.size() || !slots[source.slot].retained ||
+        slots[source.slot].cached_tokens != completed_tokens ||
+        after_source.session_publications_initial_prefix_total != 1 ||
+        after_source.context_cache_owners[ninfer::context_cache_owner_metric_index(
+            ninfer::ContextCacheMetricRole::ConversationHead,
+            ninfer::ContextCacheMetricPlacement::Device, ninfer::ContextCacheMetricPin::Unpinned,
+            ninfer::ContextCacheMetricIdentity::InitialPrefix)] != 1) {
+        std::cerr << "unstored Response did not retain its completed assistant response as a "
+                     "Device conversation head: slot="
+                  << source.slot
+                  << " publications=" << after_source.session_publications_initial_prefix_total
+                  << " finish=" << static_cast<int>(source.finish_reason)
+                  << " generated=" << source.generated_token_ids.size()
+                  << " retained_tokens=" << (source.slot < 0 ? 0 : slots[source.slot].cached_tokens)
+                  << " state_d2h=" << after_source.state_d2h_count << '\n';
+        return 1;
+    }
+
+    history.push_back(Json{{"role", "assistant"}, {"content", source.content}});
+    history.push_back(Json{{"role", "user"}, {"content", "Continue briefly."}});
+    Json pressure_history          = history;
+    pressure_history[0]["content"] = "An unrelated conversation needing its own model state.";
+    // Only one Device State slot is available. An unrelated active request must offload the
+    // completed endpoint itself; offloading only an older replay checkpoint cannot satisfy this.
+    const auto pressure =
+        engine.generate(engine.prepare(prepare_input(pressure_history)), fixed_output(2));
+    const auto after_pressure = settled_stats();
+    if (pressure.generated_token_ids.size() != 2 ||
+        after_pressure.state_d2h_count <= after_source.state_d2h_count ||
+        after_pressure.main_kv_d2h_pages <= after_source.main_kv_d2h_pages ||
+        after_pressure.backend_kv_d2h_pages <= after_source.backend_kv_d2h_pages) {
+        std::cerr << "unstored Response pressure did not offload complete State/Main/MTP\n";
+        return 1;
+    }
+
+    const auto restored = engine.generate(engine.prepare(prepare_input(history)), fixed_output(8));
+    const auto after_restore = settled_stats();
+    // The final sampled token can be pending at finish, requiring one token of boundary replay.
+    // The assistant response preceding that token must be reused, not re-prefilled from its prompt.
+    if (restored.reused_prompt_tokens < completed_tokens - 1 ||
+        restored.reused_prompt_tokens * 100ULL < restored.prompt.prompt_tokens * 99ULL ||
+        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
+        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+        after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages ||
+        after_restore.session_publications_initial_prefix_total !=
+            after_pressure.session_publications_initial_prefix_total + 1 ||
+        after_restore.session_supersessions_total != 1) {
+        std::cerr << "unstored Response lost its completed response or conversation head on RAM "
+                     "restore: reused="
+                  << restored.reused_prompt_tokens << " completed=" << completed_tokens
+                  << " path=" << static_cast<int>(restored.prefix_reuse_path)
+                  << " best=" << restored.materialization.best_reuse_prompt_tokens
+                  << " dropped=" << after_pressure.pressure_checkpoints_dropped
+                  << " d2h=" << after_pressure.state_d2h_count
+                  << " h2d=" << after_restore.state_h2d_count
+                  << " restores=" << after_restore.state_restores
+                  << " state_occupancy=" << after_source.device_state_occupied_slots << '/'
+                  << after_pressure.device_state_occupied_slots << '/'
+                  << after_pressure.host_state_occupied_slots
+                  << " content=" << Json(source.content).dump()
+                  << " publications=" << after_restore.session_publications_initial_prefix_total
+                  << " supersessions=" << after_restore.session_supersessions_total << '\n';
+        return 1;
+    }
+    const auto cold =
+        engine.generate(engine.prepare(prepare_input(history)), fixed_output(8, false));
+    if (restored.generated_token_ids != cold.generated_token_ids ||
+        restored.speculative.drafted_tokens != cold.speculative.drafted_tokens ||
+        restored.speculative.accepted_tokens != cold.speculative.accepted_tokens ||
+        cold.reused_prompt_tokens != 0 || cold.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        std::cerr << "RAM-restored completed Response diverged from cold continuation\n";
+        return 1;
+    }
+    std::cout << "responses_host_continuation completed_tokens=" << completed_tokens
+              << " reused_tokens=" << restored.reused_prompt_tokens
+              << " next_prompt_tokens=" << restored.prompt.prompt_tokens
+              << " generated_tokens=" << restored.generated_token_ids.size()
+              << " state_h2d=" << after_restore.state_h2d_count - after_pressure.state_h2d_count
+              << " main_h2d_pages="
+              << after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages
+              << " mtp_h2d_pages="
+              << after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages
+              << " exact_cold_match=true\n";
     return 0;
 }
 
@@ -4550,6 +4689,15 @@ int main() {
             return 1;
         }
         const int result = exercise_host_restore(qwen38_groupwise, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "responses-host-continuation") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cout << "skip: responses-host-continuation requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 77;
+        }
+        const int result = exercise_responses_host_continuation(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

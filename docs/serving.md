@@ -625,11 +625,16 @@ rendering and identity still determine reuse. Changing the boolean alone never i
 checkpoint already proved compatible by the model runtime.
 
 For Engine-local reuse, a stored root Response receives one bounded session key derived from its
-response ID, and every `previous_response_id` child inherits that key. `store:false` roots remain
-anonymous; a `store:false` child may read its inherited session checkpoint but does not replace the
-stored chain's latest endpoint. Response-store eviction or deletion removes the HTTP object, not an
-independently retained Engine checkpoint; the latter remains bounded by the Engine's own retention
-and pressure policy. No session key or cache marker is added to the HTTP schema.
+response ID, and every `previous_response_id` child inherits that key. `store:false` controls only
+HTTP response storage: roots use normal Engine retention, including Frontend-inferred initial-prefix
+lineage when available, and children advance their inherited Engine conversation head. Each successful
+completion retains the prompt and generated assistant response with its matching State/Main/MTP
+checkpoint, initially in VRAM and eligible for RAM offload under pressure. The next matching turn
+can restore that checkpoint and evaluate the new suffix and any required boundary replay. Updating
+the Engine head does not mutate a stored HTTP response or make an unstored response retrievable.
+Response-store eviction or deletion removes the HTTP object, not an independently retained Engine
+checkpoint; the latter remains bounded by the Engine's own retention and pressure policy. No session
+key or cache marker is added to the HTTP schema.
 
 Resource behavior:
 

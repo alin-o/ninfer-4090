@@ -162,6 +162,12 @@ int test_basic_request_and_resolution() {
                   resolved.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
                   resolved.cache_hints.update_session_index,
               "stored root response receives one live Engine session");
+    const OpenAIResponsesResolvedPrompt unstored =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", false);
+    failures += check(!unstored.session_key && !unstored.cache_hints.session_key &&
+                          unstored.cache_hints.retention == ninfer::CacheRetentionHint::Default &&
+                          unstored.cache_hints.update_session_index,
+                      "unstored root preserves inferred Engine lineage and normal retention");
     return failures;
 }
 
@@ -996,13 +1002,15 @@ int test_previous_response_call_graph() {
                           !resolved.preserve_thinking_semantic_change,
                       "parent continuation inherits session and prompt semantics");
 
-    const OpenAIResponsesResolvedPrompt disposable =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_disposable", false);
-    failures +=
-        check(disposable.session_key == "responses-session" &&
-                  disposable.cache_hints.retention == ninfer::CacheRetentionHint::Disposable &&
-                  !disposable.cache_hints.update_session_index,
-              "store=false consumes parent session without advancing it");
+    const OpenAIResponsesResolvedPrompt unstored =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", false);
+    failures += check(
+        unstored.session_key == "responses-session" &&
+            unstored.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
+            unstored.cache_hints.update_session_index,
+        "unstored child advances its retained Engine conversation independently of HTTP storage");
+    failures += check(store.get("resp_parent")->context == context && !store.get("resp_unstored"),
+                      "Engine retention policy must not mutate or create stored HTTP responses");
 
     Json partial     = reordered_body;
     partial["input"] = Json::array(

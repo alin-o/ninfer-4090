@@ -45,6 +45,7 @@ public:
 
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+    [[nodiscard]] std::string take_rendered_text();
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

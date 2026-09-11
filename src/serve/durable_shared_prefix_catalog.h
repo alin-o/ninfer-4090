@@ -38,6 +38,7 @@ struct DurableSharedPrefixCatalogOptions {
     std::function<void()> before_temporary_remove;
     std::function<void()> before_manifest_rename;
     std::function<void()> before_manifest_temporary_remove;
+    std::function<void(const ninfer::CheckpointLifecycleFact&)> lifecycle_observer;
 };
 
 struct DurableSharedPrefixCatalogStats {
@@ -67,9 +68,13 @@ struct DurableSharedPrefixCatalogStats {
 
 struct DurableSharedPrefixRestore {
     std::uint32_t frontier = 0;
-    bool loaded_from_ssd   = false;
-    bool warm_available    = false;
+    std::string content_digest;
+    std::uint64_t serialized_bytes = 0;
+    std::uint64_t elapsed_ns       = 0;
+    bool loaded_from_ssd           = false;
+    bool warm_available            = false;
     std::string fallback_reason;
+    std::vector<ninfer::CheckpointLifecycleFact> lifecycle;
 };
 
 // Gateway-owned filesystem transport. Engine supplies opaque, Program-produced records and owns
@@ -94,6 +99,8 @@ public:
     void observe_hit(const DurableSharedPrefixRestore& restore, std::uint32_t reused_tokens,
                      PrefixReusePath path) noexcept;
     void drain();
+    void
+    set_lifecycle_observer(std::function<void(const ninfer::CheckpointLifecycleFact&)> observer);
     [[nodiscard]] DurableSharedPrefixCatalogStats stats() const noexcept;
 
     // Narrow storage seams used by deterministic filesystem regressions.

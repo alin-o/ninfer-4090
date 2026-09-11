@@ -26,6 +26,13 @@ struct RequestLifetime;
 struct RequestCapacity;
 class DurableSharedPrefixCatalog;
 
+struct CapturedMediaMetadata {
+    ninfer::MediaKind kind = ninfer::MediaKind::Image;
+    std::string media_type;
+    std::uint64_t bytes = 0;
+    std::string sha256;
+};
+
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
     double ttft_seconds    = 0.0;
@@ -66,6 +73,8 @@ struct GenerationOutcome {
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
+    ninfer::RequestCheckpointSummary checkpoints;
+    std::vector<ninfer::CheckpointLifecycleFact> checkpoint_lifecycle;
     // Lane that served the request and the retained session's digest (empty when the lane did
     // not retain it) - the handle a client needs for /slots save operations.
     int id_slot = -1;
@@ -102,9 +111,19 @@ struct PreparedRequest {
     std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
     bool preserve_thinking                 = false;
     std::uint32_t durable_restore_frontier = 0;
-    bool durable_loaded_from_ssd           = false;
-    bool durable_warm_available            = false;
+    std::string durable_restore_digest;
+    std::uint64_t durable_restore_bytes      = 0;
+    std::uint64_t durable_restore_elapsed_ns = 0;
+    std::vector<ninfer::CheckpointLifecycleFact> durable_lifecycle;
+    // Populated only when generation propagates a non-RequestError exception after Engine
+    // settlement (transport/render/generic failure). Gateways attach it to the classified
+    // terminal failure without changing the original exception type.
+    std::vector<ninfer::CheckpointLifecycleFact> failure_checkpoint_lifecycle;
+    bool durable_loaded_from_ssd = false;
+    bool durable_warm_available  = false;
     std::string durable_fallback_reason;
+    std::shared_ptr<const std::string> rendered_prompt;
+    std::vector<CapturedMediaMetadata> captured_media;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -180,6 +199,15 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    // A gateway that cannot enter streaming generation after submit must still consume the
+    // Engine handle. Cancellation is requested, settlement is awaited, and every immutable fact
+    // committed before settlement is returned without changing the gateway's original failure.
+    [[nodiscard]] std::vector<ninfer::CheckpointLifecycleFact>
+    cancel_and_settle(PreparedRequest& prepared) noexcept;
+
+    void set_checkpoint_lifecycle_observer(
+        std::function<void(const ninfer::CheckpointLifecycleFact&)> observer);
+
     void warmup();
 
 private:
@@ -204,7 +232,7 @@ private:
     std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
     mutable std::unique_ptr<DurableSharedPrefixCatalog> durable_catalog_;
-    std::uint32_t automatic_private_anchors_ = 0;
+    std::uint32_t automatic_private_anchors_             = 0;
     std::uint32_t automatic_private_execution_frontiers_ = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

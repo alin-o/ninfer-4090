@@ -100,6 +100,7 @@ struct ProcessorOptions {
 
 struct ProcessedInput {
     std::vector<int> input_ids;
+    std::string rendered_text;
     std::vector<std::uint8_t> token_types;
     // Axis-major [3, input_ids.size()] in temporal, height, width order.
     std::vector<std::int32_t> positions;
@@ -111,12 +112,14 @@ struct ProcessedInput {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+
     // Recognition metadata travels with media prompts too. Media anchors are classified by the
     // Frontend as SSD-ineligible, but recognition diagnostics must not disappear.
     struct StructuralBoundary {
         std::optional<std::uint32_t> frontier;
         std::uint32_t origins = 0;
     };
+
     std::vector<StructuralBoundary> structural_boundaries;
     std::optional<std::uint32_t> first_volatile_token;
     PreprocessStats stats;

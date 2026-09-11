@@ -24,6 +24,7 @@
 #include <deque>
 #include <exception>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,30 @@
 #include <vector>
 
 namespace ninfer::runtime {
+
+// Private type-erasure carrier used only between EngineCore and GenerationHandle. Public callers
+// continue to observe the original OutputSink/engine exception; GenerationHandle separately
+// retains these already-settled facts for the serving boundary.
+class SettledGenerationFailure final : public std::exception {
+public:
+    SettledGenerationFailure(std::exception_ptr cause,
+                             std::vector<CheckpointLifecycleFact> checkpoint_lifecycle)
+        : cause_(std::move(cause)), checkpoint_lifecycle_(std::move(checkpoint_lifecycle)) {}
+
+    [[nodiscard]] const char* what() const noexcept override {
+        return "generation failed after checkpoint lifecycle settlement";
+    }
+
+    [[nodiscard]] std::vector<CheckpointLifecycleFact> take_checkpoint_lifecycle() noexcept {
+        return std::move(checkpoint_lifecycle_);
+    }
+
+    [[noreturn]] void rethrow_cause() const { std::rethrow_exception(cause_); }
+
+private:
+    std::exception_ptr cause_;
+    std::vector<CheckpointLifecycleFact> checkpoint_lifecycle_;
+};
 
 template <class Instance>
 class EngineCore {
@@ -281,6 +306,25 @@ public:
         return published_stats_;
     }
 
+    void attach_checkpoint_snapshot(std::vector<CheckpointLifecycleFact>& facts) const {
+        if (facts.empty()) { return; }
+        const MemorySummary memory = instance_.program->memory_summary();
+        const CheckpointKvCapacitySnapshot snapshot{
+            .device_main_capacity_pages    = memory.device_main_kv_capacity_pages,
+            .device_main_used_pages        = memory.device_main_kv_occupied_pages,
+            .device_main_page_bytes        = memory.device_main_kv_page_bytes,
+            .device_backend_capacity_pages = memory.device_backend_kv_capacity_pages,
+            .device_backend_used_pages     = memory.device_backend_kv_occupied_pages,
+            .device_backend_page_bytes     = memory.device_backend_kv_page_bytes,
+            .state_image_bytes             = memory.checkpoint_state_image_bytes,
+            .host_main_page_bytes          = memory.host_main_kv_page_bytes,
+            .host_backend_page_bytes       = memory.host_backend_kv_page_bytes,
+            .host_capacity_bytes           = memory.host_kv_capacity_bytes,
+            .host_used_bytes               = memory.host_kv_occupied_bytes,
+        };
+        for (CheckpointLifecycleFact& fact : facts) { fact.kv_snapshot = snapshot; }
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -376,17 +420,31 @@ public:
             view.handle == nullptr || (expected_owner && view.id != *expected_owner)) {
             throw std::invalid_argument("shared catalog slot holds no matching prefix");
         }
-        return run_shared_snapshot_operation([&] {
+        auto snapshot          = run_shared_snapshot_operation([&] {
             return instance_.program->begin_export_shared_prefix(
                 *view.handle, model_binding,
                 targets::qwen3_6::SharedPrefixPersistenceMetadata{
-                    .evidence             = view.metadata.evidence,
-                    .structural_origins   = view.metadata.structural_origins,
-                    .structural_role      = view.metadata.structural_role,
-                    .ssd_eligible         = view.metadata.ssd_eligible,
-                    .first_volatile_token = view.metadata.first_volatile_token},
+                             .evidence             = view.metadata.evidence,
+                             .structural_origins   = view.metadata.structural_origins,
+                             .structural_role      = view.metadata.structural_role,
+                             .ssd_eligible         = view.metadata.ssd_eligible,
+                             .first_volatile_token = view.metadata.first_volatile_token},
                 reserve);
         });
+        const auto& checkpoint = view.summary.checkpoint;
+        snapshot.checkpoint    = CheckpointLifecycleFact{
+               .key_digests      = checkpoint.shortlist_key.digests,
+               .content_digest   = snapshot.content_digest,
+               .frontier         = checkpoint.ref.frontier,
+               .identity_tag     = checkpoint.shortlist_key.identity_tag,
+               .ordinal          = checkpoint.ref.ordinal,
+               .role             = CheckpointLifecycleRole::SharedStablePrefix,
+               .scope            = CheckpointLifecycleScope::Shared,
+               .state_images     = 1,
+               .main_kv_pages    = checkpoint.required_kv.main_pages,
+               .backend_kv_pages = checkpoint.required_kv.backend_pages,
+        };
+        return snapshot;
     }
 
     [[nodiscard]] std::vector<targets::qwen3_6::DurableSharedPrefixCandidate>
@@ -496,6 +554,46 @@ public:
                     ssd_backed);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
+                }
+                if (result.disposition == ResourceManagement::SharedImportDisposition::Cancelled) {
+                    throw RequestError(RequestErrorKind::Cancelled,
+                                       "shared snapshot import was cancelled");
+                }
+                {
+                    const auto view = resources_.shared_catalog_slot(result.slot);
+                    if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+                        view.handle == nullptr) {
+                        throw std::logic_error(
+                            "shared import adoption lost its catalogued owner under lock");
+                    }
+                    result.summary             = view.summary;
+                    const auto& checkpoint     = view.summary.checkpoint;
+                    const MemorySummary memory = instance_.program->memory_summary();
+                    const CheckpointKvCapacitySnapshot kv_snapshot{
+                        .device_main_capacity_pages    = memory.device_main_kv_capacity_pages,
+                        .device_main_used_pages        = memory.device_main_kv_occupied_pages,
+                        .device_main_page_bytes        = memory.device_main_kv_page_bytes,
+                        .device_backend_capacity_pages = memory.device_backend_kv_capacity_pages,
+                        .device_backend_used_pages     = memory.device_backend_kv_occupied_pages,
+                        .device_backend_page_bytes     = memory.device_backend_kv_page_bytes,
+                        .state_image_bytes             = memory.checkpoint_state_image_bytes,
+                        .host_main_page_bytes          = memory.host_main_kv_page_bytes,
+                        .host_backend_page_bytes       = memory.host_backend_kv_page_bytes,
+                        .host_capacity_bytes           = memory.host_kv_capacity_bytes,
+                        .host_used_bytes               = memory.host_kv_occupied_bytes,
+                    };
+                    result.checkpoint = CheckpointLifecycleFact{
+                        .key_digests      = checkpoint.shortlist_key.digests,
+                        .frontier         = checkpoint.ref.frontier,
+                        .identity_tag     = checkpoint.shortlist_key.identity_tag,
+                        .ordinal          = checkpoint.ref.ordinal,
+                        .role             = CheckpointLifecycleRole::SharedStablePrefix,
+                        .scope            = CheckpointLifecycleScope::Shared,
+                        .state_images     = 1,
+                        .main_kv_pages    = checkpoint.required_kv.main_pages,
+                        .backend_kv_pages = checkpoint.required_kv.backend_pages,
+                        .kv_snapshot      = kv_snapshot,
+                    };
                 }
                 return result;
             },
@@ -1123,9 +1221,37 @@ private:
             }
             if (!done) { continue; }
 
-            if (caller_error != nullptr) { std::rethrow_exception(caller_error); }
             std::lock_guard lock(request->mutex);
-            if (request->error != nullptr) { std::rethrow_exception(request->error); }
+            if (caller_error != nullptr) {
+                std::vector<CheckpointLifecycleFact> lifecycle;
+                if (request->error != nullptr) {
+                    try {
+                        std::rethrow_exception(request->error);
+                    } catch (const RequestError& error) {
+                        lifecycle = error.checkpoint_lifecycle();
+                    } catch (...) {}
+                    lifecycle.insert(lifecycle.end(),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.begin()),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.end()));
+                } else {
+                    lifecycle = std::move(request->result.checkpoint_lifecycle);
+                }
+                throw SettledGenerationFailure(caller_error, std::move(lifecycle));
+            }
+            if (request->error != nullptr) {
+                try {
+                    std::rethrow_exception(request->error);
+                } catch (const RequestError& error) {
+                    std::vector<CheckpointLifecycleFact> lifecycle = error.checkpoint_lifecycle();
+                    lifecycle.insert(lifecycle.end(),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.begin()),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.end()));
+                    throw RequestError(error.kind(), error.what(), std::move(lifecycle));
+                } catch (...) {
+                    throw SettledGenerationFailure(request->error,
+                                                   std::move(request->checkpoint_lifecycle));
+                }
+            }
             return std::move(request->result);
         }
     }
@@ -1278,6 +1404,8 @@ private:
         result.materialization         = request->materialization_diagnostics;
         result.slot                    = request->retained_slot;
         result.session_digest          = request->retained_session_digest;
+        result.checkpoints             = request->checkpoint_summary;
+        result.checkpoint_lifecycle    = std::move(request->checkpoint_lifecycle);
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1370,6 +1498,13 @@ private:
                 resources_.lane_publication_slot(LaneId{lane});
             auto finished =
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
+            attach_checkpoint_snapshot(finished.lifecycle);
+            request->checkpoint_lifecycle.insert(
+                request->checkpoint_lifecycle.end(),
+                std::make_move_iterator(finished.lifecycle.begin()),
+                std::make_move_iterator(finished.lifecycle.end()));
+            request->checkpoint_summary =
+                summarize_checkpoint_lifecycle(request->checkpoint_lifecycle);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             if (finished.disposition == FinishDisposition::Catalogued && publication) {
@@ -1907,6 +2042,11 @@ private:
                     MaterializingRequest& control = *materializing_;
                     const std::uint32_t lane      = control.destination.value;
                     const auto request            = control.request;
+                    attach_checkpoint_snapshot(terminal.lifecycle);
+                    request->checkpoint_lifecycle.insert(
+                        request->checkpoint_lifecycle.end(),
+                        std::make_move_iterator(terminal.lifecycle.begin()),
+                        std::make_move_iterator(terminal.lifecycle.end()));
                     if (terminal.status == ContextTransactionStatus::Aborted) {
                         if (terminal.activation) {
                             throw std::logic_error(
@@ -1933,7 +2073,9 @@ private:
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
-                    request->model_state                 = EngineRequestState::Prefill;
+                    request->checkpoint_summary =
+                        summarize_checkpoint_lifecycle(request->checkpoint_lifecycle);
+                    request->model_state = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;
@@ -1950,6 +2092,11 @@ private:
                     if (*kind != ContextTransactionKind::ActiveCapture || !capture) {
                         throw std::logic_error("active-capture outcome has no Engine owner");
                     }
+                    attach_checkpoint_snapshot(terminal.lifecycle);
+                    capture->checkpoint_lifecycle.insert(
+                        capture->checkpoint_lifecycle.end(),
+                        std::make_move_iterator(terminal.lifecycle.begin()),
+                        std::make_move_iterator(terminal.lifecycle.end()));
                     if (terminal.status == ContextTransactionStatus::Published) {
                         ++cumulative_stats_.active_captures_completed;
                     } else if (terminal.status == ContextTransactionStatus::Aborted) {
@@ -1957,6 +2104,8 @@ private:
                     } else {
                         throw std::logic_error("active capture returned an invalid terminal state");
                     }
+                    capture->checkpoint_summary =
+                        summarize_checkpoint_lifecycle(capture->checkpoint_lifecycle);
                     capture->capture_pending = false;
                     capture->model_state     = capture->post_capture_state;
                     request_admission_check();

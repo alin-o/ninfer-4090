@@ -5461,7 +5461,29 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
     work.state_changes.clear();
     work.main_kv_changes.clear();
     work.backend_kv_changes.clear();
+    work.pending_kv_offloads.clear();
     if (work.option.evicts_continuation) { return; }
+
+    const auto count_demotions = [](const auto& actions) {
+        return static_cast<std::size_t>(
+            std::count_if(actions.begin(), actions.end(), [](const auto& action) {
+                return action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+            }));
+    };
+    work.pending_kv_offloads.reserve(count_demotions(work.option.main_kv_changes) +
+                                     count_demotions(work.option.backend_kv_changes));
+    const auto record_demotions = [&](const auto& actions, runtime::ContextResourceClass resource) {
+        for (const qwen3_6::detail::PressureKVDecision& action : actions) {
+            if (action.kind != qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) { continue; }
+            work.pending_kv_offloads.push_back(runtime::CommittedKvOffloadRange{
+                .resource   = resource,
+                .begin_page = action.begin_page,
+                .page_count = action.page_count,
+            });
+        }
+    };
+    record_demotions(work.option.main_kv_changes, runtime::ContextResourceClass::MainKV);
+    record_demotions(work.option.backend_kv_changes, runtime::ContextResourceClass::BackendKV);
 
     work.state_changes.resize(work.option.state_changes.size());
 
@@ -6262,10 +6284,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             collect_pressure_operations(work);
             const std::uint32_t index = transaction.shared_victim_indices[position];
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
-                .owner              = transaction.shared_pressure_results[position].owner,
-                .disposition        = runtime::VictimDisposition::Retained,
-                .pressure_committed = true,
-                .final_summary      = shared_prefix_summary(shared_prefix_states[index]),
+                .owner                 = transaction.shared_pressure_results[position].owner,
+                .disposition           = runtime::VictimDisposition::Retained,
+                .pressure_committed    = true,
+                .final_summary         = shared_prefix_summary(shared_prefix_states[index]),
+                .committed_kv_offloads = std::move(work.pending_kv_offloads),
             };
             complete_pressure_delta(work);
             transaction.shared_victim_released[position] = true;
@@ -6280,6 +6303,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             retain_private_result(transaction.pressure_results[position],
                                   continuation_states[work.continuation_index]);
             transaction.pressure_results[position].pressure_committed = true;
+            transaction.pressure_results[position].committed_kv_offloads =
+                std::move(work.pending_kv_offloads);
             complete_pressure_delta(work);
             transaction.victim_released[position] = true;
         }
@@ -8823,6 +8848,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = shared_prefix_summary(
                         shared_prefix_states[transaction.shared_victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
@@ -8837,6 +8863,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = continuation_summary(
                         continuation_states[transaction.victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
@@ -9336,6 +9363,10 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     }
     try {
         out.summary.long_anchors.reserve(state.long_anchors.size());
+        // ResourceManager publishes at most endpoint + rewrite + every long anchor after the
+        // physical freeze. Reserve before mutation so observability cannot introduce a
+        // post-commit allocation failure at terminal retention.
+        out.lifecycle.reserve(state.long_anchors.size() + 2U);
     } catch (...) { return out; }
     try {
         if (state.state.fork_pending) {
@@ -12470,12 +12501,34 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.text_kv_bytes                = text_kv_bytes;
     out.mtp_kv_bytes                 = mtp_kv_bytes;
     out.gdn_state_bytes              = gdn_state_bytes;
+    out.checkpoint_state_image_bytes = state_images ? state_images->host_layout().image_bytes : 0;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
+    const auto device_page_bytes     = [](const DeviceKVPagePool& pool) {
+        std::size_t bytes = 0;
+        for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+            bytes += pool.plane(index).bytes() / pool.capacity_pages();
+        }
+        return bytes;
+    };
+    if (text_kv_pages) {
+        const DeviceKVPagePool& pool      = text_kv_pages->physical_pool();
+        out.device_main_kv_capacity_pages = pool.capacity_pages();
+        out.device_main_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_main_kv_page_bytes     = device_page_bytes(pool);
+    }
+    if (backend_kv_pages) {
+        const DeviceKVPagePool& pool         = backend_kv_pages->physical_pool();
+        out.device_backend_kv_capacity_pages = pool.capacity_pages();
+        out.device_backend_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_backend_kv_page_bytes     = device_page_bytes(pool);
+    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
     }
+    out.host_main_kv_page_bytes    = text_host_kv_page_stride;
+    out.host_backend_kv_page_bytes = backend_host_kv_page_stride;
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();

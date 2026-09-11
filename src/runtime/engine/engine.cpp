@@ -165,6 +165,11 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
     return impl_ != nullptr ? impl_->prepare : empty;
 }
 
+std::string PreparedPrompt::take_rendered_text() {
+    if (impl_ == nullptr) { return {}; }
+    return impl_->value.take_rendered_text();
+}
+
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 class GenerationHandle::Impl {
@@ -173,6 +178,8 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        [[nodiscard]] virtual std::vector<CheckpointLifecycleFact>
+        take_failure_checkpoint_lifecycle() noexcept = 0;
     };
 
     template <class Submission>
@@ -182,12 +189,23 @@ public:
             : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
-            return submission_.wait(sink, cancellation);
+            try {
+                return submission_.wait(sink, cancellation);
+            } catch (runtime::SettledGenerationFailure& failure) {
+                failure_checkpoint_lifecycle_ = failure.take_checkpoint_lifecycle();
+                failure.rethrow_cause();
+            }
+        }
+
+        [[nodiscard]] std::vector<CheckpointLifecycleFact>
+        take_failure_checkpoint_lifecycle() noexcept override {
+            return std::move(failure_checkpoint_lifecycle_);
         }
 
     private:
         std::shared_ptr<void> keep_alive_;
         Submission submission_;
+        std::vector<CheckpointLifecycleFact> failure_checkpoint_lifecycle_;
     };
 
     template <class Submission>
@@ -198,6 +216,11 @@ public:
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
+    }
+
+    [[nodiscard]] std::vector<CheckpointLifecycleFact>
+    take_failure_checkpoint_lifecycle() noexcept {
+        return state_->take_failure_checkpoint_lifecycle();
     }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
@@ -226,7 +249,17 @@ const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const no
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
     std::unique_ptr<Impl> impl = std::move(impl_);
-    return impl->wait(sink, cancellation);
+    try {
+        return impl->wait(sink, cancellation);
+    } catch (...) {
+        failure_checkpoint_lifecycle_ = impl->take_failure_checkpoint_lifecycle();
+        throw;
+    }
+}
+
+std::vector<CheckpointLifecycleFact>
+GenerationHandle::take_failure_checkpoint_lifecycle() noexcept {
+    return std::move(failure_checkpoint_lifecycle_);
 }
 
 namespace {
@@ -829,7 +862,7 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                 std::uint64_t adoption_nanoseconds   = 0;
                 bool validation_completed            = false;
                 try {
-                    const auto result = core->import_shared_prefix(
+                    auto result = core->import_shared_prefix(
                         std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
                         &adoption_nanoseconds,
                         [&] {
@@ -839,16 +872,17 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                             }
                         },
                         bytes, true, candidate, &validation_completed);
-                    const auto summary = core->shared_prefix_slot_summary(result.slot);
-                    if (!summary) {
-                        throw std::logic_error("durable shared import has no catalogued summary");
+                    if (!result.summary || !result.checkpoint) {
+                        throw std::logic_error(
+                            "durable shared import has no locked publication identity");
                     }
                     return {
                             .disposition            = static_cast<std::uint32_t>(result.disposition),
                             .slot                   = result.slot,
-                            .frontier               = summary->checkpoint.ref.frontier,
+                            .frontier               = result.summary->checkpoint.ref.frontier,
                             .validation_nanoseconds = validation_nanoseconds,
                             .adoption_nanoseconds   = adoption_nanoseconds,
+                            .checkpoint             = std::move(*result.checkpoint),
                     };
                 } catch (const RequestError&) {
                     throw;
@@ -861,11 +895,9 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
             }
         },
         engine.impl_->core);
-    if (cancellation.requested()) {
-        // Adoption is atomic and remains a valid warm source. Cancellation only prevents the
-        // caller from continuing to submission; it never tears down a committed shared owner.
-        throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
-    }
+    // A cancellation observed after the locked adoption boundary is handled by the caller's
+    // next preparation checkpoint. Returning the committed identity lets that failure retain the
+    // SSD lifecycle fact instead of making a completed adoption disappear from observability.
     return imported;
 }
 
@@ -998,17 +1030,16 @@ runtime::testing::SharedSnapshotTestAccess::import(Engine& engine,
                               core->import_shared_prefix(bytes, binding);
                               core->shared_prefix_slot_summary(std::uint32_t{});
                           }) {
-                const auto result  = core->import_shared_prefix(bytes, binding);
-                const auto summary = core->shared_prefix_slot_summary(result.slot);
-                if (!summary) {
-                    throw std::logic_error("shared import result has no catalogued summary");
+                auto result = core->import_shared_prefix(bytes, binding);
+                if (!result.summary) {
+                    throw std::logic_error("shared import result has no locked summary");
                 }
                 return {.disposition      = static_cast<std::uint32_t>(result.disposition),
                         .slot             = result.slot,
-                        .frontier         = summary->checkpoint.ref.frontier,
-                        .main_frontier    = summary->checkpoint.required_kv.main_frontier,
-                        .backend_frontier = summary->checkpoint.required_kv.backend_frontier,
-                        .state_residency  = summary->checkpoint.state_residency};
+                        .frontier         = result.summary->checkpoint.ref.frontier,
+                        .main_frontier    = result.summary->checkpoint.required_kv.main_frontier,
+                        .backend_frontier = result.summary->checkpoint.required_kv.backend_frontier,
+                        .state_residency  = result.summary->checkpoint.state_residency};
             } else {
                 throw std::logic_error("shared snapshots require a generation Engine");
             }

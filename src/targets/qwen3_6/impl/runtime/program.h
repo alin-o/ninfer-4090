@@ -880,6 +880,9 @@ private:
             std::vector<StateChangeWork> state_changes;
             std::vector<KVChangeWork> main_kv_changes;
             std::vector<KVChangeWork> backend_kv_changes;
+            // Allocated before any physical mutation, then moved into the terminal owner result
+            // only after publish_pressure_work commits the corresponding Host replicas.
+            std::vector<runtime::CommittedKvOffloadRange> pending_kv_offloads;
             detail::PhysicalDelta committed_delta;
             bool submitted                 = false;
             bool completed                 = false;

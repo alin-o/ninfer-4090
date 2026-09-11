@@ -99,6 +99,10 @@ struct RetainedSessionSnapshot {
     // Shared-prefix exports use this carrier too. For those records this is the SHA-256 digest
     // of the exact semantic prefix identity; private NINFSES1 v3 writers leave it empty.
     std::string content_digest;
+    // Engine-published logical identity and exact checkpoint resource quantities for an
+    // asynchronous shared-prefix persistence lifecycle fact. Private session snapshots leave it
+    // at its default value.
+    CheckpointLifecycleFact checkpoint;
     // Set only by begin_save_continuation(). Consumers must invoke this before reading bytes.
     // It waits for the producer event (not unrelated device work), then assembles `bytes` from
     // the owned pinned staging image. The callback is deliberately consumer-owned: Program only
@@ -896,6 +900,7 @@ struct MaterializationVictimResult {
     runtime::VictimDisposition disposition = runtime::VictimDisposition::Retained;
     bool pressure_committed                = false;
     std::optional<ContinuationSummary> final_summary;
+    std::vector<runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct MaterializationSharedVictimResult {
@@ -903,6 +908,7 @@ struct MaterializationSharedVictimResult {
     runtime::VictimDisposition disposition = runtime::VictimDisposition::Retained;
     bool pressure_committed                = false;
     std::optional<SharedPrefixSummary> final_summary;
+    std::vector<runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct MaterializationSourceResult {
@@ -964,6 +970,7 @@ struct FinishResult {
     SpeculativeStats speculative;
     ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
+    std::vector<CheckpointLifecycleFact> lifecycle;
 };
 
 template <class Variant>

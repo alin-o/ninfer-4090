@@ -122,7 +122,8 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
     ninfer::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind       = ninfer::product::media_acquire::SourceKind::Data;
+        source.media_type = ninfer::product::media_acquire::data_uri_media_type(source.value);
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
         source.kind = ninfer::product::media_acquire::SourceKind::Url;
     } else {
@@ -139,7 +140,8 @@ ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
     ninfer::product::media_acquire::Source source;
     source.value = part.at("video_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind       = ninfer::product::media_acquire::SourceKind::Data;
+        source.media_type = ninfer::product::media_acquire::data_uri_media_type(source.value);
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
         source.kind = ninfer::product::media_acquire::SourceKind::Url;
     } else {

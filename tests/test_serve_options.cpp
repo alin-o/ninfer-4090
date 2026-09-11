@@ -36,6 +36,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.request_log_content_dir.empty(),
+                      "request content capture is not disabled by default");
     failures +=
         check(defaults.slot_save_path.empty(), "slot persistence is not disabled by default");
     failures += check(!defaults.deprecated_turn_checkpoints_given,
@@ -405,9 +407,24 @@ int main() {
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",
                       "--request-log-jsonl did not preserve its path");
+    const ServeOptions captured =
+        parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl", "requests.jsonl",
+               "--request-log-content-dir", "request-content"});
+    failures += check(captured.request_log_content_dir == "request-content",
+                      "--request-log-content-dir did not preserve its path");
+    bool capture_without_jsonl_rejected = false;
+    try {
+        (void)parse(
+            {"ninfer-serve", "model.ninfer", "--request-log-content-dir", "request-content"});
+    } catch (const std::invalid_argument&) { capture_without_jsonl_rejected = true; }
+    failures += check(capture_without_jsonl_rejected,
+                      "request content capture was accepted without JSONL logging");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    failures += check(serve_usage_text("ninfer-serve").find("--request-log-content-dir") !=
+                          std::string::npos,
+                      "serve help omits --request-log-content-dir");
 
     const ServeOptions slots =
         parse({"ninfer-serve", "model.ninfer", "--slot-save-path", "/var/lib/ninfer/slots"});

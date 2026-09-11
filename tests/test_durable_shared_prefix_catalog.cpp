@@ -552,6 +552,44 @@ void test_orphan_cleanup_preserves_unrelated_files() {
            "orphan cleanup removed files outside the durable catalog namespace");
 }
 
+void test_persistence_lifecycle_observer_reports_settlement() {
+    TemporaryDirectory temporary;
+    std::vector<ninfer::CheckpointLifecycleFact> facts;
+    auto configured               = options(temporary.path);
+    configured.lifecycle_observer = [&](const auto& fact) { facts.push_back(fact); };
+    DurableSharedPrefixCatalog catalog(std::move(configured));
+    auto persisted                        = snapshot('1', 31, {1, 2, 3, 4});
+    persisted.checkpoint.key_digests      = {17, 29};
+    persisted.checkpoint.identity_tag     = 41;
+    persisted.checkpoint.ordinal          = 3;
+    persisted.checkpoint.main_kv_pages    = 7;
+    persisted.checkpoint.backend_kv_pages = 2;
+    catalog.enqueue(std::move(persisted));
+    catalog.drain();
+    expect(facts.size() == 1 &&
+               facts.front().operation == ninfer::CheckpointLifecycleOperation::Persisted &&
+               facts.front().source_tier == ninfer::CheckpointLifecycleTier::Host &&
+               facts.front().destination_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+               facts.front().status == ninfer::CheckpointLifecycleStatus::Committed &&
+               facts.front().content_digest == std::string(64, '1') &&
+               facts.front().frontier == 31 && facts.front().serialized_bytes == 4 &&
+               facts.front().key_digests == std::array<std::uint64_t, 2>{17, 29} &&
+               facts.front().identity_tag == 41 && facts.front().ordinal == 3 &&
+               facts.front().main_kv_pages == 7 && facts.front().backend_kv_pages == 2 &&
+               facts.front().elapsed_ns.has_value(),
+           "durable commit did not publish an exact persistence lifecycle fact");
+
+    facts.clear();
+    catalog.set_lifecycle_observer([&](const auto& fact) { facts.push_back(fact); });
+    // An invalid Program-produced frontier is rejected before any file is published, but still
+    // has a settled, machine-readable failed persistence attempt.
+    catalog.enqueue(snapshot('2', 0, {5, 6}));
+    catalog.drain();
+    expect(facts.size() == 1 && facts.front().status == ninfer::CheckpointLifecycleStatus::Failed &&
+               facts.front().operation == ninfer::CheckpointLifecycleOperation::Persisted,
+           "durable failure was omitted or reported as a committed persistence event");
+}
+
 } // namespace
 
 int main() {
@@ -564,6 +602,7 @@ int main() {
     test_pre_rename_failure_retains_charge_until_cleanup_is_durable();
     test_repeated_manifest_temporary_failures_stay_charged_and_bounded();
     test_orphan_cleanup_preserves_unrelated_files();
+    test_persistence_lifecycle_observer_reports_settlement();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

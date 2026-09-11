@@ -105,6 +105,34 @@ and HTTP records must not contain:
 - request bodies or arbitrary client-controlled headers;
 - full data URLs or unredacted query strings.
 
+The only exception is the explicit machine-artifact path enabled by
+`--request-log-content-dir`. It writes prompt and response bodies to separate Markdown files, never
+to operational stderr or inline JSONL. Its JSONL records contain only relative names, sizes,
+SHA-256 digests, and stable publication status/error classes. The option is deliberately coupled to
+the versioned request log so every persisted body is request-correlated. Gateway code owns atomic
+file publication; Frontend supplies the exact rendered prompt; Engine/GenerationService supplies
+the final logical response. Operators own permissions, retention, and rotation for this sensitive
+directory.
+The publisher emits and hashes bounded fragments from those existing buffers; formatting and I/O
+exceptions are capture failures and must never escape after the request lifecycle has claimed its
+terminal state.
+
+Checkpoint lifecycle JSONL records follow the same ownership boundaries. ResourceManager supplies
+validated logical retention/tier facts, Program supplies physical State/Main/backend-KV quantities,
+Engine publishes request-attributable immutable facts, and the Gateway serializes them. Durable
+catalog filesystem completion is a Gateway-owned background fact and therefore uses null
+request/response correlation unless an owning request is explicitly carried. Producers must not
+manufacture lifecycle records by subtracting global counters or label an incomplete transfer as
+committed. Tier values are `device`, `host`, `ssd`, and `none`; status values are `committed`,
+`failed`, and `aborted`. Program publishes committed per-owner KV ranges so a KV-only pressure
+demotion is observable even when State residency is unchanged; ResourceManager intersects those
+ranges with each surviving logical checkpoint rather than sampling allocator deltas. The emitted
+resource quantities describe the identified checkpoint's complete recovery footprint.
+Terminal summaries, including request-error and post-adoption preparation-rejection summaries, are
+reductions of the same immutable fact list. Program publishes the complete per-image State transfer
+layout; the aggregate linear State pool is not a valid checkpoint byte quantity. Durable import
+identity and occupancy must be captured before releasing the Engine execution lock.
+
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
 value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational
@@ -145,7 +173,10 @@ Serve owns request failure classification and severity. A prepared generation re
 machine terminal: `request_done` immediately after `GenerationService::run()` returns, or
 `request_error` if it does not return an outcome. Response rendering, Responses storage, and terminal
 transport happen after that transaction; their failures are operational `response` records and do
-not create a second request JSONL terminal.
+not create a second request JSONL terminal. A streaming Gateway failure before `run()` begins is a
+special settlement path, not an abandoned handle: the Gateway requests cancellation, awaits the
+submitted Engine request, merges durable and Engine checkpoint facts, then records the original
+transport/render classification.
 
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.

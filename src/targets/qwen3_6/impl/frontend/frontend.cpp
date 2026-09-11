@@ -362,12 +362,13 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
 
 fi::ChatRenderOptions render_options(const PromptOptions& options,
                                      std::span<const PromptCacheMarker> cache_markers = {}) {
-    fi::ChatRenderOptions rendered{.continuation      = options.continuation,
-                                   .enable_thinking   = options.enable_thinking,
-                                   .reasoning_effort  = options.reasoning_effort,
-                                   .preserve_thinking = options.preserve_thinking,
-                                   .add_vision_id     = options.add_vision_id,
-                                   .tool_jsons        = options.tool_jsons};
+    fi::ChatRenderOptions rendered{.continuation          = options.continuation,
+                                   .enable_thinking       = options.enable_thinking,
+                                   .reasoning_effort      = options.reasoning_effort,
+                                   .preserve_thinking     = options.preserve_thinking,
+                                   .add_vision_id         = options.add_vision_id,
+                                   .capture_rendered_text = options.capture_rendered_text,
+                                   .tool_jsons            = options.tool_jsons};
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
 }
@@ -1186,6 +1187,11 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     };
 }
 
+std::string PreparedPrompt::take_rendered_text() {
+    if (data_ == nullptr) { return {}; }
+    return std::move(data_->rendered_text);
+}
+
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -1572,6 +1578,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                   control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+        result.rendered_text  = std::move(processed.rendered_text);
         result.token_types    = std::move(processed.token_types);
         result.positions      = std::move(processed.positions);
         result.rope_delta     = processed.rope_delta;
@@ -1603,7 +1610,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         structural_boundaries = std::move(processed.structural_boundaries);
         first_volatile_token  = processed.first_volatile_token;
     } else {
-        const fi::RenderedChat rendered =
+        fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
@@ -1614,7 +1621,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
         }
-        result.token_ids                   = std::move(encoded.input_ids);
+        result.token_ids = std::move(encoded.input_ids);
+        if (options.capture_rendered_text) { result.rendered_text = std::move(rendered.text); }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);

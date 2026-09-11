@@ -1,9 +1,11 @@
 #include "serve/operational_log.h"
 #include "serve/request_log.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -136,8 +138,18 @@ int main() {
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
     memory.kv_payload_bytes                  = 400;
+    memory.gdn_state_bytes                   = 8192;
+    memory.checkpoint_state_image_bytes      = 8192;
+    memory.device_main_kv_capacity_pages     = 100;
+    memory.device_main_kv_occupied_pages     = 25;
+    memory.device_main_kv_page_bytes         = 4096;
+    memory.device_backend_kv_capacity_pages  = 50;
+    memory.device_backend_kv_occupied_pages  = 60;
+    memory.device_backend_kv_page_bytes      = 2048;
     memory.host_state_capacity_slots         = 3;
     memory.host_state_occupied_slots         = 1;
+    memory.host_main_kv_page_bytes           = 5000;
+    memory.host_backend_kv_page_bytes        = 3000;
     memory.host_kv_capacity_bytes            = 64ULL << 20;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
 
@@ -274,15 +286,27 @@ int main() {
         .output_tokens_explicit            = true,
         .preserve_thinking_semantic_change = true,
     };
-    const RequestLogContext context =
+    RequestLogContext context =
         make_request_log_context(7, "openai_chat_completions", request, metadata, prepared);
-    const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
+    context.kv_snapshot = make_kv_capacity_snapshot(memory);
+    const Json started  = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
     failures += check(started.at("request").at("response_id") == "chatcmpl-correlation-fixture",
                       "wire response id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
+    failures +=
+        check(started.at("kv_capacity").at("device").at("main").at("capacity_pages") == 100 &&
+                  started.at("kv_capacity").at("device").at("main").at("used_pages") == 25 &&
+                  started.at("kv_capacity").at("device").at("main").at("free_pages") == 75 &&
+                  started.at("kv_capacity").at("device").at("main").at("used_bytes") == 25 * 4096 &&
+                  started.at("kv_capacity").at("device").at("backend").at("free_pages") == 0 &&
+                  started.at("kv_capacity").at("device").at("backend").at("free_bytes") == 0 &&
+                  started.at("kv_capacity").at("host").at("capacity_bytes") == (64ULL << 20) &&
+                  started.at("kv_capacity").at("host").at("used_bytes") == (8ULL << 20) &&
+                  started.at("kv_capacity").at("host").at("free_bytes") == (56ULL << 20),
+              "KV snapshot arithmetic or saturated free capacity is wrong");
     failures += check(started.at("request").at("enable_thinking") == true,
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
@@ -306,11 +330,20 @@ int main() {
               "request-scoped media preparation diagnostics missing");
 
     ApiError preparation_error;
-    preparation_error.status                          = 400;
-    preparation_error.type                            = "invalid_request_error";
-    preparation_error.param                           = "messages";
-    preparation_error.code                            = "context_length_exceeded";
-    preparation_error.message                         = "sentinel-client-value\nsecond-record";
+    preparation_error.status               = 400;
+    preparation_error.type                 = "invalid_request_error";
+    preparation_error.param                = "messages";
+    preparation_error.code                 = "context_length_exceeded";
+    preparation_error.message              = "sentinel-client-value\nsecond-record";
+    preparation_error.checkpoint_lifecycle = {
+        ninfer::CheckpointLifecycleFact{
+            .frontier         = 128,
+            .operation        = ninfer::CheckpointLifecycleOperation::Restored,
+            .source_tier      = ninfer::CheckpointLifecycleTier::Ssd,
+            .destination_tier = ninfer::CheckpointLifecycleTier::Host,
+            .status           = ninfer::CheckpointLifecycleStatus::Committed,
+        },
+    };
     GenerationRequest rejected_request                = request;
     rejected_request.reasoning_effort                 = RequestedReasoningEffort::High;
     const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
@@ -320,10 +353,12 @@ int main() {
     failures +=
         check(rejected.at("event") == "request_rejected" && rejected.at("phase") == "prepare",
               "preparation rejection event or phase mismatch");
-    failures += check(rejected.at("request").at("request_id") == 8 &&
-                          rejected.at("request").at("media_item_count") == 1 &&
-                          rejected.at("request").at("message_count") == 2,
-                      "preparation rejection request shape missing");
+    failures +=
+        check(rejected.at("request").at("request_id") == 8 &&
+                  rejected.at("request").at("response_id") == "chatcmpl-correlation-fixture" &&
+                  rejected.at("request").at("media_item_count") == 1 &&
+                  rejected.at("request").at("message_count") == 2,
+              "preparation rejection request shape missing");
     failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
                           rejected.at("request").at("resolved_reasoning_effort").is_null(),
                       "rejection log fabricated a resolved reasoning effort");
@@ -332,6 +367,9 @@ int main() {
                           rejected.at("error").at("param") == "messages" &&
                           rejected.at("error").at("message") == preparation_error.message,
                       "preparation rejection API error missing");
+    failures += check(rejected.at("checkpoint_summary").at("reuse_loaded") == true &&
+                          rejected.at("checkpoint_summary").at("restore_committed") == true,
+                      "preparation rejection lost a committed durable restore summary");
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures +=
         check(client_rejection.severity == OperationalSeverity::Info &&
@@ -398,10 +436,30 @@ int main() {
                           .selected_degradation_units = 2,
                           .selected_maximal_fallback  = false,
     };
-    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
-                                                   .model_thinking_tokens = 256,
-                                                   .injected_tokens       = 19,
-                                                   .applied               = true};
+    outcome.thinking           = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+                                                             .model_thinking_tokens = 256,
+                                                             .injected_tokens       = 19,
+                                                             .applied               = true};
+    outcome.checkpoints        = {.reuse_loaded      = true,
+                                  .restore_committed = true,
+                                  .offload_committed = true,
+                                  .created_committed = 2,
+                                  .capture_aborted   = 1};
+    const auto checkpoint_fact = [](ninfer::CheckpointLifecycleOperation operation,
+                                    ninfer::CheckpointLifecycleStatus status =
+                                        ninfer::CheckpointLifecycleStatus::Committed) {
+        return ninfer::CheckpointLifecycleFact{
+            .frontier = 64, .operation = operation, .status = status};
+    };
+    outcome.checkpoint_lifecycle = {
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Loaded),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Restored),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Offloaded),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created,
+                        ninfer::CheckpointLifecycleStatus::Aborted),
+    };
 
     // Fork-local fields on the operational request line: upstream's restructure dropped
     // speculative decoding and host timings, and this fork restated them. The fixture above
@@ -428,6 +486,12 @@ int main() {
               "operational request line lost the host timings");
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("checkpoint_summary").at("reuse_loaded") == true &&
+                          done.at("checkpoint_summary").at("restore_committed") == true &&
+                          done.at("checkpoint_summary").at("created_committed") == 2 &&
+                          done.at("checkpoint_summary").at("offload_committed") == true &&
+                          done.at("checkpoint_summary").at("capture_aborted") == 1,
+                      "request terminal lost immutable checkpoint facts");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
@@ -479,11 +543,91 @@ int main() {
             done.at("engine_timing").at("units").at("prefill") == 4,
         "request Engine timing exposure is incomplete");
 
-    const Json error =
-        Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
+    const ninfer::CheckpointLifecycleFact lifecycle_fact{
+        .key_digests      = {0x0123456789abcdefULL, 0xfedcba9876543210ULL},
+        .frontier         = 192,
+        .identity_tag     = 7,
+        .ordinal          = 2,
+        .role             = ninfer::CheckpointLifecycleRole::LongAnchor,
+        .scope            = ninfer::CheckpointLifecycleScope::Private,
+        .operation        = ninfer::CheckpointLifecycleOperation::Offloaded,
+        .source_tier      = ninfer::CheckpointLifecycleTier::Device,
+        .destination_tier = ninfer::CheckpointLifecycleTier::Host,
+        .status           = ninfer::CheckpointLifecycleStatus::Committed,
+        .state_images     = 1,
+        .main_kv_pages    = 3,
+        .backend_kv_pages = 4,
+        .elapsed_ns       = 12345,
+    };
+    const Json lifecycle =
+        Json::parse(format_checkpoint_lifecycle_json("serve-test", 3500, context, lifecycle_fact));
+    failures += check(
+        lifecycle.at("event") == "checkpoint_lifecycle" &&
+            lifecycle.at("request").at("request_id") == 7 &&
+            lifecycle.at("request").at("response_id") == "chatcmpl-correlation-fixture" &&
+            lifecycle.at("checkpoint").at("key_digest") == "0123456789abcdeffedcba9876543210" &&
+            lifecycle.at("checkpoint").at("frontier") == 192 &&
+            lifecycle.at("checkpoint").at("role") == "long_anchor" &&
+            lifecycle.at("checkpoint").at("scope") == "private" &&
+            lifecycle.at("operation") == "offloaded" && lifecycle.at("status") == "committed" &&
+            lifecycle.at("source_tier") == "device" && lifecycle.at("destination_tier") == "host" &&
+            lifecycle.at("resources").at("state").at("bytes") == 8192 &&
+            lifecycle.at("resources").at("main_kv").at("bytes") == 3 * 5000 &&
+            lifecycle.at("resources").at("backend_kv").at("bytes") == 4 * 3000 &&
+            lifecycle.at("elapsed_ns") == 12345 &&
+            lifecycle.at("kv_capacity").at("device").at("main").at("used_pages") == 25,
+        "checkpoint lifecycle identity, tier, quantity, correlation, or KV snapshot mismatch");
+    RequestLogContext background_context;
+    background_context.kv_snapshot = context.kv_snapshot;
+    const Json background          = Json::parse(
+        format_checkpoint_lifecycle_json("serve-test", 3501, background_context, lifecycle_fact));
+    failures += check(background.at("request").at("request_id").is_null() &&
+                          background.at("request").at("response_id").is_null(),
+                      "background checkpoint activity fabricated request correlation");
+    ApiError lifecycle_error;
+    lifecycle_error.status               = 499;
+    lifecycle_error.code                 = "client_disconnected";
+    lifecycle_error.checkpoint_lifecycle = {lifecycle_fact};
+    failures +=
+        check(make_generation_request_failure(lifecycle_error).checkpoint_lifecycle.size() == 1,
+              "request failure discarded aborted checkpoint lifecycle facts");
+    const RequestFailure disconnected_after_reuse = attach_checkpoint_lifecycle(
+        make_client_disconnected_failure(RequestFailurePhase::Transport),
+        lifecycle_error.checkpoint_lifecycle);
+    failures += check(
+        disconnected_after_reuse.classification == RequestFailureClass::ClientDisconnected &&
+            disconnected_after_reuse.phase == RequestFailurePhase::Transport &&
+            disconnected_after_reuse.checkpoint_lifecycle.size() == 1 &&
+            disconnected_after_reuse.checkpoint_lifecycle.front().key_digests ==
+                lifecycle_fact.key_digests,
+        "attaching settled lifecycle facts changed transport classification or lost identity");
+
+    const std::string media_prompt = format_prompt_markdown(
+        "model-visible <|vision_start|><|image_pad|><|vision_end|>",
+        std::array<CapturedMediaMetadata, 1>{CapturedMediaMetadata{
+            .kind       = ninfer::MediaKind::Image,
+            .media_type = "image/png\nunsafe`field",
+            .bytes      = 1234,
+            .sha256     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }});
+    failures += check(media_prompt.starts_with("model-visible <|vision_start|>") &&
+                          media_prompt.find("kind=`image`") != std::string::npos &&
+                          media_prompt.find("bytes=`1234`") != std::string::npos &&
+                          media_prompt.find("sha256=`aaaaaaaa") != std::string::npos &&
+                          media_prompt.find("https://") == std::string::npos &&
+                          media_prompt.find("data:") == std::string::npos,
+                      "prompt Markdown lost safe media metadata or included a media source");
+
+    const Json error = Json::parse(
+        format_request_error_json("serve-test", 4000, context, "generation failed",
+                                  summarize_checkpoint_lifecycle(outcome.checkpoint_lifecycle)));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
+    failures += check(error.at("checkpoint_summary").at("created_committed") == 2 &&
+                          error.at("checkpoint_summary").at("restore_committed") == true &&
+                          error.at("checkpoint_summary").at("capture_aborted") == 1,
+                      "request error omitted its lifecycle-derived checkpoint summary");
 
     const OperationalRecord internal_failure = render_request_failure(
         context,
@@ -638,6 +782,184 @@ int main() {
     }
     input.close();
     std::filesystem::remove(log_path);
+
+    const std::filesystem::path capture_root =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-request-content-test-" +
+#ifdef _WIN32
+         std::to_string(static_cast<long long>(::_getpid())));
+#else
+         std::to_string(static_cast<long long>(::getpid())));
+#endif
+    std::filesystem::remove_all(capture_root);
+    std::filesystem::create_directories(capture_root);
+    const std::filesystem::path capture_log = capture_root / "requests.jsonl";
+    const std::filesystem::path content_dir = capture_root / "content";
+    RequestLogContext captured_context      = context;
+    const std::string rendered_prompt =
+        "<|im_start|>user\nrendered prompt secret, not raw JSON<|im_end|>\n";
+    captured_context.rendered_prompt   = std::make_shared<const std::string>(rendered_prompt);
+    GenerationOutcome captured_outcome = outcome;
+    captured_outcome.checkpoint_lifecycle.clear();
+    captured_outcome.reasoning  = "private chain of thought";
+    captured_outcome.text       = "final assistant content";
+    captured_outcome.tool_calls = {{.name = "lookup", .arguments_json = R"({"key":"secret"})"}};
+    std::string first_prompt_file;
+    {
+        JsonlRequestLog writer(capture_log.string(), {}, {}, content_dir);
+        writer.write_request_start(captured_context);
+        writer.write_request_done(captured_context, captured_outcome);
+        failures += check(captured_context.prompt_file.status == "written" &&
+                              captured_context.prompt_file.file.starts_with("prompt") &&
+                              captured_context.prompt_file.file.ends_with(".md"),
+                          "captured prompt did not publish a prefixed Markdown file");
+        first_prompt_file = captured_context.prompt_file.file;
+    }
+    std::ifstream captured_input(capture_log);
+    std::string captured_start_line;
+    std::string captured_done_line;
+    std::getline(captured_input, captured_start_line);
+    std::getline(captured_input, captured_done_line);
+    const Json captured_start       = Json::parse(captured_start_line);
+    const Json captured_done        = Json::parse(captured_done_line);
+    const Json& prompt_meta         = captured_start.at("content_files").at("prompt");
+    const Json& response_meta       = captured_done.at("content_files").at("response");
+    const std::string response_file = response_meta.at("file").get<std::string>();
+    failures += check(prompt_meta.at("status") == "written" &&
+                          prompt_meta.at("bytes") == rendered_prompt.size() &&
+                          prompt_meta.at("sha256").get<std::string>().size() == 64,
+                      "prompt content reference is incomplete");
+    failures += check(response_meta.at("status") == "written" &&
+                          response_file.starts_with("response") && response_file.ends_with(".md") &&
+                          first_prompt_file.substr(6) == response_file.substr(8),
+                      "prompt and response filenames do not share one request suffix");
+    std::ifstream prompt_input(content_dir / first_prompt_file, std::ios::binary);
+    const std::string stored_prompt((std::istreambuf_iterator<char>(prompt_input)), {});
+    failures += check(stored_prompt == rendered_prompt,
+                      "prompt Markdown is not the exact Frontend-rendered text");
+    std::ifstream response_input(content_dir / response_file, std::ios::binary);
+    const std::string stored_response((std::istreambuf_iterator<char>(response_input)), {});
+    const auto sha256_hex = [](std::string_view value) {
+        return ninfer::targets::qwen3_6::frontend_internal::sha256_hex(
+            ninfer::targets::qwen3_6::frontend_internal::sha256(value));
+    };
+    failures += check(prompt_meta.at("sha256") == sha256_hex(stored_prompt) &&
+                          response_meta.at("sha256") == sha256_hex(stored_response),
+                      "JSONL digest does not match the atomically published Markdown file");
+    failures += check(stored_response == format_response_markdown(captured_outcome) &&
+                          stored_response.find("private chain of thought") != std::string::npos &&
+                          stored_response.find("final assistant content") != std::string::npos &&
+                          stored_response.find(R"({"key":"secret"})") != std::string::npos,
+                      "response Markdown lost reasoning, content, or tool calls");
+    failures +=
+        check(captured_start_line.find("rendered prompt secret") == std::string::npos &&
+                  captured_done_line.find("private chain of thought") == std::string::npos &&
+                  captured_done_line.find("final assistant content") == std::string::npos &&
+                  captured_done_line.find(R"({"key":"secret"})") == std::string::npos,
+              "captured content leaked inline into JSONL");
+
+    const std::filesystem::path protocol_log = capture_root / "protocols.jsonl";
+    std::vector<std::string> protocol_responses;
+    {
+        JsonlRequestLog writer(protocol_log.string(), {}, {}, content_dir);
+        const std::array<std::pair<const char*, bool>, 4> protocols{{
+            {"openai_chat_completions", false},
+            {"openai_responses", false},
+            {"anthropic_messages", false},
+            {"openai_chat_completions", true},
+        }};
+        for (std::size_t index = 0; index < protocols.size(); ++index) {
+            RequestLogContext protocol_context = context;
+            protocol_context.id                = 20 + index;
+            protocol_context.protocol          = protocols[index].first;
+            protocol_context.stream            = protocols[index].second;
+            protocol_context.rendered_prompt = std::make_shared<const std::string>(rendered_prompt);
+            writer.write_request_start(protocol_context);
+            writer.write_request_done(protocol_context, captured_outcome);
+            protocol_responses.push_back("response" + writer.server_instance_id() + "-request-" +
+                                         std::to_string(protocol_context.id) + ".md");
+        }
+    }
+    std::ifstream protocol_input(protocol_log);
+    std::string protocol_jsonl((std::istreambuf_iterator<char>(protocol_input)), {});
+    failures += check(protocol_jsonl.find(rendered_prompt) == std::string::npos &&
+                          protocol_jsonl.find(captured_outcome.text) == std::string::npos &&
+                          protocol_jsonl.find(captured_outcome.reasoning) == std::string::npos,
+                      "one protocol path embedded captured content in JSONL");
+    for (const std::string& file : protocol_responses) {
+        std::ifstream response(content_dir / file, std::ios::binary);
+        const std::string value((std::istreambuf_iterator<char>(response)), {});
+        failures += check(value == format_response_markdown(captured_outcome),
+                          "protocol or streaming mode changed final response Markdown");
+    }
+
+    RequestLogContext restarted_context = context;
+    restarted_context.rendered_prompt   = std::make_shared<const std::string>("restart prompt");
+    {
+        JsonlRequestLog restarted((capture_root / "restart.jsonl").string(), {}, {}, content_dir);
+        restarted.write_request_start(restarted_context);
+    }
+    failures += check(restarted_context.prompt_file.status == "written" &&
+                          restarted_context.prompt_file.file != first_prompt_file,
+                      "same request ID collided across server instances");
+
+    const std::filesystem::path unusable = capture_root / "not-a-directory";
+    { std::ofstream marker(unusable); }
+    bool unusable_rejected = false;
+    try {
+        JsonlRequestLog rejected((capture_root / "unusable.jsonl").string(), {}, {}, unusable);
+    } catch (const std::runtime_error&) { unusable_rejected = true; }
+    failures += check(unusable_rejected, "unusable content directory did not fail startup");
+
+    const std::filesystem::path failure_dir = capture_root / "failures";
+    RequestLogContext failed_context        = context;
+    failed_context.rendered_prompt = std::make_shared<const std::string>("still infer this");
+    const std::filesystem::path failure_log = capture_root / "failures.jsonl";
+    {
+        bool prompt_fragment_failed = false;
+        JsonlRequestLog writer(failure_log.string(), {}, {}, failure_dir,
+                               [&](std::string_view stage, const std::filesystem::path&,
+                                   const std::filesystem::path& final) {
+                                   const std::string filename = final.filename().string();
+                                   if (stage == "fragment_written" &&
+                                       filename.starts_with("prompt") && !prompt_fragment_failed) {
+                                       prompt_fragment_failed = true;
+                                       throw std::runtime_error("injected fragment failure");
+                                   }
+                                   if (stage == "before_rename" &&
+                                       filename.starts_with("response")) {
+                                       std::filesystem::create_directory(final);
+                                   }
+                               });
+        writer.write_request_start(failed_context);
+        writer.write_request_done(failed_context, captured_outcome);
+    }
+    std::ifstream failure_input(failure_log);
+    std::string failed_start_line;
+    std::string failed_done_line;
+    std::getline(failure_input, failed_start_line);
+    std::getline(failure_input, failed_done_line);
+    const Json failed_start = Json::parse(failed_start_line);
+    const Json failed_done  = Json::parse(failed_done_line);
+    failures +=
+        check(failed_start.at("content_files").at("prompt").at("status") == "failed" &&
+                  failed_start.at("content_files").at("prompt").at("file").is_null() &&
+                  failed_start.at("content_files").at("prompt").at("error_class") ==
+                      "format_or_io_failure" &&
+                  failed_done.at("event") == "request_done" &&
+                  failed_done.at("content_files").at("response").at("status") == "failed" &&
+                  failed_done.at("content_files").at("response").at("file").is_null() &&
+                  failed_done.at("content_files").at("response").at("error_class") ==
+                      "atomic_rename_failed",
+              "injected write/rename failure emitted a false reference or failed inference");
+    bool partial_found = false;
+    for (const auto& entry : std::filesystem::directory_iterator(failure_dir)) {
+        if (entry.path().filename().string().find(".tmp") != std::string::npos) {
+            partial_found = true;
+        }
+    }
+    failures += check(!partial_found, "content write failure left a temporary partial file");
+    std::filesystem::remove_all(capture_root);
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

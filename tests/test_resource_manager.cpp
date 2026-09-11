@@ -450,6 +450,7 @@ struct FakeMaterializationVictimResult {
     VictimDisposition disposition = VictimDisposition::Retained;
     bool pressure_committed       = false;
     std::optional<FakeContinuationSummary> final_summary;
+    std::vector<ninfer::runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct FakeMaterializationSharedVictimResult {
@@ -457,6 +458,7 @@ struct FakeMaterializationSharedVictimResult {
     VictimDisposition disposition = VictimDisposition::Retained;
     bool pressure_committed       = false;
     std::optional<FakeSharedPrefixSummary> final_summary;
+    std::vector<ninfer::runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct FakeMaterializationSourceResult {
@@ -557,6 +559,7 @@ struct FakeFinishResult {
     FakeSpeculativeStats speculative;
     FakeContinuationSummary summary;
     std::optional<FakeContinuationHandle> continuation;
+    std::vector<ninfer::CheckpointLifecycleFact> lifecycle;
 };
 
 struct FakeAbortResult {
@@ -885,12 +888,42 @@ public:
                         const std::uint32_t content = sequence_content_keys_.at(owner);
                         if (action.dropped_checkpoints == 0 ||
                             malform_private_checkpoint_identity) {
-                            victim.final_summary->endpoint = endpoint(content, finish_frontier);
+                            auto checkpoint = endpoint(content, finish_frontier);
+                            if (std::any_of(
+                                    transfer_observations_to_publish.begin(),
+                                    transfer_observations_to_publish.end(),
+                                    [](const auto& transfer) {
+                                        return transfer.direction ==
+                                                   ninfer::runtime::ContextTransferDirection::
+                                                       DeviceToHost &&
+                                               transfer.resource ==
+                                                   ninfer::runtime::ContextResourceClass::State;
+                                    })) {
+                                checkpoint.state_residency =
+                                    ninfer::runtime::ReplicaResidency::Both;
+                            }
+                            victim.final_summary->endpoint = std::move(checkpoint);
                         }
                         if (finish_with_rewrite && (action.dropped_checkpoints == 0 ||
                                                     !malform_private_checkpoint_identity)) {
                             victim.final_summary->rewrite =
                                 rewrite_checkpoint(content, finish_frontier - 1U);
+                        }
+                        for (const auto& transfer : transfer_observations_to_publish) {
+                            if (transfer.direction !=
+                                    ninfer::runtime::ContextTransferDirection::DeviceToHost ||
+                                (transfer.resource !=
+                                     ninfer::runtime::ContextResourceClass::MainKV &&
+                                 transfer.resource !=
+                                     ninfer::runtime::ContextResourceClass::BackendKV)) {
+                                continue;
+                            }
+                            victim.committed_kv_offloads.push_back(
+                                ninfer::runtime::CommittedKvOffloadRange{
+                                    .resource   = transfer.resource,
+                                    .begin_page = 0,
+                                    .page_count = transfer.page_count,
+                                });
                         }
                     }
                     result.victims.push_back(std::move(victim));
@@ -966,12 +999,37 @@ public:
                 victim.final_summary.emplace();
                 const std::uint32_t content = sequence_content_keys_.at(owner_id);
                 if (action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
-                    victim.final_summary->endpoint = endpoint(content, finish_frontier);
+                    auto checkpoint = endpoint(content, finish_frontier);
+                    if (std::any_of(transfer_observations_to_publish.begin(),
+                                    transfer_observations_to_publish.end(),
+                                    [](const auto& transfer) {
+                                        return transfer.direction ==
+                                                   ninfer::runtime::ContextTransferDirection::
+                                                       DeviceToHost &&
+                                               transfer.resource ==
+                                                   ninfer::runtime::ContextResourceClass::State;
+                                    })) {
+                        checkpoint.state_residency = ninfer::runtime::ReplicaResidency::Both;
+                    }
+                    victim.final_summary->endpoint = std::move(checkpoint);
                 }
                 if (finish_with_rewrite &&
                     (action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
+                }
+                for (const auto& transfer : transfer_observations_to_publish) {
+                    if (transfer.direction !=
+                            ninfer::runtime::ContextTransferDirection::DeviceToHost ||
+                        (transfer.resource != ninfer::runtime::ContextResourceClass::MainKV &&
+                         transfer.resource != ninfer::runtime::ContextResourceClass::BackendKV)) {
+                        continue;
+                    }
+                    victim.committed_kv_offloads.push_back(ninfer::runtime::CommittedKvOffloadRange{
+                        .resource   = transfer.resource,
+                        .begin_page = 0,
+                        .page_count = transfer.page_count,
+                    });
                 }
             }
             result.victims.push_back(std::move(victim));
@@ -1932,20 +1990,18 @@ void test_state_transfer_stats_report_physical_bytes_not_image_units() {
     FakeProgram program;
     program.transfer_observations_to_publish = {
         ContextTransferObservation{
-            .resource  = ninfer::runtime::ContextResourceClass::State,
-            .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
-            .units     = 2,
-            .work      = ninfer::TransferWork{.payload_bytes   = 615'817'216,
-                                              .copy_operations = 2},
+            .resource   = ninfer::runtime::ContextResourceClass::State,
+            .direction  = ninfer::runtime::ContextTransferDirection::HostToDevice,
+            .units      = 2,
+            .work       = ninfer::TransferWork{.payload_bytes = 615'817'216, .copy_operations = 2},
             .elapsed_ns = 10,
         },
         ContextTransferObservation{
-            .resource  = ninfer::runtime::ContextResourceClass::MainKV,
-            .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
-            .units     = 4'096,
+            .resource   = ninfer::runtime::ContextResourceClass::MainKV,
+            .direction  = ninfer::runtime::ContextTransferDirection::HostToDevice,
+            .units      = 4'096,
             .page_count = 1,
-            .work       = ninfer::TransferWork{.payload_bytes   = 4'096,
-                                               .copy_operations = 1},
+            .work       = ninfer::TransferWork{.payload_bytes = 4'096, .copy_operations = 1},
             .elapsed_ns = 20,
         },
     };
@@ -1956,6 +2012,151 @@ void test_state_transfer_stats_report_physical_bytes_not_image_units() {
     require(stats.state_h2d_count == 1 && stats.state_h2d_bytes == 615'817'216 &&
                 stats.main_kv_h2d_pages == 1 && stats.main_kv_h2d_bytes == 4'096,
             "transfer statistics confused State image units with physical bytes");
+}
+
+FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
+                               std::uint32_t frontier = 16);
+
+void test_checkpoint_reuse_lifecycle_distinguishes_device_and_host() {
+    const auto run = [](bool host_restore) {
+        FakeManager manager = make_manager(1, 2);
+        FakeProgram program;
+        const ActiveRequest seed = start_active(manager, program, 73, make_base(73), 1);
+        (void)finish_active(manager, program, seed);
+        if (host_restore) {
+            program.required_pressure_actions        = 1;
+            program.transfer_observations_to_publish = {
+                ContextTransferObservation{
+                    .resource   = ninfer::runtime::ContextResourceClass::State,
+                    .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                    .units      = 1,
+                    .work       = ninfer::TransferWork{.payload_bytes = 1024, .copy_operations = 1},
+                    .elapsed_ns = 11,
+                },
+                ContextTransferObservation{
+                    .resource   = ninfer::runtime::ContextResourceClass::MainKV,
+                    .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                    .units      = 4096,
+                    .page_count = 1,
+                    .work       = ninfer::TransferWork{.payload_bytes = 4096, .copy_operations = 1},
+                    .elapsed_ns = 13,
+                },
+            };
+            auto pressure = manager.inspect(program, FakePreparedPrompt{74}, make_base(74), 2);
+            require(pressure.choice.has_value(), "Host lifecycle fixture found no pressure plan");
+            const LaneId pressure_lane = pressure.choice->destination();
+            require(manager.reserve_materialization(program, std::move(*pressure.choice),
+                                                    FakePreparedPrompt{74}, {}) ==
+                        FakeManager::MaterializationReserveResult::Reserved,
+                    "Host lifecycle fixture could not reserve pressure materialization");
+            auto pressure_progress = manager.progress_context_transaction(program, {});
+            auto pressure_outcome =
+                std::get<FakeManager::MaterializationOutcome>(std::move(pressure_progress));
+            const auto offloaded = std::find_if(
+                pressure_outcome.lifecycle.begin(), pressure_outcome.lifecycle.end(),
+                [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded;
+                });
+            require(pressure_outcome.status == ContextTransactionStatus::Published &&
+                        pressure_outcome.activation &&
+                        offloaded != pressure_outcome.lifecycle.end() &&
+                        offloaded->source_tier == ninfer::CheckpointLifecycleTier::Device &&
+                        offloaded->destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                        offloaded->status == ninfer::CheckpointLifecycleStatus::Committed &&
+                        offloaded->key_digests[0] == 73 && offloaded->frontier == 16 &&
+                        offloaded->state_images == 1 && offloaded->main_kv_pages == 1 &&
+                        offloaded->backend_kv_pages == 0,
+                    "actual pressure settlement did not publish the exact Host offload fact");
+            auto pressure_activation                   = std::move(*pressure_outcome.activation);
+            const FakeSequenceHandle pressure_sequence = pressure_activation.sequence();
+            manager.adopt(program, std::move(pressure_activation));
+            (void)manager.abort(program, pressure_lane, pressure_sequence);
+
+            program.required_pressure_actions        = 0;
+            program.transfer_observations_to_publish = {
+                ContextTransferObservation{
+                    .resource   = ninfer::runtime::ContextResourceClass::State,
+                    .direction  = ninfer::runtime::ContextTransferDirection::HostToDevice,
+                    .units      = 1,
+                    .work       = ninfer::TransferWork{.payload_bytes = 1024, .copy_operations = 1},
+                    .elapsed_ns = 17,
+                },
+                ContextTransferObservation{
+                    .resource   = ninfer::runtime::ContextResourceClass::MainKV,
+                    .direction  = ninfer::runtime::ContextTransferDirection::HostToDevice,
+                    .units      = 4096,
+                    .page_count = 1,
+                    .work       = ninfer::TransferWork{.payload_bytes = 4096, .copy_operations = 1},
+                    .elapsed_ns = 19,
+                },
+            };
+        }
+        auto inspection = manager.inspect(program, FakePreparedPrompt{73}, make_base(73), 3);
+        require(inspection.choice && inspection.choice->summary().reusable_prompt_tokens != 0,
+                "reuse lifecycle fixture did not select its checkpoint");
+        require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                FakePreparedPrompt{73}, {}) ==
+                    FakeManager::MaterializationReserveResult::Reserved,
+                "reuse lifecycle fixture could not reserve materialization");
+        auto progress = manager.progress_context_transaction(program, {});
+        auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published &&
+                    outcome.lifecycle.size() == 1,
+                "reuse lifecycle fixture did not publish exactly one source fact");
+        const auto& fact = outcome.lifecycle.front();
+        require(fact.operation == (host_restore ? ninfer::CheckpointLifecycleOperation::Restored
+                                                : ninfer::CheckpointLifecycleOperation::Loaded) &&
+                    fact.source_tier == (host_restore ? ninfer::CheckpointLifecycleTier::Host
+                                                      : ninfer::CheckpointLifecycleTier::Device) &&
+                    fact.destination_tier == ninfer::CheckpointLifecycleTier::Device &&
+                    fact.status == ninfer::CheckpointLifecycleStatus::Committed &&
+                    fact.key_digests[0] == 73 && fact.frontier == 16 && fact.state_images == 1 &&
+                    fact.main_kv_pages == 1 && fact.backend_kv_pages == 0 &&
+                    (!host_restore || fact.elapsed_ns == 36),
+                "reuse lifecycle source tier, operation, status, or elapsed time is wrong");
+    };
+    run(false);
+    run(true);
+}
+
+void test_checkpoint_kv_only_offload_lifecycle() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 81, make_base(81), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.required_pressure_actions        = 1;
+    program.transfer_observations_to_publish = {ContextTransferObservation{
+        .resource   = ninfer::runtime::ContextResourceClass::MainKV,
+        .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+        .units      = 4096,
+        .page_count = 1,
+        .work       = ninfer::TransferWork{.payload_bytes = 4096, .copy_operations = 1},
+        .elapsed_ns = 13,
+    }};
+    auto pressure = manager.inspect(program, FakePreparedPrompt{82}, make_base(82), 2);
+    require(pressure.choice.has_value(), "KV-only lifecycle fixture found no pressure plan");
+    const LaneId pressure_lane = pressure.choice->destination();
+    require(manager.reserve_materialization(program, std::move(*pressure.choice),
+                                            FakePreparedPrompt{82}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "KV-only lifecycle fixture could not reserve pressure materialization");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    const auto offloaded =
+        std::find_if(outcome.lifecycle.begin(), outcome.lifecycle.end(), [](const auto& fact) {
+            return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded;
+        });
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation &&
+                offloaded != outcome.lifecycle.end() && offloaded->key_digests[0] == 81 &&
+                offloaded->frontier == 16 && offloaded->state_images == 1 &&
+                offloaded->main_kv_pages == 1 && offloaded->backend_kv_pages == 0 &&
+                ninfer::summarize_checkpoint_lifecycle(outcome.lifecycle).offload_committed,
+            "KV-only pressure did not publish exact attributable pages and summary");
+    auto activation                            = std::move(*outcome.activation);
+    const FakeSequenceHandle pressure_sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+    (void)manager.abort(program, pressure_lane, pressure_sequence);
 }
 
 void test_private_portfolio_loss_keeps_checkpoint_identity_fixed() {
@@ -2591,7 +2792,7 @@ void test_dominating_identity_does_not_build_pressure_graph() {
 }
 
 FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
-                               std::uint32_t frontier = 16) {
+                               std::uint32_t frontier) {
     program.finish_frontier = frontier;
     manager.mark_terminal_pending(request.lane);
     return manager.finish(program, request.lane, request.sequence);
@@ -2607,6 +2808,13 @@ void test_root_lifecycle_and_prefix_reuse() {
     require(finish.status == ConsumeStatus::Consumed &&
                 finish.disposition == FinishDisposition::Catalogued,
             "terminal continuation was not catalogued");
+    require(finish.lifecycle.size() == 1 &&
+                finish.lifecycle.front().operation ==
+                    ninfer::CheckpointLifecycleOperation::Created &&
+                finish.lifecycle.front().status == ninfer::CheckpointLifecycleStatus::Committed &&
+                finish.lifecycle.front().role == ninfer::CheckpointLifecycleRole::SessionEndpoint &&
+                finish.lifecycle.front().frontier == 16,
+            "terminal retention did not publish its created endpoint fact");
     require(manager.lane_state(first.lane) == ninfer::runtime::LogicalLaneState::Free,
             "terminal lane did not return to Free");
 
@@ -2660,6 +2868,8 @@ void test_materialization_abort_preserves_source() {
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation,
             "cancelled materialization did not abort before publication");
+    require(outcome.lifecycle.empty(),
+            "aborted materialization fabricated a committed checkpoint lifecycle event");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
             "aborted Move did not restore its source visibility");
 
@@ -2672,6 +2882,46 @@ void test_materialization_abort_preserves_source() {
                                           {});
     require(program.started_source_id == seed.sequence.id,
             "abort restored the wrong source capability");
+}
+
+void test_aborted_pressure_transfer_reports_exact_uncommitted_offload() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 6, make_base(6), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.required_pressure_actions        = 1;
+    program.abort_progress                   = true;
+    program.transfer_observations_to_publish = {
+        ContextTransferObservation{
+            .resource   = ninfer::runtime::ContextResourceClass::State,
+            .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .units      = 1,
+            .work       = ninfer::TransferWork{.payload_bytes = 1024, .copy_operations = 1},
+            .elapsed_ns = 23,
+        },
+    };
+    auto inspection = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    require(inspection.choice.has_value(), "aborted offload fixture found no pressure plan");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{7}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "aborted offload fixture could not reserve materialization");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation &&
+                outcome.lifecycle.size() == 1,
+            "aborted pressure transfer did not settle exactly one lifecycle attempt");
+    const auto& fact = outcome.lifecycle.front();
+    require(fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded &&
+                fact.source_tier == ninfer::CheckpointLifecycleTier::Device &&
+                fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                fact.status == ninfer::CheckpointLifecycleStatus::Aborted &&
+                fact.key_digests[0] == 6 && fact.frontier == 16 && fact.state_images == 1 &&
+                fact.main_kv_pages == 1 && fact.backend_kv_pages == 0,
+            "aborted pressure transfer fabricated a commit or lost checkpoint identity/quantity");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "aborted pressure transfer did not restore its exact source owner");
 }
 
 void test_committed_victim_survives_transaction_abort() {
@@ -2693,6 +2943,13 @@ void test_committed_victim_survives_transaction_abort() {
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Aborted,
             "pressure transaction did not take the abort path");
+    require(std::any_of(outcome.lifecycle.begin(), outcome.lifecycle.end(),
+                        [](const auto& fact) {
+                            return fact.operation ==
+                                       ninfer::CheckpointLifecycleOperation::Evicted &&
+                                   fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                        }),
+            "committed victim eviction was absent from lifecycle facts");
     const std::uint32_t catalogued =
         (manager.catalog_state(0) == FakeManager::CatalogState::Catalogued ? 1U : 0U) +
         (manager.catalog_state(1) == FakeManager::CatalogState::Catalogued ? 1U : 0U);
@@ -3198,6 +3455,15 @@ void test_in_progress_adoption_and_private_capture() {
     require(outcome.status == ContextTransactionStatus::Published &&
                 !manager.context_transaction_kind(),
             "private capture was not adopted to a stable logical state");
+    require(outcome.lifecycle.size() == 2 &&
+                std::all_of(
+                    outcome.lifecycle.begin(), outcome.lifecycle.end(),
+                    [](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Created &&
+                               fact.status == ninfer::CheckpointLifecycleStatus::Committed &&
+                               fact.destination_tier == ninfer::CheckpointLifecycleTier::Device;
+                    }),
+            "private checkpoint creation facts were not published at capture adoption");
     require(manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
             "private capture disturbed active lane ownership");
     (void)finish_active(manager, program, active, 24);
@@ -4099,8 +4365,13 @@ int main() {
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("State transfer physical byte accounting",
              test_state_transfer_stats_report_physical_bytes_not_image_units);
+    run_test("Device and Host checkpoint reuse lifecycle",
+             test_checkpoint_reuse_lifecycle_distinguishes_device_and_host);
+    run_test("KV-only checkpoint offload lifecycle", test_checkpoint_kv_only_offload_lifecycle);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
+    run_test("aborted pressure transfer lifecycle",
+             test_aborted_pressure_transfer_reports_exact_uncommitted_offload);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
     run_test("eviction observer reservation ordering",
              test_eviction_observer_runs_after_physical_reservation);

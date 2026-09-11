@@ -32,6 +32,9 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // Moves the optional Frontend-rendered prompt out before submission. Empty means capture was
+    // not requested; the Engine never reconstructs prompt semantics from token IDs.
+    [[nodiscard]] std::string take_rendered_text();
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -59,10 +62,17 @@ public:
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
+    // If wait() propagates an exception raised outside the Engine's RequestError contract (for
+    // example, an OutputSink transport failure), the request is still settled before the
+    // exception escapes. This moves the immutable checkpoint facts committed before settlement;
+    // it is empty for failures that already carry facts in RequestError.
+    [[nodiscard]] std::vector<CheckpointLifecycleFact> take_failure_checkpoint_lifecycle() noexcept;
+
 private:
     class Impl;
     explicit GenerationHandle(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
+    std::vector<CheckpointLifecycleFact> failure_checkpoint_lifecycle_;
 
     friend class Engine;
 };

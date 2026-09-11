@@ -747,12 +747,11 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     EncodedChat encoded;
     std::vector<std::size_t> byte_boundaries;
-    byte_boundaries.reserve((rendered.rewrite_checkpoint ? 1U : 0U) +
-                            rendered.rewrite_execution_boundaries.size() +
-                            rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
-                            rendered.structural_boundaries.size() +
-                            (rendered.first_volatile_offset ? 1U : 0U) +
-                            rendered.media_token_runs.size() * 2U);
+    byte_boundaries.reserve(
+        (rendered.rewrite_checkpoint ? 1U : 0U) + rendered.rewrite_execution_boundaries.size() +
+        rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
+        rendered.structural_boundaries.size() + (rendered.first_volatile_offset ? 1U : 0U) +
+        rendered.media_token_runs.size() * 2U);
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
     }
@@ -767,7 +766,9 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     for (const RenderedChat::StructuralBoundary& boundary : rendered.structural_boundaries) {
         byte_boundaries.push_back(boundary.offset);
     }
-    if (rendered.first_volatile_offset) { byte_boundaries.push_back(*rendered.first_volatile_offset); }
+    if (rendered.first_volatile_offset) {
+        byte_boundaries.push_back(*rendered.first_volatile_offset);
+    }
     for (const MediaTokenRunByteSpec& run : rendered.media_token_runs) {
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
@@ -834,10 +835,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
         encoded.structural_boundaries.push_back(EncodedChat::StructuralBoundary{
             .frontier = boundary.exact_frontier
-                            ? std::optional<std::uint32_t>(to_frontier(*boundary.exact_frontier,
-                                                                        "structural boundary"))
+                            ? std::optional<std::uint32_t>(
+                                  to_frontier(*boundary.exact_frontier, "structural boundary"))
                             : std::nullopt,
-            .origins = source.origins});
+            .origins  = source.origins});
     }
     if (rendered.first_volatile_offset) {
         const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
@@ -940,6 +941,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
     const std::size_t media_bytes      = validate_media_inputs(parts, options_);
+    const bool capture_rendered_text   = render_options.capture_rendered_text;
     RenderedChat rendered              = chat_template_.render(messages, std::move(render_options));
     const std::size_t encode_limit =
         maximum_prompt_tokens == std::numeric_limits<std::size_t>::max()
@@ -1092,7 +1094,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                              "prepared prompt exceeds Engine max_context " +
                                  std::to_string(maximum_prompt_tokens));
     }
-    output.input_ids                   = std::move(encoded.input_ids);
+    output.input_ids = std::move(encoded.input_ids);
+    if (capture_rendered_text) { output.rendered_text = std::move(rendered.text); }
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);

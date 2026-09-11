@@ -81,7 +81,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
-           "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
+           "[--request-log-jsonl FILE] [--request-log-content-dir DIR] "
+           "[--slot-save-path DIR] [--auto-save-evicted] "
            "[--shared-prefix-cache-dir DIR] [--shared-prefix-cache-max-records N] "
            "[--shared-prefix-cache-max-mib N] [--shared-prefix-cache-staging-mib N] "
            "[--shared-prefix-cache-workers N] [--shared-prefix-cache-jobs N] "
@@ -102,6 +103,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-content-dir atomically persists sensitive model-visible prompts "
+           "and final responses as Markdown (requires --request-log-jsonl); operators own "
+           "directory permissions, retention and rotation\n"
            "       --slot-save-path enables llama.cpp-style session persistence: POST "
            "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
            "slot's resident session to or from DIR (disabled when omitted)\n"
@@ -285,6 +289,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--request-log-content-dir") {
+            options.request_log_content_dir = require_value("--request-log-content-dir");
+            if (options.request_log_content_dir.empty()) {
+                throw std::invalid_argument("--request-log-content-dir must not be empty");
+            }
         } else if (arg == "--slot-save-path") {
             options.slot_save_path = require_value("--slot-save-path");
             if (options.slot_save_path.empty()) {
@@ -418,6 +427,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.auto_save_evicted && options.slot_save_path.empty()) {
         throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
+    }
+    if (!options.request_log_content_dir.empty() && options.request_log_jsonl.empty()) {
+        throw std::invalid_argument("--request-log-content-dir requires --request-log-jsonl");
     }
     if (!options.allow_prefix_reuse) {
         if (!options.shared_prefix_cache_dir.empty()) {

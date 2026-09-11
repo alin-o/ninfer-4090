@@ -892,7 +892,41 @@ is also rejected if it resolves to the model artifact.
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.
 
-Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
+### Sensitive prompt/response capture
+
+`--request-log-content-dir DIR` is a separate, explicit opt-in and is rejected unless
+`--request-log-jsonl` is also enabled. The server creates `DIR` when necessary and verifies that it
+is a writable directory before readiness. **Enabling this option persists sensitive user text,
+assistant text, reasoning, and tool arguments/results. Operators are responsible for restrictive
+directory permissions, access control, retention, backup policy, and rotation.** NInfer does not
+rotate or delete these files.
+
+Each accepted request uses the collision-free suffix
+`{server_instance_id}-request-{request_id}` and atomically publishes the pair
+`prompt{suffix}.md` and `response{suffix}.md`. The prompt file begins with the exact
+Frontend-rendered, model-visible text; it is not the HTTP JSON body. For multimodal requests, a
+trailing Markdown appendix identifies each item only by image/video kind, sanitized media type,
+decoded byte count, and SHA-256 digest. Media URLs, signed query strings, data URIs, base64
+payloads, authorization/cookie headers, and original binary media are never copied into the
+capture. The model-visible image/video control tokens remain in the rendered prompt. The response
+Markdown has explicit reasoning/thinking, assistant-content, and tool-call sections with byte
+counts and collision-safe fences. It is built from the final logical `GenerationOutcome`, so
+streaming and non-streaming requests produce the same representation rather than recording
+transport chunks.
+
+Files are written to a temporary sibling and renamed only after a complete flush. A write failure
+does not fail inference. Instead, the corresponding JSONL `content_files.prompt` or
+`content_files.response` object reports `status: "failed"`, a stable `error_class`, and null file,
+byte, and digest fields; generation failure reports the response as `not_available`. A successful
+entry contains only the relative filename, byte count, and SHA-256 digest. No captured body is
+embedded in JSONL or operational stderr. When the option is absent, `content_files` is absent and
+the existing content-free behavior is unchanged.
+Production publication renders and hashes bounded fragments directly from the Frontend and final
+outcome buffers; it does not construct a second request-sized Markdown string. Formatting,
+hashing, write, flush, and rename failures all remain inside the capture failure classification,
+so they cannot suppress the request's terminal record.
+
+Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request records also carry the wire `response_id`, which permits
 completion-order-independent correlation with protocol clients. Request-start records include
@@ -902,11 +936,43 @@ payload-size fields; they do not infer request behavior from process-global coun
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, exact generated token IDs, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
-| `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
+| `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, boundary-consistent KV capacity/used/free, and optional prompt-file publication metadata |
+| `request_rejected` | parsed request shape and response identity, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, the exact HTTP status/type/code/parameter/message, and any lifecycle-derived checkpoint summary for a synchronous preparation rejection |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, exact generated token IDs, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, complete speculative-decoding counters, terminal KV capacity/used/free, and optional response-file metadata |
+| `request_error` | the resolved request configuration, generation/cancellation/pre-outcome transport terminal message, lifecycle-derived checkpoint summary, terminal KV capacity/used/free, and optional content-file status |
+| `checkpoint_lifecycle` | stable checkpoint key/content digest and frontier, role/scope, operation/status, source/destination tier, exact State/Main/backend-KV quantities, measured elapsed nanoseconds when available, request/response correlation or explicit null background correlation, and a boundary-coherent KV snapshot |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
+
+Checkpoint lifecycle operations are `created`, `loaded`, `restored`, `offloaded`, `persisted`, and
+`evicted`; tiers are `device`, `host`, `ssd`, and `none`. Status is `committed`, `failed`, or
+`aborted`. ResourceManager emits Device/Host facts only after validated transaction adoption,
+Engine carries attributable facts with the owning request, and the Gateway emits asynchronous SSD
+publication facts with null request/response IDs. A committed fact means that operation crossed its
+own publication boundary; partial or cancelled work is never promoted to committed. `state.images`
+counts StateImage objects and `state.bytes` uses the Program-published, per-image physical transfer
+layout (linear State plus continuation-hidden and optional DFlash components), never the complete
+multi-slot linear State pool. Main and
+backend KV report pages separately and derive bytes from their distinct Program-published page
+sizes. For a partial KV-only offload, committed per-owner page ranges establish that the identified
+checkpoint changed tier even when its State residency does not change; the record's quantities
+continue to describe that checkpoint's complete recovery footprint. `serialized_bytes` is
+meaningful for SSD records.
+
+If streaming transport fails before the initial event is published, or the registered content
+provider is never entered, the Gateway cancels and settles the already-submitted Engine request
+before writing its original transport/render terminal. Checkpoint facts committed during durable
+adoption or Engine settlement therefore remain attached to that request error.
+
+`request_done.checkpoint_summary` and the corresponding error/rejection summaries are compact views
+derived from those immutable facts: whether reuse selected a checkpoint, whether a Host/SSD restore
+committed, and how many request captures or offloads committed or aborted. They are not computed
+from global throughput counter deltas.
+
+Request-start, request-terminal, and checkpoint lifecycle `kv_capacity` objects use authoritative
+physical pool/store values. Device Main and backend pools each report capacity/used/free in pages
+and bytes; Host KV reports capacity/used/free bytes. Free values saturate at zero if an observed
+used value exceeds capacity. Shared aliases do not add occupancy, and CUDA's general free-memory
+value is not treated as KV capacity.
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
 `resolved_reasoning_effort` is `none`, a native effort tier, or `null` when thinking is enabled but
@@ -939,7 +1005,7 @@ round count; `units` reports its prefill/control unit counts. In a compact batch
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
 
-The JSONL file contains no generated response text and never records an API-key value; `argv`
+The JSONL file contains no prompt, generated response, reasoning, or tool text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the
 aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
 request ID when they enter synchronous preparation. Successful preparation produces
@@ -949,6 +1015,13 @@ returns its outcome, or `request_error` when generation fails before an outcome 
 response rendering, Responses storage, or terminal transport failures are operational response
 events only and do not add a second JSONL terminal. Schema/model validation rejections before
 preparation and token-count-only calls are not measurement requests and do not receive request IDs.
+
+The `kv_capacity` object on accepted-request start and terminal records is one Program-boundary
+snapshot, not a sample of CUDA's general free-memory counter. `device.main` and `device.backend`
+each report `capacity_pages`, `used_pages`, `free_pages`, `page_bytes`, and corresponding byte
+values. Host KV reports capacity/used/free bytes. Used values come from the physical page pools and
+Host KV arena, including reservations; shared aliases are therefore not double-counted. Free is
+saturated at zero if a defensive snapshot ever observes used above capacity.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts

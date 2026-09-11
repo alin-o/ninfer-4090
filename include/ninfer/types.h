@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -395,6 +397,9 @@ struct PromptOptions {
     std::optional<ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
     bool add_vision_id     = false;
+    // Frontend retains its exact rendered/model-visible text only for an explicitly enabled
+    // product capture path. It remains absent for normal Engine callers.
+    bool capture_rendered_text = false;
     std::vector<std::string> tool_jsons;
 };
 
@@ -499,15 +504,95 @@ enum class RequestErrorKind : std::uint8_t {
     Unavailable,
 };
 
+enum class CheckpointLifecycleOperation : std::uint8_t {
+    Created,
+    Loaded,
+    Restored,
+    Offloaded,
+    Persisted,
+    Evicted,
+};
+
+enum class CheckpointLifecycleTier : std::uint8_t {
+    None,
+    Device,
+    Host,
+    Ssd,
+};
+
+enum class CheckpointLifecycleStatus : std::uint8_t {
+    Committed,
+    Failed,
+    Aborted,
+};
+
+enum class CheckpointLifecycleRole : std::uint8_t {
+    SessionEndpoint,
+    TurnClosure,
+    ResponseReplay,
+    SharedStablePrefix,
+    LongAnchor,
+};
+
+enum class CheckpointLifecycleScope : std::uint8_t {
+    Private,
+    Shared,
+};
+
+struct CheckpointKvCapacitySnapshot {
+    std::uint32_t device_main_capacity_pages    = 0;
+    std::uint32_t device_main_used_pages        = 0;
+    std::uint64_t device_main_page_bytes        = 0;
+    std::uint32_t device_backend_capacity_pages = 0;
+    std::uint32_t device_backend_used_pages     = 0;
+    std::uint64_t device_backend_page_bytes     = 0;
+    std::uint64_t state_image_bytes             = 0;
+    std::uint64_t host_main_page_bytes          = 0;
+    std::uint64_t host_backend_page_bytes       = 0;
+    std::uint64_t host_capacity_bytes           = 0;
+    std::uint64_t host_used_bytes               = 0;
+};
+
+// One immutable fact emitted only after the owning physical/logical boundary has settled. The
+// digest pair is the target's stable semantic shortlist key; durable SSD records additionally use
+// content_digest. Resource quantities describe this checkpoint, not process-global deltas.
+struct CheckpointLifecycleFact {
+    std::array<std::uint64_t, 2> key_digests{};
+    std::string content_digest;
+    std::uint32_t frontier                   = 0;
+    std::uint32_t identity_tag               = 0;
+    std::uint32_t ordinal                    = 0;
+    CheckpointLifecycleRole role             = CheckpointLifecycleRole::SessionEndpoint;
+    CheckpointLifecycleScope scope           = CheckpointLifecycleScope::Private;
+    CheckpointLifecycleOperation operation   = CheckpointLifecycleOperation::Created;
+    CheckpointLifecycleTier source_tier      = CheckpointLifecycleTier::None;
+    CheckpointLifecycleTier destination_tier = CheckpointLifecycleTier::None;
+    CheckpointLifecycleStatus status         = CheckpointLifecycleStatus::Committed;
+    std::uint32_t state_images               = 0;
+    std::uint32_t main_kv_pages              = 0;
+    std::uint32_t backend_kv_pages           = 0;
+    std::uint64_t serialized_bytes           = 0;
+    std::optional<std::uint64_t> elapsed_ns;
+    std::optional<CheckpointKvCapacitySnapshot> kv_snapshot;
+};
+
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message,
+                 std::vector<CheckpointLifecycleFact> checkpoint_lifecycle = {})
+        : std::invalid_argument(std::move(message)), kind_(kind),
+          checkpoint_lifecycle_(std::move(checkpoint_lifecycle)) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    [[nodiscard]] const std::vector<CheckpointLifecycleFact>&
+    checkpoint_lifecycle() const noexcept {
+        return checkpoint_lifecycle_;
+    }
+
 private:
     RequestErrorKind kind_;
+    std::vector<CheckpointLifecycleFact> checkpoint_lifecycle_;
 };
 
 struct PromptSummary {
@@ -657,6 +742,51 @@ struct ThinkingBudgetStats {
     bool applied                  = false;
 };
 
+// Immutable request-correlated checkpoint facts published by Engine transaction boundaries.
+// They deliberately contain no sampled process-global deltas.
+struct RequestCheckpointSummary {
+    bool reuse_loaded               = false;
+    bool restore_committed          = false;
+    bool offload_committed          = false;
+    std::uint32_t created_committed = 0;
+    std::uint32_t capture_aborted   = 0;
+};
+
+[[nodiscard]] inline RequestCheckpointSummary
+summarize_checkpoint_lifecycle(std::span<const CheckpointLifecycleFact> facts) noexcept {
+    RequestCheckpointSummary summary;
+    for (const CheckpointLifecycleFact& fact : facts) {
+        if (fact.status == CheckpointLifecycleStatus::Committed) {
+            switch (fact.operation) {
+            case CheckpointLifecycleOperation::Loaded:
+                summary.reuse_loaded = true;
+                break;
+            case CheckpointLifecycleOperation::Restored:
+                summary.reuse_loaded      = true;
+                summary.restore_committed = true;
+                break;
+            case CheckpointLifecycleOperation::Created:
+                if (summary.created_committed != std::numeric_limits<std::uint32_t>::max()) {
+                    ++summary.created_committed;
+                }
+                break;
+            case CheckpointLifecycleOperation::Offloaded:
+                summary.offload_committed = true;
+                break;
+            case CheckpointLifecycleOperation::Persisted:
+            case CheckpointLifecycleOperation::Evicted:
+                break;
+            }
+        } else if (fact.status == CheckpointLifecycleStatus::Aborted &&
+                   (fact.operation == CheckpointLifecycleOperation::Created ||
+                    fact.operation == CheckpointLifecycleOperation::Offloaded) &&
+                   summary.capture_aborted != std::numeric_limits<std::uint32_t>::max()) {
+            ++summary.capture_aborted;
+        }
+    }
+    return summary;
+}
+
 enum class PrefixReusePath : std::uint8_t {
     Root,
     PrivateEndpoint,
@@ -762,6 +892,8 @@ struct GenerationResult {
     std::int32_t slot = -1;
     std::string session_digest;
     ThinkingBudgetStats thinking;
+    RequestCheckpointSummary checkpoints;
+    std::vector<CheckpointLifecycleFact> checkpoint_lifecycle;
 };
 
 struct ArenaMemorySummary {
@@ -808,12 +940,24 @@ struct MemorySummary {
     std::size_t text_kv_bytes                     = 0;
     std::size_t mtp_kv_bytes                      = 0;
     std::size_t gdn_state_bytes                   = 0;
-    std::size_t dflash_kv_bytes                   = 0;
-    std::size_t replay_records_bytes              = 0;
-    std::uint32_t host_state_capacity_slots       = 0;
-    std::uint32_t host_state_occupied_slots       = 0;
-    std::size_t host_kv_capacity_bytes            = 0;
-    std::size_t host_kv_occupied_bytes            = 0;
+    // One complete checkpoint StateImage in the authoritative physical transfer layout. Unlike
+    // gdn_state_bytes, this includes continuation-hidden and optional DFlash components and is
+    // not multiplied by the number of Device slots.
+    std::size_t checkpoint_state_image_bytes       = 0;
+    std::size_t dflash_kv_bytes                    = 0;
+    std::size_t replay_records_bytes               = 0;
+    std::uint32_t device_main_kv_capacity_pages    = 0;
+    std::uint32_t device_main_kv_occupied_pages    = 0;
+    std::size_t device_main_kv_page_bytes          = 0;
+    std::uint32_t device_backend_kv_capacity_pages = 0;
+    std::uint32_t device_backend_kv_occupied_pages = 0;
+    std::size_t device_backend_kv_page_bytes       = 0;
+    std::uint32_t host_state_capacity_slots        = 0;
+    std::uint32_t host_state_occupied_slots        = 0;
+    std::size_t host_main_kv_page_bytes            = 0;
+    std::size_t host_backend_kv_page_bytes         = 0;
+    std::size_t host_kv_capacity_bytes             = 0;
+    std::size_t host_kv_occupied_bytes             = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

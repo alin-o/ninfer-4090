@@ -290,7 +290,8 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     ninfer::product::media_acquire::Source source;
     source.value = std::move(url);
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind       = ninfer::product::media_acquire::SourceKind::Data;
+        source.media_type = ninfer::product::media_acquire::data_uri_media_type(source.value);
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
         source.kind = ninfer::product::media_acquire::SourceKind::Url;
     } else {

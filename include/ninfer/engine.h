@@ -32,6 +32,9 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // Moves the optional Frontend-rendered prompt out before submission. Empty means capture was
+    // not requested; the Engine never reconstructs prompt semantics from token IDs.
+    [[nodiscard]] std::string take_rendered_text();
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

@@ -29,6 +29,7 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    std::vector<ninfer::CheckpointLifecycleFact> checkpoint_lifecycle;
 };
 
 class ApiException : public std::runtime_error {

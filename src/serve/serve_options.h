@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,6 +27,7 @@ struct ServeOptions {
     std::string api_key;                           // empty => no auth
     std::optional<std::string> model_id_override;  // unset => artifact identity.model_id
     std::string request_log_jsonl;                 // empty => structured request logging disabled
+    std::filesystem::path request_log_content_dir; // empty => prompt/response capture disabled
     std::string slot_save_path;                    // empty => /slots save/restore/erase disabled
     std::filesystem::path shared_prefix_cache_dir; // empty => durable shared catalog disabled
     std::uint32_t shared_prefix_cache_max_records   = 16;

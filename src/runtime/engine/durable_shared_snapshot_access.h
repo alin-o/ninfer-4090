@@ -32,6 +32,7 @@ struct DurableSharedSnapshotAccess {
         std::uint32_t frontier               = 0;
         std::uint64_t validation_nanoseconds = 0;
         std::uint64_t adoption_nanoseconds   = 0;
+        CheckpointLifecycleFact checkpoint;
     };
 
     enum class RecoverySource : std::uint8_t {

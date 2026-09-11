@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace spdlog {
@@ -20,7 +21,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 20;
+inline constexpr int kRequestLogSchemaVersion        = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -56,8 +57,16 @@ std::string format_request_done_json(const std::string& server_instance_id,
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
+std::string format_checkpoint_lifecycle_json(const std::string& server_instance_id,
+                                             std::uint64_t timestamp_unix_ms,
+                                             const RequestLogContext& context,
+                                             const ninfer::CheckpointLifecycleFact& fact);
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
+// Protocol-neutral final assistant representation used by both streaming and aggregate paths.
+std::string format_response_markdown(const GenerationOutcome& outcome);
+std::string format_prompt_markdown(std::string_view rendered_prompt,
+                                   std::span<const CapturedMediaMetadata> media);
 
 ServerLogEnvironment query_server_log_environment(int device);
 
@@ -67,7 +76,8 @@ class JsonlRequestLog {
 public:
     explicit JsonlRequestLog(const std::string& path,
                              const std::string& protected_artifact_path = {},
-                             std::shared_ptr<spdlog::logger> logger     = {});
+                             std::shared_ptr<spdlog::logger> logger     = {},
+                             const std::filesystem::path& content_dir   = {});
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
@@ -83,17 +93,24 @@ public:
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
                             const ninfer::MemorySummary& memory);
-    void write_request_start(const RequestLogContext& context);
+    void write_request_start(RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
+    void write_checkpoint_lifecycle(const ninfer::CheckpointLifecycleFact& fact,
+                                    std::optional<KvCapacitySnapshot> snapshot = std::nullopt);
+    void write_checkpoint_lifecycle(const RequestLogContext& context,
+                                    const ninfer::CheckpointLifecycleFact& fact);
     void write_throughput(const ThroughputReport& report);
 
 private:
+    RequestLogContext::ContentFile write_content(std::string_view prefix, std::uint64_t request_id,
+                                                 std::string_view content) noexcept;
     void append(std::string record);
 
     std::string path_;
     std::string server_instance_id_;
+    std::filesystem::path content_dir_;
     std::ofstream output_;
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;

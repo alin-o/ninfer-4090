@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/durable_shared_prefix_catalog.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include "product/media_acquire/acquire.h"
 #include <spdlog/logger.h>
@@ -42,8 +43,9 @@ struct RequestLifetime {
 
 ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
-    error.param   = "messages";
-    error.message = exception.what();
+    error.param                = "messages";
+    error.message              = exception.what();
+    error.checkpoint_lifecycle = exception.checkpoint_lifecycle();
     switch (exception.kind()) {
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
@@ -352,8 +354,18 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
+                ninfer::OwnedMedia media = acquire_media(part, prepared.lifetime->deadline,
+                                                         is_cancelled, remaining_media_bytes);
+                if (!options_.request_log_content_dir.empty()) {
+                    prepared.captured_media.push_back(CapturedMediaMetadata{
+                        .kind       = media.kind,
+                        .media_type = media.media_type,
+                        .bytes      = media.bytes.size(),
+                        .sha256     = ninfer::targets::qwen3_6::frontend_internal::sha256_hex(
+                            ninfer::targets::qwen3_6::frontend_internal::sha256(media.bytes)),
+                    });
+                }
+                return media;
             });
         std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
         const bool protocol_allows_engine_automatic =
@@ -370,8 +382,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         // A disabled request still cannot publish or reuse a checkpoint, but retaining these
         // structural frontiers keeps its recurrent-State chunk decomposition identical to the
         // cache-participating cold producer used for exact continuation comparisons.
-        input.context_cache.automatic_private_anchors =
-            automatic_private_execution_frontiers_;
+        input.context_cache.automatic_private_anchors = automatic_private_execution_frontiers_;
+        input.options.capture_rendered_text           = !options_.request_log_content_dir.empty();
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -385,14 +397,22 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             const DurableSharedPrefixRestore restore =
                 durable_catalog_->restore_matching(*engine_, prompt, prepared.lifetime->deadline,
                                                    control.cancellation, request_options);
-            prepared.durable_restore_frontier = restore.frontier;
-            prepared.durable_loaded_from_ssd  = restore.loaded_from_ssd;
-            prepared.durable_warm_available   = restore.warm_available;
-            prepared.durable_fallback_reason  = restore.fallback_reason;
+            prepared.durable_restore_frontier   = restore.frontier;
+            prepared.durable_restore_digest     = restore.content_digest;
+            prepared.durable_restore_bytes      = restore.serialized_bytes;
+            prepared.durable_restore_elapsed_ns = restore.elapsed_ns;
+            prepared.durable_lifecycle          = restore.lifecycle;
+            prepared.durable_loaded_from_ssd    = restore.loaded_from_ssd;
+            prepared.durable_warm_available     = restore.warm_available;
+            prepared.durable_fallback_reason    = restore.fallback_reason;
             check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
+        if (!options_.request_log_content_dir.empty()) {
+            prepared.rendered_prompt =
+                std::make_shared<const std::string>(prompt.take_rendered_text());
+        }
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
@@ -462,25 +482,33 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
     if (durable_catalog_) {
         durable_catalog_->observe_hit(
-            DurableSharedPrefixRestore{.frontier        = prepared.durable_restore_frontier,
-                                       .loaded_from_ssd = prepared.durable_loaded_from_ssd,
-                                       .warm_available  = prepared.durable_warm_available,
-                                       .fallback_reason = prepared.durable_fallback_reason},
+            DurableSharedPrefixRestore{.frontier         = prepared.durable_restore_frontier,
+                                       .content_digest   = prepared.durable_restore_digest,
+                                       .serialized_bytes = prepared.durable_restore_bytes,
+                                       .elapsed_ns       = prepared.durable_restore_elapsed_ns,
+                                       .loaded_from_ssd  = prepared.durable_loaded_from_ssd,
+                                       .warm_available   = prepared.durable_warm_available,
+                                       .fallback_reason  = prepared.durable_fallback_reason},
             result.reused_prompt_tokens, result.prefix_reuse_path);
         durable_catalog_->schedule_exports(*engine_);
     }
     GenerationOutcome outcome;
-    outcome.text                = std::move(result.content);
-    outcome.reasoning           = std::move(result.reasoning);
-    outcome.generated_token_ids = std::move(result.generated_token_ids);
-    outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens   = static_cast<int>(outcome.generated_token_ids.size());
-    outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
-    outcome.thinking            = result.thinking;
-    outcome.finish_reason       = result.finish_reason;
-    outcome.matched_stop_string = std::move(result.matched_stop_string);
-    outcome.id_slot             = result.slot;
-    outcome.session_digest      = std::move(result.session_digest);
+    outcome.text                 = std::move(result.content);
+    outcome.reasoning            = std::move(result.reasoning);
+    outcome.generated_token_ids  = std::move(result.generated_token_ids);
+    outcome.prompt_tokens        = static_cast<int>(result.prompt.prompt_tokens);
+    outcome.completion_tokens    = static_cast<int>(outcome.generated_token_ids.size());
+    outcome.reasoning_tokens     = static_cast<int>(result.reasoning_tokens);
+    outcome.thinking             = result.thinking;
+    outcome.finish_reason        = result.finish_reason;
+    outcome.matched_stop_string  = std::move(result.matched_stop_string);
+    outcome.id_slot              = result.slot;
+    outcome.session_digest       = std::move(result.session_digest);
+    outcome.checkpoints          = result.checkpoints;
+    outcome.checkpoint_lifecycle = std::move(result.checkpoint_lifecycle);
+    outcome.checkpoint_lifecycle.insert(outcome.checkpoint_lifecycle.end(),
+                                        std::make_move_iterator(prepared.durable_lifecycle.begin()),
+                                        std::make_move_iterator(prepared.durable_lifecycle.end()));
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =
@@ -492,14 +520,18 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
-    outcome.metrics.engine_timing               = result.engine_timing;
-    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
-    outcome.metrics.materialization             = result.materialization;
-    outcome.metrics.durable_restore_frontier    = prepared.durable_restore_frontier;
-    outcome.metrics.durable_loaded_from_ssd     = prepared.durable_loaded_from_ssd;
-    outcome.metrics.durable_warm_available      = prepared.durable_warm_available;
-    outcome.metrics.durable_fallback_reason     = prepared.durable_fallback_reason;
+    outcome.metrics.engine_timing            = result.engine_timing;
+    outcome.metrics.prefix_cache_hit_tokens  = result.reused_prompt_tokens;
+    outcome.metrics.prefix_reuse_path        = result.prefix_reuse_path;
+    outcome.metrics.materialization          = result.materialization;
+    outcome.metrics.durable_restore_frontier = prepared.durable_restore_frontier;
+    outcome.metrics.durable_loaded_from_ssd  = prepared.durable_loaded_from_ssd;
+    outcome.metrics.durable_warm_available   = prepared.durable_warm_available;
+    outcome.metrics.durable_fallback_reason  = prepared.durable_fallback_reason;
+    if (prepared.durable_loaded_from_ssd) {
+        outcome.checkpoints.reuse_loaded      = true;
+        outcome.checkpoints.restore_committed = true;
+    }
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;
@@ -540,6 +572,11 @@ ninfer::RuntimeStats GenerationService::runtime_stats() const {
     result.shared_ssd_unpublished_records         = durable.unpublished_records;
     result.shared_ssd_unpublished_bytes           = durable.unpublished_bytes;
     return result;
+}
+
+void GenerationService::set_checkpoint_lifecycle_observer(
+    std::function<void(const ninfer::CheckpointLifecycleFact&)> observer) {
+    if (durable_catalog_) { durable_catalog_->set_lifecycle_observer(std::move(observer)); }
 }
 
 void GenerationService::warmup() {

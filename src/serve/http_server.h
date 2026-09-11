@@ -91,10 +91,10 @@ private:
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
 
-    void record_request_start(const RequestLogContext& context);
+    void record_request_start(RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);
-    void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
-    void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
+    void record_request_done(RequestLogContext& context, const GenerationOutcome& outcome);
+    void record_request_failure(RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();

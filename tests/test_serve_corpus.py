@@ -52,10 +52,10 @@ TIERED_PREDECESSOR_CALIBRATION = Path(
 )
 
 
-def test_request_log_v20_identity_is_accepted() -> None:
+def test_request_log_v21_identity_is_accepted() -> None:
     current = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 20,
+        "schema_version": 21,
         "event": "server_start",
     }
     require_server_log_identity(current, "server_start")
@@ -88,7 +88,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
         "artifact_type": "ninfer_serve_request_log",
-        "schema_version": 20,
+        "schema_version": 21,
         "event": "request_done",
         "request": {
             "model": spec.model_id,
@@ -339,7 +339,7 @@ def test_tiered_cache_concurrent_events_join_by_response_identity(tmp_path: Path
     path = tmp_path / "requests.jsonl"
     events = [
         {
-            "schema_version": 20,
+            "schema_version": 21,
             "event": "request_done",
             "request": {"request_id": request_id, "response_id": response_id},
         }
@@ -347,7 +347,7 @@ def test_tiered_cache_concurrent_events_join_by_response_identity(tmp_path: Path
     ]
     path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     joined = done_by_response_id(
-        path, 0, ["response-a", "response-b"], 0.1, allowed_schemas=(20,)
+        path, 0, ["response-a", "response-b"], 0.1, allowed_schemas=(21,)
     )
     assert joined["response-a"]["request"]["request_id"] == 1
     assert joined["response-b"]["request"]["request_id"] == 2

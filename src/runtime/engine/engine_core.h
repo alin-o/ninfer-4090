@@ -24,6 +24,7 @@
 #include <deque>
 #include <exception>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -281,6 +282,25 @@ public:
         return published_stats_;
     }
 
+    void attach_checkpoint_snapshot(std::vector<CheckpointLifecycleFact>& facts) const {
+        if (facts.empty()) { return; }
+        const MemorySummary memory = instance_.program->memory_summary();
+        const CheckpointKvCapacitySnapshot snapshot{
+            .device_main_capacity_pages    = memory.device_main_kv_capacity_pages,
+            .device_main_used_pages        = memory.device_main_kv_occupied_pages,
+            .device_main_page_bytes        = memory.device_main_kv_page_bytes,
+            .device_backend_capacity_pages = memory.device_backend_kv_capacity_pages,
+            .device_backend_used_pages     = memory.device_backend_kv_occupied_pages,
+            .device_backend_page_bytes     = memory.device_backend_kv_page_bytes,
+            .state_image_bytes             = memory.gdn_state_bytes,
+            .host_main_page_bytes          = memory.host_main_kv_page_bytes,
+            .host_backend_page_bytes       = memory.host_backend_kv_page_bytes,
+            .host_capacity_bytes           = memory.host_kv_capacity_bytes,
+            .host_used_bytes               = memory.host_kv_occupied_bytes,
+        };
+        for (CheckpointLifecycleFact& fact : facts) { fact.kv_snapshot = snapshot; }
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -376,17 +396,31 @@ public:
             view.handle == nullptr || (expected_owner && view.id != *expected_owner)) {
             throw std::invalid_argument("shared catalog slot holds no matching prefix");
         }
-        return run_shared_snapshot_operation([&] {
+        auto snapshot          = run_shared_snapshot_operation([&] {
             return instance_.program->begin_export_shared_prefix(
                 *view.handle, model_binding,
                 targets::qwen3_6::SharedPrefixPersistenceMetadata{
-                    .evidence             = view.metadata.evidence,
-                    .structural_origins   = view.metadata.structural_origins,
-                    .structural_role      = view.metadata.structural_role,
-                    .ssd_eligible         = view.metadata.ssd_eligible,
-                    .first_volatile_token = view.metadata.first_volatile_token},
+                             .evidence             = view.metadata.evidence,
+                             .structural_origins   = view.metadata.structural_origins,
+                             .structural_role      = view.metadata.structural_role,
+                             .ssd_eligible         = view.metadata.ssd_eligible,
+                             .first_volatile_token = view.metadata.first_volatile_token},
                 reserve);
         });
+        const auto& checkpoint = view.summary.checkpoint;
+        snapshot.checkpoint    = CheckpointLifecycleFact{
+               .key_digests      = checkpoint.shortlist_key.digests,
+               .content_digest   = snapshot.content_digest,
+               .frontier         = checkpoint.ref.frontier,
+               .identity_tag     = checkpoint.shortlist_key.identity_tag,
+               .ordinal          = checkpoint.ref.ordinal,
+               .role             = CheckpointLifecycleRole::SharedStablePrefix,
+               .scope            = CheckpointLifecycleScope::Shared,
+               .state_images     = 1,
+               .main_kv_pages    = checkpoint.required_kv.main_pages,
+               .backend_kv_pages = checkpoint.required_kv.backend_pages,
+        };
+        return snapshot;
     }
 
     [[nodiscard]] std::vector<targets::qwen3_6::DurableSharedPrefixCandidate>
@@ -1125,7 +1159,17 @@ private:
 
             if (caller_error != nullptr) { std::rethrow_exception(caller_error); }
             std::lock_guard lock(request->mutex);
-            if (request->error != nullptr) { std::rethrow_exception(request->error); }
+            if (request->error != nullptr) {
+                try {
+                    std::rethrow_exception(request->error);
+                } catch (const RequestError& error) {
+                    std::vector<CheckpointLifecycleFact> lifecycle = error.checkpoint_lifecycle();
+                    lifecycle.insert(lifecycle.end(),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.begin()),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.end()));
+                    throw RequestError(error.kind(), error.what(), std::move(lifecycle));
+                }
+            }
             return std::move(request->result);
         }
     }
@@ -1278,6 +1322,8 @@ private:
         result.materialization         = request->materialization_diagnostics;
         result.slot                    = request->retained_slot;
         result.session_digest          = request->retained_session_digest;
+        result.checkpoints             = request->checkpoint_summary;
+        result.checkpoint_lifecycle    = std::move(request->checkpoint_lifecycle);
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1907,6 +1953,11 @@ private:
                     MaterializingRequest& control = *materializing_;
                     const std::uint32_t lane      = control.destination.value;
                     const auto request            = control.request;
+                    attach_checkpoint_snapshot(terminal.lifecycle);
+                    request->checkpoint_lifecycle.insert(
+                        request->checkpoint_lifecycle.end(),
+                        std::make_move_iterator(terminal.lifecycle.begin()),
+                        std::make_move_iterator(terminal.lifecycle.end()));
                     if (terminal.status == ContextTransactionStatus::Aborted) {
                         if (terminal.activation) {
                             throw std::logic_error(
@@ -1933,7 +1984,11 @@ private:
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
-                    request->model_state                 = EngineRequestState::Prefill;
+                    request->checkpoint_summary.reuse_loaded =
+                        control.summary.prefix_reuse_path != PrefixReusePath::Root;
+                    request->checkpoint_summary.restore_committed = terminal.restore_committed;
+                    request->checkpoint_summary.offload_committed = terminal.offload_committed;
+                    request->model_state                          = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;
@@ -1950,10 +2005,20 @@ private:
                     if (*kind != ContextTransactionKind::ActiveCapture || !capture) {
                         throw std::logic_error("active-capture outcome has no Engine owner");
                     }
+                    attach_checkpoint_snapshot(terminal.lifecycle);
+                    capture->checkpoint_lifecycle.insert(
+                        capture->checkpoint_lifecycle.end(),
+                        std::make_move_iterator(terminal.lifecycle.begin()),
+                        std::make_move_iterator(terminal.lifecycle.end()));
                     if (terminal.status == ContextTransactionStatus::Published) {
                         ++cumulative_stats_.active_captures_completed;
+                        capture->checkpoint_summary.created_committed += terminal.created_committed;
+                        capture->checkpoint_summary.offload_committed =
+                            capture->checkpoint_summary.offload_committed ||
+                            terminal.offload_committed;
                     } else if (terminal.status == ContextTransactionStatus::Aborted) {
                         ++cumulative_stats_.active_captures_aborted;
+                        ++capture->checkpoint_summary.capture_aborted;
                     } else {
                         throw std::logic_error("active capture returned an invalid terminal state");
                     }

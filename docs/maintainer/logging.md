@@ -105,6 +105,24 @@ and HTTP records must not contain:
 - request bodies or arbitrary client-controlled headers;
 - full data URLs or unredacted query strings.
 
+The only exception is the explicit machine-artifact path enabled by
+`--request-log-content-dir`. It writes prompt and response bodies to separate Markdown files, never
+to operational stderr or inline JSONL. Its JSONL records contain only relative names, sizes,
+SHA-256 digests, and stable publication status/error classes. The option is deliberately coupled to
+the versioned request log so every persisted body is request-correlated. Gateway code owns atomic
+file publication; Frontend supplies the exact rendered prompt; Engine/GenerationService supplies
+the final logical response. Operators own permissions, retention, and rotation for this sensitive
+directory.
+
+Checkpoint lifecycle JSONL records follow the same ownership boundaries. ResourceManager supplies
+validated logical retention/tier facts, Program supplies physical State/Main/backend-KV quantities,
+Engine publishes request-attributable immutable facts, and the Gateway serializes them. Durable
+catalog filesystem completion is a Gateway-owned background fact and therefore uses null
+request/response correlation unless an owning request is explicitly carried. Producers must not
+manufacture lifecycle records by subtracting global counters or label an incomplete transfer as
+committed. Tier values are `device`, `host`, `ssd`, and `none`; status values are `committed`,
+`failed`, and `aborted`.
+
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
 value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational

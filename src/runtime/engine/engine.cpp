@@ -165,6 +165,11 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
     return impl_ != nullptr ? impl_->prepare : empty;
 }
 
+std::string PreparedPrompt::take_rendered_text() {
+    if (impl_ == nullptr) { return {}; }
+    return impl_->value.take_rendered_text();
+}
+
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 class GenerationHandle::Impl {
@@ -843,12 +848,45 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                     if (!summary) {
                         throw std::logic_error("durable shared import has no catalogued summary");
                     }
+                    const MemorySummary memory = core->memory_summary();
                     return {
                             .disposition            = static_cast<std::uint32_t>(result.disposition),
                             .slot                   = result.slot,
                             .frontier               = summary->checkpoint.ref.frontier,
                             .validation_nanoseconds = validation_nanoseconds,
                             .adoption_nanoseconds   = adoption_nanoseconds,
+                            .checkpoint =
+                            CheckpointLifecycleFact{
+                                    .key_digests      = summary->checkpoint.shortlist_key.digests,
+                                    .frontier         = summary->checkpoint.ref.frontier,
+                                    .identity_tag     = summary->checkpoint.shortlist_key.identity_tag,
+                                    .ordinal          = summary->checkpoint.ref.ordinal,
+                                    .role             = CheckpointLifecycleRole::SharedStablePrefix,
+                                    .scope            = CheckpointLifecycleScope::Shared,
+                                    .state_images     = 1,
+                                    .main_kv_pages    = summary->checkpoint.required_kv.main_pages,
+                                    .backend_kv_pages = summary->checkpoint.required_kv.backend_pages,
+                                    .kv_snapshot =
+                                    CheckpointKvCapacitySnapshot{
+                                            .device_main_capacity_pages =
+                                            memory.device_main_kv_capacity_pages,
+                                            .device_main_used_pages =
+                                            memory.device_main_kv_occupied_pages,
+                                            .device_main_page_bytes = memory.device_main_kv_page_bytes,
+                                            .device_backend_capacity_pages =
+                                            memory.device_backend_kv_capacity_pages,
+                                            .device_backend_used_pages =
+                                            memory.device_backend_kv_occupied_pages,
+                                            .device_backend_page_bytes =
+                                            memory.device_backend_kv_page_bytes,
+                                            .state_image_bytes    = memory.gdn_state_bytes,
+                                            .host_main_page_bytes = memory.host_main_kv_page_bytes,
+                                            .host_backend_page_bytes =
+                                            memory.host_backend_kv_page_bytes,
+                                            .host_capacity_bytes = memory.host_kv_capacity_bytes,
+                                            .host_used_bytes     = memory.host_kv_occupied_bytes,
+                                    },
+                            },
                     };
                 } catch (const RequestError&) {
                     throw;

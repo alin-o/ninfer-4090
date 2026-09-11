@@ -70,7 +70,7 @@ memory layout. Request and throughput records supply queue delay, TTFT, total/ma
 tier/frontier, evaluated/reused tokens, MTP counters, physical transfer costs, actual reclaimed
 capacity, occupancy, evictions, SSD I/O/checksum/adoption cost, and peak staging.
 
-Schema-v20 request records carry the public-wire response identity and exact generated token IDs.
+Schema-v21 request records carry the public-wire response identity and exact generated token IDs.
 Concurrent responses are joined to completion-order-independent `request_done` rows by that
 identity. Measured Device/Host/SSD continuations are fixture-hash aligned with cache-disabled cold;
 target token IDs and MTP round/drafted/accepted/fallback counters receive separate verdicts, and any

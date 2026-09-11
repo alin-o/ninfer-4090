@@ -168,6 +168,7 @@ struct PrepareStats {
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
+    std::string rendered_text;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;

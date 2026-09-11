@@ -80,6 +80,8 @@ public:
     using CaptureOffer                    = typename Package::CaptureOffer;
     using ContinuationSummary             = typename Package::ContinuationSummary;
     using SharedPrefixSummary             = typename Package::SharedPrefixSummary;
+    using CheckpointSummary =
+        std::remove_cvref_t<decltype(std::declval<SharedPrefixSummary>().checkpoint)>;
     using PrefixShortlistKey =
         std::remove_cvref_t<decltype(std::declval<SharedPrefixSummary>().checkpoint.shortlist_key)>;
     using CaptureAssessment                 = typename Package::CaptureAssessment;
@@ -228,6 +230,9 @@ public:
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
         std::optional<PublishedActivation> activation;
         MaterializationDiagnostics diagnostics;
+        bool restore_committed = false;
+        bool offload_committed = false;
+        std::vector<CheckpointLifecycleFact> lifecycle;
     };
 
     enum class MaterializationReserveResult : std::uint8_t {
@@ -243,6 +248,9 @@ public:
 
     struct ActiveCaptureOutcome {
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
+        std::uint32_t created_committed = 0;
+        bool offload_committed          = false;
+        std::vector<CheckpointLifecycleFact> lifecycle;
     };
 
     using ContextTransactionOutcome =
@@ -709,9 +717,8 @@ public:
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
         if (candidate.publishes_shared) {
-            const bool pressure_evidence =
-                shared_candidate_has_credit(candidate.shared_evidence) ||
-                matching_reuse_domains(candidate.shortlist_key) >= 2U;
+            const bool pressure_evidence = shared_candidate_has_credit(candidate.shared_evidence) ||
+                                           matching_reuse_domains(candidate.shortlist_key) >= 2U;
 
             std::vector<CaptureScenario> scenarios;
             scenarios.reserve(static_cast<std::size_t>(shared_catalog_count_) + 1U);
@@ -2979,6 +2986,156 @@ private:
                            [&](const auto& anchor) { return anchor.ref == checkpoint; });
     }
 
+    [[nodiscard]] static const auto* find_checkpoint(const ContinuationSummary& summary,
+                                                     CheckpointRef checkpoint) noexcept {
+        if (summary.endpoint && summary.endpoint->ref == checkpoint) { return &*summary.endpoint; }
+        if (summary.rewrite && summary.rewrite->ref == checkpoint) { return &*summary.rewrite; }
+        const auto found = std::find_if(summary.long_anchors.begin(), summary.long_anchors.end(),
+                                        [&](const auto& value) { return value.ref == checkpoint; });
+        return found == summary.long_anchors.end() ? nullptr : &*found;
+    }
+
+    [[nodiscard]] static CheckpointLifecycleRole lifecycle_role(CheckpointKind kind) noexcept {
+        switch (kind) {
+        case CheckpointKind::SessionEndpoint:
+            return CheckpointLifecycleRole::SessionEndpoint;
+        case CheckpointKind::TurnClosure:
+            return CheckpointLifecycleRole::TurnClosure;
+        case CheckpointKind::ResponseReplay:
+            return CheckpointLifecycleRole::ResponseReplay;
+        case CheckpointKind::SharedStablePrefix:
+            return CheckpointLifecycleRole::SharedStablePrefix;
+        case CheckpointKind::LongAnchor:
+            return CheckpointLifecycleRole::LongAnchor;
+        }
+        return CheckpointLifecycleRole::SessionEndpoint;
+    }
+
+    [[nodiscard]] static CheckpointLifecycleFact
+    lifecycle_fact(const auto& checkpoint, CheckpointLifecycleOperation operation,
+                   CheckpointLifecycleTier source, CheckpointLifecycleTier destination,
+                   CheckpointLifecycleStatus status,
+                   std::optional<std::uint64_t> elapsed_ns = std::nullopt) {
+        CheckpointLifecycleFact fact;
+        if constexpr (requires { checkpoint.shortlist_key.digests; }) {
+            fact.key_digests = checkpoint.shortlist_key.digests;
+        } else if constexpr (requires { checkpoint.shortlist_key.digest; }) {
+            fact.key_digests[0] = checkpoint.shortlist_key.digest;
+        }
+        if constexpr (requires { checkpoint.shortlist_key.identity_tag; }) {
+            fact.identity_tag = checkpoint.shortlist_key.identity_tag;
+        }
+        fact.frontier         = checkpoint.ref.frontier;
+        fact.ordinal          = checkpoint.ref.ordinal;
+        fact.role             = lifecycle_role(checkpoint.ref.kind);
+        fact.scope            = checkpoint.scope == CheckpointScope::Shared
+                                    ? CheckpointLifecycleScope::Shared
+                                    : CheckpointLifecycleScope::Private;
+        fact.operation        = operation;
+        fact.source_tier      = source;
+        fact.destination_tier = destination;
+        fact.status           = status;
+        fact.state_images     = 1;
+        fact.main_kv_pages    = checkpoint.required_kv.main_pages;
+        fact.backend_kv_pages = checkpoint.required_kv.backend_pages;
+        fact.elapsed_ns       = elapsed_ns;
+        return fact;
+    }
+
+    template <class Result>
+    [[nodiscard]] static std::optional<std::uint64_t>
+    transfer_elapsed(const Result& result, ContextTransferDirection direction) noexcept {
+        std::uint64_t total = 0;
+        bool observed       = false;
+        for (const ContextTransferObservation& transfer : result.transfer_observations) {
+            if (transfer.direction != direction) { continue; }
+            observed = true;
+            total    = total > std::numeric_limits<std::uint64_t>::max() - transfer.elapsed_ns
+                           ? std::numeric_limits<std::uint64_t>::max()
+                           : total + transfer.elapsed_ns;
+        }
+        return observed ? std::optional<std::uint64_t>(total) : std::nullopt;
+    }
+
+    template <class Result, class PrivateResultFor, class SharedResultFor>
+    [[nodiscard]] std::vector<CheckpointLifecycleFact>
+    pressure_lifecycle(const std::vector<OwnerClaim>& private_claims,
+                       const std::vector<OwnerClaim>& shared_claims, const Result& result,
+                       PrivateResultFor&& private_result_for,
+                       SharedResultFor&& shared_result_for) const {
+        std::vector<CheckpointLifecycleFact> facts;
+        for (const OwnerClaim& claim : private_claims) {
+            const ContinuationSummary& before = catalog_[claim.capability.slot].summary;
+            const auto& after                 = private_result_for(claim);
+            for (const CheckpointRef dropped : claim.dropped_checkpoints) {
+                if (!after.pressure_committed) { continue; }
+                if (const auto* checkpoint = find_checkpoint(before, dropped)) {
+                    facts.push_back(lifecycle_fact(
+                        *checkpoint, CheckpointLifecycleOperation::Evicted,
+                        checkpoint->state_residency == ReplicaResidency::HostOnly
+                            ? CheckpointLifecycleTier::Host
+                            : CheckpointLifecycleTier::Device,
+                        CheckpointLifecycleTier::None, CheckpointLifecycleStatus::Committed));
+                }
+            }
+            if (!after.pressure_committed && result.status == ContextTransactionStatus::Aborted &&
+                has_transfer_direction(result, ContextTransferDirection::DeviceToHost)) {
+                const auto append_aborted = [&](const auto& checkpoint) {
+                    facts.push_back(lifecycle_fact(
+                        checkpoint, CheckpointLifecycleOperation::Offloaded,
+                        CheckpointLifecycleTier::Device, CheckpointLifecycleTier::Host,
+                        CheckpointLifecycleStatus::Aborted));
+                };
+                if (before.endpoint) { append_aborted(*before.endpoint); }
+                if (before.rewrite) { append_aborted(*before.rewrite); }
+                for (const auto& anchor : before.long_anchors) { append_aborted(anchor); }
+            }
+            if (!after.pressure_committed || !after.final_summary) { continue; }
+            const auto observe_offload = [&](const auto& checkpoint) {
+                const auto* final = find_checkpoint(*after.final_summary, checkpoint.ref);
+                if (final != nullptr &&
+                    checkpoint.state_residency == ReplicaResidency::DeviceOnly &&
+                    final->state_residency != ReplicaResidency::DeviceOnly) {
+                    facts.push_back(lifecycle_fact(*final, CheckpointLifecycleOperation::Offloaded,
+                                                   CheckpointLifecycleTier::Device,
+                                                   CheckpointLifecycleTier::Host,
+                                                   CheckpointLifecycleStatus::Committed));
+                }
+            };
+            if (before.endpoint) { observe_offload(*before.endpoint); }
+            if (before.rewrite) { observe_offload(*before.rewrite); }
+            for (const auto& anchor : before.long_anchors) { observe_offload(anchor); }
+        }
+        for (const OwnerClaim& claim : shared_claims) {
+            const auto& before = shared_catalog_[claim.capability.slot].summary.checkpoint;
+            const auto& after  = shared_result_for(claim);
+            if (after.pressure_committed && after.disposition == VictimDisposition::Evicted) {
+                facts.push_back(lifecycle_fact(before, CheckpointLifecycleOperation::Evicted,
+                                               before.state_residency == ReplicaResidency::HostOnly
+                                                   ? CheckpointLifecycleTier::Host
+                                                   : CheckpointLifecycleTier::Device,
+                                               CheckpointLifecycleTier::None,
+                                               CheckpointLifecycleStatus::Committed));
+            } else if (!after.pressure_committed &&
+                       result.status == ContextTransactionStatus::Aborted &&
+                       has_transfer_direction(result, ContextTransferDirection::DeviceToHost)) {
+                facts.push_back(lifecycle_fact(before, CheckpointLifecycleOperation::Offloaded,
+                                               CheckpointLifecycleTier::Device,
+                                               CheckpointLifecycleTier::Host,
+                                               CheckpointLifecycleStatus::Aborted));
+            } else if (after.pressure_committed && after.final_summary &&
+                       before.state_residency == ReplicaResidency::DeviceOnly &&
+                       after.final_summary->checkpoint.state_residency !=
+                           ReplicaResidency::DeviceOnly) {
+                facts.push_back(lifecycle_fact(
+                    after.final_summary->checkpoint, CheckpointLifecycleOperation::Offloaded,
+                    CheckpointLifecycleTier::Device, CheckpointLifecycleTier::Host,
+                    CheckpointLifecycleStatus::Committed));
+            }
+        }
+        return facts;
+    }
+
     [[nodiscard]] static std::uint32_t
     continuation_checkpoint_count(const ContinuationSummary& summary) noexcept {
         const std::size_t count = static_cast<std::size_t>(summary.endpoint.has_value()) +
@@ -3420,6 +3577,42 @@ private:
             }
         }
 
+        std::vector<CheckpointLifecycleFact> lifecycle =
+            pressure_lifecycle(record->private_claims, record->shared_claims, result,
+                               private_result_for, shared_result_for);
+        const CheckpointSummary* selected_checkpoint = nullptr;
+        if (record->selected_observation) {
+            const PolicyObservationKey& selected = *record->selected_observation;
+            if (selected.shared) {
+                selected_checkpoint = &shared_catalog_[selected.slot].summary.checkpoint;
+            } else {
+                selected_checkpoint =
+                    find_checkpoint(catalog_[selected.slot].summary, selected.checkpoint);
+            }
+        }
+        if (selected_checkpoint != nullptr) {
+            const bool restored =
+                has_transfer_direction(result, ContextTransferDirection::HostToDevice);
+            const auto restore_elapsed =
+                record->private_claims.empty() && record->shared_claims.empty()
+                    ? transfer_elapsed(result, ContextTransferDirection::HostToDevice)
+                    : std::nullopt;
+            if (published) {
+                lifecycle.push_back(lifecycle_fact(
+                    *selected_checkpoint,
+                    restored ? CheckpointLifecycleOperation::Restored
+                             : CheckpointLifecycleOperation::Loaded,
+                    restored ? CheckpointLifecycleTier::Host : CheckpointLifecycleTier::Device,
+                    CheckpointLifecycleTier::Device, CheckpointLifecycleStatus::Committed,
+                    restore_elapsed));
+            } else if (restored) {
+                lifecycle.push_back(
+                    lifecycle_fact(*selected_checkpoint, CheckpointLifecycleOperation::Restored,
+                                   CheckpointLifecycleTier::Host, CheckpointLifecycleTier::Device,
+                                   CheckpointLifecycleStatus::Aborted, restore_elapsed));
+            }
+        }
+
         if (published) { observe_selected_hit(*record); }
         for (const OwnerClaim& claim : record->private_claims) {
             apply_private_action(claim, published, private_result_for(claim));
@@ -3475,7 +3668,7 @@ private:
             lanes_[record->destination.value] = LogicalLaneState::Free;
             transaction_.template emplace<std::monostate>();
             program.finalize_context_transaction();
-            return {.status = ContextTransactionStatus::Aborted};
+            return {.status = ContextTransactionStatus::Aborted, .lifecycle = std::move(lifecycle)};
         }
 
         CatalogEntry& publication = catalog_[record->publication_slot];
@@ -3504,11 +3697,18 @@ private:
         }
         StartResult start = std::move(*result.published);
         result.published.reset();
+        const bool restore_committed =
+            has_transfer_direction(result, ContextTransferDirection::HostToDevice);
+        const bool offload_committed =
+            has_transfer_direction(result, ContextTransferDirection::DeviceToHost);
         commit_demand(std::move(record->demand));
         return MaterializationOutcome{
-            .status      = ContextTransactionStatus::Published,
-            .activation  = PublishedActivation(*this, std::move(start), record->destination),
-            .diagnostics = record->diagnostics,
+            .status            = ContextTransactionStatus::Published,
+            .activation        = PublishedActivation(*this, std::move(start), record->destination),
+            .diagnostics       = record->diagnostics,
+            .restore_committed = restore_committed,
+            .offload_committed = offload_committed,
+            .lifecycle         = std::move(lifecycle),
         };
     }
 
@@ -3640,6 +3840,38 @@ private:
                 throw std::logic_error("private capture returned an unexpected shared publication");
             }
         }
+        std::vector<CheckpointLifecycleFact> lifecycle =
+            pressure_lifecycle(record->private_claims, record->shared_claims, result,
+                               private_result_for, shared_result_for);
+        if (published) {
+            const ActiveEntry& current_active = active_[record->lane.value];
+            const ContinuationSummary& before = catalog_[current_active.publication_slot].summary;
+            const auto append_created         = [&](const auto& checkpoint) {
+                if (!continuation_contains_checkpoint(before, checkpoint.ref)) {
+                    lifecycle.push_back(lifecycle_fact(
+                        checkpoint, CheckpointLifecycleOperation::Created,
+                        CheckpointLifecycleTier::None, CheckpointLifecycleTier::Device,
+                        CheckpointLifecycleStatus::Committed));
+                }
+            };
+            if (record->publishes_private) {
+                if (result.active_summary.endpoint) {
+                    append_created(*result.active_summary.endpoint);
+                }
+                if (result.active_summary.rewrite) {
+                    append_created(*result.active_summary.rewrite);
+                }
+                for (const auto& anchor : result.active_summary.long_anchors) {
+                    append_created(anchor);
+                }
+            }
+            if (record->publishes_shared && result.shared) {
+                lifecycle.push_back(lifecycle_fact(
+                    result.shared->summary.checkpoint, CheckpointLifecycleOperation::Created,
+                    CheckpointLifecycleTier::None, CheckpointLifecycleTier::Device,
+                    CheckpointLifecycleStatus::Committed));
+            }
+        }
         for (const OwnerClaim& claim : record->private_claims) {
             apply_private_action(claim, published, private_result_for(claim));
         }
@@ -3662,7 +3894,7 @@ private:
             observe_operations(result);
             transaction_.template emplace<std::monostate>();
             program.finalize_context_transaction();
-            return {.status = ContextTransactionStatus::Aborted};
+            return {.status = ContextTransactionStatus::Aborted, .lifecycle = std::move(lifecycle)};
         }
         ActiveEntry& active = active_[record->lane.value];
         if (record->publishes_private) {
@@ -3683,8 +3915,7 @@ private:
             publication.observation =
                 RetentionObservation{.retention_class = RetentionClass::SharedStable};
             publication.transaction_pins = 0;
-            publication.explicit_credit =
-                shared_candidate_has_credit(record->shared_evidence);
+            publication.explicit_credit  = shared_candidate_has_credit(record->shared_evidence);
             publication.credit_expiry_epoch =
                 publication.explicit_credit
                     ? (demand_epoch_ >
@@ -3703,11 +3934,19 @@ private:
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));
         }
+        const std::uint32_t created_committed =
+            static_cast<std::uint32_t>(record->publishes_private) +
+            static_cast<std::uint32_t>(record->publishes_shared);
+        const bool offload_committed =
+            has_transfer_direction(result, ContextTransferDirection::DeviceToHost);
         observe_transfers(result);
         observe_operations(result);
         transaction_.template emplace<std::monostate>();
         program.finalize_context_transaction();
-        return {.status = ContextTransactionStatus::Published};
+        return {.status            = ContextTransactionStatus::Published,
+                .created_committed = created_committed,
+                .offload_committed = offload_committed,
+                .lifecycle         = std::move(lifecycle)};
     }
 
     void release_active_references(LaneId lane) {
@@ -3948,6 +4187,15 @@ private:
             d2d_seconds += seconds;
             break;
         }
+    }
+
+    template <class Result>
+    [[nodiscard]] static bool has_transfer_direction(const Result& result,
+                                                     ContextTransferDirection direction) noexcept {
+        return std::any_of(result.transfer_observations.begin(), result.transfer_observations.end(),
+                           [&](const ContextTransferObservation& observation) {
+                               return observation.direction == direction;
+                           });
     }
 
     template <class Result>

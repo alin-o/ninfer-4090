@@ -12472,10 +12472,31 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.gdn_state_bytes              = gdn_state_bytes;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
+    const auto device_page_bytes     = [](const DeviceKVPagePool& pool) {
+        std::size_t bytes = 0;
+        for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+            bytes += pool.plane(index).bytes() / pool.capacity_pages();
+        }
+        return bytes;
+    };
+    if (text_kv_pages) {
+        const DeviceKVPagePool& pool      = text_kv_pages->physical_pool();
+        out.device_main_kv_capacity_pages = pool.capacity_pages();
+        out.device_main_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_main_kv_page_bytes     = device_page_bytes(pool);
+    }
+    if (backend_kv_pages) {
+        const DeviceKVPagePool& pool         = backend_kv_pages->physical_pool();
+        out.device_backend_kv_capacity_pages = pool.capacity_pages();
+        out.device_backend_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_backend_kv_page_bytes     = device_page_bytes(pool);
+    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
     }
+    out.host_main_kv_page_bytes    = text_host_kv_page_stride;
+    out.host_backend_kv_page_bytes = backend_host_kv_page_stride;
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();

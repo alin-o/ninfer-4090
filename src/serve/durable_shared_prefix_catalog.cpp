@@ -563,12 +563,41 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
         }
     }
 
+    void publish_lifecycle(const CheckpointLifecycleFact& checkpoint, std::string_view digest,
+                           std::uint32_t frontier, std::uint64_t bytes, std::uint64_t elapsed_ns,
+                           CheckpointLifecycleStatus status) noexcept {
+        try {
+            std::function<void(const CheckpointLifecycleFact&)> observer;
+            {
+                std::lock_guard lock(mutex);
+                observer = options.lifecycle_observer;
+            }
+            if (!observer) { return; }
+            CheckpointLifecycleFact fact = checkpoint;
+            fact.content_digest          = digest;
+            fact.frontier                = frontier;
+            fact.role                    = CheckpointLifecycleRole::SharedStablePrefix;
+            fact.scope                   = CheckpointLifecycleScope::Shared;
+            fact.operation               = CheckpointLifecycleOperation::Persisted;
+            fact.source_tier             = CheckpointLifecycleTier::Host;
+            fact.destination_tier        = CheckpointLifecycleTier::Ssd;
+            fact.status                  = status;
+            fact.state_images            = 1;
+            fact.serialized_bytes        = bytes;
+            fact.elapsed_ns              = elapsed_ns;
+            observer(fact);
+        } catch (...) {}
+    }
+
     void publish(Snapshot snapshot) {
-        const std::string digest     = snapshot.content_digest;
-        const std::uint32_t frontier = snapshot.tokens;
+        const std::string digest        = snapshot.content_digest;
+        const std::uint32_t frontier    = snapshot.tokens;
+        const Clock::time_point started = Clock::now();
+        std::uint64_t serialized_bytes  = snapshot.transfer_bytes;
         try {
             if (snapshot.await_transfer) { snapshot.await_transfer(snapshot.bytes); }
             snapshot.await_transfer = {};
+            serialized_bytes        = snapshot.bytes.size();
             if (!valid_digest(digest) || frontier == 0 || snapshot.bytes.empty()) {
                 throw std::invalid_argument("Program produced invalid durable snapshot metadata");
             }
@@ -659,12 +688,25 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
                 }
             }
             settle_write(digest, committed);
+            publish_lifecycle(
+                snapshot.checkpoint, digest, frontier, serialized_bytes,
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
+                        .count()),
+                committed ? CheckpointLifecycleStatus::Committed
+                          : CheckpointLifecycleStatus::Failed);
         } catch (...) {
             {
                 std::lock_guard lock(mutex);
                 ++values.writes_failed;
             }
             settle_write(digest, false);
+            publish_lifecycle(
+                snapshot.checkpoint, digest, frontier, serialized_bytes,
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
+                        .count()),
+                CheckpointLifecycleStatus::Failed);
         }
         snapshot.release_storage();
     }
@@ -739,7 +781,13 @@ DurableSharedPrefixCatalog::~DurableSharedPrefixCatalog() noexcept {
 }
 
 void DurableSharedPrefixCatalog::enqueue(Snapshot snapshot, std::function<void(bool)> settlement) {
-    const auto state              = state_;
+    const auto state           = state_;
+    const auto publish_failure = [&]() noexcept {
+        state->publish_lifecycle(snapshot.checkpoint, snapshot.content_digest, snapshot.tokens,
+                                 snapshot.transfer_bytes != 0 ? snapshot.transfer_bytes
+                                                              : snapshot.bytes.size(),
+                                 0, CheckpointLifecycleStatus::Failed);
+    };
     const auto settle_immediately = [&](bool committed) noexcept {
         if (!settlement) { return; }
         try {
@@ -758,18 +806,21 @@ void DurableSharedPrefixCatalog::enqueue(Snapshot snapshot, std::function<void(b
         if (bytes > SIZE_MAX / 2U) {
             settle_snapshot_source();
             settle_immediately(false);
+            publish_failure();
             return;
         }
         snapshot.queue_reservation = state->reserve(bytes * 2U);
         if (!snapshot.queue_reservation) {
             settle_snapshot_source();
             settle_immediately(false);
+            publish_failure();
             return;
         }
     }
     if (!valid_digest(snapshot.content_digest)) {
         settle_snapshot_source();
         settle_immediately(false);
+        publish_failure();
         return;
     }
     {
@@ -797,6 +848,10 @@ void DurableSharedPrefixCatalog::enqueue(Snapshot snapshot, std::function<void(b
             } catch (...) {}
         }
         state->settle_write(holder->content_digest, false);
+        state->publish_lifecycle(holder->checkpoint, holder->content_digest, holder->tokens,
+                                 holder->transfer_bytes != 0 ? holder->transfer_bytes
+                                                             : holder->bytes.size(),
+                                 0, CheckpointLifecycleStatus::Failed);
     }
 }
 
@@ -939,6 +994,23 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
     Engine& engine, const PreparedPrompt& prompt, Clock::time_point deadline,
     const CancellationView& cancellation, const RequestOptions& request_options) {
     DurableSharedPrefixRestore observation;
+    const auto append_lifecycle = [&](const Candidate& candidate, CheckpointLifecycleStatus status,
+                                      std::uint64_t serialized_bytes, std::uint64_t elapsed_ns,
+                                      const CheckpointLifecycleFact* identity = nullptr) {
+        CheckpointLifecycleFact fact = identity != nullptr ? *identity : CheckpointLifecycleFact{};
+        fact.content_digest          = candidate.content_digest;
+        fact.frontier                = candidate.frontier;
+        fact.role                    = CheckpointLifecycleRole::SharedStablePrefix;
+        fact.scope                   = CheckpointLifecycleScope::Shared;
+        fact.operation               = CheckpointLifecycleOperation::Restored;
+        fact.source_tier             = CheckpointLifecycleTier::Ssd;
+        fact.destination_tier        = CheckpointLifecycleTier::Host;
+        fact.status                  = status;
+        fact.state_images            = 1;
+        fact.serialized_bytes        = serialized_bytes;
+        fact.elapsed_ns              = elapsed_ns;
+        observation.lifecycle.push_back(std::move(fact));
+    };
     const auto candidates = runtime::DurableSharedSnapshotAccess::candidates(engine, prompt);
     std::vector<Candidate> available;
     {
@@ -966,10 +1038,19 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
             }
             return observation;
         }
-        observation.fallback_reason = decision.reason;
-        const Candidate candidate   = decision.candidate;
-        auto loaded                 = load_record(candidate, deadline, cancellation);
+        observation.fallback_reason             = decision.reason;
+        const Candidate candidate               = decision.candidate;
+        const Clock::time_point restore_started = Clock::now();
+        auto loaded                             = load_record(candidate, deadline, cancellation);
         if (!loaded.bytes) {
+            append_lifecycle(
+                candidate,
+                cancellation.requested() ? CheckpointLifecycleStatus::Aborted
+                                         : CheckpointLifecycleStatus::Failed,
+                0,
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               Clock::now() - restore_started)
+                                               .count()));
             observation.fallback_reason =
                 Clock::now() >= deadline ? "ssd-deadline" : "ssd-unavailable";
             available.erase(std::remove(available.begin(), available.end(), candidate),
@@ -985,8 +1066,16 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                 state_->values.validation_nanoseconds += imported.validation_nanoseconds;
                 state_->values.adoption_nanoseconds += imported.adoption_nanoseconds;
             }
-            observation.frontier        = imported.frontier;
+            observation.frontier         = imported.frontier;
+            observation.content_digest   = candidate.content_digest;
+            observation.serialized_bytes = loaded.bytes->size();
+            observation.elapsed_ns       = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - restore_started)
+                    .count());
             observation.loaded_from_ssd = true;
+            append_lifecycle(candidate, CheckpointLifecycleStatus::Committed,
+                             observation.serialized_bytes, observation.elapsed_ns,
+                             &imported.checkpoint);
             return observation;
         } catch (const RequestError& error) {
             if (error.kind() == RequestErrorKind::Cancelled) { throw; }
@@ -1001,6 +1090,11 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
         } catch (const std::invalid_argument&) {
             observation.fallback_reason = "ssd-adoption-unavailable";
         }
+        append_lifecycle(
+            candidate, CheckpointLifecycleStatus::Failed, loaded.bytes->size(),
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - restore_started)
+                    .count()));
         available.erase(std::remove(available.begin(), available.end(), candidate),
                         available.end());
     }
@@ -1050,6 +1144,12 @@ void DurableSharedPrefixCatalog::drain() {
     state_->drained.wait(lock, [&] {
         return state_->jobs.empty() && state_->active_jobs == 0 && state_->reserved_jobs == 0;
     });
+}
+
+void DurableSharedPrefixCatalog::set_lifecycle_observer(
+    std::function<void(const ninfer::CheckpointLifecycleFact&)> observer) {
+    std::lock_guard lock(state_->mutex);
+    state_->options.lifecycle_observer = std::move(observer);
 }
 
 DurableSharedPrefixCatalogStats DurableSharedPrefixCatalog::stats() const noexcept {

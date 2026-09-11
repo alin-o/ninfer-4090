@@ -5,10 +5,36 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
 namespace ninfer::serve {
+
+struct KvCapacitySnapshot {
+    struct DevicePool {
+        std::uint32_t capacity_pages = 0;
+        std::uint32_t used_pages     = 0;
+        std::uint32_t free_pages     = 0;
+        std::uint64_t capacity_bytes = 0;
+        std::uint64_t used_bytes     = 0;
+        std::uint64_t free_bytes     = 0;
+        std::uint64_t page_bytes     = 0;
+    };
+
+    DevicePool device_main;
+    DevicePool device_backend;
+    std::uint64_t state_image_bytes       = 0;
+    std::uint64_t host_main_page_bytes    = 0;
+    std::uint64_t host_backend_page_bytes = 0;
+    std::uint64_t host_capacity_bytes     = 0;
+    std::uint64_t host_used_bytes         = 0;
+    std::uint64_t host_free_bytes         = 0;
+};
+
+[[nodiscard]] KvCapacitySnapshot make_kv_capacity_snapshot(const ninfer::MemorySummary& memory);
+[[nodiscard]] KvCapacitySnapshot
+make_kv_capacity_snapshot(const ninfer::CheckpointKvCapacitySnapshot& snapshot);
 
 // Fork-local: the host-exposed total this deployment reports on the request line. Shared
 // between the operational renderer and the JSONL record so the two cannot drift.
@@ -41,6 +67,22 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    // Shares the one Frontend-owned rendered buffer until the gateway publishes prompt Markdown.
+    // JSON formatters never serialize this value.
+    std::shared_ptr<const std::string> rendered_prompt;
+    std::vector<CapturedMediaMetadata> captured_media;
+
+    struct ContentFile {
+        std::string status; // empty when capture is disabled
+        std::string file;
+        std::uint64_t bytes = 0;
+        std::string sha256;
+        std::string error_class;
+    };
+
+    ContentFile prompt_file;
+    ContentFile response_file;
+    std::optional<KvCapacitySnapshot> kv_snapshot;
 };
 
 struct RequestLogMetadata {
@@ -100,6 +142,7 @@ struct RequestFailure {
     // Used only by the independent JSONL measurement writer. Operational rendering never consumes
     // this field.
     std::string machine_message;
+    std::vector<ninfer::CheckpointLifecycleFact> checkpoint_lifecycle;
 };
 
 struct ThroughputReport {

@@ -28,6 +28,7 @@ std::string format_seconds(double seconds) {
     std::snprintf(text, sizeof(text), "%.2f", seconds);
     return text;
 }
+
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
     error.status  = 500;
@@ -227,7 +228,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       logger_(logger), operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
+                     options_.request_log_content_dir) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -265,7 +267,10 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
     return std::make_shared<RequestLifecycle>(*this, std::move(context));
 }
 
-void HttpServer::record_request_start(const RequestLogContext& context) {
+void HttpServer::record_request_start(RequestLogContext& context) {
+    if (service_ != nullptr) {
+        context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
+    }
     request_jsonl_.write_request_start(context);
     // Upstream dropped RequestLogContext::prompt_tokens, which this fork declared and read
     // here but never assigned anywhere - so this argument has always been 0 and the
@@ -280,16 +285,19 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
     operational_log_.request_rejected(context);
 }
 
-void HttpServer::record_request_done(const RequestLogContext& context,
-                                     const GenerationOutcome& outcome) {
+void HttpServer::record_request_done(RequestLogContext& context, const GenerationOutcome& outcome) {
+    context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
     request_jsonl_.write_request_done(context, outcome);
     metrics_.end_request(context.id);
     metrics_.record(outcome);
     operational_log_.request_done(context, outcome);
 }
 
-void HttpServer::record_request_failure(const RequestLogContext& context,
-                                        const RequestFailure& failure) {
+void HttpServer::record_request_failure(RequestLogContext& context, const RequestFailure& failure) {
+    context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
+    for (const ninfer::CheckpointLifecycleFact& fact : failure.checkpoint_lifecycle) {
+        request_jsonl_.write_checkpoint_lifecycle(context, fact);
+    }
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
     metrics_.end_request(context.id);
@@ -447,9 +455,9 @@ void HttpServer::register_routes() {
                         "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(metrics_.render(options_.max_concurrency,
-                                        service_ != nullptr ? service_->runtime_stats()
-                                                            : ninfer::RuntimeStats{}),
+        res.set_content(metrics_.render(options_.max_concurrency, service_ != nullptr
+                                                                      ? service_->runtime_stats()
+                                                                      : ninfer::RuntimeStats{}),
                         "text/plain; version=0.0.4");
     });
     // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per
@@ -459,8 +467,7 @@ void HttpServer::register_routes() {
     // `session_digest`. Before the service attaches (model still loading) every slot reads
     // idle.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
-        const bool speculative =
-            options_.speculative.backend != ninfer::SpeculativeBackend::None;
+        const bool speculative = options_.speculative.backend != ninfer::SpeculativeBackend::None;
         std::vector<ninfer::SlotState> states;
         std::uint32_t slot_count = options_.max_concurrency;
         if (service_ != nullptr) {
@@ -469,9 +476,8 @@ void HttpServer::register_routes() {
         }
         nlohmann::json slots = nlohmann::json::array();
         for (std::uint32_t i = 0; i < slot_count; ++i) {
-            const ninfer::SlotState state =
-                i < states.size() ? states[i] : ninfer::SlotState{};
-            nlohmann::json checkpoints = nlohmann::json::array();
+            const ninfer::SlotState state = i < states.size() ? states[i] : ninfer::SlotState{};
+            nlohmann::json checkpoints    = nlohmann::json::array();
             for (const ninfer::SlotCheckpoint& checkpoint : state.checkpoints) {
                 checkpoints.push_back({{"frontier", checkpoint.frontier},
                                        {"session_digest", checkpoint.session_digest}});
@@ -638,35 +644,33 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
         if (action == "save") {
             const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
             logger_->info("{}", "slot save id=" + id_text + " file=" + *sanitized +
-                     " n_saved=" + std::to_string(saved.tokens) +
-                     " n_written=" + std::to_string(saved.bytes) +
-                     " session=" + saved.session_digest + " in " +
-                     format_seconds(saved.seconds) + " s");
-            res.set_content(
-                nlohmann::json{{"id_slot", slot},
-                               {"filename", *sanitized},
-                               {"n_saved", saved.tokens},
-                               {"n_written", saved.bytes},
-                               {"session_digest", saved.session_digest},
-                               {"timings", {{"save_ms", saved.seconds * 1000.0}}}}
-                    .dump(),
-                "application/json");
+                                    " n_saved=" + std::to_string(saved.tokens) +
+                                    " n_written=" + std::to_string(saved.bytes) +
+                                    " session=" + saved.session_digest + " in " +
+                                    format_seconds(saved.seconds) + " s");
+            res.set_content(nlohmann::json{{"id_slot", slot},
+                                           {"filename", *sanitized},
+                                           {"n_saved", saved.tokens},
+                                           {"n_written", saved.bytes},
+                                           {"session_digest", saved.session_digest},
+                                           {"timings", {{"save_ms", saved.seconds * 1000.0}}}}
+                                .dump(),
+                            "application/json");
         } else {
             const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
             logger_->info("{}", "slot restore id=" + id_text + " file=" + *sanitized +
-                     " n_restored=" + std::to_string(restored.tokens) +
-                     " n_read=" + std::to_string(restored.bytes) +
-                     " session=" + restored.session_digest + " in " +
-                     format_seconds(restored.seconds) + " s");
-            res.set_content(
-                nlohmann::json{{"id_slot", slot},
-                               {"filename", *sanitized},
-                               {"n_restored", restored.tokens},
-                               {"n_read", restored.bytes},
-                               {"session_digest", restored.session_digest},
-                               {"timings", {{"restore_ms", restored.seconds * 1000.0}}}}
-                    .dump(),
-                "application/json");
+                                    " n_restored=" + std::to_string(restored.tokens) +
+                                    " n_read=" + std::to_string(restored.bytes) +
+                                    " session=" + restored.session_digest + " in " +
+                                    format_seconds(restored.seconds) + " s");
+            res.set_content(nlohmann::json{{"id_slot", slot},
+                                           {"filename", *sanitized},
+                                           {"n_restored", restored.tokens},
+                                           {"n_read", restored.bytes},
+                                           {"session_digest", restored.session_digest},
+                                           {"timings", {{"restore_ms", restored.seconds * 1000.0}}}}
+                                .dump(),
+                            "application/json");
         }
     } catch (const ninfer::RequestError& engine_error) {
         fail(409, "slot_busy", engine_error.what());
@@ -686,6 +690,16 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
+    if (request_jsonl_.enabled()) {
+        service.set_checkpoint_lifecycle_observer(
+            [this](const ninfer::CheckpointLifecycleFact& fact) {
+                std::optional<KvCapacitySnapshot> snapshot;
+                if (service_ != nullptr) {
+                    snapshot = make_kv_capacity_snapshot(service_->memory_summary());
+                }
+                request_jsonl_.write_checkpoint_lifecycle(fact, std::move(snapshot));
+            });
+    }
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());

@@ -1,6 +1,7 @@
 #include "serve/request_log.h"
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <spdlog/logger.h>
 
@@ -11,9 +12,11 @@
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -172,6 +175,80 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     return "unknown";
 }
 
+const char* checkpoint_operation_name(ninfer::CheckpointLifecycleOperation operation) {
+    switch (operation) {
+    case ninfer::CheckpointLifecycleOperation::Created:
+        return "created";
+    case ninfer::CheckpointLifecycleOperation::Loaded:
+        return "loaded";
+    case ninfer::CheckpointLifecycleOperation::Restored:
+        return "restored";
+    case ninfer::CheckpointLifecycleOperation::Offloaded:
+        return "offloaded";
+    case ninfer::CheckpointLifecycleOperation::Persisted:
+        return "persisted";
+    case ninfer::CheckpointLifecycleOperation::Evicted:
+        return "evicted";
+    }
+    return "unknown";
+}
+
+const char* checkpoint_tier_name(ninfer::CheckpointLifecycleTier tier) {
+    switch (tier) {
+    case ninfer::CheckpointLifecycleTier::None:
+        return "none";
+    case ninfer::CheckpointLifecycleTier::Device:
+        return "device";
+    case ninfer::CheckpointLifecycleTier::Host:
+        return "host";
+    case ninfer::CheckpointLifecycleTier::Ssd:
+        return "ssd";
+    }
+    return "unknown";
+}
+
+const char* checkpoint_status_name(ninfer::CheckpointLifecycleStatus status) {
+    switch (status) {
+    case ninfer::CheckpointLifecycleStatus::Committed:
+        return "committed";
+    case ninfer::CheckpointLifecycleStatus::Failed:
+        return "failed";
+    case ninfer::CheckpointLifecycleStatus::Aborted:
+        return "aborted";
+    }
+    return "unknown";
+}
+
+const char* checkpoint_role_name(ninfer::CheckpointLifecycleRole role) {
+    switch (role) {
+    case ninfer::CheckpointLifecycleRole::SessionEndpoint:
+        return "session_endpoint";
+    case ninfer::CheckpointLifecycleRole::TurnClosure:
+        return "turn_closure";
+    case ninfer::CheckpointLifecycleRole::ResponseReplay:
+        return "response_replay";
+    case ninfer::CheckpointLifecycleRole::SharedStablePrefix:
+        return "shared_stable_prefix";
+    case ninfer::CheckpointLifecycleRole::LongAnchor:
+        return "long_anchor";
+    }
+    return "unknown";
+}
+
+std::string checkpoint_key_digest(const std::array<std::uint64_t, 2>& digests) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << digests[0] << std::setw(16)
+        << digests[1];
+    return out.str();
+}
+
+std::uint64_t saturating_product(std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return lhs * rhs;
+}
+
 Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, const char* event) {
     return Json{{"artifact_type", kRequestLogArtifactType},
                 {"schema_version", kRequestLogSchemaVersion},
@@ -244,6 +321,41 @@ Json request_json(const RequestLogContext& context) {
         {"preserve_thinking", context.preserve_thinking},
         {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
         {"sampling", sampler_json(context.sampling)}};
+}
+
+Json content_file_json(const RequestLogContext::ContentFile& file) {
+    Json value{{"status", file.status}};
+    value["file"]        = file.file.empty() ? Json(nullptr) : Json(file.file);
+    value["bytes"]       = file.status == "written" ? Json(file.bytes) : Json(nullptr);
+    value["sha256"]      = file.sha256.empty() ? Json(nullptr) : Json(file.sha256);
+    value["error_class"] = file.error_class.empty() ? Json(nullptr) : Json(file.error_class);
+    return value;
+}
+
+void add_content_json(Json& record, const RequestLogContext& context) {
+    if (context.prompt_file.status.empty()) { return; }
+    record["content_files"] = Json{{"prompt", content_file_json(context.prompt_file)},
+                                   {"response", content_file_json(context.response_file)}};
+}
+
+Json device_kv_pool_json(const KvCapacitySnapshot::DevicePool& pool) {
+    return Json{{"capacity_pages", pool.capacity_pages}, {"used_pages", pool.used_pages},
+                {"free_pages", pool.free_pages},         {"page_bytes", pool.page_bytes},
+                {"capacity_bytes", pool.capacity_bytes}, {"used_bytes", pool.used_bytes},
+                {"free_bytes", pool.free_bytes}};
+}
+
+void add_kv_snapshot_json(Json& record, const KvCapacitySnapshot& snapshot) {
+    record["kv_capacity"] =
+        Json{{"device", Json{{"main", device_kv_pool_json(snapshot.device_main)},
+                             {"backend", device_kv_pool_json(snapshot.device_backend)}}},
+             {"host", Json{{"capacity_bytes", snapshot.host_capacity_bytes},
+                           {"used_bytes", snapshot.host_used_bytes},
+                           {"free_bytes", snapshot.host_free_bytes}}}};
+}
+
+void add_kv_snapshot_json(Json& record, const RequestLogContext& context) {
+    if (context.kv_snapshot) { add_kv_snapshot_json(record, *context.kv_snapshot); }
 }
 
 Json preparation_json(const RequestLogContext& context) {
@@ -433,21 +545,23 @@ std::string format_server_start_json(
         default_thinking_budget = *options.default_thinking_budget;
     }
 
-    record["server"]                               = Json{{"host", options.host},
-                                                          {"port", options.port},
-                                                          {"public_model_id", public_model_id},
-                                                          {"api_key_configured", !options.api_key.empty()},
-                                                          {"cors_enabled", options.enable_cors},
-                                                          {"max_request_bytes", options.max_request_bytes},
-                                                          {"media_cache_bytes", options.media_cache_bytes},
-                                                          {"media_live_bytes", options.media_live_bytes},
-                                                          {"media_preprocess_threads", options.media_preprocess_threads},
-                                                          {"request_log_jsonl", options.request_log_jsonl},
-                                                          {"slot_save_path", options.slot_save_path},
-                                                          {"default_output_tokens", options.default_max_tokens},
-                                                          {"default_thinking", options.enable_thinking},
-                                                          {"default_thinking_budget", std::move(default_thinking_budget)},
-                                                          {"default_preserve_thinking", options.preserve_thinking}};
+    record["server"] =
+        Json{{"host", options.host},
+             {"port", options.port},
+             {"public_model_id", public_model_id},
+             {"api_key_configured", !options.api_key.empty()},
+             {"cors_enabled", options.enable_cors},
+             {"max_request_bytes", options.max_request_bytes},
+             {"media_cache_bytes", options.media_cache_bytes},
+             {"media_live_bytes", options.media_live_bytes},
+             {"media_preprocess_threads", options.media_preprocess_threads},
+             {"request_log_jsonl", options.request_log_jsonl},
+             {"request_log_content_capture", !options.request_log_content_dir.empty()},
+             {"slot_save_path", options.slot_save_path},
+             {"default_output_tokens", options.default_max_tokens},
+             {"default_thinking", options.enable_thinking},
+             {"default_thinking_budget", std::move(default_thinking_budget)},
+             {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"target", load.target},
@@ -530,8 +644,16 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
+             {"device_main_kv_capacity_pages", memory.device_main_kv_capacity_pages},
+             {"device_main_kv_occupied_pages", memory.device_main_kv_occupied_pages},
+             {"device_main_kv_page_bytes", memory.device_main_kv_page_bytes},
+             {"device_backend_kv_capacity_pages", memory.device_backend_kv_capacity_pages},
+             {"device_backend_kv_occupied_pages", memory.device_backend_kv_occupied_pages},
+             {"device_backend_kv_page_bytes", memory.device_backend_kv_page_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_main_kv_page_bytes", memory.host_main_kv_page_bytes},
+             {"host_backend_kv_page_bytes", memory.host_backend_kv_page_bytes},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
@@ -553,6 +675,8 @@ std::string format_request_start_json(const std::string& server_instance_id,
     Json record                   = event_base(server_instance_id, timestamp, "request_start");
     record["request"]             = request_json(context);
     record["preparation_seconds"] = preparation_json(context);
+    add_content_json(record, context);
+    add_kv_snapshot_json(record, context);
     return record.dump();
 }
 
@@ -592,6 +716,12 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
          {"thinking_control_tokens", outcome.thinking.injected_tokens},
          {"thinking_control_applied", outcome.thinking.applied},
          {"tool_call_count", outcome.tool_calls.size()}};
+    record["checkpoint_summary"] =
+        Json{{"reuse_loaded", outcome.checkpoints.reuse_loaded},
+             {"restore_committed", outcome.checkpoints.restore_committed},
+             {"created_committed", outcome.checkpoints.created_committed},
+             {"offload_committed", outcome.checkpoints.offload_committed},
+             {"capture_aborted", outcome.checkpoints.capture_aborted}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
@@ -599,6 +729,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
+    add_content_json(record, context);
+    add_kv_snapshot_json(record, context);
     return record.dump();
 }
 
@@ -608,7 +740,139 @@ std::string format_request_error_json(const std::string& server_instance_id,
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
     record["error"]   = Json{{"message", message}};
+    add_content_json(record, context);
+    add_kv_snapshot_json(record, context);
     return record.dump();
+}
+
+std::string format_checkpoint_lifecycle_json(const std::string& server_instance_id,
+                                             std::uint64_t timestamp,
+                                             const RequestLogContext& context,
+                                             const ninfer::CheckpointLifecycleFact& fact) {
+    Json record       = event_base(server_instance_id, timestamp, "checkpoint_lifecycle");
+    record["request"] = Json{
+        {"request_id", context.id == 0 ? Json(nullptr) : Json(context.id)},
+        {"response_id", context.response_id.empty() ? Json(nullptr) : Json(context.response_id)}};
+    record["checkpoint"] = Json{
+        {"key_digest", checkpoint_key_digest(fact.key_digests)},
+        {"content_digest", fact.content_digest.empty() ? Json(nullptr) : Json(fact.content_digest)},
+        {"frontier", fact.frontier},
+        {"identity_tag", fact.identity_tag},
+        {"ordinal", fact.ordinal},
+        {"role", checkpoint_role_name(fact.role)},
+        {"scope", fact.scope == ninfer::CheckpointLifecycleScope::Shared ? "shared" : "private"}};
+    record["operation"]        = checkpoint_operation_name(fact.operation);
+    record["status"]           = checkpoint_status_name(fact.status);
+    record["source_tier"]      = checkpoint_tier_name(fact.source_tier);
+    record["destination_tier"] = checkpoint_tier_name(fact.destination_tier);
+    const std::optional<KvCapacitySnapshot> fact_snapshot =
+        fact.kv_snapshot
+            ? std::optional<KvCapacitySnapshot>(make_kv_capacity_snapshot(*fact.kv_snapshot))
+            : std::nullopt;
+    const KvCapacitySnapshot* snapshot =
+        fact_snapshot ? &*fact_snapshot : (context.kv_snapshot ? &*context.kv_snapshot : nullptr);
+    const std::uint64_t state_bytes =
+        snapshot ? saturating_product(fact.state_images, snapshot->state_image_bytes) : 0;
+    const bool host_quantity = fact.source_tier == ninfer::CheckpointLifecycleTier::Host ||
+                               fact.destination_tier == ninfer::CheckpointLifecycleTier::Host;
+    const std::uint64_t main_bytes =
+        snapshot ? saturating_product(fact.main_kv_pages, host_quantity
+                                                              ? snapshot->host_main_page_bytes
+                                                              : snapshot->device_main.page_bytes)
+                 : 0;
+    const std::uint64_t backend_bytes =
+        snapshot ? saturating_product(fact.backend_kv_pages,
+                                      host_quantity ? snapshot->host_backend_page_bytes
+                                                    : snapshot->device_backend.page_bytes)
+                 : 0;
+    record["resources"] =
+        Json{{"state", Json{{"images", fact.state_images}, {"bytes", state_bytes}}},
+             {"main_kv", Json{{"pages", fact.main_kv_pages}, {"bytes", main_bytes}}},
+             {"backend_kv", Json{{"pages", fact.backend_kv_pages}, {"bytes", backend_bytes}}},
+             {"serialized_bytes", fact.serialized_bytes}};
+    record["elapsed_ns"] = fact.elapsed_ns ? Json(*fact.elapsed_ns) : Json(nullptr);
+    if (snapshot) { add_kv_snapshot_json(record, *snapshot); }
+    return record.dump();
+}
+
+namespace {
+
+std::string markdown_fence(std::string_view text) {
+    std::size_t longest = 0;
+    std::size_t run     = 0;
+    for (const char value : text) {
+        if (value == '~') {
+            longest = std::max(longest, ++run);
+        } else {
+            run = 0;
+        }
+    }
+    return std::string(std::max<std::size_t>(4, longest + 1), '~');
+}
+
+void append_markdown_block(std::string& out, std::string_view heading, std::string_view language,
+                           std::string_view value) {
+    out += "## ";
+    out += heading;
+    out += "\n\nBytes: ";
+    out += std::to_string(value.size());
+    out += "\n\n";
+    const std::string fence = markdown_fence(value);
+    out += fence;
+    out += language;
+    out += '\n';
+    out.append(value);
+    if (!value.empty() && value.back() != '\n') { out += '\n'; }
+    out += fence;
+    out += "\n\n";
+}
+
+} // namespace
+
+std::string format_prompt_markdown(std::string_view rendered_prompt,
+                                   std::span<const CapturedMediaMetadata> media) {
+    std::string result(rendered_prompt);
+    if (media.empty()) { return result; }
+    result += "\n\n---\n\n## Non-text media metadata\n\n";
+    for (std::size_t index = 0; index < media.size(); ++index) {
+        const CapturedMediaMetadata& item = media[index];
+        std::string safe_type;
+        safe_type.reserve(std::min<std::size_t>(item.media_type.size(), 128));
+        for (const unsigned char value : item.media_type.substr(0, 128)) {
+            safe_type +=
+                value >= 0x20 && value != 0x7f && value != '`' ? static_cast<char>(value) : ' ';
+        }
+        result += "- item ";
+        result += std::to_string(index + 1);
+        result += ": kind=`";
+        result += item.kind == ninfer::MediaKind::Image ? "image" : "video";
+        result += "`, media_type=`";
+        result += safe_type.empty() ? "unknown" : safe_type;
+        result += "`, bytes=`";
+        result += std::to_string(item.bytes);
+        result += "`, sha256=`";
+        result += item.sha256;
+        result += "`\n";
+    }
+    return result;
+}
+
+std::string format_response_markdown(const GenerationOutcome& outcome) {
+    std::string result = "# Final model response\n\n";
+    append_markdown_block(result, "Reasoning / thinking", "text", outcome.reasoning);
+    append_markdown_block(result, "Assistant content", "text", outcome.text);
+    result += "## Tool calls\n\n";
+    if (outcome.tool_calls.empty()) {
+        result += "None.\n";
+        return result;
+    }
+    for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        const std::string label               = "Tool call " + std::to_string(index + 1);
+        append_markdown_block(result, label + " name", "text", call.name);
+        append_markdown_block(result, label + " arguments", "json", call.arguments_json);
+    }
+    return result;
 }
 
 std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
@@ -827,14 +1091,39 @@ ServerLogEnvironment query_server_log_environment(int device) {
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
-                                 std::shared_ptr<spdlog::logger> logger)
-    : path_(path), logger_(std::move(logger)) {
+                                 std::shared_ptr<spdlog::logger> logger,
+                                 const std::filesystem::path& content_dir)
+    : path_(path), content_dir_(content_dir), logger_(std::move(logger)) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
         normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
     server_instance_id_ = new_server_instance_id();
+    if (!content_dir_.empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(content_dir_, error);
+        if (error || !std::filesystem::is_directory(content_dir_, error) || error) {
+            throw std::runtime_error("failed to create request-log content directory: " +
+                                     content_dir_.string());
+        }
+        const std::filesystem::path probe = content_dir_ / ("." + server_instance_id_ + ".probe");
+        {
+            std::ofstream output(probe, std::ios::binary | std::ios::out | std::ios::trunc);
+            output << "probe";
+            output.flush();
+            if (!output) {
+                std::filesystem::remove(probe, error);
+                throw std::runtime_error("request-log content directory is not writable: " +
+                                         content_dir_.string());
+            }
+        }
+        std::filesystem::remove(probe, error);
+        if (error) {
+            throw std::runtime_error("request-log content directory probe cleanup failed: " +
+                                     content_dir_.string());
+        }
+    }
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
@@ -857,8 +1146,20 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                     query_server_log_environment(options.device), artifact_size));
 }
 
-void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
+void JsonlRequestLog::write_request_start(RequestLogContext& context) {
     if (!enabled()) { return; }
+    if (!content_dir_.empty()) {
+        context.prompt_file =
+            context.rendered_prompt
+                ? write_content(
+                      "prompt", context.id,
+                      format_prompt_markdown(*context.rendered_prompt, context.captured_media))
+                : RequestLogContext::ContentFile{.status      = "failed",
+                                                 .error_class = "rendered_prompt_missing"};
+        context.response_file.status = "pending";
+        context.rendered_prompt.reset();
+        context.captured_media.clear();
+    }
     append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
 }
 
@@ -870,13 +1171,95 @@ void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& c
 void JsonlRequestLog::write_request_done(const RequestLogContext& context,
                                          const GenerationOutcome& outcome) {
     if (!enabled()) { return; }
-    append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+    RequestLogContext terminal = context;
+    if (!content_dir_.empty()) {
+        terminal.response_file =
+            write_content("response", context.id, format_response_markdown(outcome));
+    }
+    for (const ninfer::CheckpointLifecycleFact& fact : outcome.checkpoint_lifecycle) {
+        append(
+            format_checkpoint_lifecycle_json(server_instance_id_, unix_time_ms(), terminal, fact));
+    }
+    append(format_request_done_json(server_instance_id_, unix_time_ms(), terminal, outcome));
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,
                                           const std::string& message) {
     if (!enabled()) { return; }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+    RequestLogContext terminal = context;
+    if (!content_dir_.empty()) {
+        terminal.response_file = {.status = "not_available", .error_class = "generation_failed"};
+    }
+    append(format_request_error_json(server_instance_id_, unix_time_ms(), terminal, message));
+}
+
+void JsonlRequestLog::write_checkpoint_lifecycle(const ninfer::CheckpointLifecycleFact& fact,
+                                                 std::optional<KvCapacitySnapshot> snapshot) {
+    if (!enabled()) { return; }
+    RequestLogContext context;
+    context.kv_snapshot = std::move(snapshot);
+    append(format_checkpoint_lifecycle_json(server_instance_id_, unix_time_ms(), context, fact));
+}
+
+void JsonlRequestLog::write_checkpoint_lifecycle(const RequestLogContext& context,
+                                                 const ninfer::CheckpointLifecycleFact& fact) {
+    if (!enabled()) { return; }
+    append(format_checkpoint_lifecycle_json(server_instance_id_, unix_time_ms(), context, fact));
+}
+
+RequestLogContext::ContentFile JsonlRequestLog::write_content(std::string_view prefix,
+                                                              std::uint64_t request_id,
+                                                              std::string_view content) noexcept {
+    RequestLogContext::ContentFile result;
+    result.status = "failed";
+    std::filesystem::path temporary;
+    try {
+        const std::string suffix   = server_instance_id_ + "-request-" + std::to_string(request_id);
+        const std::string filename = std::string(prefix) + suffix + ".md";
+        const std::filesystem::path final = content_dir_ / filename;
+        temporary                         = content_dir_ / ("." + filename + ".tmp");
+        std::error_code error;
+        if (std::filesystem::exists(final, error) || error) {
+            result.error_class = error ? "destination_check_failed" : "destination_collision";
+            return result;
+        }
+        const std::string digest = targets::qwen3_6::frontend_internal::sha256_hex(
+            targets::qwen3_6::frontend_internal::sha256(content));
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!output) {
+                result.error_class = "temporary_open_failed";
+                return result;
+            }
+            output.write(content.data(), static_cast<std::streamsize>(content.size()));
+            output.flush();
+            if (!output) {
+                output.close();
+                std::filesystem::remove(temporary, error);
+                result.error_class = "temporary_write_failed";
+                return result;
+            }
+        }
+        std::filesystem::rename(temporary, final, error);
+        if (error) {
+            std::error_code cleanup;
+            std::filesystem::remove(temporary, cleanup);
+            result.error_class = "atomic_rename_failed";
+            return result;
+        }
+        result.status = "written";
+        result.file   = filename;
+        result.bytes  = content.size();
+        result.sha256 = digest;
+        return result;
+    } catch (...) {
+        if (!temporary.empty()) {
+            std::error_code cleanup;
+            std::filesystem::remove(temporary, cleanup);
+        }
+        result.error_class = "unexpected_io_failure";
+        return result;
+    }
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {

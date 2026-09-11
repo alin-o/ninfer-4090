@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 MANIFEST_TYPE = "ninfer_tiered_cache_fixture_manifest"
 MANIFEST_VERSION = 1
 EVIDENCE_TYPE = "ninfer_tiered_cache_evidence"
-EVIDENCE_VERSION = 4
+EVIDENCE_VERSION = 5
 CALIBRATION_TYPE = "ninfer_tiered_cache_predecessor_calibration"
 CALIBRATION_VERSION = 1
 

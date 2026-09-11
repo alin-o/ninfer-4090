@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -17,6 +18,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench.tiered_cache_replay import sha256_file
+from tools.artifact.container import Artifact, ResourceObject
+from tools.convert.qwen3_8_27b.convert import OFFICIAL_RESOURCE_SHA256
 
 
 REAL_SCENARIOS = (
@@ -37,6 +40,43 @@ NATIVE_CASES = {
     "resource-manager": "ninfer_resource_manager_test",
     "durable-shared-prefix-catalog": "ninfer_durable_shared_prefix_catalog_test",
 }
+
+
+def artifact_frontend_identity(path: Path) -> dict[str, object]:
+    resources: dict[str, dict[str, object]] = {}
+    with Artifact.open(path) as artifact:
+        if (artifact.identity.model_id, artifact.identity.weights_id) != (
+            "qwen3.8-27b",
+            "groupwise-int",
+        ):
+            raise ValueError(
+                "authorized artifact identity differs: "
+                f"{artifact.identity.model_id}/{artifact.identity.weights_id}"
+            )
+        for name, expected_sha256 in OFFICIAL_RESOURCE_SHA256.items():
+            obj = artifact.find(name)
+            if not isinstance(obj, ResourceObject):
+                raise ValueError(f"artifact frontend object is not a resource: {name}")
+            actual_sha256 = hashlib.sha256(artifact.payload(obj)).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"artifact frontend resource hash differs for {name}: "
+                    f"{actual_sha256} != {expected_sha256}"
+                )
+            resources[name] = {
+                "sha256": actual_sha256,
+                "offset": obj.offset,
+                "bytes": obj.bytes,
+                "encoding": obj.encoding,
+            }
+    return {
+        "authorization": "user-authorized-target-artifact-2026-09-11",
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "model_id": "qwen3.8-27b",
+        "weights_id": "groupwise-int",
+        "resources": resources,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -64,6 +104,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cases: dict[str, dict[str, object]] = {}
     failed = False
+    try:
+        frontend_identity = artifact_frontend_identity(weights)
+    except (KeyError, OSError, ValueError) as error:
+        parser.error(str(error))
     base_environment = dict(os.environ)
     base_environment["NINFER_QWEN3_8_27B_WEIGHTS"] = str(weights)
     for scenario in REAL_SCENARIOS:
@@ -115,6 +159,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "evidence": str(log),
             "test_executable_sha256": sha256_file(executable),
         }
+
+    artifact_frontend_status = str(cases["host-restore"]["status"])
+    cases["official-tokenizer-lineage"] = {
+        "status": artifact_frontend_status,
+        "command": cases["host-restore"]["command"],
+        "returncode": cases["host-restore"]["returncode"],
+        "evidence": (
+            "embedded official-source Qwen3.8 frontend objects matched their pinned hashes; "
+            "the artifact-backed public Engine Frontend path passed host-restore"
+        ),
+        "test_executable_sha256": sha256_file(prefix_test),
+        "artifact_frontend": frontend_identity,
+    }
 
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"],

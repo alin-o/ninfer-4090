@@ -30,11 +30,9 @@ Run the target profile with at least three trials per arm:
 
 ```bash
 export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer
-python3 tools/bench/build_tiered_cache_baseline.py \
-  --output-dir .local/tiered-cache-baseline-c7
-
 # Optional validation evidence. This records exact executable hashes, includes complete private
-# State/Main/MTP Host restoration, and preserves skips.
+# State/Main/MTP Host restoration, validates the embedded Qwen3.8 frontend-object hashes, and
+# preserves skips.
 python3 tools/bench/run_tiered_cache_validation.py \
   --serve build-agent-verify/apps/ninfer-serve \
   --weights "$NINFER_QWEN3_8_27B_WEIGHTS" \
@@ -42,17 +40,20 @@ python3 tools/bench/run_tiered_cache_validation.py \
 
 python3 tools/bench/run_tiered_cache_replay.py \
   --serve build-agent-verify/apps/ninfer-serve \
-  --baseline-serve .local/tiered-cache-baseline-c7/build/apps/ninfer-serve \
-  --baseline-build-identity .local/tiered-cache-baseline-c7/baseline-build.json \
   --validation-evidence .local/tiered-cache-validation.json \
   --samples 3
 ```
 
+This default is the user-authorized 2026-09-11 comparison: the existing-cache control and the
+tiered profiles use the same current executable. Reports label it as a configuration comparison
+and make no historical speedup claim. For an optional historical audit, build the recorded revision
+with `build_tiered_cache_baseline.py` and supply both `--baseline-serve` and
+`--baseline-build-identity`; neither historical input is required for target acceptance.
+
 The harness fixes `max-context=128000`, `max-concurrency=4`, `kv-capacity=auto`, RK4V4-E8 KV,
-MTP draft window 3, and the optimized draft head. It runs cache-disabled cold, current
-existing-cache from the separately built and hash-pinned recorded revision, Device, forced-Host,
-restart SSD, all serving-boundary, and four-way overlap arms. The current binary is never labeled as
-the recorded baseline. It loads the repository-local, identity-pinned predecessor calibration and
+MTP draft window 3, and the optimized draft head. It runs cache-disabled cold, a current-build
+existing-cache configuration control, Device, forced-Host, restart SSD, all serving-boundary, and
+four-way overlap arms. It loads the repository-local, identity-pinned predecessor calibration and
 writes the numeric material-improvement threshold before starting any optimized arm. The threshold
 is the larger of (a) the predecessor's complete private State/Main/MTP Host H2D work estimate,
 expressed as a fraction of the existing-cache median, and (b) three times the largest relative MAD
@@ -81,10 +82,11 @@ them. Only live occupancy and explicit high-water metrics use maxima. Reclaimed-
 from the alias-aware runtime counters. Required validation rows are PASS only when named,
 executable-pinned evidence is supplied; the identified validation case map is embedded into
 `evidence.json` so derived verdicts do not depend on an ignored side file. Missing required evidence
-remains UNVERIFIED and gates target correctness, the performance claim, configuration decisions,
-the overall verdict, and exit status. Supplemental official-tokenizer fixture lineage remains
-separately UNVERIFIED without an authorized identity-pinned local tokenizer artifact, but does not
-gate the target verdicts; the tools never download a tokenizer or model.
+remains UNVERIFIED and gates target correctness, the configuration-improvement result, configuration
+decisions, the overall verdict, and exit status. Supplemental frontend lineage hashes the embedded
+official-source objects in the authorized Qwen3.8 artifact and couples them to an artifact-backed
+public Engine validation. A separate Qwen3.6 tokenizer triplet is explicitly waived and is not a
+target gate. The tools never download or extract a tokenizer or model.
 
 The complete private Host row specifically requires the `host-restore` real-artifact scenario. A
 passing shared-snapshot scenario proves the shared-owner SSD codec/adoption path and rollback

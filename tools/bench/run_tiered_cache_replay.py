@@ -485,9 +485,10 @@ def run_profile(
     cache_dir = cache_dir or root / "shared-cache"
     request_log.parent.mkdir(parents=True, exist_ok=True)
     baseline_profile = profile == "existing"
+    historical_baseline = baseline_profile and getattr(args, "historical_baseline", False)
     serve = args.baseline_serve if baseline_profile else args.serve
     allowed_schemas = (
-        (BASELINE_REQUEST_LOG_SCHEMA,) if baseline_profile else (REQUEST_LOG_SCHEMA,)
+        (BASELINE_REQUEST_LOG_SCHEMA,) if historical_baseline else (REQUEST_LOG_SCHEMA,)
     )
     command = server_command(serve, args.weights, args.port, request_log, profile, cache_dir)
     measurements: list[dict[str, Any]] = []
@@ -509,7 +510,7 @@ def run_profile(
                 request_log,
                 done_count,
                 args.request_timeout_seconds,
-                expected_response_id=None if baseline_profile else response_id,
+                expected_response_id=None if historical_baseline else response_id,
                 allowed_schemas=allowed_schemas,
             )
             seed_measurement = request_measurement(
@@ -584,7 +585,7 @@ def run_profile(
                     request_log,
                     done_count,
                     args.request_timeout_seconds,
-                    expected_response_id=None if baseline_profile else response_id,
+                    expected_response_id=None if historical_baseline else response_id,
                     allowed_schemas=allowed_schemas,
                 )
                 setup_measurements.append(
@@ -1083,6 +1084,7 @@ def load_baseline_identity(path: Path, serve: Path) -> dict[str, Any]:
     if value.get("serve_sha256") != actual_sha256:
         raise ReplayError("baseline executable SHA-256 differs from its build identity")
     return {
+        "kind": "historical-recorded-revision",
         "source_revision": BASELINE_REVISION,
         "source_archive_sha256": archive_sha256,
         "serve_path": str(serve),
@@ -1091,6 +1093,37 @@ def load_baseline_identity(path: Path, serve: Path) -> dict[str, Any]:
         "build_identity_sha256": sha256_file(path),
         "build_command": value.get("build_command"),
         "compiler": value.get("compiler"),
+    }
+
+
+def current_build_control_identity(serve: Path) -> dict[str, Any]:
+    source_revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    source_dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    return {
+        "kind": "current-build-configuration-control",
+        "source_revision": source_revision,
+        "source_dirty": source_dirty,
+        "serve_path": str(serve),
+        "serve_sha256": sha256_file(serve),
+        "same_executable_as_optimized_profiles": True,
+        "configuration": "existing-cache control with Device-only anonymous exact-prefix policy",
+        "claim_scope": (
+            "configuration comparison within one current build; no historical speedup claim"
+        ),
     }
 
 
@@ -1159,33 +1192,37 @@ def official_tokenizer_status(
     if case is None:
         return (
             "UNVERIFIED",
-            "missing identified validation evidence: official-tokenizer-lineage",
+            "missing identified validation evidence: Qwen3.8 artifact-backed Frontend lineage",
         )
     if case.get("status") == "FAIL":
         return "FAIL", str(case.get("evidence", "recorded failure"))
-    artifact = case.get("tokenizer_artifact")
+    artifact = case.get("artifact_frontend")
     if case.get("status") != "PASS" or not isinstance(artifact, dict):
         return (
             "UNVERIFIED",
-            "official-tokenizer evidence is absent, skipped, or not identity-pinned",
+            "target artifact frontend evidence is absent, skipped, or not identity-pinned",
         )
     path_value = artifact.get("path")
-    expected_sha256 = artifact.get("sha256")
+    resources = artifact.get("resources")
     if (
-        artifact.get("authorization") != "user-authorized-local-artifact"
+        artifact.get("authorization") != "user-authorized-target-artifact-2026-09-11"
         or not isinstance(path_value, str)
-        or not isinstance(expected_sha256, str)
+        or artifact.get("model_id") != "qwen3.8-27b"
+        or artifact.get("weights_id") != "groupwise-int"
+        or not isinstance(resources, dict)
+        or not resources
     ):
-        return "UNVERIFIED", "official-tokenizer evidence lacks authorized local artifact identity"
-    tokenizer_path = Path(path_value).resolve()
-    if not tokenizer_path.is_file() or sha256_file(tokenizer_path) != expected_sha256:
+        return "UNVERIFIED", "target artifact frontend evidence lacks authorized object identity"
+    artifact_path = Path(path_value).resolve()
+    if not artifact_path.is_file() or artifact_path.stat().st_size != artifact.get("bytes"):
         return (
             "UNVERIFIED",
-            "authorized official-tokenizer artifact is unavailable or hash-mismatched",
+            "authorized target artifact is unavailable or its recorded size changed",
         )
     return (
         "PASS",
-        f"authorized identity-pinned local tokenizer: {tokenizer_path} ({expected_sha256})",
+        f"authorized Qwen3.8 artifact-backed Frontend: {artifact_path}; "
+        f"{len(resources)} embedded resource objects hash-pinned",
     )
 
 
@@ -1268,9 +1305,17 @@ def build_supplemental_evidence(
     return [
         {
             "status": tokenizer_status,
-            "case": "official-tokenizer lineage for frontend boundary fixtures",
+            "case": "Qwen3.8 artifact-backed Frontend lineage for boundary fixtures",
             "evidence": tokenizer_evidence,
-        }
+        },
+        {
+            "status": "WAIVED",
+            "case": "separate Qwen3.6 tokenizer triplet",
+            "evidence": (
+                "waived by Alin Olteanu on 2026-09-11; the authorized Qwen3.8 artifact-backed "
+                "Frontend is the target validation path"
+            ),
+        },
     ]
 
 
@@ -1310,7 +1355,7 @@ def configuration_decision(
         "tier_actions": actions,
         "reason": (
             "Every measured tier exceeded the frozen threshold; no tier was slower than the "
-            "recorded-revision existing-cache baseline, so these measurements do not justify a "
+            "explicitly labeled existing-cache control, so the measurements do not justify a "
             "cost-preset/config change."
             if not missed
             else "The measured evidence does not support every tier. Profiles below the frozen "
@@ -1368,8 +1413,8 @@ def campaign_verdict(
         "performance_measurement": measured_performance,
         "correctness": correctness,
         "reason": (
-            "Target production acceptance and the material-improvement claim are established "
-            "by the required evidence; supplemental evidence is reported separately."
+            "Target production acceptance and material improvement within the explicitly labeled "
+            "comparison scope are established; no claim is made beyond that scope."
             if overall == "PASS"
             else "Target production acceptance is not established; inspect required failed and "
             "unverified rows and the measured comparisons."
@@ -1404,6 +1449,19 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         if isinstance(validation_identity, dict)
         else "- Required validation identity is embedded per case in the raw evidence."
     )
+    baseline = evidence["baseline"]
+    if baseline.get("kind") == "current-build-configuration-control":
+        baseline_identity_line = (
+            "- Existing-cache control: same current serve SHA-256 "
+            f"`{baseline['serve_sha256']}` at `{baseline['source_revision']}`; "
+            "configuration-only comparison; no historical speedup claim."
+        )
+    else:
+        baseline_identity_line = (
+            f"- Existing-cache historical baseline revision: `{baseline['source_revision']}`; "
+            f"separate serve SHA-256: `{baseline['serve_sha256']}`; build identity: "
+            f"`{baseline['build_identity_path']}`."
+        )
     lines = [
         f"# Tiered cache production-profile replay ({evidence['date']})",
         "",
@@ -1427,9 +1485,7 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         f"- Resolved KV: {engine['kv_capacity']} tokens / {engine['kv_capacity_page_groups']} "
         f"page groups (`{engine['kv_capacity_mode']}`); State slots active+retained "
         f"{cache['total_device_state_slots']}; Host KV {cache['host_kv_capacity_bytes']} bytes.",
-        f"- Existing-cache baseline revision: `{evidence['baseline']['source_revision']}`; "
-        f"separate serve SHA-256: `{evidence['baseline']['serve_sha256']}`; build identity: "
-        f"`{evidence['baseline']['build_identity_path']}`.",
+        baseline_identity_line,
         validation_identity_line,
         "",
         "## Frozen threshold",
@@ -1474,6 +1530,12 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         ]
     )
     lines.extend(["", "## Material comparisons", ""])
+    lines.append(
+        "These are current-build configuration comparisons and do not claim a speedup over a "
+        "historical revision."
+        if baseline.get("kind") == "current-build-configuration-control"
+        else "These comparisons use the separately identified historical control executable."
+    )
     for profile, comparison in evidence["comparisons"].items():
         lines.append(
             f"- {profile}: reduction {comparison['reduction_fraction'] * 100:.2f}%; "
@@ -1548,7 +1610,7 @@ def reanalyze_evidence(
     if (
         not isinstance(evidence, dict)
         or evidence.get("artifact_type") != EVIDENCE_TYPE
-        or evidence_version not in {2, 3, EVIDENCE_VERSION}
+        or evidence_version not in {2, 3, 4, EVIDENCE_VERSION}
     ):
         raise ReplayError("unsupported replay evidence identity")
     measurements = evidence.get("measurements")
@@ -1640,7 +1702,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reanalyze-evidence",
         type=Path,
-        help="recompute derived verdicts/report from an existing schema-v2/v3 evidence JSON",
+        help="recompute derived verdicts/report from an existing schema-v2..v5 evidence JSON",
     )
     parser.add_argument("--verify-source", action="store_true")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -1654,12 +1716,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--baseline-serve",
         type=Path,
-        help="ninfer-serve built from the recorded baseline revision",
+        help=(
+            "optional ninfer-serve built from the recorded baseline revision; omit with "
+            "--baseline-build-identity for a current-build configuration control"
+        ),
     )
     parser.add_argument(
         "--baseline-build-identity",
         type=Path,
-        help="hash-pinned build identity emitted for --baseline-serve",
+        help=(
+            "optional hash-pinned build identity emitted for --baseline-serve; omit both "
+            "historical options for the authorized current-build comparison"
+        ),
     )
     parser.add_argument(
         "--validation-evidence",
@@ -1706,13 +1774,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(check, indent=2, sort_keys=True))
         return 0
     args.serve = args.serve.resolve()
-    if args.baseline_serve is None or args.baseline_build_identity is None:
+    if (args.baseline_serve is None) != (args.baseline_build_identity is None):
         raise ReplayError(
-            "measurement requires --baseline-serve and --baseline-build-identity; the current "
-            "binary cannot stand in for the recorded revision"
+            "--baseline-serve and --baseline-build-identity must be supplied together"
         )
-    args.baseline_serve = args.baseline_serve.resolve()
-    args.baseline_build_identity = args.baseline_build_identity.resolve()
+    args.historical_baseline = args.baseline_serve is not None
+    if args.baseline_serve is not None:
+        args.baseline_serve = args.baseline_serve.resolve()
+        assert args.baseline_build_identity is not None
+        args.baseline_build_identity = args.baseline_build_identity.resolve()
+    else:
+        args.baseline_serve = args.serve
     args.weights = args.weights.resolve()
     if not args.serve.is_file() or not os.access(args.serve, os.X_OK):
         raise ReplayError(f"ninfer-serve executable is unavailable: {args.serve}")
@@ -1720,7 +1792,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ReplayError(f"baseline ninfer-serve executable is unavailable: {args.baseline_serve}")
     if not args.weights.is_file():
         raise ReplayError(f"authorized model artifact is unavailable: {args.weights}")
-    baseline = load_baseline_identity(args.baseline_build_identity, args.baseline_serve)
+    baseline = (
+        load_baseline_identity(args.baseline_build_identity, args.baseline_serve)
+        if args.historical_baseline
+        else current_build_control_identity(args.serve)
+    )
     output = (
         args.output_dir.resolve()
         if args.output_dir
@@ -1874,7 +1950,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "serve_sha256": current_serve_sha256,
         },
         "baseline": baseline,
-        "baseline_method": "separate hash-pinned executable built from the recorded revision",
+        "baseline_method": (
+            "separate hash-pinned executable built from the recorded revision"
+            if args.historical_baseline
+            else "same current executable with existing-cache control configuration"
+        ),
+        "comparison_scope": (
+            "historical recorded-revision comparison"
+            if args.historical_baseline
+            else "current-build configuration comparison; no historical speedup claim"
+        ),
         "artifact": {"path": str(args.weights), "bytes": args.weights.stat().st_size},
         "fixture": check,
         "methodology": {
@@ -1884,7 +1969,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "raw_render_replay_is_protocol_separate": True,
             "profiles": [
                 "cold-current",
-                "existing-recorded-revision",
+                (
+                    "existing-recorded-revision"
+                    if args.historical_baseline
+                    else "existing-current-build-configuration-control"
+                ),
                 "device",
                 "host",
                 "ssd",

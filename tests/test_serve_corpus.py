@@ -23,6 +23,7 @@ from tools.bench.run_tiered_cache_replay import (
     campaign_exit_status,
     campaign_verdict,
     configuration_decision,
+    current_build_control_identity,
     done_by_response_id,
     load_baseline_identity,
     load_validation_cases,
@@ -479,9 +480,19 @@ def test_tiered_cache_verdicts_are_derived_and_missing_validation_is_unverified(
     assert supplemental == [
         {
             "status": "UNVERIFIED",
-            "case": "official-tokenizer lineage for frontend boundary fixtures",
-            "evidence": "official-tokenizer evidence is absent, skipped, or not identity-pinned",
-        }
+            "case": "Qwen3.8 artifact-backed Frontend lineage for boundary fixtures",
+            "evidence": (
+                "target artifact frontend evidence is absent, skipped, or not identity-pinned"
+            ),
+        },
+        {
+            "status": "WAIVED",
+            "case": "separate Qwen3.6 tokenizer triplet",
+            "evidence": (
+                "waived by Alin Olteanu on 2026-09-11; the authorized Qwen3.8 artifact-backed "
+                "Frontend is the target validation path"
+            ),
+        },
     ]
 
     decision = configuration_decision(
@@ -569,7 +580,7 @@ def test_supplemental_tokenizer_does_not_gate_target_verdicts() -> None:
     decision = configuration_decision(comparisons, verdict["correctness"])
 
     assert all(row["status"] == "PASS" for row in required)
-    assert supplemental[0]["status"] == "UNVERIFIED"
+    assert [row["status"] for row in supplemental] == ["UNVERIFIED", "WAIVED"]
     assert verdict["correctness"] == "PASS"
     assert verdict["performance"] == "PASS"
     assert verdict["performance_measurement"] == "PASS"
@@ -593,6 +604,45 @@ def test_supplemental_tokenizer_does_not_gate_target_verdicts() -> None:
     assert failed["performance_measurement"] == "PASS"
     assert failed["overall"] == "FAIL"
     assert campaign_exit_status(failed) == 3
+
+
+def test_current_build_control_is_explicitly_configuration_only(tmp_path) -> None:
+    serve = tmp_path / "ninfer-serve"
+    serve.write_bytes(b"current executable")
+
+    identity = current_build_control_identity(serve)
+
+    assert identity["kind"] == "current-build-configuration-control"
+    assert identity["same_executable_as_optimized_profiles"] is True
+    assert identity["serve_sha256"] == sha256_file(serve)
+    assert identity["claim_scope"] == (
+        "configuration comparison within one current build; no historical speedup claim"
+    )
+
+
+def test_artifact_backed_frontend_lineage_uses_target_artifact_without_triplet(tmp_path) -> None:
+    artifact = tmp_path / "qwen3_8_27b.ninfer"
+    artifact.write_bytes(b"identity-pinned artifact fixture")
+    supplemental = build_supplemental_evidence(
+        {
+            "official-tokenizer-lineage": {
+                "status": "PASS",
+                "artifact_frontend": {
+                    "authorization": "user-authorized-target-artifact-2026-09-11",
+                    "path": str(artifact),
+                    "bytes": artifact.stat().st_size,
+                    "model_id": "qwen3.8-27b",
+                    "weights_id": "groupwise-int",
+                    "resources": {
+                        "frontend/tokenizer.json": {"sha256": "a" * 64},
+                    },
+                },
+            }
+        }
+    )
+
+    assert [row["status"] for row in supplemental] == ["PASS", "WAIVED"]
+    assert "artifact-backed Frontend" in supplemental[0]["evidence"]
 
 
 def test_tiered_cache_boundary_verdict_requires_unique_preserved_identities() -> None:

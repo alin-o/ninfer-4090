@@ -4,7 +4,7 @@
   "provenance": {
     "source_commit": "69ef567748cc6b79604caeef64e4bb22309afdab",
     "source_report": "docs/maintainer/2026-09-10-qwen3.8-27b-context-cache-calibration.md",
-    "source_report_sha256": "1c84e30f145ec0d8df79115558ff980d4b6a35e6b49c6449595c290bdd4ea6e3",
+    "source_report_sha256": "3deae3ba3c608c5751b56baf736436927cd3e3f3d1ebe1dd3bfab4fa68184c36",
     "measured_at": "2026-09-10"
   },
   "target": {

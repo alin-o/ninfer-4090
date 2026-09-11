@@ -3,8 +3,8 @@
 Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
 client. Correctness is owned by the affected suites under [`tests/`](../../tests/README.md).
 
-The production-profile tiered shared-prefix replay, its recorded-revision baseline builder, and its
-executable-pinned validation importer are documented in
+The production-profile tiered shared-prefix replay, its default current-build configuration
+control, optional recorded-revision builder, and executable-pinned validation importer are documented in
 [`../../bench/README.md`](../../bench/README.md#tiered-shared-prefix-replay).
 
 ## External Serve TTFT

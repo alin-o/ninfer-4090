@@ -263,7 +263,7 @@ public:
         std::uint32_t warm_frontier = 0;
         std::uint64_t warm_cost_ns  = 0;
         WarmRecoveryTier warm_tier  = WarmRecoveryTier::None;
-        bool ssd_feasible           = false;
+        std::optional<std::size_t> ssd_candidate_index;
     };
 
     template <class DurableCandidate>
@@ -350,9 +350,14 @@ public:
             std::any_of(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
                 return entry.state == SharedCatalogState::Vacant && !entry.handle;
             });
-        result.ssd_feasible =
-            !ssd_candidates.empty() && vacant_logical &&
-            program.durable_shared_prefix_import_feasible(ssd_candidates.front().frontier);
+        if (vacant_logical) {
+            for (std::size_t index = 0; index < ssd_candidates.size(); ++index) {
+                if (program.durable_shared_prefix_import_feasible(ssd_candidates[index].frontier)) {
+                    result.ssd_candidate_index = index;
+                    break;
+                }
+            }
+        }
         return result;
     }
 

@@ -12,10 +12,31 @@
 #include <unistd.h>
 #include <vector>
 
+namespace ninfer::serve::testing {
+
+// Storage-only regression access for the validation-to-invalidation race. Production restoration
+// reaches the same methods after Program validation rejects a loaded record.
+struct DurableSharedPrefixCatalogTestAccess {
+    [[nodiscard]] static auto load_record(DurableSharedPrefixCatalog& catalog,
+                                          const DurableSharedPrefixCatalog::Candidate& candidate,
+                                          DurableSharedPrefixCatalog::Clock::time_point deadline) {
+        return catalog.load_record(candidate, deadline);
+    }
+
+    template <class LoadedRecord>
+    static void invalidate_loaded(DurableSharedPrefixCatalog& catalog,
+                                  const LoadedRecord& loaded) noexcept {
+        catalog.invalidate_loaded(loaded);
+    }
+};
+
+} // namespace ninfer::serve::testing
+
 namespace {
 
 using ninfer::serve::DurableSharedPrefixCatalog;
 using ninfer::serve::DurableSharedPrefixCatalogOptions;
+using ninfer::serve::testing::DurableSharedPrefixCatalogTestAccess;
 
 struct TemporaryDirectory {
     TemporaryDirectory() {
@@ -72,6 +93,14 @@ std::filesystem::path record_path(const std::filesystem::path& directory, std::s
         if (name.starts_with(digest) && name.ends_with(".nsh")) { return it->path(); }
     }
     return {};
+}
+
+std::uint32_t temporary_file_count(const std::filesystem::path& directory) {
+    std::uint32_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().filename().string().find(".tmp.") != std::string::npos) { ++count; }
+    }
+    return count;
 }
 
 void test_restart_lazy_load_and_duplicate_write() {
@@ -300,6 +329,103 @@ void test_replacement_and_repeated_manifest_failures_stay_bounded() {
     }
 }
 
+void test_stale_loaded_version_cannot_invalidate_replacement() {
+    TemporaryDirectory temporary;
+    auto configured      = options(temporary.path);
+    configured.workers   = 2;
+    configured.max_jobs  = 2;
+    const auto candidate = DurableSharedPrefixCatalog::Candidate{
+        .content_digest = std::string(64, '6'), .frontier = 25};
+    const std::vector<std::uint8_t> stale{1, 2, 3};
+    const std::vector<std::uint8_t> replacement{3, 2, 1};
+    DurableSharedPrefixCatalog catalog(std::move(configured));
+    catalog.enqueue(snapshot('6', candidate.frontier, stale));
+    catalog.drain();
+
+    auto loaded = DurableSharedPrefixCatalogTestAccess::load_record(
+        catalog, candidate, DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+    std::promise<void> invalidation_ready;
+    std::promise<void> release_invalidation;
+    auto release = release_invalidation.get_future().share();
+    std::thread delayed_invalidation([&] {
+        invalidation_ready.set_value();
+        release.wait();
+        DurableSharedPrefixCatalogTestAccess::invalidate_loaded(catalog, loaded);
+    });
+    invalidation_ready.get_future().wait();
+
+    std::promise<bool> replacement_settled;
+    catalog.enqueue(snapshot('6', candidate.frontier, replacement),
+                    [&](bool committed) { replacement_settled.set_value(committed); });
+    expect(replacement_settled.get_future().get(),
+           "replacement did not commit while stale validation was pending");
+    release_invalidation.set_value();
+    delayed_invalidation.join();
+    loaded.bytes.reset();
+    catalog.drain();
+
+    auto current =
+        catalog.load(candidate, DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+    expect(current && *current == replacement && catalog.stats().manifest_records == 1,
+           "delayed stale-record invalidation deleted the committed replacement");
+    current.reset();
+    catalog.drain();
+}
+
+void test_pre_rename_failure_retains_charge_until_cleanup_is_durable() {
+    {
+        TemporaryDirectory temporary;
+        auto configured                 = options(temporary.path);
+        configured.before_record_rename = [] {
+            throw std::runtime_error("injected rename failure");
+        };
+        DurableSharedPrefixCatalog catalog(std::move(configured));
+        catalog.enqueue(snapshot('4', 26, {1, 2, 3, 4}));
+        catalog.drain();
+        const auto stats = catalog.stats();
+        expect(stats.writes_failed == 1 && stats.unpublished_records == 0 &&
+                   stats.unpublished_bytes == 0 && temporary_file_count(temporary.path) == 0,
+               "pre-rename failure did not durably clean and uncharge its temporary payload");
+    }
+
+    TemporaryDirectory temporary;
+    auto configured                 = options(temporary.path);
+    configured.max_records          = 1;
+    configured.max_bytes            = 4;
+    configured.before_record_rename = [] { throw std::runtime_error("injected rename failure"); };
+    configured.before_temporary_remove = [] {
+        throw std::runtime_error("injected cleanup failure");
+    };
+    {
+        DurableSharedPrefixCatalog catalog(std::move(configured));
+        catalog.enqueue(snapshot('3', 27, {1, 2, 3, 4}));
+        catalog.drain();
+        auto stats = catalog.stats();
+        expect(stats.writes_failed == 1 && stats.unpublished_records == 1 &&
+                   stats.unpublished_bytes == 4 && temporary_file_count(temporary.path) == 1,
+               "failed temporary cleanup released its directory quota charge");
+        catalog.enqueue(snapshot('2', 28, {4}));
+        catalog.drain();
+        stats = catalog.stats();
+        expect(stats.manifest_records == 0 && stats.quota_rejections >= 1 &&
+                   temporary_file_count(temporary.path) == 1,
+               "uncharged failed-cleanup payload allowed the directory quota to be exceeded");
+    }
+    {
+        auto restarted        = options(temporary.path);
+        restarted.max_records = 1;
+        restarted.max_bytes   = 4;
+        DurableSharedPrefixCatalog catalog(std::move(restarted));
+        expect(catalog.stats().unpublished_records == 0 &&
+                   temporary_file_count(temporary.path) == 0,
+               "restart did not durably settle the failed-cleanup orphan");
+        catalog.enqueue(snapshot('2', 28, {4}));
+        catalog.drain();
+        expect(catalog.stats().manifest_records == 1,
+               "settled orphan charge continued to block publication after restart");
+    }
+}
+
 void test_orphan_cleanup_preserves_unrelated_files() {
     TemporaryDirectory temporary;
     const std::filesystem::path unrelated_temporary = temporary.path / "keep.tmp.user";
@@ -321,6 +447,8 @@ int main() {
     test_interrupted_manifest_preserves_previous_commit();
     test_first_load_registration_race_releases_loser_outside_mutex();
     test_replacement_and_repeated_manifest_failures_stay_bounded();
+    test_stale_loaded_version_cannot_invalidate_replacement();
+    test_pre_rename_failure_retains_charge_until_cleanup_is_durable();
     test_orphan_cleanup_preserves_unrelated_files();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -1039,6 +1039,11 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
+    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) {
+        inspected_durable_frontiers.push_back(frontier);
+        return frontier <= max_durable_import_frontier;
+    }
+
     void execute_scheduled_decode(std::span<const FakeSequenceHandle> members) {
         require(transaction_kind_ == TransactionKind::Materialization,
                 "independent work was not interleaved with a materialization transfer");
@@ -1264,9 +1269,11 @@ public:
     std::vector<std::vector<std::uint64_t>> seal_attempts;
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
+    std::vector<std::uint32_t> inspected_durable_frontiers;
     std::vector<std::uint32_t> released_continuations;
     std::vector<std::uint32_t> released_shared_prefixes;
-    std::uint64_t shared_import_adoptions = 0;
+    std::uint64_t shared_import_adoptions     = 0;
+    std::uint32_t max_durable_import_frontier = UINT32_MAX;
     std::vector<std::string_view> timeline;
 
 private:
@@ -2172,6 +2179,24 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
     require(result && result->candidate == PlanningCandidateId{.value = 1} &&
                 program.pressure_planning_sessions == 1,
             "equal lower bound bypassed the pressure target that wins the stable tie-break");
+}
+
+void test_durable_recovery_uses_first_feasible_ssd_candidate() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 1, 1);
+    FakeProgram program;
+    program.max_durable_import_frontier = 32;
+    const std::array candidates{DurableCandidate{.frontier = 60}, DurableCandidate{.frontier = 32}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{17}, make_base(17),
+                                         std::span<const DurableCandidate>(candidates));
+
+    require(inspection.ssd_candidate_index && *inspection.ssd_candidate_index == 1 &&
+                program.inspected_durable_frontiers == std::vector<std::uint32_t>({60, 32}),
+            "durable recovery stopped at an infeasible deepest SSD record");
 }
 
 void test_guided_pressure_prefers_complete_durable_recovery() {
@@ -4007,6 +4032,8 @@ int main() {
              test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
+    run_test("shallower feasible durable recovery",
+             test_durable_recovery_uses_first_feasible_ssd_candidate);
     run_test("durable recovery pressure preference",
              test_guided_pressure_prefers_complete_durable_recovery);
     run_test("machine cost is selection-only",

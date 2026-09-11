@@ -769,23 +769,34 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                           }) {
                 const auto inspected = core->inspect_durable_shared_prefix_recovery(
                     prompt.impl_->value, resolved.execution, available_ssd_candidates);
-                const Candidate* deepest_ssd =
-                    available_ssd_candidates.empty() ? nullptr : &available_ssd_candidates.front();
+                const Candidate* feasible_ssd = nullptr;
+                std::size_t feasible_index    = 0;
+                if (inspected.ssd_candidate_index &&
+                    *inspected.ssd_candidate_index < available_ssd_candidates.size()) {
+                    feasible_index = *inspected.ssd_candidate_index;
+                    feasible_ssd   = &available_ssd_candidates[feasible_index];
+                }
                 if (inspected.warm_frontier != 0 &&
-                    (deepest_ssd == nullptr || inspected.warm_frontier >= deepest_ssd->frontier)) {
+                    (feasible_ssd == nullptr ||
+                     inspected.warm_frontier >= feasible_ssd->frontier)) {
+                    const char* reason = "deeper-memory-ready";
+                    if (feasible_ssd != nullptr &&
+                        inspected.warm_frontier == feasible_ssd->frontier) {
+                        reason = "same-boundary-memory-ready";
+                    } else if (feasible_ssd == nullptr && !available_ssd_candidates.empty()) {
+                        reason = "ssd-adoption-infeasible-memory-ready";
+                    }
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
-                            .reason                   = deepest_ssd != nullptr &&
-                                              inspected.warm_frontier == deepest_ssd->frontier
-                                                            ? "same-boundary-memory-ready"
-                                                            : "deeper-memory-ready"};
+                            .reason                   = reason};
                 }
-                if (deepest_ssd != nullptr && inspected.ssd_feasible) {
+                if (feasible_ssd != nullptr) {
                     return {.source    = RecoverySource::Ssd,
-                            .candidate = *deepest_ssd,
-                            .frontier  = deepest_ssd->frontier,
-                            .reason    = "ssd-deeper-feasible"};
+                            .candidate = *feasible_ssd,
+                            .frontier  = feasible_ssd->frontier,
+                            .reason    = feasible_index == 0 ? "ssd-deeper-feasible"
+                                                             : "ssd-shallower-feasible"};
                 }
                 if (inspected.warm_frontier != 0) {
                     return {.source                   = RecoverySource::Memory,
@@ -793,8 +804,8 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
                             .reason                   = "ssd-adoption-infeasible-memory-ready"};
                 }
-                return {.reason =
-                            deepest_ssd == nullptr ? "ssd-unavailable" : "ssd-adoption-infeasible"};
+                return {.reason = available_ssd_candidates.empty() ? "ssd-unavailable"
+                                                                   : "ssd-adoption-infeasible"};
             }
             return {.reason = "ssd-engine-unsupported"};
         },

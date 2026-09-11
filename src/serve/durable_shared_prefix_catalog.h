@@ -16,6 +16,10 @@
 
 namespace ninfer::serve {
 
+namespace testing {
+struct DurableSharedPrefixCatalogTestAccess;
+}
+
 struct DurableSharedPrefixCatalogOptions {
     std::filesystem::path directory;
     std::uint32_t max_records   = 16;
@@ -29,6 +33,9 @@ struct DurableSharedPrefixCatalogOptions {
     std::function<void()> before_payload_read;
     // Deterministic first-load registration race seam. Production leaves it empty.
     std::function<void()> before_load_registration;
+    // Deterministic pre-rename and failed-cleanup seams. Production leaves them empty.
+    std::function<void()> before_record_rename;
+    std::function<void()> before_temporary_remove;
 };
 
 struct DurableSharedPrefixCatalogStats {
@@ -95,6 +102,19 @@ public:
 
 private:
     struct State;
+
+    struct LoadedRecord {
+        std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+        std::string digest;
+        std::string filename;
+        std::uint64_t order = 0;
+    };
+
+    [[nodiscard]] LoadedRecord load_record(const Candidate& candidate, Clock::time_point deadline,
+                                           const CancellationView& cancellation = {});
+    void invalidate_loaded(const LoadedRecord& loaded) noexcept;
+
+    friend struct testing::DurableSharedPrefixCatalogTestAccess;
     std::shared_ptr<State> state_;
 };
 

@@ -102,41 +102,66 @@ void sync_directory(const std::filesystem::path& directory) {
     }
 }
 
+struct AtomicWriteState {
+    std::filesystem::path temporary;
+    bool temporary_created = false;
+    bool cleanup_confirmed = false;
+    bool renamed           = false;
+};
+
+bool remove_temporary(const std::filesystem::path& directory, AtomicWriteState& state,
+                      const std::function<void()>& before_remove) noexcept {
+    try {
+        if (before_remove) { before_remove(); }
+        std::error_code error;
+        std::filesystem::remove(state.temporary, error);
+        if (error) { return false; }
+        // The charge represents the possible crash-visible directory entry. Release it only after
+        // both the absence of that entry and the parent-directory update are durable.
+        sync_directory(directory);
+        state.cleanup_confirmed = true;
+        return true;
+    } catch (...) { return false; }
+}
+
 void atomic_write(const std::filesystem::path& directory, const std::filesystem::path& final_path,
                   std::span<const std::uint8_t> bytes, std::uint64_t nonce,
-                  bool* renamed = nullptr) {
-    if (renamed != nullptr) { *renamed = false; }
-    const std::filesystem::path temporary =
+                  AtomicWriteState* observed                 = nullptr,
+                  const std::function<void()>& before_rename = {},
+                  const std::function<void()>& before_remove = {}) {
+    AtomicWriteState local;
+    AtomicWriteState& state = observed != nullptr ? *observed : local;
+    state                   = {};
+    state.temporary =
         directory / (final_path.filename().string() + ".tmp." + std::to_string(nonce));
-    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int fd = ::open(state.temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) {
         throw std::runtime_error(error_text("durable shared-prefix temporary open failed"));
     }
+    state.temporary_created = true;
     try {
         write_all(fd, bytes);
         if (::fsync(fd) != 0) {
             throw std::runtime_error(error_text("durable shared-prefix file sync failed"));
         }
-        if (::close(fd) != 0) {
+        const int close_result = ::close(fd);
+        fd                     = -1;
+        if (close_result != 0) {
             throw std::runtime_error(error_text("durable shared-prefix file close failed"));
         }
+        if (before_rename) { before_rename(); }
+        if (::rename(state.temporary.c_str(), final_path.c_str()) != 0) {
+            throw std::runtime_error(error_text("durable shared-prefix rename failed"));
+        }
+        state.renamed = true;
+        sync_directory(directory);
     } catch (...) {
         const int saved_errno = errno;
-        ::close(fd);
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
+        if (fd >= 0) { ::close(fd); }
+        if (!state.renamed) { (void)remove_temporary(directory, state, before_remove); }
         errno = saved_errno;
         throw;
     }
-    if (::rename(temporary.c_str(), final_path.c_str()) != 0) {
-        const int saved_errno = errno;
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        errno = saved_errno;
-        throw std::runtime_error(error_text("durable shared-prefix rename failed"));
-    }
-    if (renamed != nullptr) { *renamed = true; }
-    sync_directory(directory);
 }
 
 std::vector<std::string_view> split_tabs(std::string_view line) {
@@ -182,6 +207,7 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
         std::mutex mutex;
         std::condition_variable cv;
         std::shared_ptr<Payload> payload;
+        Record record;
         std::string error;
         bool done = false;
     };
@@ -326,6 +352,14 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
 
     void cleanup_orphans() noexcept {
         std::uint32_t removed = 0;
+        std::vector<std::optional<std::uint64_t>> pending_deletion_charges;
+        const auto charge_orphan = [&](std::optional<std::uint64_t> bytes) {
+            unpublished_records =
+                unpublished_records == UINT32_MAX ? UINT32_MAX : unpublished_records + 1U;
+            unpublished_bytes = !bytes || unpublished_bytes > UINT64_MAX - *bytes
+                                    ? UINT64_MAX
+                                    : unpublished_bytes + *bytes;
+        };
         std::error_code error;
         for (std::filesystem::directory_iterator it(options.directory, error), end;
              !error && it != end; it.increment(error)) {
@@ -337,21 +371,28 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
             const bool indexed =
                 indexed_record != records.end() && indexed_record->second.filename == name;
             if (temporary || (record && !indexed)) {
+                error.clear();
+                const std::uint64_t size = it->file_size(error);
+                const std::optional<std::uint64_t> bytes =
+                    error ? std::nullopt : std::optional(size);
+                error.clear();
                 bool removed_now = false;
                 if (removed < kMaximumOrphanCleanup) {
                     removed_now = std::filesystem::remove(it->path(), error);
-                    if (!error && removed_now) { ++removed; }
+                    if (!error && removed_now) {
+                        ++removed;
+                        pending_deletion_charges.push_back(bytes);
+                    }
                 }
-                if (!removed_now) {
-                    error.clear();
-                    const std::uint64_t bytes = it->file_size(error);
-                    unpublished_records =
-                        unpublished_records == UINT32_MAX ? UINT32_MAX : unpublished_records + 1U;
-                    unpublished_bytes = error || unpublished_bytes > UINT64_MAX - bytes
-                                            ? UINT64_MAX
-                                            : unpublished_bytes + bytes;
-                }
+                if (!removed_now) { charge_orphan(bytes); }
                 error.clear();
+            }
+        }
+        if (!pending_deletion_charges.empty()) {
+            try {
+                sync_directory(options.directory);
+            } catch (...) {
+                for (const auto bytes : pending_deletion_charges) { charge_orphan(bytes); }
             }
         }
     }
@@ -508,25 +549,26 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
                                   .bytes    = snapshot.bytes.size(),
                                   .order    = next_order++};
                     const std::filesystem::path record_path = options.directory / record.filename;
-                    bool record_published                   = false;
-                    bool retain_unpublished                 = false;
+                    AtomicWriteState record_write;
+                    bool retain_unpublished = false;
                     try {
                         atomic_write(options.directory, record_path, snapshot.bytes,
-                                     record.order * 2U, &record_published);
+                                     record.order * 2U, &record_write, options.before_record_rename,
+                                     options.before_temporary_remove);
                         const std::string manifest = manifest_contents(record, digest);
                         if (options.before_manifest_publish) { options.before_manifest_publish(); }
-                        bool manifest_renamed = false;
+                        AtomicWriteState manifest_write;
                         try {
                             atomic_write(options.directory, options.directory / kManifestName,
                                          std::span<const std::uint8_t>(
                                              reinterpret_cast<const std::uint8_t*>(manifest.data()),
                                              manifest.size()),
-                                         record.order * 2U + 1U, &manifest_renamed);
+                                         record.order * 2U + 1U, &manifest_write);
                         } catch (...) {
                             // After manifest rename, the commit marker may survive a crash even if
                             // its parent fsync failed. Keep the referenced payload and its quota
                             // charge; restart will resolve which manifest version persisted.
-                            retain_unpublished = manifest_renamed;
+                            retain_unpublished = manifest_write.renamed;
                             throw;
                         }
                         {
@@ -550,9 +592,10 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
                                                previous->bytes);
                         }
                     } catch (...) {
-                        if (record_published && !retain_unpublished) {
+                        if (record_write.renamed && !retain_unpublished) {
                             remove_unpublished(record_path, record.bytes);
-                        } else if (!record_published) {
+                        } else if (!record_write.renamed && (!record_write.temporary_created ||
+                                                             record_write.cleanup_confirmed)) {
                             std::lock_guard lock(mutex);
                             release_unpublished(record.bytes);
                         }
@@ -572,14 +615,18 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
         snapshot.release_storage();
     }
 
-    void invalidate(std::string_view digest) noexcept {
+    void invalidate(std::string_view digest, std::string_view filename,
+                    std::uint64_t order) noexcept {
         try {
             std::scoped_lock publish_lock(publish_mutex);
             std::optional<Record> invalid;
             {
                 std::lock_guard lock(mutex);
                 const auto found = records.find(std::string(digest));
-                if (found == records.end()) { return; }
+                if (found == records.end() || found->second.filename != filename ||
+                    found->second.order != order) {
+                    return;
+                }
                 invalid = found->second;
             }
             const std::string manifest = manifest_contents(std::nullopt, digest);
@@ -592,7 +639,8 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
             {
                 std::lock_guard lock(mutex);
                 const auto found = records.find(std::string(digest));
-                if (found == records.end() || found->second.filename != invalid->filename) {
+                if (found == records.end() || found->second.filename != invalid->filename ||
+                    found->second.order != invalid->order) {
                     return;
                 }
                 catalog_bytes -= invalid->bytes;
@@ -702,6 +750,12 @@ void DurableSharedPrefixCatalog::enqueue(Snapshot snapshot, std::function<void(b
 std::shared_ptr<const std::vector<std::uint8_t>>
 DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point deadline,
                                  const CancellationView& cancellation) {
+    return load_record(candidate, deadline, cancellation).bytes;
+}
+
+DurableSharedPrefixCatalog::LoadedRecord
+DurableSharedPrefixCatalog::load_record(const Candidate& candidate, Clock::time_point deadline,
+                                        const CancellationView& cancellation) {
     const auto state = state_;
     std::shared_ptr<State::LoadJob> job;
     State::Record record;
@@ -711,10 +765,13 @@ DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point d
         if (found == state->records.end() || found->second.frontier != candidate.frontier) {
             return {};
         }
-        record = found->second;
-        if (const auto pending = state->pending_loads[candidate.content_digest].lock()) {
-            job = pending;
-            ++state->values.loads_coalesced;
+        record             = found->second;
+        const auto pending = state->pending_loads.find(record.filename);
+        if (pending != state->pending_loads.end()) {
+            if (const auto shared = pending->second.lock()) {
+                job = shared;
+                ++state->values.loads_coalesced;
+            }
         }
     }
     if (!job) {
@@ -724,18 +781,23 @@ DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point d
         job                       = std::make_shared<State::LoadJob>();
         job->payload              = std::make_shared<State::LoadJob::Payload>();
         job->payload->reservation = std::move(reservation);
+        job->record               = record;
         if (state->options.before_load_registration) { state->options.before_load_registration(); }
         bool enqueue_load = false;
         std::shared_ptr<State::LoadJob> redundant;
         {
             std::lock_guard lock(state->mutex);
-            if (const auto pending = state->pending_loads[candidate.content_digest].lock()) {
-                redundant = std::move(job);
-                job       = pending;
-                ++state->values.loads_coalesced;
-            } else {
-                state->pending_loads[candidate.content_digest] = job;
-                enqueue_load                                   = true;
+            const auto pending = state->pending_loads.find(record.filename);
+            if (pending != state->pending_loads.end()) {
+                if (const auto shared = pending->second.lock()) {
+                    redundant = std::move(job);
+                    job       = shared;
+                    ++state->values.loads_coalesced;
+                }
+            }
+            if (!redundant) {
+                state->pending_loads[record.filename] = job;
+                enqueue_load                          = true;
             }
         }
         // Payload destruction releases the staging reservation by locking State::mutex. Never
@@ -782,7 +844,7 @@ DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point d
                         succeeded = queued_job->error.empty();
                     }
                     std::lock_guard lock(state->mutex);
-                    state->pending_loads.erase(record.digest);
+                    state->pending_loads.erase(record.filename);
                     if (succeeded) {
                         ++state->values.loads_completed;
                     } else {
@@ -794,7 +856,7 @@ DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point d
                 });
             } catch (...) {
                 std::lock_guard lock(state->mutex);
-                state->pending_loads.erase(record.digest);
+                state->pending_loads.erase(record.filename);
                 throw;
             }
         }
@@ -806,7 +868,18 @@ DurableSharedPrefixCatalog::load(const Candidate& candidate, Clock::time_point d
         job->cv.wait_for(lock, std::chrono::milliseconds(10));
     }
     if (!job->error.empty()) { return {}; }
-    return std::shared_ptr<const std::vector<std::uint8_t>>(job->payload, &job->payload->bytes);
+    return {
+        .bytes =
+            std::shared_ptr<const std::vector<std::uint8_t>>(job->payload, &job->payload->bytes),
+        .digest   = job->record.digest,
+        .filename = job->record.filename,
+        .order    = job->record.order,
+    };
+}
+
+void DurableSharedPrefixCatalog::invalidate_loaded(const LoadedRecord& loaded) noexcept {
+    if (!loaded.bytes) { return; }
+    state_->invalidate(loaded.digest, loaded.filename, loaded.order);
 }
 
 DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
@@ -842,8 +915,8 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
         }
         observation.fallback_reason = decision.reason;
         const Candidate candidate   = decision.candidate;
-        auto bytes                  = load(candidate, deadline, cancellation);
-        if (!bytes) {
+        auto loaded                 = load_record(candidate, deadline, cancellation);
+        if (!loaded.bytes) {
             observation.fallback_reason =
                 Clock::now() >= deadline ? "ssd-deadline" : "ssd-unavailable";
             available.erase(std::remove(available.begin(), available.end(), candidate),
@@ -852,8 +925,8 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
             continue;
         }
         try {
-            const auto imported = runtime::DurableSharedSnapshotAccess::import(engine, candidate,
-                                                                               bytes, cancellation);
+            const auto imported = runtime::DurableSharedSnapshotAccess::import(
+                engine, candidate, loaded.bytes, cancellation);
             {
                 std::lock_guard lock(state_->mutex);
                 state_->values.validation_nanoseconds += imported.validation_nanoseconds;
@@ -870,7 +943,7 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                 std::lock_guard lock(state_->mutex);
                 ++state_->values.corrupt_records;
             }
-            state_->invalidate(candidate.content_digest);
+            invalidate_loaded(loaded);
             observation.fallback_reason = "ssd-validation";
         } catch (const std::invalid_argument&) {
             observation.fallback_reason = "ssd-adoption-unavailable";

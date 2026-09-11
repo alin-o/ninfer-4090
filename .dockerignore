@@ -2,8 +2,14 @@
 .cache
 .claude
 .codex
+.agent
+.agents
+.omp
+.pi
 .idea
 .pytest_cache
+.worktrees
+.local
 .vscode
 
 build
@@ -15,6 +21,7 @@ out
 profiles
 logs
 models
+profile
 
 **/__pycache__
 **/.venv
@@ -40,6 +47,3 @@ dist
 model-cards
 docs
 *.md
-
-profile/
-.worktrees/

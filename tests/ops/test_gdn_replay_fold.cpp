@@ -789,7 +789,10 @@ int main() {
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
+    failures += run_case({30, 32, 8192}, 2, 1, {1}, 1833U, true);
+    failures += run_case({30, 32, 8192}, 2, 1, {2}, 1837U, true);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
+    failures += run_case({30, 32, 8192}, 6, 1, {3}, 1843U, true);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
     failures += run_record_fold_rounds();

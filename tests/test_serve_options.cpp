@@ -86,9 +86,15 @@ int main() {
         failures += check(resolve_automatic_private_anchors(defaults, disabled) == 0U,
                           "a disabled context cache still proposes automatic anchors");
         const ServeOptions no_reuse = parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse"});
-        failures += check(no_reuse.auto_long_anchors == 0U &&
+        failures += check(!no_reuse.auto_long_anchors.has_value() &&
                               resolve_automatic_private_anchors(no_reuse, resolved) == 0U,
-                          "--no-prefix-reuse did not disable automatic anchors");
+                          "--no-prefix-reuse did not disable automatic captures");
+        failures += check(resolve_automatic_private_execution_frontiers(no_reuse) == 2U,
+                          "--no-prefix-reuse erased canonical private execution frontiers");
+        failures += check(resolve_automatic_private_execution_frontiers(none) == 0U &&
+                              resolve_automatic_private_execution_frontiers(one) == 1U &&
+                              resolve_automatic_private_execution_frontiers(anchors) == 2U,
+                          "private execution frontier depth did not follow configured policy");
     }
 
     const ServeOptions auto_save = parse(

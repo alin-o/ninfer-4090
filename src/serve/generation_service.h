@@ -205,6 +205,7 @@ private:
     std::unique_ptr<ninfer::Engine> engine_;
     mutable std::unique_ptr<DurableSharedPrefixCatalog> durable_catalog_;
     std::uint32_t automatic_private_anchors_ = 0;
+    std::uint32_t automatic_private_execution_frontiers_ = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

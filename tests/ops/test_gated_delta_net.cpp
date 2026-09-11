@@ -258,6 +258,57 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     return failures;
 }
 
+int state_alias_equivalence_case(const Case& test_case, std::uint32_t seed) {
+    const gdn_ref::Inputs in = make_inputs(test_case, seed);
+    const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    GuardedDeviceBuffer inplace_state(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer distinct_state_in(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer distinct_state_out(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer inplace_out(in.v.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer distinct_out(in.v.size() * sizeof(std::uint16_t));
+    inplace_state.copy_from_host(in.state.data(), inplace_state.bytes());
+    distinct_state_in.copy_from_host(in.state.data(), distinct_state_in.bytes());
+
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor inplace_state_tensor(
+        inplace_state.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor distinct_state_in_tensor(
+        distinct_state_in.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor distinct_state_out_tensor(
+        distinct_state_out.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor inplace_out_tensor(
+        inplace_out.data(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor distinct_out_tensor(
+        distinct_out.data(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, test_case.normalize_qk, test_case.tokens,
+        test_case.tokens);
+    WorkspaceArena inplace_workspace(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena distinct_workspace(std::max<std::size_t>(workspace_bytes, 256));
+
+    ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, inplace_workspace,
+                         inplace_state_tensor, inplace_out_tensor, nullptr);
+    ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, distinct_workspace,
+                         distinct_state_in_tensor, distinct_state_out_tensor, distinct_out_tensor,
+                         nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string(test_case.name) + " state-alias equivalence";
+    int failures            = 0;
+    failures += verify_exact(label + " out", from_device<std::uint16_t>(inplace_out.data(),
+                                                                         in.v.size()),
+                             from_device<std::uint16_t>(distinct_out.data(), in.v.size()));
+    failures += verify_exact(label + " state", from_device<float>(inplace_state.data(),
+                                                                   in.state.size()),
+                             from_device<float>(distinct_state_out.data(), in.state.size()));
+    return failures;
+}
+
 int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
                       const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
@@ -467,6 +518,11 @@ int main() {
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    // A Device checkpoint fork changes the State destination address, not the represented
+    // recurrence. Production cache frontiers commonly leave short suffix chunks, so require the
+    // disjoint and in-place state forms to be bit-identical there.
+    failures += state_alias_equivalence_case(
+        {"27b cache-frontier suffix fused-qk-norm", 16, 48, 34, true}, 12334u);
 
     // The production decode path updates selected state-pool slots in place at width one.
     failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,

@@ -1638,6 +1638,29 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()), structural_boundaries, first_volatile_token);
+    // A retained State image is numerically tied to the GDN chunk decomposition that produced
+    // it. Make every interior cache opportunity an execution boundary even when this request
+    // disables reuse or policy declines the capture. Otherwise a cache-enabled request can split
+    // at an explicit/shared frontier while its cache-disabled cold control crosses the frontier in
+    // one chunk; both executions have identical tokens but can eventually choose different greedy
+    // tokens. The prompt endpoint is already a natural chunk boundary, and recording that
+    // redundant opportunity would make a later continuation appear structurally incompatible.
+    auto& execution_frontiers = result.identity.rewrite_execution_frontiers;
+    execution_frontiers.reserve(execution_frontiers.size() +
+                                result.context_cache.opportunities.size() +
+                                (result.identity.rewrite_checkpoint ? 1U : 0U));
+    if (result.identity.rewrite_checkpoint) {
+        execution_frontiers.push_back(result.identity.rewrite_checkpoint->frontier);
+    }
+    for (const PreparedCacheOpportunity& opportunity : result.context_cache.opportunities) {
+        if (opportunity.frontier < result.token_ids.size()) {
+            execution_frontiers.push_back(opportunity.frontier);
+        }
+    }
+    std::sort(execution_frontiers.begin(), execution_frontiers.end());
+    execution_frontiers.erase(
+        std::unique(execution_frontiers.begin(), execution_frontiers.end()),
+        execution_frontiers.end());
     if (inferred_session) {
         result.context_cache.session_key = inferred_session;
         if (requested_retention == CacheRetentionHint::Default) {

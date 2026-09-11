@@ -91,6 +91,10 @@ ServeOptions parse_serve_options(int argc, char** argv);
 // ServeOptions::context_cache, whose optionals are still unset.
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved);
+// The same configured/default message-boundary depth without the cache-enabled gate. These
+// frontiers canonicalize recurrent-State prefill decomposition even for a cold request that is
+// forbidden from reading or publishing cache entries.
+std::uint32_t resolve_automatic_private_execution_frontiers(const ServeOptions& options);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);

@@ -2110,6 +2110,9 @@ int exercise_cache_fixture_equivalence(const char* artifact) {
         input.options.enable_thinking   = false;
         input.context_cache.session_key = std::move(session_key);
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        // Match the serving default so cold and cache-participating requests declare the same
+        // canonical trailing message-boundary decomposition.
+        input.context_cache.automatic_private_anchors = 2;
         return input;
     };
     const auto continuation_input = [&initial_input](std::string session_key,
@@ -4186,7 +4189,12 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
     }
 
     {
-        ninfer::Engine failed(shared_snapshot_engine_options(artifact));
+        ninfer::EngineOptions failed_options = shared_snapshot_engine_options(artifact);
+        // Canonical rewrite frontiers keep the unrelated resident and fatal-path prompt owners
+        // distinct. Reserve one additional catalog cell so the tested import reaches the injected
+        // State-allocation failure instead of being rejected earlier by logical capacity.
+        failed_options.context_cache.max_shared_prefixes = 3;
+        ninfer::Engine failed(std::move(failed_options));
         ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
         constexpr std::string_view resident_prefix = "fatal owner fixture\n";
         resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);

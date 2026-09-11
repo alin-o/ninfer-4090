@@ -282,6 +282,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     prompt_capabilities_ = engine_->prompt_capabilities();
     automatic_private_anchors_ =
         resolve_automatic_private_anchors(options_, engine_->options().context_cache);
+    automatic_private_execution_frontiers_ =
+        resolve_automatic_private_execution_frontiers(options_);
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
@@ -363,11 +365,13 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         input.context_cache.allow_engine_automatic_shared_prefixes =
             input.context_cache.allow_engine_automatic_shared_prefixes &&
             protocol_allows_engine_automatic;
-        // Server policy, not protocol: every prompt gets the same trailing-boundary anchors
-        // whichever endpoint it came through. Zero when reuse is off (prepare_impl then also
-        // clears allow_prefix_reuse, so the Frontend ignores the hint either way).
+        // Server policy, not protocol: every prompt gets the same trailing-boundary execution
+        // frontiers whichever endpoint it came through and whether cache participation is on.
+        // A disabled request still cannot publish or reuse a checkpoint, but retaining these
+        // structural frontiers keeps its recurrent-State chunk decomposition identical to the
+        // cache-participating cold producer used for exact continuation comparisons.
         input.context_cache.automatic_private_anchors =
-            cache_participation == CacheParticipation::ReadWrite ? automatic_private_anchors_ : 0U;
+            automatic_private_execution_frontiers_;
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

@@ -7903,8 +7903,17 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
+    if (has_context_transaction() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
+    }
+    // A retained-prefix activation can leave its asynchronous StateImage fork pending until the
+    // next Program boundary. Reaching an optional capture frontier in that interval is ordinary
+    // scheduling, not an invariant failure: the capture cannot own the same physical StateImage
+    // transaction, so consume this offer and continue the request. A later frontier may still be
+    // captured after the fork settles.
+    if (has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));
@@ -11646,12 +11655,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers.begin(),
-                    staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
-                if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
-                    (!split_frontier || *rewrite_split < *split_frontier)) {
-                    split_frontier = *rewrite_split;
+                const auto execution_split                  = std::upper_bound(
+                    staged.prompt.prefill_execution_frontiers.begin(),
+                    staged.prompt.prefill_execution_frontiers.end(), staged.cursor);
+                if (execution_split != staged.prompt.prefill_execution_frontiers.end() &&
+                    (!split_frontier || *execution_split < *split_frontier)) {
+                    split_frontier = *execution_split;
                 }
                 schedule::PrefillChunkResult result;
                 timing.pause();

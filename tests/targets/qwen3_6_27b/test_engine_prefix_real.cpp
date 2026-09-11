@@ -2110,6 +2110,9 @@ int exercise_cache_fixture_equivalence(const char* artifact) {
         input.options.enable_thinking   = false;
         input.context_cache.session_key = std::move(session_key);
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        // Match the serving default so cold and cache-participating requests declare the same
+        // canonical trailing message-boundary decomposition.
+        input.context_cache.automatic_private_anchors = 2;
         return input;
     };
     const auto continuation_input = [&initial_input](std::string session_key,
@@ -4186,7 +4189,12 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
     }
 
     {
-        ninfer::Engine failed(shared_snapshot_engine_options(artifact));
+        ninfer::EngineOptions failed_options = shared_snapshot_engine_options(artifact);
+        // Canonical rewrite frontiers keep the unrelated resident and fatal-path prompt owners
+        // distinct. Reserve one additional catalog cell so the tested import reaches the injected
+        // State-allocation failure instead of being rejected earlier by logical capacity.
+        failed_options.context_cache.max_shared_prefixes = 3;
+        ninfer::Engine failed(std::move(failed_options));
         ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
         constexpr std::string_view resident_prefix = "fatal owner fixture\n";
         resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
@@ -4412,6 +4420,48 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
     return 0;
 }
 
+int exercise_capture_after_prefix_fork(const char* artifact) {
+    ninfer::EngineOptions options                   = shared_snapshot_engine_options(artifact);
+    options.max_concurrency                         = 1;
+    options.max_pending_requests                    = 1;
+    options.context_cache.device_state_slots        = 3;
+    options.context_cache.host_state_slots          = 4;
+    options.context_cache.host_kv_capacity_bytes    = 512ULL << 20;
+    options.context_cache.max_private_continuations = 8;
+    options.context_cache.max_shared_prefixes       = 4;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(std::move(options));
+
+    const auto branch = [](std::string suffix) {
+        ninfer::PromptInput input = shared_snapshot_prompt();
+        input.messages.back().parts.front().text =
+            "Begin with TEST, then identify synthetic branch " + std::move(suffix) + '.';
+        input.context_cache.automatic_private_anchors = 2;
+        return input;
+    };
+
+    std::uint32_t reused = 0;
+    for (std::uint32_t index = 0; index < 5; ++index) {
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare(branch(std::to_string(index))), fixed_output(8));
+        if (generated.generated_token_ids.size() != 8 ||
+            generated.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "capture-after-prefix-fork branch " << index
+                      << " did not complete after optional capture contention\n";
+            return 1;
+        }
+        reused += generated.reused_prompt_tokens != 0;
+    }
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    if (!engine.healthy() || reused < 2 || stats.shared_stable_prefix_selections == 0) {
+        std::cerr << "capture-after-prefix-fork did not preserve reusable execution: healthy="
+                  << engine.healthy() << " reused=" << reused
+                  << " shared=" << stats.shared_stable_prefix_selections << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -4458,6 +4508,11 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
     if (const int result = exercise_concurrent_resource_settlement(artifact, expected_target);
         result != 0) {
         return result;
+    }
+    if (expected_target == "qwen3_8_27b") {
+        if (const int result = exercise_capture_after_prefix_fork(artifact); result != 0) {
+            return result;
+        }
     }
     // Own Engine (and scope) per exercise: auto-save-on-eviction is a startup option.
     if (const int result = exercise_auto_save_evicted(artifact); result != 0) { return result; }
@@ -4559,6 +4614,15 @@ int main() {
             return 1;
         }
         const int result = exercise_four_request_root_fallback(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "capture-after-prefix-fork") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "capture-after-prefix-fork requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_capture_after_prefix_fork(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

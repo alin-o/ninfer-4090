@@ -941,6 +941,7 @@ public:
                     };
                 }
             }
+            result.transfer_observations = transfer_observations_to_publish;
             return result;
         }
 
@@ -1025,6 +1026,7 @@ public:
             sequence_content_keys_.at(sequence_id) = pending_prompt_.content_key;
             result.published = FakeStartResult{.sequence = FakeSequenceHandle{sequence_id}};
         }
+        result.transfer_observations = transfer_observations_to_publish;
         return result;
     }
 
@@ -1251,6 +1253,7 @@ public:
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
     UniquePhysicalReclamation target_reclamation;
+    std::vector<ContextTransferObservation> transfer_observations_to_publish;
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -1922,6 +1925,37 @@ ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint
     require(manager.lane_state(lane) == ninfer::runtime::LogicalLaneState::Active,
             "published lane was not adopted as active");
     return ActiveRequest{.lane = lane, .sequence = sequence};
+}
+
+void test_state_transfer_stats_report_physical_bytes_not_image_units() {
+    FakeManager manager = make_manager();
+    FakeProgram program;
+    program.transfer_observations_to_publish = {
+        ContextTransferObservation{
+            .resource  = ninfer::runtime::ContextResourceClass::State,
+            .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
+            .units     = 2,
+            .work      = ninfer::TransferWork{.payload_bytes   = 615'817'216,
+                                              .copy_operations = 2},
+            .elapsed_ns = 10,
+        },
+        ContextTransferObservation{
+            .resource  = ninfer::runtime::ContextResourceClass::MainKV,
+            .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
+            .units     = 4'096,
+            .page_count = 1,
+            .work       = ninfer::TransferWork{.payload_bytes   = 4'096,
+                                               .copy_operations = 1},
+            .elapsed_ns = 20,
+        },
+    };
+
+    (void)start_active(manager, program, 70, make_base(70), 1);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.state_h2d_count == 1 && stats.state_h2d_bytes == 615'817'216 &&
+                stats.main_kv_h2d_pages == 1 && stats.main_kv_h2d_bytes == 4'096,
+            "transfer statistics confused State image units with physical bytes");
 }
 
 void test_private_portfolio_loss_keeps_checkpoint_identity_fixed() {
@@ -4045,6 +4079,8 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("State transfer physical byte accounting",
+             test_state_transfer_stats_report_physical_bytes_not_image_units);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);

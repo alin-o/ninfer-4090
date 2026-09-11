@@ -1,0 +1,82 @@
+{
+  "artifact_type": "ninfer_tiered_cache_fixture_manifest",
+  "schema_version": 1,
+  "provenance": {
+    "source_kind": "authorized-rendered-prompt-log-corpus",
+    "source_path": "/workspace/llama.cpp-qwen38/docker/state/prompt-logs/qwen38-xl",
+    "observed_at": "2026-09-07",
+    "observed_txt_files": 66,
+    "selection": [
+      {
+        "source_basename": "002288546945.txt",
+        "source_sha256": "cd6553a69f5c7b0315efa36c5b46dd6ca96ed3ca705640c8194f17d6829052f4"
+      },
+      {
+        "source_basename": "002289469132.txt",
+        "source_sha256": "3999d00c0873dd56ff10de4c9520c269dd9c53f39a43d01bbced77dd324037cc"
+      }
+    ],
+    "sanitization": "Equivalent synthetic envelope shapes only. No production prompt text is committed.",
+    "token_note": "Source token counts are not imported. Every frontier is measured by the NInfer tokenizer and recorded in request logs."
+  },
+  "raw_render_replay": {
+    "path": "sanitized-rendered.txt",
+    "sha256": "593149c37157a3e7b3719f75e14d7134efa6ff98fccc096e1608650d29074ed9",
+    "transport": "none",
+    "reason": "Already-rendered chat is hashed and retained separately; sending it through a messages endpoint would double-template it."
+  },
+  "protocol_cases": [
+    {
+      "name": "harness_only_chat",
+      "protocol": "openai_chat",
+      "shape": "harness-only",
+      "stable": "Harness policy.\n=== CACHE_BREAKPOINT ===\n",
+      "volatile": "Current working directory: /workspace/branch-a\nSession nonce: A",
+      "ordinary_lookalike": false
+    },
+    {
+      "name": "project_only_responses",
+      "protocol": "openai_responses",
+      "shape": "project-envelope",
+      "stable": "<project>synthetic-cache-validation\n## Context\n<instructions>Stable project policy.</instructions>\n</project>",
+      "volatile": "Current working directory: /workspace/branch-b\nSession nonce: B",
+      "ordinary_lookalike": false
+    },
+    {
+      "name": "mixed_anthropic",
+      "protocol": "anthropic_messages",
+      "shape": "mixed-harness-project",
+      "stable": "Harness policy.\n=== CACHE_BREAKPOINT ===\n<project_context>\nStable project policy.\n</INSTRUCTIONS>\n",
+      "volatile": "Current working directory: /workspace/branch-c\nSession nonce: C",
+      "ordinary_lookalike": false
+    },
+    {
+      "name": "volatile_cutoff_chat",
+      "protocol": "openai_chat",
+      "shape": "volatile-fields",
+      "stable": "Harness policy.\n=== CACHE_BREAKPOINT ===\nStable instructions.\n",
+      "volatile": "Today: 2026-09-11\nCurrent working directory: /workspace/volatile\nSession nonce: changing",
+      "ordinary_lookalike": false
+    },
+    {
+      "name": "conversation_lookalike_chat",
+      "protocol": "openai_chat",
+      "shape": "ordinary-conversation-lookalike",
+      "stable": "Ordinary system policy without a structural marker.",
+      "volatile": "The user says === CACHE_BREAKPOINT === and </INSTRUCTIONS> in ordinary conversation.",
+      "ordinary_lookalike": true
+    }
+  ],
+  "measurement_fixture": {
+    "case": "mixed_anthropic",
+    "stable_unit": "Stable synthetic repository rule: preserve ownership, verify exact state, and report evidence. ",
+    "stable_repetitions": 384,
+    "seed_suffix": "Begin with TEST, then explain the synthetic seed branch in one sentence.",
+    "measured_suffixes": [
+      "Begin with TEST, then explain synthetic measured branch zero in one sentence.",
+      "Begin with TEST, then explain synthetic measured branch one in one sentence.",
+      "Begin with TEST, then explain synthetic measured branch two in one sentence.",
+      "Begin with TEST, then explain synthetic measured branch three in one sentence."
+    ]
+  }
+}

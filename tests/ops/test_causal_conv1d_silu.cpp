@@ -389,6 +389,70 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     return failures;
 }
 
+int split_state_alias_equivalence_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim,
+                                       std::int32_t value_dim, std::int32_t T,
+                                       std::uint32_t seed) {
+    const LogicalInput input                = make_input(C, T, seed);
+    const std::vector<std::uint16_t> x_bits = bf16_bits(input.x);
+    const std::vector<std::uint16_t> w_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits = bf16_bits(make_state(C, seed + 2U));
+    const std::size_t q_elements                 = static_cast<std::size_t>(q_dim) * T;
+    const std::size_t k_elements                 = static_cast<std::size_t>(k_dim) * T;
+    const std::size_t v_elements                 = static_cast<std::size_t>(value_dim) * T;
+
+    DeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer weight(w_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer alias_state(state_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer distinct_state_in(state_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer distinct_state_out(state_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer alias_q(q_elements * sizeof(std::uint16_t));
+    DeviceBuffer alias_k(k_elements * sizeof(std::uint16_t));
+    DeviceBuffer alias_v(v_elements * sizeof(std::uint16_t));
+    DeviceBuffer distinct_q(alias_q.bytes);
+    DeviceBuffer distinct_k(alias_k.bytes);
+    DeviceBuffer distinct_v(alias_v.bytes);
+    x.copy_from_host(x_bits.data(), x.bytes);
+    weight.copy_from_host(w_bits.data(), weight.bytes);
+    alias_state.copy_from_host(state_bits.data(), alias_state.bytes);
+    distinct_state_in.copy_from_host(state_bits.data(), distinct_state_in.bytes);
+
+    const Tensor tx(x.p, DType::BF16, {C, T});
+    const Tensor tw(weight.p, DType::BF16, {C, 4});
+    Tensor alias_state_tensor(alias_state.p, DType::BF16, {C, 3});
+    const Tensor distinct_state_in_tensor(distinct_state_in.p, DType::BF16, {C, 3});
+    Tensor distinct_state_out_tensor(distinct_state_out.p, DType::BF16, {C, 3});
+    Tensor alias_q_tensor(alias_q.p, DType::BF16, {q_dim, T});
+    Tensor alias_k_tensor(alias_k.p, DType::BF16, {k_dim, T});
+    Tensor alias_v_tensor(alias_v.p, DType::BF16, {value_dim, T});
+    Tensor distinct_q_tensor(distinct_q.p, DType::BF16, {q_dim, T});
+    Tensor distinct_k_tensor(distinct_k.p, DType::BF16, {k_dim, T});
+    Tensor distinct_v_tensor(distinct_v.p, DType::BF16, {value_dim, T});
+
+    ops::causal_conv1d_silu_split(tx, tw, alias_state_tensor, alias_state_tensor, alias_q_tensor,
+                                  alias_k_tensor, alias_v_tensor, nullptr);
+    ops::causal_conv1d_silu_split(tx, tw, distinct_state_in_tensor, distinct_state_out_tensor,
+                                  distinct_q_tensor, distinct_k_tensor, distinct_v_tensor,
+                                  nullptr);
+    cuda_synchronize();
+
+    const std::string tag = "causal_conv1d_silu_split state-alias equivalence C=" +
+                            std::to_string(C) + " T=" + std::to_string(T);
+    int failures = 0;
+    failures += verify_exact((tag + " q").c_str(),
+                             from_device<std::uint16_t>(alias_q, q_elements),
+                             from_device<std::uint16_t>(distinct_q, q_elements));
+    failures += verify_exact((tag + " k").c_str(),
+                             from_device<std::uint16_t>(alias_k, k_elements),
+                             from_device<std::uint16_t>(distinct_k, k_elements));
+    failures += verify_exact((tag + " v").c_str(),
+                             from_device<std::uint16_t>(alias_v, v_elements),
+                             from_device<std::uint16_t>(distinct_v, v_elements));
+    failures += verify_exact((tag + " state").c_str(),
+                             from_device<std::uint16_t>(alias_state, state_bits.size()),
+                             from_device<std::uint16_t>(distinct_state_out, state_bits.size()));
+    return failures;
+}
+
 int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed) {
     const LogicalInput input       = make_input(C, T, seed);
     const std::vector<float> state = make_state(C, seed + 2U);
@@ -750,6 +814,10 @@ int main() {
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
                                7000U + static_cast<std::uint32_t>(T));
     }
+    // A Device capture changes the suffix prefill from an in-place State update to a disjoint
+    // source/destination update. Require that choice to preserve every BF16 activation and the
+    // resulting convolution history at the production 27B suffix width.
+    failures += split_state_alias_equivalence_case(kQwen27Channels, 2048, 2048, 6144, 41, 6041U);
 
     // The exact-alias state form, on both geometries, across every route boundary.
     for (const std::int32_t T : {1, 2, 15, 16, 17, 32, 33, 64, 65, 257}) {

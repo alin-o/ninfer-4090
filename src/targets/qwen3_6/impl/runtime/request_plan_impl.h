@@ -316,14 +316,25 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
-    std::uint32_t previous_rewrite_frontier = 0;
-    for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
-        if (frontier == 0 || frontier > base->summary.prompt_tokens ||
-            frontier <= previous_rewrite_frontier) {
-            throw std::invalid_argument(
-                "rewrite execution frontiers must be ordered unique prompt positions");
+    const auto validate_execution_frontiers = [&](std::span<const std::uint32_t> frontiers,
+                                                  const char* kind) {
+        std::uint32_t previous = 0;
+        for (const std::uint32_t frontier : frontiers) {
+            if (frontier == 0 || frontier > base->summary.prompt_tokens || frontier <= previous) {
+                throw std::invalid_argument(std::string(kind) +
+                                            " must be ordered unique prompt positions");
+            }
+            previous = frontier;
         }
-        previous_rewrite_frontier = frontier;
+    };
+    validate_execution_frontiers(prompt.identity.rewrite_execution_frontiers,
+                                 "rewrite execution frontiers");
+    validate_execution_frontiers(prompt.prefill_execution_frontiers, "prefill execution frontiers");
+    if (!std::includes(prompt.prefill_execution_frontiers.begin(),
+                       prompt.prefill_execution_frontiers.end(),
+                       prompt.identity.rewrite_execution_frontiers.begin(),
+                       prompt.identity.rewrite_execution_frontiers.end())) {
+        throw std::invalid_argument("prefill execution frontiers omit a rewrite boundary");
     }
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
@@ -404,11 +415,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             capture_backing = std::move(backing);
         }
         for (CaptureGroup& group : base->capture_groups) {
-            auto identity          = std::make_shared<PreparedCaptureIdentity>();
-            identity->backing      = capture_backing;
-            identity->rebuild_work = rebuild_work_at_frontier(
-                prompt, group.frontier, prefill_chunk, base->capture_groups,
-                prompt.identity.rewrite_execution_frontiers);
+            auto identity     = std::make_shared<PreparedCaptureIdentity>();
+            identity->backing = capture_backing;
+            identity->rebuild_work =
+                rebuild_work_at_frontier(prompt, group.frontier, prefill_chunk,
+                                         base->capture_groups, prompt.prefill_execution_frontiers);
             identity->shortlist_key = qwen3_6::PrefixShortlistKey{
                 .digests      = base->prefix_digests.at(group.frontier),
                 .frontier     = group.frontier,
@@ -417,11 +428,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             group.identity = std::move(identity);
         }
         for (CaptureGroup& group : base->shared_candidates) {
-            auto identity          = std::make_shared<PreparedCaptureIdentity>();
-            identity->backing      = capture_backing;
-            identity->rebuild_work = rebuild_work_at_frontier(
-                prompt, group.frontier, prefill_chunk, base->capture_groups,
-                prompt.identity.rewrite_execution_frontiers);
+            auto identity     = std::make_shared<PreparedCaptureIdentity>();
+            identity->backing = capture_backing;
+            identity->rebuild_work =
+                rebuild_work_at_frontier(prompt, group.frontier, prefill_chunk,
+                                         base->capture_groups, prompt.prefill_execution_frontiers);
             identity->shortlist_key = qwen3_6::PrefixShortlistKey{
                 .digests      = base->prefix_digests.at(group.frontier),
                 .frontier     = group.frontier,
@@ -442,15 +453,15 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
-                               base->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               base->capture_groups, prompt.prefill_execution_frontiers);
     base->root_rebuild_work =
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
-                                 base->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                                 base->capture_groups, prompt.prefill_execution_frontiers);
     for (const CaptureGroup& group : base->capture_groups) {
         runtime_support::include_rebuild_boundary(base->root_rebuild_tail_begin, group.frontier,
                                                   base->summary.prompt_tokens);
     }
-    for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
+    for (const std::uint32_t frontier : prompt.prefill_execution_frontiers) {
         runtime_support::include_rebuild_boundary(base->root_rebuild_tail_begin, frontier,
                                                   base->summary.prompt_tokens);
     }
@@ -745,7 +756,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               plan->capture_groups, prompt.prefill_execution_frontiers);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -770,7 +781,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     plan->remaining_prefill_work =
         scheduled_prefill_work(plan->reuse_base, plan->summary.prompt_tokens,
                                remaining_vision_items, remaining_vision_patches, prefill_chunk,
-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               plan->capture_groups, prompt.prefill_execution_frontiers);
     plan->transfer_requirements.reserve(4);
     const auto add_state_transfer = [&](runtime::ContextTransferDirection direction,
                                         bool dflash_local_only = false) {
@@ -1289,7 +1300,7 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,
-                               plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               plan.capture_groups, prompt.prefill_execution_frontiers);
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {
@@ -1310,7 +1321,7 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
     }
     plan.remaining_prefill_work = scheduled_prefill_work(
         plan.reuse_base, plan.summary.prompt_tokens, vision_items, vision_patches, prefill_chunk,
-        plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
+        plan.capture_groups, prompt.prefill_execution_frontiers);
 }
 
 runtime::PrefillWork

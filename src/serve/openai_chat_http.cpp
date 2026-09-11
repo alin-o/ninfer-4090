@@ -34,8 +34,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
+    const std::uint64_t req_id                = ++request_seq_;
+    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
     const RequestLogMetadata metadata{.model                  = request.model,
+                                      .response_id            = identity.id,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
@@ -60,8 +62,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
-    auto lifecycle                            = begin_request(make_request_log_context(
+    auto lifecycle = begin_request(make_request_log_context(
         req_id, "openai_chat_completions", request.generation, metadata, prepared));
 
     if (!request.stream) {

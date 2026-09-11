@@ -431,7 +431,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
-        options.auto_long_anchors                    = 0;
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
@@ -481,6 +480,13 @@ std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved) {
     if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
     const std::uint32_t cap = resolved.max_long_anchors_per_continuation.value_or(0U);
+    return std::min(options.auto_long_anchors.value_or(cap), cap);
+}
+
+std::uint32_t resolve_automatic_private_execution_frontiers(const ServeOptions& options) {
+    constexpr std::uint32_t default_cap = 2U;
+    const std::uint32_t cap =
+        options.context_cache.max_long_anchors_per_continuation.value_or(default_cap);
     return std::min(options.auto_long_anchors.value_or(cap), cap);
 }
 

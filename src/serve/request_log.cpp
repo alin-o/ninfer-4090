@@ -220,28 +220,30 @@ Json overrides_json(const ninfer::SamplingOverrides& overrides) {
 Json request_json(const RequestLogContext& context) {
     Json thinking_budget = nullptr;
     if (context.thinking_budget) { thinking_budget = *context.thinking_budget; }
-    return Json{{"request_id", context.id},
-                {"protocol", context.protocol},
-                {"model", context.model},
-                {"stream", context.stream},
-                {"message_count", context.message_count},
-                {"media_item_count", context.media_item_count},
-                {"requested_output_tokens", context.requested_output_tokens},
-                {"requested_output_tokens_source",
-                 context.requested_output_tokens_client_set ? "client" : "server_default"},
-                {"tool_count", context.tool_count},
-                {"tool_choice", tool_choice_name(context.tool_choice)},
-                {"has_tool_history", context.has_tool_history},
-                {"enable_thinking", context.enable_thinking},
-                {"thinking_budget", std::move(thinking_budget)},
-                {"requested_reasoning_effort",
-                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
-                {"resolved_reasoning_effort",
-                 resolved_reasoning_effort_json(context.enable_thinking,
-                                                context.resolved_reasoning_effort)},
-                {"preserve_thinking", context.preserve_thinking},
-                {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
-                {"sampling", sampler_json(context.sampling)}};
+    return Json{
+        {"request_id", context.id},
+        {"response_id", context.response_id.empty() ? Json(nullptr) : Json(context.response_id)},
+        {"protocol", context.protocol},
+        {"model", context.model},
+        {"stream", context.stream},
+        {"message_count", context.message_count},
+        {"media_item_count", context.media_item_count},
+        {"requested_output_tokens", context.requested_output_tokens},
+        {"requested_output_tokens_source",
+         context.requested_output_tokens_client_set ? "client" : "server_default"},
+        {"tool_count", context.tool_count},
+        {"tool_choice", tool_choice_name(context.tool_choice)},
+        {"has_tool_history", context.has_tool_history},
+        {"enable_thinking", context.enable_thinking},
+        {"thinking_budget", std::move(thinking_budget)},
+        {"requested_reasoning_effort",
+         requested_reasoning_effort_json(context.requested_reasoning_effort)},
+        {"resolved_reasoning_effort",
+         resolved_reasoning_effort_json(context.enable_thinking,
+                                        context.resolved_reasoning_effort)},
+        {"preserve_thinking", context.preserve_thinking},
+        {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+        {"sampling", sampler_json(context.sampling)}};
 }
 
 Json preparation_json(const RequestLogContext& context) {
@@ -573,6 +575,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
          {"finish_reason", finish_reason_name(outcome.finish_reason)},
          {"prompt_tokens", outcome.prompt_tokens},
          {"completion_tokens", outcome.completion_tokens},
+         {"generated_token_ids", outcome.generated_token_ids},
          {"computed_prefill_tokens",
           std::max(0, outcome.prompt_tokens -
                           static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},

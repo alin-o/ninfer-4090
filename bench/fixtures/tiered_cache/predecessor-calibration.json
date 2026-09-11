@@ -1,0 +1,37 @@
+{
+  "artifact_type": "ninfer_tiered_cache_predecessor_calibration",
+  "schema_version": 1,
+  "provenance": {
+    "source_commit": "69ef567748cc6b79604caeef64e4bb22309afdab",
+    "source_report": "docs/maintainer/2026-09-10-qwen3.8-27b-context-cache-calibration.md",
+    "source_report_sha256": "3deae3ba3c608c5751b56baf736436927cd3e3f3d1ebe1dd3bfab4fa68184c36",
+    "measured_at": "2026-09-10"
+  },
+  "target": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "compute_capability": "8.9",
+    "model_id": "qwen3.8-27b",
+    "weights_id": "groupwise-int",
+    "kv_dtype": "rk4v4-e8",
+    "mtp_draft_tokens": 3,
+    "max_context": 128000,
+    "max_concurrency": 4,
+    "kv_capacity_mode": "auto"
+  },
+  "complete_private_host_snapshot": {
+    "state_bytes": 307908608,
+    "main_kv_bytes": 4194304,
+    "mtp_kv_bytes": 262144,
+    "physical_h2d_payload_bytes": 312365056,
+    "copy_operations": 3
+  },
+  "h2d_cost_reference": {
+    "source": "generic-default selected by the predecessor calibration",
+    "source_path": "src/runtime/engine/context_cost_defaults.cpp",
+    "source_sha256": "34dc1681985a96413003b834521459d27c07d0b72dc5ee1a2c7218b3e7ecc4ef",
+    "batch_ns": 50000,
+    "operation_ns": 12000,
+    "ns_per_byte_q32": 107374182
+  },
+  "threshold_role": "Require the observed net TTFT saving to exceed one complete private Host H2D materialization estimate; three baseline relative MADs may impose a larger threshold. This cost-model estimate is an effect-size floor, not a measured latency result."
+}

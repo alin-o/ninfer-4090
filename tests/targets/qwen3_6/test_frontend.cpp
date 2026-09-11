@@ -1112,12 +1112,15 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const std::vector<ninfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
     int failures =
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
-    failures += check(text_data.identity.rewrite_checkpoint &&
-                          text_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          text_data.identity.rewrite_checkpoint->frontier == 5 &&
-                          text_data.starts_in_reasoning && !text_data.has_media(),
-                      "text frontend did not preserve prefix/thinking identity");
+    failures +=
+        check(text_data.identity.rewrite_checkpoint &&
+                  text_data.identity.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                  text_data.identity.rewrite_checkpoint->frontier == 5 &&
+                  std::binary_search(text_data.identity.rewrite_execution_frontiers.begin(),
+                                     text_data.identity.rewrite_execution_frontiers.end(), 5U) &&
+                  text_data.starts_in_reasoning && !text_data.has_media(),
+              "text frontend did not preserve canonical prefix/thinking identity");
     failures +=
         check(text_data.position_axis(0).back() == 8 && text_data.position_axis(1).back() == 8 &&
                   text_data.position_axis(2).back() == 8,
@@ -1132,14 +1135,16 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     preserved_input.options.preserve_thinking = true;
     const auto preserved_prompt               = frontend.prepare(std::move(preserved_input));
     const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
-    failures += check(preserved_data.identity.rewrite_checkpoint &&
-                          preserved_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved_data.identity.rewrite_checkpoint->frontier == 5 &&
-                          preserved_data.identity.rewrite_checkpoint->frontier <
-                              preserved_data.token_ids.size(),
-                      "preserve-thinking prompt did not publish a pre-generation response "
-                      "checkpoint");
+    failures += check(
+        preserved_data.identity.rewrite_checkpoint &&
+            preserved_data.identity.rewrite_checkpoint->kind ==
+                ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+            preserved_data.identity.rewrite_checkpoint->frontier == 5 &&
+            std::binary_search(preserved_data.identity.rewrite_execution_frontiers.begin(),
+                               preserved_data.identity.rewrite_execution_frontiers.end(), 5U) &&
+            preserved_data.identity.rewrite_checkpoint->frontier < preserved_data.token_ids.size(),
+        "preserve-thinking prompt did not publish a pre-generation response "
+        "checkpoint");
 
     ninfer::ChatMessage nonthinking_message;
     nonthinking_message.role = ninfer::ChatRole::User;
@@ -1463,12 +1468,16 @@ int test_automatic_private_anchor_opportunities() {
         two                                           = anchors(data);
         const bool inside = std::all_of(two.begin(), two.end(), [&](std::uint32_t frontier) {
             return frontier != 0 && frontier < data.token_ids.size() &&
+                   std::binary_search(data.prefill_execution_frontiers.begin(),
+                                      data.prefill_execution_frontiers.end(), frontier) &&
+                   !std::binary_search(data.identity.rewrite_execution_frontiers.begin(),
+                                       data.identity.rewrite_execution_frontiers.end(), frontier) &&
                    (!data.identity.rewrite_checkpoint ||
                     frontier < data.identity.rewrite_checkpoint->frontier);
         });
         failures += check(two.size() == 2 && two[0] < two[1] && inside,
                           "automatic_private_anchors=2 did not yield two distinct anchors below "
-                          "the rewrite checkpoint");
+                          "the rewrite checkpoint with canonical execution frontiers");
     }
 
     // N above the message count proposes every interior boundary (after messages 1..3) and
@@ -1613,12 +1622,17 @@ int test_explicit_leading_instruction_cache_boundary() {
             return ninfer::has_shared_candidate_evidence(
                 opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
         });
-    return check(explicit_marker != data.context_cache.opportunities.end() &&
-                     explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                     explicit_marker->frontier != 0 &&
-                     explicit_marker->frontier < data.token_ids.size(),
-                 "explicit leading-system cache boundary was lost or shadowed by the automatic "
-                 "full-system marker");
+    return check(
+        explicit_marker != data.context_cache.opportunities.end() &&
+            explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+            explicit_marker->frontier != 0 && explicit_marker->frontier < data.token_ids.size() &&
+            std::binary_search(data.prefill_execution_frontiers.begin(),
+                               data.prefill_execution_frontiers.end(), explicit_marker->frontier) &&
+            !std::binary_search(data.identity.rewrite_execution_frontiers.begin(),
+                                data.identity.rewrite_execution_frontiers.end(),
+                                explicit_marker->frontier),
+        "explicit leading-system cache boundary was lost or shadowed by the automatic "
+        "full-system marker, or did not become a canonical execution frontier");
 }
 
 int test_structural_boundary_discovery_contract() {

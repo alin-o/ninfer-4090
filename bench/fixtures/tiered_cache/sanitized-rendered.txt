@@ -1,0 +1,13 @@
+<|im_start|>system
+You are a repository assistant. Follow the stable harness policy below.
+=== CACHE_BREAKPOINT ===<project_context>
+Project: synthetic-cache-validation
+Repository rules: inspect before editing; keep protocol and engine ownership separate.
+</INSTRUCTIONS>
+Current working directory: /workspace/sanitized-project
+Session nonce: synthetic-0001
+<|im_end|>
+<|im_start|>user
+Summarize the cache validation result in one sentence.
+<|im_end|>
+<|im_start|>assistant

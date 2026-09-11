@@ -84,8 +84,7 @@ struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     // Exact token frontiers at which this serialization can agree with a typed rewrite captured
-    // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
-    // same GDN decomposition; they are not capture requests by themselves.
+    // by an earlier turn. These are durable prefix-identity facts, not capture requests.
     std::vector<std::uint32_t> rewrite_execution_frontiers;
 };
 
@@ -176,6 +175,11 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
+    // Request-local prefill boundaries include the durable rewrite identity above plus interior
+    // cache opportunities. Keeping them outside PromptIdentity makes cold and cache-participating
+    // execution use the same GDN decomposition without making an envelope-local opportunity a
+    // durable continuation-identity requirement.
+    std::vector<std::uint32_t> prefill_execution_frontiers;
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;

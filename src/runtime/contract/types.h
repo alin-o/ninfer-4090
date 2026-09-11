@@ -526,6 +526,18 @@ struct PressureCheckpointOutcome {
                                                    PressureCheckpointOutcome) noexcept = default;
 };
 
+// Program-observed KV ranges whose Device replicas were removed only after their Host copies
+// were published. ResourceManager combines these physical facts with its logical checkpoint
+// summaries; it must not infer per-owner demotions from process-global allocator deltas.
+struct CommittedKvOffloadRange {
+    ContextResourceClass resource = ContextResourceClass::MainKV;
+    std::uint32_t begin_page      = 0;
+    std::uint32_t page_count      = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(CommittedKvOffloadRange,
+                                                   CommittedKvOffloadRange) noexcept = default;
+};
+
 struct PressureOwnerOutcome {
     PlanningOwnerId owner;
     VictimDisposition disposition     = VictimDisposition::Retained;

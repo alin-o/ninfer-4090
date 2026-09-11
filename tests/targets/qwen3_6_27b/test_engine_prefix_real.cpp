@@ -3282,6 +3282,25 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
                   << " budget=" << short_b.materialization.budget_exhausted << '\n';
         return 1;
     }
+    const auto kv_offloaded =
+        std::find_if(short_b.checkpoint_lifecycle.begin(), short_b.checkpoint_lifecycle.end(),
+                     [](const auto& fact) {
+                         return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded &&
+                                fact.source_tier == ninfer::CheckpointLifecycleTier::Device &&
+                                fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                                fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                     });
+    const ninfer::RequestCheckpointSummary pressure_summary =
+        ninfer::summarize_checkpoint_lifecycle(short_b.checkpoint_lifecycle);
+    if (kv_offloaded == short_b.checkpoint_lifecycle.end() ||
+        kv_offloaded->key_digests == std::array<std::uint64_t, 2>{} ||
+        kv_offloaded->frontier == 0 ||
+        kv_offloaded->role != ninfer::CheckpointLifecycleRole::TurnClosure ||
+        kv_offloaded->scope != ninfer::CheckpointLifecycleScope::Private ||
+        !kv_offloaded->kv_snapshot || !pressure_summary.offload_committed) {
+        std::cerr << "KV-only pressure lost its attributable offload lifecycle or summary\n";
+        return 1;
+    }
     const ninfer::RuntimeStats before_resume = engine.runtime_stats();
     const ninfer::GenerationResult resumed   = engine.generate(
         engine.prepare(pressure_turn(*long_text, "", ninfer::CacheRetentionHint::Disposable)),
@@ -3307,6 +3326,25 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
                       << after_resume.host_kv_occupied_bytes;
         }
         std::cerr << '\n';
+        return 1;
+    }
+    const auto restored =
+        std::find_if(resumed.checkpoint_lifecycle.begin(), resumed.checkpoint_lifecycle.end(),
+                     [](const auto& fact) {
+                         return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                                fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                                fact.destination_tier == ninfer::CheckpointLifecycleTier::Device &&
+                                fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                     });
+    if (restored == resumed.checkpoint_lifecycle.end() ||
+        kv_offloaded->frontier != resumed.reused_prompt_tokens ||
+        kv_offloaded->key_digests != restored->key_digests || kv_offloaded->state_images != 1 ||
+        kv_offloaded->main_kv_pages != reused_pages ||
+        kv_offloaded->main_kv_pages != restored->main_kv_pages ||
+        kv_offloaded->backend_kv_pages != restored->backend_kv_pages) {
+        std::cerr << "KV-only offload lost the restored checkpoint identity or footprint: offload="
+                  << kv_offloaded->frontier << " restored=" << resumed.reused_prompt_tokens
+                  << " main=" << kv_offloaded->main_kv_pages << '/' << reused_pages << '\n';
         return 1;
     }
     return 0;

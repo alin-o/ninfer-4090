@@ -134,12 +134,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 try {
                     render_and_write(transport, [&] { return encoder->start(); });
                 } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport),
+                        service_->cancel_and_settle(stream->prepared)));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_internal_request_failure(RequestFailurePhase::ResponseRender,
+                                                      exception.what()),
+                        service_->cancel_and_settle(stream->prepared)));
                     ApiError error;
                     error.status  = 500;
                     error.type    = "internal_error";
@@ -214,11 +217,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return false;
                 }
             },
-            [stream, lifecycle](bool successful) {
+            [this, stream, lifecycle](bool successful) {
                 stream->cancelled.store(true, std::memory_order_release);
                 if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport),
+                        service_->cancel_and_settle(stream->prepared)));
                 }
             });
     } catch (const std::exception& exception) {

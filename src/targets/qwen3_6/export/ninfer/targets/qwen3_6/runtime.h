@@ -900,6 +900,7 @@ struct MaterializationVictimResult {
     runtime::VictimDisposition disposition = runtime::VictimDisposition::Retained;
     bool pressure_committed                = false;
     std::optional<ContinuationSummary> final_summary;
+    std::vector<runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct MaterializationSharedVictimResult {
@@ -907,6 +908,7 @@ struct MaterializationSharedVictimResult {
     runtime::VictimDisposition disposition = runtime::VictimDisposition::Retained;
     bool pressure_committed                = false;
     std::optional<SharedPrefixSummary> final_summary;
+    std::vector<runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct MaterializationSourceResult {

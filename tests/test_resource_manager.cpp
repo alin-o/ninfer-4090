@@ -450,6 +450,7 @@ struct FakeMaterializationVictimResult {
     VictimDisposition disposition = VictimDisposition::Retained;
     bool pressure_committed       = false;
     std::optional<FakeContinuationSummary> final_summary;
+    std::vector<ninfer::runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct FakeMaterializationSharedVictimResult {
@@ -457,6 +458,7 @@ struct FakeMaterializationSharedVictimResult {
     VictimDisposition disposition = VictimDisposition::Retained;
     bool pressure_committed       = false;
     std::optional<FakeSharedPrefixSummary> final_summary;
+    std::vector<ninfer::runtime::CommittedKvOffloadRange> committed_kv_offloads;
 };
 
 struct FakeMaterializationSourceResult {
@@ -887,13 +889,16 @@ public:
                         if (action.dropped_checkpoints == 0 ||
                             malform_private_checkpoint_identity) {
                             auto checkpoint = endpoint(content, finish_frontier);
-                            if (std::any_of(transfer_observations_to_publish.begin(),
-                                            transfer_observations_to_publish.end(),
-                                            [](const auto& transfer) {
-                                                return transfer.direction ==
-                                                       ninfer::runtime::ContextTransferDirection::
-                                                           DeviceToHost;
-                                            })) {
+                            if (std::any_of(
+                                    transfer_observations_to_publish.begin(),
+                                    transfer_observations_to_publish.end(),
+                                    [](const auto& transfer) {
+                                        return transfer.direction ==
+                                                   ninfer::runtime::ContextTransferDirection::
+                                                       DeviceToHost &&
+                                               transfer.resource ==
+                                                   ninfer::runtime::ContextResourceClass::State;
+                                    })) {
                                 checkpoint.state_residency =
                                     ninfer::runtime::ReplicaResidency::Both;
                             }
@@ -903,6 +908,22 @@ public:
                                                     !malform_private_checkpoint_identity)) {
                             victim.final_summary->rewrite =
                                 rewrite_checkpoint(content, finish_frontier - 1U);
+                        }
+                        for (const auto& transfer : transfer_observations_to_publish) {
+                            if (transfer.direction !=
+                                    ninfer::runtime::ContextTransferDirection::DeviceToHost ||
+                                (transfer.resource !=
+                                     ninfer::runtime::ContextResourceClass::MainKV &&
+                                 transfer.resource !=
+                                     ninfer::runtime::ContextResourceClass::BackendKV)) {
+                                continue;
+                            }
+                            victim.committed_kv_offloads.push_back(
+                                ninfer::runtime::CommittedKvOffloadRange{
+                                    .resource   = transfer.resource,
+                                    .begin_page = 0,
+                                    .page_count = transfer.page_count,
+                                });
                         }
                     }
                     result.victims.push_back(std::move(victim));
@@ -979,12 +1000,15 @@ public:
                 const std::uint32_t content = sequence_content_keys_.at(owner_id);
                 if (action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
                     auto checkpoint = endpoint(content, finish_frontier);
-                    if (std::any_of(
-                            transfer_observations_to_publish.begin(),
-                            transfer_observations_to_publish.end(), [](const auto& transfer) {
-                                return transfer.direction ==
-                                       ninfer::runtime::ContextTransferDirection::DeviceToHost;
-                            })) {
+                    if (std::any_of(transfer_observations_to_publish.begin(),
+                                    transfer_observations_to_publish.end(),
+                                    [](const auto& transfer) {
+                                        return transfer.direction ==
+                                                   ninfer::runtime::ContextTransferDirection::
+                                                       DeviceToHost &&
+                                               transfer.resource ==
+                                                   ninfer::runtime::ContextResourceClass::State;
+                                    })) {
                         checkpoint.state_residency = ninfer::runtime::ReplicaResidency::Both;
                     }
                     victim.final_summary->endpoint = std::move(checkpoint);
@@ -993,6 +1017,19 @@ public:
                     (action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
+                }
+                for (const auto& transfer : transfer_observations_to_publish) {
+                    if (transfer.direction !=
+                            ninfer::runtime::ContextTransferDirection::DeviceToHost ||
+                        (transfer.resource != ninfer::runtime::ContextResourceClass::MainKV &&
+                         transfer.resource != ninfer::runtime::ContextResourceClass::BackendKV)) {
+                        continue;
+                    }
+                    victim.committed_kv_offloads.push_back(ninfer::runtime::CommittedKvOffloadRange{
+                        .resource   = transfer.resource,
+                        .begin_page = 0,
+                        .page_count = transfer.page_count,
+                    });
                 }
             }
             result.victims.push_back(std::move(victim));
@@ -2080,6 +2117,46 @@ void test_checkpoint_reuse_lifecycle_distinguishes_device_and_host() {
     };
     run(false);
     run(true);
+}
+
+void test_checkpoint_kv_only_offload_lifecycle() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 81, make_base(81), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.required_pressure_actions        = 1;
+    program.transfer_observations_to_publish = {ContextTransferObservation{
+        .resource   = ninfer::runtime::ContextResourceClass::MainKV,
+        .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+        .units      = 4096,
+        .page_count = 1,
+        .work       = ninfer::TransferWork{.payload_bytes = 4096, .copy_operations = 1},
+        .elapsed_ns = 13,
+    }};
+    auto pressure = manager.inspect(program, FakePreparedPrompt{82}, make_base(82), 2);
+    require(pressure.choice.has_value(), "KV-only lifecycle fixture found no pressure plan");
+    const LaneId pressure_lane = pressure.choice->destination();
+    require(manager.reserve_materialization(program, std::move(*pressure.choice),
+                                            FakePreparedPrompt{82}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "KV-only lifecycle fixture could not reserve pressure materialization");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    const auto offloaded =
+        std::find_if(outcome.lifecycle.begin(), outcome.lifecycle.end(), [](const auto& fact) {
+            return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded;
+        });
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation &&
+                offloaded != outcome.lifecycle.end() && offloaded->key_digests[0] == 81 &&
+                offloaded->frontier == 16 && offloaded->state_images == 1 &&
+                offloaded->main_kv_pages == 1 && offloaded->backend_kv_pages == 0 &&
+                ninfer::summarize_checkpoint_lifecycle(outcome.lifecycle).offload_committed,
+            "KV-only pressure did not publish exact attributable pages and summary");
+    auto activation                            = std::move(*outcome.activation);
+    const FakeSequenceHandle pressure_sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+    (void)manager.abort(program, pressure_lane, pressure_sequence);
 }
 
 void test_private_portfolio_loss_keeps_checkpoint_identity_fixed() {
@@ -4290,6 +4367,7 @@ int main() {
              test_state_transfer_stats_report_physical_bytes_not_image_units);
     run_test("Device and Host checkpoint reuse lifecycle",
              test_checkpoint_reuse_lifecycle_distinguishes_device_and_host);
+    run_test("KV-only checkpoint offload lifecycle", test_checkpoint_kv_only_offload_lifecycle);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("aborted pressure transfer lifecycle",

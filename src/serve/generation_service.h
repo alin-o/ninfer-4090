@@ -199,6 +199,12 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    // A gateway that cannot enter streaming generation after submit must still consume the
+    // Engine handle. Cancellation is requested, settlement is awaited, and every immutable fact
+    // committed before settlement is returned without changing the gateway's original failure.
+    [[nodiscard]] std::vector<ninfer::CheckpointLifecycleFact>
+    cancel_and_settle(PreparedRequest& prepared) noexcept;
+
     void set_checkpoint_lifecycle_observer(
         std::function<void(const ninfer::CheckpointLifecycleFact&)> observer);
 

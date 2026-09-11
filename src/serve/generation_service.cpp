@@ -568,6 +568,31 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     return outcome;
 }
 
+std::vector<ninfer::CheckpointLifecycleFact>
+GenerationService::cancel_and_settle(PreparedRequest& prepared) noexcept {
+    try {
+        if (!prepared.generation) {
+            if (!prepared.failure_checkpoint_lifecycle.empty()) {
+                return std::move(prepared.failure_checkpoint_lifecycle);
+            }
+            return std::move(prepared.durable_lifecycle);
+        }
+        StreamSink sink;
+        sink.is_cancelled = [] { return true; };
+        try {
+            GenerationOutcome outcome = run(prepared, &sink, [] { return true; });
+            return std::move(outcome.checkpoint_lifecycle);
+        } catch (const ApiException& exception) {
+            return exception.error().checkpoint_lifecycle;
+        } catch (...) {
+            if (!prepared.failure_checkpoint_lifecycle.empty()) {
+                return std::move(prepared.failure_checkpoint_lifecycle);
+            }
+            return std::move(prepared.durable_lifecycle);
+        }
+    } catch (...) { return {}; }
+}
+
 ninfer::RuntimeStats GenerationService::runtime_stats() const {
     ninfer::RuntimeStats result = engine_->runtime_stats();
     if (!durable_catalog_) { return result; }

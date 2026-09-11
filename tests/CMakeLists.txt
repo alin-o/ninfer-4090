@@ -153,7 +153,7 @@ add_test(NAME ninfer_qwen3_8_shared_snapshot_lifecycle_test
 set_tests_properties(ninfer_qwen3_8_shared_snapshot_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_openai_cache_real_test
   SOURCES test_openai_cache_real.cpp
-  LIBRARIES ninfer_serve CUDA::cudart)
+  LIBRARIES ninfer_serve spdlog::spdlog CUDA::cudart)
 target_include_directories(ninfer_openai_cache_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 set_tests_properties(ninfer_openai_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)

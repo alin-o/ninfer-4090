@@ -3077,6 +3077,18 @@ private:
         return observed ? std::optional<std::uint64_t>(total) : std::nullopt;
     }
 
+    [[nodiscard]] static std::uint32_t
+    offloaded_kv_pages(std::span<const CommittedKvOffloadRange> ranges,
+                       ContextResourceClass resource, std::uint32_t checkpoint_pages) noexcept {
+        std::uint64_t pages = 0;
+        for (const CommittedKvOffloadRange& range : ranges) {
+            if (range.resource != resource || range.begin_page >= checkpoint_pages) { continue; }
+            const std::uint32_t available = checkpoint_pages - range.begin_page;
+            pages += std::min(range.page_count, available);
+        }
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(pages, checkpoint_pages));
+    }
+
     template <class Result, class PrivateResultFor, class SharedResultFor>
     [[nodiscard]] std::vector<CheckpointLifecycleFact>
     pressure_lifecycle(const std::vector<OwnerClaim>& private_claims,
@@ -3113,14 +3125,22 @@ private:
             if (!after.pressure_committed || !after.final_summary) { continue; }
             const auto observe_offload = [&](const auto& checkpoint) {
                 const auto* final = find_checkpoint(*after.final_summary, checkpoint.ref);
-                if (final != nullptr &&
+                if (final == nullptr) { return; }
+                const bool state_offloaded =
                     checkpoint.state_residency == ReplicaResidency::DeviceOnly &&
-                    final->state_residency != ReplicaResidency::DeviceOnly) {
-                    facts.push_back(lifecycle_fact(*final, CheckpointLifecycleOperation::Offloaded,
-                                                   CheckpointLifecycleTier::Device,
-                                                   CheckpointLifecycleTier::Host,
-                                                   CheckpointLifecycleStatus::Committed));
-                }
+                    final->state_residency != ReplicaResidency::DeviceOnly;
+                const std::uint32_t main_offloaded =
+                    offloaded_kv_pages(after.committed_kv_offloads, ContextResourceClass::MainKV,
+                                       final->required_kv.main_pages);
+                const std::uint32_t backend_offloaded =
+                    offloaded_kv_pages(after.committed_kv_offloads, ContextResourceClass::BackendKV,
+                                       final->required_kv.backend_pages);
+                if (!state_offloaded && main_offloaded == 0 && backend_offloaded == 0) { return; }
+                CheckpointLifecycleFact fact =
+                    lifecycle_fact(*final, CheckpointLifecycleOperation::Offloaded,
+                                   CheckpointLifecycleTier::Device, CheckpointLifecycleTier::Host,
+                                   CheckpointLifecycleStatus::Committed);
+                facts.push_back(std::move(fact));
             };
             if (before.endpoint) { observe_offload(*before.endpoint); }
             if (before.rewrite) { observe_offload(*before.rewrite); }
@@ -3143,14 +3163,24 @@ private:
                                                CheckpointLifecycleTier::Device,
                                                CheckpointLifecycleTier::Host,
                                                CheckpointLifecycleStatus::Aborted));
-            } else if (after.pressure_committed && after.final_summary &&
-                       before.state_residency == ReplicaResidency::DeviceOnly &&
-                       after.final_summary->checkpoint.state_residency !=
-                           ReplicaResidency::DeviceOnly) {
-                facts.push_back(lifecycle_fact(
-                    after.final_summary->checkpoint, CheckpointLifecycleOperation::Offloaded,
-                    CheckpointLifecycleTier::Device, CheckpointLifecycleTier::Host,
-                    CheckpointLifecycleStatus::Committed));
+            } else if (after.pressure_committed && after.final_summary) {
+                const auto& final = after.final_summary->checkpoint;
+                const bool state_offloaded =
+                    before.state_residency == ReplicaResidency::DeviceOnly &&
+                    final.state_residency != ReplicaResidency::DeviceOnly;
+                const std::uint32_t main_offloaded =
+                    offloaded_kv_pages(after.committed_kv_offloads, ContextResourceClass::MainKV,
+                                       final.required_kv.main_pages);
+                const std::uint32_t backend_offloaded =
+                    offloaded_kv_pages(after.committed_kv_offloads, ContextResourceClass::BackendKV,
+                                       final.required_kv.backend_pages);
+                if (state_offloaded || main_offloaded != 0 || backend_offloaded != 0) {
+                    CheckpointLifecycleFact fact = lifecycle_fact(
+                        final, CheckpointLifecycleOperation::Offloaded,
+                        CheckpointLifecycleTier::Device, CheckpointLifecycleTier::Host,
+                        CheckpointLifecycleStatus::Committed);
+                    facts.push_back(std::move(fact));
+                }
             }
         }
         return facts;

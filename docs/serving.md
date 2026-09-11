@@ -953,7 +953,15 @@ counts StateImage objects and `state.bytes` uses the Program-published, per-imag
 layout (linear State plus continuation-hidden and optional DFlash components), never the complete
 multi-slot linear State pool. Main and
 backend KV report pages separately and derive bytes from their distinct Program-published page
-sizes. `serialized_bytes` is meaningful for SSD records.
+sizes. For a partial KV-only offload, committed per-owner page ranges establish that the identified
+checkpoint changed tier even when its State residency does not change; the record's quantities
+continue to describe that checkpoint's complete recovery footprint. `serialized_bytes` is
+meaningful for SSD records.
+
+If streaming transport fails before the initial event is published, or the registered content
+provider is never entered, the Gateway cancels and settles the already-submitted Engine request
+before writing its original transport/render terminal. Checkpoint facts committed during durable
+adoption or Engine settlement therefore remain attached to that request error.
 
 `request_done.checkpoint_summary` and the corresponding error/rejection summaries are compact views
 derived from those immutable facts: whether reuse selected a checkpoint, whether a Host/SSD restore

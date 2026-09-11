@@ -124,7 +124,10 @@ catalog filesystem completion is a Gateway-owned background fact and therefore u
 request/response correlation unless an owning request is explicitly carried. Producers must not
 manufacture lifecycle records by subtracting global counters or label an incomplete transfer as
 committed. Tier values are `device`, `host`, `ssd`, and `none`; status values are `committed`,
-`failed`, and `aborted`.
+`failed`, and `aborted`. Program publishes committed per-owner KV ranges so a KV-only pressure
+demotion is observable even when State residency is unchanged; ResourceManager intersects those
+ranges with each surviving logical checkpoint rather than sampling allocator deltas. The emitted
+resource quantities describe the identified checkpoint's complete recovery footprint.
 Terminal summaries, including request-error and post-adoption preparation-rejection summaries, are
 reductions of the same immutable fact list. Program publishes the complete per-image State transfer
 layout; the aggregate linear State pool is not a valid checkpoint byte quantity. Durable import
@@ -170,7 +173,10 @@ Serve owns request failure classification and severity. A prepared generation re
 machine terminal: `request_done` immediately after `GenerationService::run()` returns, or
 `request_error` if it does not return an outcome. Response rendering, Responses storage, and terminal
 transport happen after that transaction; their failures are operational `response` records and do
-not create a second request JSONL terminal.
+not create a second request JSONL terminal. A streaming Gateway failure before `run()` begins is a
+special settlement path, not an abandoned handle: the Gateway requests cancellation, awaits the
+submitted Engine request, merges durable and Engine checkpoint facts, then records the original
+transport/render classification.
 
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.

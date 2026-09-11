@@ -5461,7 +5461,29 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
     work.state_changes.clear();
     work.main_kv_changes.clear();
     work.backend_kv_changes.clear();
+    work.pending_kv_offloads.clear();
     if (work.option.evicts_continuation) { return; }
+
+    const auto count_demotions = [](const auto& actions) {
+        return static_cast<std::size_t>(
+            std::count_if(actions.begin(), actions.end(), [](const auto& action) {
+                return action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+            }));
+    };
+    work.pending_kv_offloads.reserve(count_demotions(work.option.main_kv_changes) +
+                                     count_demotions(work.option.backend_kv_changes));
+    const auto record_demotions = [&](const auto& actions, runtime::ContextResourceClass resource) {
+        for (const qwen3_6::detail::PressureKVDecision& action : actions) {
+            if (action.kind != qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) { continue; }
+            work.pending_kv_offloads.push_back(runtime::CommittedKvOffloadRange{
+                .resource   = resource,
+                .begin_page = action.begin_page,
+                .page_count = action.page_count,
+            });
+        }
+    };
+    record_demotions(work.option.main_kv_changes, runtime::ContextResourceClass::MainKV);
+    record_demotions(work.option.backend_kv_changes, runtime::ContextResourceClass::BackendKV);
 
     work.state_changes.resize(work.option.state_changes.size());
 
@@ -6262,10 +6284,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             collect_pressure_operations(work);
             const std::uint32_t index = transaction.shared_victim_indices[position];
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
-                .owner              = transaction.shared_pressure_results[position].owner,
-                .disposition        = runtime::VictimDisposition::Retained,
-                .pressure_committed = true,
-                .final_summary      = shared_prefix_summary(shared_prefix_states[index]),
+                .owner                 = transaction.shared_pressure_results[position].owner,
+                .disposition           = runtime::VictimDisposition::Retained,
+                .pressure_committed    = true,
+                .final_summary         = shared_prefix_summary(shared_prefix_states[index]),
+                .committed_kv_offloads = std::move(work.pending_kv_offloads),
             };
             complete_pressure_delta(work);
             transaction.shared_victim_released[position] = true;
@@ -6280,6 +6303,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             retain_private_result(transaction.pressure_results[position],
                                   continuation_states[work.continuation_index]);
             transaction.pressure_results[position].pressure_committed = true;
+            transaction.pressure_results[position].committed_kv_offloads =
+                std::move(work.pending_kv_offloads);
             complete_pressure_delta(work);
             transaction.victim_released[position] = true;
         }
@@ -8823,6 +8848,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = shared_prefix_summary(
                         shared_prefix_states[transaction.shared_victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
@@ -8837,6 +8863,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = continuation_summary(
                         continuation_states[transaction.victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }

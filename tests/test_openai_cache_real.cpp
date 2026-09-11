@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/anthropic_messages.h"
+#include "serve/http_server.h"
 #include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_responses.h"
@@ -7,6 +8,8 @@
 #include "serve/request_log.h"
 
 #include <cuda_runtime.h>
+#include <spdlog/logger.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include <algorithm>
 #include <array>
@@ -15,10 +18,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <netinet/in.h>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -142,6 +148,67 @@ void exercise_disconnect_after_checkpoint_reuse(const char* artifact) {
                 failure.classification == RequestFailureClass::ClientDisconnected &&
                 summarize_checkpoint_lifecycle(failure.checkpoint_lifecycle).restore_committed,
             "disconnect after reuse lost settled facts or changed transport classification");
+}
+
+void exercise_stream_failure_before_wait(const char* artifact) {
+    GenerationService service(options(artifact));
+    const auto prepare = [&] {
+        Json body{{"model", "qwen3.8"},
+                  {"messages", Json::array({Json{{"role", "user"},
+                                                 {"content", "cancel before stream start"}}})},
+                  {"max_tokens", 8},
+                  {"stream", true}};
+        GenerationRequest request = parse_chat_completion_request(body, RequestLimits{}).generation;
+        PreparedRequest prepared  = service.prepare(request, GenerationConsumerMode::Streaming);
+        // SSD adoption is synchronous in prepare(). Model that already-committed fact explicitly
+        // so both gateway paths prove they merge it while cancelling the submitted Engine work.
+        prepared.durable_lifecycle.push_back(CheckpointLifecycleFact{
+            .key_digests      = {0x1234, 0x5678},
+            .content_digest   = std::string(64, 'a'),
+            .frontier         = 64,
+            .role             = CheckpointLifecycleRole::SharedStablePrefix,
+            .scope            = CheckpointLifecycleScope::Shared,
+            .operation        = CheckpointLifecycleOperation::Restored,
+            .source_tier      = CheckpointLifecycleTier::Ssd,
+            .destination_tier = CheckpointLifecycleTier::Device,
+            .status           = CheckpointLifecycleStatus::Committed,
+            .state_images     = 1,
+            .main_kv_pages    = 1,
+        });
+        return prepared;
+    };
+    const auto verify = [&](PreparedRequest prepared, bool fail_initial_write, const char* label) {
+        if (fail_initial_write) {
+            httplib::DataSink failed_sink;
+            failed_sink.write = [](const char*, std::size_t) { return false; };
+            std::atomic<bool> cancelled{false};
+            SseTransport transport(failed_sink, cancelled);
+            bool disconnected = false;
+            try {
+                transport.write("data: initial-event\n\n");
+            } catch (const ClientDisconnected&) { disconnected = true; }
+            require(disconnected && cancelled.load(std::memory_order_acquire),
+                    "initial SSE write fixture did not fail at the transport boundary");
+        }
+        const std::vector<CheckpointLifecycleFact> facts = service.cancel_and_settle(prepared);
+        const auto restored = std::find_if(facts.begin(), facts.end(), [](const auto& fact) {
+            return fact.operation == CheckpointLifecycleOperation::Restored &&
+                   fact.source_tier == CheckpointLifecycleTier::Ssd &&
+                   fact.status == CheckpointLifecycleStatus::Committed;
+        });
+        const RequestFailure failure = attach_checkpoint_lifecycle(
+            make_client_disconnected_failure(RequestFailurePhase::Transport), facts);
+        require(restored != facts.end() &&
+                    summarize_checkpoint_lifecycle(facts).restore_committed &&
+                    failure.classification == RequestFailureClass::ClientDisconnected &&
+                    failure.phase == RequestFailurePhase::Transport,
+                label);
+        (void)settled_stats(service);
+    };
+
+    verify(prepare(), true, "initial SSE write failure lost pre-generation checkpoint facts");
+    verify(prepare(), false,
+           "stream provider that never started lost pre-generation checkpoint facts");
 }
 
 void exercise_harness(const char* artifact) {
@@ -402,6 +469,12 @@ void exercise_protocol_content_capture(const char* artifact) {
     require(chat_aggregate.prompt.find("## Non-text media") != std::string::npos &&
                 responses_capture.prompt.find("## Non-text media") != std::string::npos &&
                 anthropic_capture.prompt.find("## Non-text media") != std::string::npos &&
+                chat_aggregate.prompt.find("media_type=`image/x-portable-pixmap`") !=
+                    std::string::npos &&
+                responses_capture.prompt.find("media_type=`image/x-portable-pixmap`") !=
+                    std::string::npos &&
+                anthropic_capture.prompt.find("media_type=`image/x-portable-pixmap`") !=
+                    std::string::npos &&
                 chat_aggregate.prompt.find(media_payload) == std::string::npos &&
                 responses_capture.prompt.find(data_uri) == std::string::npos &&
                 anthropic_capture.prompt.find(media_payload) == std::string::npos,
@@ -422,6 +495,130 @@ void exercise_protocol_content_capture(const char* artifact) {
             "JSONL embedded acquired media or model-visible text");
 }
 
+int reserve_loopback_port() {
+    const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) { throw std::runtime_error("failed to create port reservation socket"); }
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    if (::bind(socket_fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        ::close(socket_fd);
+        throw std::runtime_error("failed to reserve loopback port");
+    }
+    socklen_t length = sizeof(address);
+    if (::getsockname(socket_fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+        ::close(socket_fd);
+        throw std::runtime_error("failed to inspect loopback port");
+    }
+    const int port = ntohs(address.sin_port);
+    ::close(socket_fd);
+    return port;
+}
+
+void exercise_http_secret_exclusion(const char* artifact) {
+    TemporaryDirectory temporary;
+    constexpr std::string_view authorization_secret = "authorization-secret-6cb22c";
+    constexpr std::string_view cookie_secret        = "cookie-secret-11ca3a";
+    constexpr std::string_view signed_query_secret  = "signed-query-secret-bdc997";
+
+    ServeOptions configured            = options(artifact);
+    configured.host                    = "127.0.0.1";
+    configured.port                    = reserve_loopback_port();
+    configured.api_key                 = authorization_secret;
+    configured.request_log_jsonl       = temporary.path / "requests.jsonl";
+    configured.request_log_content_dir = temporary.path / "content";
+    configured.context_cache           = ContextCacheOptions{.enabled = false};
+    configured.enable_vision           = true;
+    configured.log_stats_interval_ms   = 0;
+
+    std::ostringstream operational;
+    auto sink   = std::make_shared<spdlog::sinks::ostream_sink_mt>(operational);
+    auto logger = std::make_shared<spdlog::logger>("capture-secret-test", sink);
+    logger->set_pattern("%v");
+    GenerationService service(configured, {}, logger);
+    HttpServer server(configured, logger);
+    require(server.bind(), "failed to bind HTTP privacy regression server");
+    server.attach(service);
+
+    struct Listener {
+        HttpServer* server = nullptr;
+        std::thread thread;
+
+        ~Listener() {
+            server->stop();
+            if (thread.joinable()) { thread.join(); }
+        }
+    } listener{.server = &server, .thread = std::thread([&] { (void)server.listen(); })};
+
+    const std::string signed_url =
+        "http://127.0.0.1:" + std::to_string(configured.port) +
+        "/private.ppm?X-Amz-Signature=" + std::string(signed_query_secret);
+    const Json body{
+        {"model", server.public_model_id()},
+        {"messages",
+         Json::array(
+             {Json{{"role", "user"},
+                   {"content", Json::array({Json{{"type", "text"}, {"text", "secret-url-request"}},
+                                            Json{{"type", "image_url"},
+                                                 {"image_url", Json{{"url", signed_url}}}}})}}})},
+        {"max_tokens", 1}};
+    httplib::Client client(configured.host, configured.port);
+    httplib::Headers headers{{"Authorization", "Bearer " + std::string(authorization_secret)},
+                             {"Cookie", "session=" + std::string(cookie_secret)}};
+    const std::string media_payload = base64(capture_ppm());
+    const std::string data_uri      = "data:image/x-portable-pixmap;base64," + media_payload;
+    const Json accepted_body{
+        {"model", server.public_model_id()},
+        {"messages",
+         Json::array(
+             {Json{{"role", "user"},
+                   {"content", Json::array({Json{{"type", "text"}, {"text", "http-safe-media"}},
+                                            Json{{"type", "image_url"},
+                                                 {"image_url", Json{{"url", data_uri}}}}})}}})},
+        {"max_tokens", 1}};
+    const httplib::Result accepted =
+        client.Post("/v1/chat/completions", headers, accepted_body.dump(), "application/json");
+    require(accepted && accepted->status == 200,
+            "credential-bearing HTTP media request did not publish capture files");
+
+    const httplib::Result response =
+        client.Post("/v1/chat/completions", headers, body.dump(), "application/json");
+    require(response && response->status == 400,
+            "signed media URL did not reach deterministic acquisition rejection");
+    const Json response_body = Json::parse(response->body);
+    require(response_body.at("error").at("code") == "invalid_media",
+            "signed media URL was not rejected by the media acquisition boundary");
+
+    logger->flush();
+    std::string markdown;
+    std::error_code directory_error;
+    if (std::filesystem::exists(configured.request_log_content_dir, directory_error)) {
+        for (const auto& entry :
+             std::filesystem::directory_iterator(configured.request_log_content_dir)) {
+            if (entry.is_regular_file()) { markdown += read_file(entry.path()); }
+        }
+    }
+    const std::string jsonl = read_file(configured.request_log_jsonl);
+    const std::string logs  = operational.str();
+    const std::string wire  = response->body;
+    require(markdown.find("## Non-text media") != std::string::npos &&
+                markdown.find("kind=`image`") != std::string::npos &&
+                markdown.find("media_type=`image/x-portable-pixmap`") != std::string::npos &&
+                markdown.find("bytes=`3085`") != std::string::npos &&
+                markdown.find("sha256=`") != std::string::npos &&
+                markdown.find(media_payload) == std::string::npos &&
+                jsonl.find(media_payload) == std::string::npos,
+            "HTTP media capture lost safe metadata or persisted its base64 payload");
+    for (const std::string_view secret :
+         {authorization_secret, cookie_secret, signed_query_secret}) {
+        require(
+            markdown.find(secret) == std::string::npos && jsonl.find(secret) == std::string::npos &&
+                logs.find(secret) == std::string::npos && wire.find(secret) == std::string::npos,
+            "HTTP credential or signed-query secret escaped a redacted boundary");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -435,7 +632,9 @@ int main() {
     try {
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
+        exercise_stream_failure_before_wait(artifact);
         exercise_protocol_content_capture(artifact);
+        exercise_http_secret_exclusion(artifact);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

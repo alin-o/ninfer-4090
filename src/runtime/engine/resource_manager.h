@@ -3893,7 +3893,12 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        // State observations retain image cardinality in `units` for logical planning. Their
+        // physical byte volume is carried by TransferWork, just as it is for grouped pressure
+        // copies. KV observations use typed payload bytes directly as their units.
+        const std::uint64_t bytes = observation.resource == ContextResourceClass::State
+                                        ? observation.work.payload_bytes
+                                        : observation.units;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {

@@ -110,9 +110,12 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         if (!part.at("detail").is_string()) {
             bad_request("input_image.detail must be a string", "input");
         }
-        if (part.at("detail").get<std::string>() != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
-                        "image_detail_not_supported");
+        // Codex sends high/original hints. All accepted hints use the native Vision policy.
+        const std::string detail = part.at("detail").get<std::string>();
+        if (detail != "auto" && detail != "high" && detail != "original") {
+            bad_request("input_image.detail must be 'auto', 'high', or 'original'; "
+                        "a low-detail preprocessing profile is not supported",
+                        "input", "image_detail_not_supported");
         }
     }
 

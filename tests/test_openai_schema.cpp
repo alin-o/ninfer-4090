@@ -354,9 +354,9 @@ int test_messages_and_media() {
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
 
-    body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "low";
     failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+                      "unsupported low-detail image preprocessing rejected");
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();

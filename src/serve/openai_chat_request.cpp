@@ -275,12 +275,11 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
                 bad_request("image_url.detail must be a string", "messages");
             }
             const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
-                bad_request(
-                    "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that NInfer's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
-                    "messages", "image_detail_not_supported");
+            // Match Responses: Codex high/original hints use the native Vision policy.
+            if (detail != "auto" && detail != "high" && detail != "original") {
+                bad_request("image_url.detail must be 'auto', 'high', or 'original'; "
+                            "a low-detail preprocessing profile is not supported",
+                            "messages", "image_detail_not_supported");
             }
         }
     } else {

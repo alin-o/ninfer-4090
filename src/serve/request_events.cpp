@@ -177,4 +177,12 @@ RequestFailure make_client_disconnected_failure(RequestFailurePhase phase) {
     };
 }
 
+RequestFailure
+attach_checkpoint_lifecycle(RequestFailure failure,
+                            std::span<const ninfer::CheckpointLifecycleFact> checkpoint_lifecycle) {
+    failure.checkpoint_lifecycle.insert(failure.checkpoint_lifecycle.end(),
+                                        checkpoint_lifecycle.begin(), checkpoint_lifecycle.end());
+    return failure;
+}
+
 } // namespace ninfer::serve

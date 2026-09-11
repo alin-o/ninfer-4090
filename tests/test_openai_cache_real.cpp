@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/anthropic_messages.h"
+#include "serve/http_transport.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_responses.h"
 #include "serve/request_events.h"
@@ -7,11 +8,14 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -101,6 +105,43 @@ GenerationOutcome generate(GenerationService& service, const std::string& instru
                             Json::array({Json{{"role", "system"}, {"content", instructions}},
                                          Json{{"role", "user"}, {"content", user}}}),
                             responses, explicit_only);
+}
+
+void exercise_disconnect_after_checkpoint_reuse(const char* artifact) {
+    GenerationService service(options(artifact));
+    const Json history =
+        Json::array({Json{{"role", "user"}, {"content", "Retain this exact disconnect fixture."}}});
+    const GenerationOutcome seeded = generate_history(service, history, false);
+    require(seeded.checkpoints.created_committed != 0,
+            "disconnect fixture did not create a reusable checkpoint");
+
+    Json body{{"model", "qwen3.8"}, {"messages", history}, {"max_tokens", 8}, {"stream", true}};
+    GenerationRequest request = parse_chat_completion_request(body, RequestLimits{}).generation;
+    PreparedRequest prepared  = service.prepare(request, GenerationConsumerMode::Streaming);
+    StreamSink sink;
+    sink.on_content   = [](const std::string&) { throw ClientDisconnected(); };
+    sink.on_reasoning = [](const std::string&) { throw ClientDisconnected(); };
+    bool disconnected = false;
+    try {
+        (void)service.run(prepared, &sink);
+    } catch (const ClientDisconnected&) { disconnected = true; }
+
+    const auto loaded =
+        std::find_if(prepared.failure_checkpoint_lifecycle.begin(),
+                     prepared.failure_checkpoint_lifecycle.end(), [](const auto& fact) {
+                         return (fact.operation == CheckpointLifecycleOperation::Loaded ||
+                                 fact.operation == CheckpointLifecycleOperation::Restored) &&
+                                fact.status == CheckpointLifecycleStatus::Committed &&
+                                fact.frontier != 0 &&
+                                fact.key_digests != std::array<std::uint64_t, 2>{};
+                     });
+    const RequestFailure failure = attach_checkpoint_lifecycle(
+        make_client_disconnected_failure(RequestFailurePhase::Transport),
+        prepared.failure_checkpoint_lifecycle);
+    require(disconnected && loaded != prepared.failure_checkpoint_lifecycle.end() &&
+                failure.classification == RequestFailureClass::ClientDisconnected &&
+                summarize_checkpoint_lifecycle(failure.checkpoint_lifecycle).restore_committed,
+            "disconnect after reuse lost settled facts or changed transport classification");
 }
 
 void exercise_harness(const char* artifact) {
@@ -219,6 +260,38 @@ std::string read_file(const std::filesystem::path& path) {
     return std::string((std::istreambuf_iterator<char>(input)), {});
 }
 
+std::string base64(std::span<const std::uint8_t> bytes) {
+    constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    encoded.reserve((bytes.size() + 2U) / 3U * 4U);
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 3U) {
+        const std::uint32_t first  = bytes[offset];
+        const std::uint32_t second = offset + 1U < bytes.size() ? bytes[offset + 1U] : 0U;
+        const std::uint32_t third  = offset + 2U < bytes.size() ? bytes[offset + 2U] : 0U;
+        const std::uint32_t value  = (first << 16U) | (second << 8U) | third;
+        encoded.push_back(alphabet[(value >> 18U) & 63U]);
+        encoded.push_back(alphabet[(value >> 12U) & 63U]);
+        encoded.push_back(offset + 1U < bytes.size() ? alphabet[(value >> 6U) & 63U] : '=');
+        encoded.push_back(offset + 2U < bytes.size() ? alphabet[value & 63U] : '=');
+    }
+    return encoded;
+}
+
+std::vector<std::uint8_t> capture_ppm() {
+    constexpr int width      = 32;
+    constexpr int height     = 32;
+    const std::string header = "P6\n32 32\n255\n";
+    std::vector<std::uint8_t> image(header.begin(), header.end());
+    image.reserve(image.size() + width * height * 3U);
+    for (int pixel = 0; pixel < width * height; ++pixel) {
+        image.push_back(static_cast<std::uint8_t>(pixel));
+        image.push_back(static_cast<std::uint8_t>(pixel * 3));
+        image.push_back(static_cast<std::uint8_t>(pixel * 7));
+    }
+    return image;
+}
+
 struct CapturedGeneration {
     GenerationOutcome outcome;
     std::string prompt;
@@ -255,13 +328,22 @@ void exercise_protocol_content_capture(const char* artifact) {
     configured.request_log_jsonl       = temporary.path / "requests.jsonl";
     configured.request_log_content_dir = temporary.path / "content";
     configured.context_cache           = ContextCacheOptions{.enabled = false};
+    configured.enable_vision           = true;
     GenerationService service(configured);
     JsonlRequestLog writer(configured.request_log_jsonl, artifact, {},
                            configured.request_log_content_dir);
 
+    const std::vector<std::uint8_t> media_bytes = capture_ppm();
+    const std::string media_payload             = base64(media_bytes);
+    const std::string data_uri = "data:image/x-portable-pixmap;base64," + media_payload;
     const Json chat_body{
         {"model", "qwen3.8"},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "capture-chat-sentinel"}}})},
+        {"messages",
+         Json::array({Json{
+             {"role", "user"},
+             {"content", Json::array({Json{{"type", "text"}, {"text", "capture-chat-sentinel"}},
+                                      Json{{"type", "image_url"},
+                                           {"image_url", Json{{"url", data_uri}}}}})}}})},
         {"max_tokens", 4}};
     GenerationRequest chat = parse_chat_completion_request(chat_body, RequestLimits{}).generation;
     const CapturedGeneration chat_aggregate =
@@ -272,12 +354,19 @@ void exercise_protocol_content_capture(const char* artifact) {
                                                            "openai_chat_completions", 2, true);
 
     OpenAIResponsesStore store(4, 1ULL << 20);
-    const auto responses_request =
-        parse_openai_responses_create_request(Json{{"model", "qwen3.8"},
-                                                   {"input", "capture-responses-sentinel"},
-                                                   {"store", false},
-                                                   {"max_output_tokens", 4}},
-                                              RequestLimits{});
+    const auto responses_request = parse_openai_responses_create_request(
+        Json{{"model", "qwen3.8"},
+             {"input",
+              Json::array({
+                  Json{{"role", "user"},
+                       {"content",
+                        Json::array(
+                            {Json{{"type", "input_text"}, {"text", "capture-responses-sentinel"}},
+                             Json{{"type", "input_image"}, {"image_url", data_uri}}})}},
+              })},
+             {"store", false},
+             {"max_output_tokens", 4}},
+        RequestLimits{});
     auto responses = resolve_openai_responses_prompt(responses_request.prompt, store,
                                                      "capture-responses", false);
     const CapturedGeneration responses_capture = capture_generation(
@@ -289,7 +378,14 @@ void exercise_protocol_content_capture(const char* artifact) {
         parse_anthropic_messages_request(
             Json{{"model", "qwen3.8"},
                  {"messages",
-                  Json::array({Json{{"role", "user"}, {"content", "capture-anthropic-sentinel"}}})},
+                  Json::array({Json{
+                      {"role", "user"},
+                      {"content",
+                       Json::array({Json{{"type", "text"}, {"text", "capture-anthropic-sentinel"}},
+                                    Json{{"type", "image"},
+                                         {"source", Json{{"type", "base64"},
+                                                         {"media_type", "image/x-portable-pixmap"},
+                                                         {"data", media_payload}}}}})}}})},
                  {"max_tokens", 4}},
             RequestLimits{}, signer)
             .generation;
@@ -303,6 +399,13 @@ void exercise_protocol_content_capture(const char* artifact) {
     require(chat_aggregate.prompt.find("\"messages\"") == std::string::npos &&
                 responses_capture.prompt.find("\"input\"") == std::string::npos,
             "protocol capture persisted raw HTTP JSON instead of rendered prompt text");
+    require(chat_aggregate.prompt.find("## Non-text media") != std::string::npos &&
+                responses_capture.prompt.find("## Non-text media") != std::string::npos &&
+                anthropic_capture.prompt.find("## Non-text media") != std::string::npos &&
+                chat_aggregate.prompt.find(media_payload) == std::string::npos &&
+                responses_capture.prompt.find(data_uri) == std::string::npos &&
+                anthropic_capture.prompt.find(media_payload) == std::string::npos,
+            "protocol-acquired media was not reduced to safe type/size/digest metadata");
     require(streamed.outcome.text == chat_aggregate.outcome.text &&
                 streamed.outcome.reasoning == chat_aggregate.outcome.reasoning &&
                 streamed.response == chat_aggregate.response,
@@ -311,6 +414,12 @@ void exercise_protocol_content_capture(const char* artifact) {
                 responses_capture.response == format_response_markdown(responses_capture.outcome) &&
                 anthropic_capture.response == format_response_markdown(anthropic_capture.outcome),
             "a protocol capture did not preserve the final logical response");
+    const std::string jsonl = read_file(configured.request_log_jsonl);
+    require(jsonl.find(media_payload) == std::string::npos &&
+                jsonl.find("capture-chat-sentinel") == std::string::npos &&
+                jsonl.find("capture-responses-sentinel") == std::string::npos &&
+                jsonl.find("capture-anthropic-sentinel") == std::string::npos,
+            "JSONL embedded acquired media or model-visible text");
 }
 
 } // namespace
@@ -325,6 +434,7 @@ int main() {
     }
     try {
         exercise_harness(artifact);
+        exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_protocol_content_capture(artifact);
         return 0;
     } catch (const std::exception& error) {

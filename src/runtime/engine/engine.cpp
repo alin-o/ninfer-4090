@@ -178,6 +178,8 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        [[nodiscard]] virtual std::vector<CheckpointLifecycleFact>
+        take_failure_checkpoint_lifecycle() noexcept = 0;
     };
 
     template <class Submission>
@@ -187,12 +189,23 @@ public:
             : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
-            return submission_.wait(sink, cancellation);
+            try {
+                return submission_.wait(sink, cancellation);
+            } catch (runtime::SettledGenerationFailure& failure) {
+                failure_checkpoint_lifecycle_ = failure.take_checkpoint_lifecycle();
+                failure.rethrow_cause();
+            }
+        }
+
+        [[nodiscard]] std::vector<CheckpointLifecycleFact>
+        take_failure_checkpoint_lifecycle() noexcept override {
+            return std::move(failure_checkpoint_lifecycle_);
         }
 
     private:
         std::shared_ptr<void> keep_alive_;
         Submission submission_;
+        std::vector<CheckpointLifecycleFact> failure_checkpoint_lifecycle_;
     };
 
     template <class Submission>
@@ -203,6 +216,11 @@ public:
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
+    }
+
+    [[nodiscard]] std::vector<CheckpointLifecycleFact>
+    take_failure_checkpoint_lifecycle() noexcept {
+        return state_->take_failure_checkpoint_lifecycle();
     }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
@@ -231,7 +249,17 @@ const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const no
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
     std::unique_ptr<Impl> impl = std::move(impl_);
-    return impl->wait(sink, cancellation);
+    try {
+        return impl->wait(sink, cancellation);
+    } catch (...) {
+        failure_checkpoint_lifecycle_ = impl->take_failure_checkpoint_lifecycle();
+        throw;
+    }
+}
+
+std::vector<CheckpointLifecycleFact>
+GenerationHandle::take_failure_checkpoint_lifecycle() noexcept {
+    return std::move(failure_checkpoint_lifecycle_);
 }
 
 namespace {

@@ -300,12 +300,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
-            lifecycle->failure(make_generation_request_failure(error));
+            lifecycle->failure(attach_checkpoint_lifecycle(make_generation_request_failure(error),
+                                                           prepared.failure_checkpoint_lifecycle));
             write_openai_error(res, error);
             return;
         } catch (const std::exception& exception) {
-            lifecycle->failure(
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+            lifecycle->failure(attach_checkpoint_lifecycle(
+                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()),
+                prepared.failure_checkpoint_lifecycle));
             write_openai_error(res, internal_error(exception));
             return;
         }
@@ -425,22 +427,29 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
                     outcome = service_->run(stream->prepared, &output);
                 } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport),
+                        stream->prepared.failure_checkpoint_lifecycle));
                     return false;
                 } catch (const ResponseRenderFailure& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_internal_request_failure(RequestFailurePhase::ResponseRender,
+                                                      exception.what()),
+                        stream->prepared.failure_checkpoint_lifecycle));
                     return send_failed(error);
                 } catch (const ApiException& exception) {
                     const ApiError error = responses_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
+                    lifecycle->failure(
+                        attach_checkpoint_lifecycle(make_generation_request_failure(error),
+                                                    stream->prepared.failure_checkpoint_lifecycle));
                     return send_failed(error);
                 } catch (const std::exception& exception) {
                     const ApiError error = internal_error(exception);
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
+                    lifecycle->failure(attach_checkpoint_lifecycle(
+                        make_internal_request_failure(RequestFailurePhase::Generation,
+                                                      exception.what()),
+                        stream->prepared.failure_checkpoint_lifecycle));
                     return send_failed(error);
                 }
 

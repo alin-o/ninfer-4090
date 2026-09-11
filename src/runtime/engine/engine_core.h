@@ -39,6 +39,30 @@
 
 namespace ninfer::runtime {
 
+// Private type-erasure carrier used only between EngineCore and GenerationHandle. Public callers
+// continue to observe the original OutputSink/engine exception; GenerationHandle separately
+// retains these already-settled facts for the serving boundary.
+class SettledGenerationFailure final : public std::exception {
+public:
+    SettledGenerationFailure(std::exception_ptr cause,
+                             std::vector<CheckpointLifecycleFact> checkpoint_lifecycle)
+        : cause_(std::move(cause)), checkpoint_lifecycle_(std::move(checkpoint_lifecycle)) {}
+
+    [[nodiscard]] const char* what() const noexcept override {
+        return "generation failed after checkpoint lifecycle settlement";
+    }
+
+    [[nodiscard]] std::vector<CheckpointLifecycleFact> take_checkpoint_lifecycle() noexcept {
+        return std::move(checkpoint_lifecycle_);
+    }
+
+    [[noreturn]] void rethrow_cause() const { std::rethrow_exception(cause_); }
+
+private:
+    std::exception_ptr cause_;
+    std::vector<CheckpointLifecycleFact> checkpoint_lifecycle_;
+};
+
 template <class Instance>
 class EngineCore {
 
@@ -1197,8 +1221,23 @@ private:
             }
             if (!done) { continue; }
 
-            if (caller_error != nullptr) { std::rethrow_exception(caller_error); }
             std::lock_guard lock(request->mutex);
+            if (caller_error != nullptr) {
+                std::vector<CheckpointLifecycleFact> lifecycle;
+                if (request->error != nullptr) {
+                    try {
+                        std::rethrow_exception(request->error);
+                    } catch (const RequestError& error) {
+                        lifecycle = error.checkpoint_lifecycle();
+                    } catch (...) {}
+                    lifecycle.insert(lifecycle.end(),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.begin()),
+                                     std::make_move_iterator(request->checkpoint_lifecycle.end()));
+                } else {
+                    lifecycle = std::move(request->result.checkpoint_lifecycle);
+                }
+                throw SettledGenerationFailure(caller_error, std::move(lifecycle));
+            }
             if (request->error != nullptr) {
                 try {
                     std::rethrow_exception(request->error);
@@ -1208,6 +1247,9 @@ private:
                                      std::make_move_iterator(request->checkpoint_lifecycle.begin()),
                                      std::make_move_iterator(request->checkpoint_lifecycle.end()));
                     throw RequestError(error.kind(), error.what(), std::move(lifecycle));
+                } catch (...) {
+                    throw SettledGenerationFailure(request->error,
+                                                   std::move(request->checkpoint_lifecycle));
                 }
             }
             return std::move(request->result);

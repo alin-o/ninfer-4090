@@ -497,6 +497,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     } catch (const ninfer::RequestError& exception) {
         throw_with_durable_lifecycle(request_error_to_api_error(exception),
                                      prepared.durable_lifecycle);
+    } catch (...) {
+        prepared.failure_checkpoint_lifecycle = prepared.durable_lifecycle;
+        std::vector<ninfer::CheckpointLifecycleFact> settled =
+            prepared.generation.take_failure_checkpoint_lifecycle();
+        prepared.failure_checkpoint_lifecycle.insert(prepared.failure_checkpoint_lifecycle.end(),
+                                                     std::make_move_iterator(settled.begin()),
+                                                     std::make_move_iterator(settled.end()));
+        throw;
     }
     if (durable_catalog_) {
         durable_catalog_->observe_hit(

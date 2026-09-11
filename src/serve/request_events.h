@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace ninfer::serve {
@@ -171,5 +172,8 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
 [[nodiscard]] RequestFailure make_internal_request_failure(RequestFailurePhase phase,
                                                            std::string machine_message);
 [[nodiscard]] RequestFailure make_client_disconnected_failure(RequestFailurePhase phase);
+[[nodiscard]] RequestFailure
+attach_checkpoint_lifecycle(RequestFailure failure,
+                            std::span<const ninfer::CheckpointLifecycleFact> checkpoint_lifecycle);
 
 } // namespace ninfer::serve

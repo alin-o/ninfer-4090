@@ -115,6 +115,10 @@ struct PreparedRequest {
     std::uint64_t durable_restore_bytes      = 0;
     std::uint64_t durable_restore_elapsed_ns = 0;
     std::vector<ninfer::CheckpointLifecycleFact> durable_lifecycle;
+    // Populated only when generation propagates a non-RequestError exception after Engine
+    // settlement (transport/render/generic failure). Gateways attach it to the classified
+    // terminal failure without changing the original exception type.
+    std::vector<ninfer::CheckpointLifecycleFact> failure_checkpoint_lifecycle;
     bool durable_loaded_from_ssd = false;
     bool durable_warm_available  = false;
     std::string durable_fallback_reason;

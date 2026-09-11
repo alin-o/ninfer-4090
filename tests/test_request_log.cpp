@@ -591,6 +591,16 @@ int main() {
     failures +=
         check(make_generation_request_failure(lifecycle_error).checkpoint_lifecycle.size() == 1,
               "request failure discarded aborted checkpoint lifecycle facts");
+    const RequestFailure disconnected_after_reuse = attach_checkpoint_lifecycle(
+        make_client_disconnected_failure(RequestFailurePhase::Transport),
+        lifecycle_error.checkpoint_lifecycle);
+    failures += check(
+        disconnected_after_reuse.classification == RequestFailureClass::ClientDisconnected &&
+            disconnected_after_reuse.phase == RequestFailurePhase::Transport &&
+            disconnected_after_reuse.checkpoint_lifecycle.size() == 1 &&
+            disconnected_after_reuse.checkpoint_lifecycle.front().key_digests ==
+                lifecycle_fact.key_digests,
+        "attaching settled lifecycle facts changed transport classification or lost identity");
 
     const std::string media_prompt = format_prompt_markdown(
         "model-visible <|vision_start|><|image_pad|><|vision_end|>",

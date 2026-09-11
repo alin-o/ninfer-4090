@@ -269,6 +269,7 @@ int main() {
 
     const RequestLogMetadata metadata{
         .model                             = "qwen3.6-27b",
+        .response_id                       = "chatcmpl-correlation-fixture",
         .stream                            = false,
         .output_tokens_explicit            = true,
         .preserve_thinking_semantic_change = true,
@@ -278,6 +279,8 @@ int main() {
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
+    failures += check(started.at("request").at("response_id") == "chatcmpl-correlation-fixture",
+                      "wire response id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == true,
@@ -346,8 +349,9 @@ int main() {
               "operational overload rejection is not warning severity");
 
     GenerationOutcome outcome;
+    outcome.generated_token_ids              = {17, 23, 42};
     outcome.prompt_tokens                    = 401;
-    outcome.completion_tokens                = 1024;
+    outcome.completion_tokens                = 3;
     outcome.finish_reason                    = ninfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds          = 0.1234567890123;
     outcome.metrics.ttft_seconds             = 0.3580246791357;
@@ -427,6 +431,8 @@ int main() {
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
+    failures += check(done.at("result").at("generated_token_ids") == Json::array({17, 23, 42}),
+                      "exact generated token ids missing");
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",

@@ -30,18 +30,32 @@ Run the target profile with at least three trials per arm:
 
 ```bash
 export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer
+python3 tools/bench/build_tiered_cache_baseline.py \
+  --output-dir .local/tiered-cache-baseline-c7
+
+# Optional validation evidence. This records exact executable hashes and preserves skips.
+python3 tools/bench/run_tiered_cache_validation.py \
+  --serve build-agent-verify/apps/ninfer-serve \
+  --weights "$NINFER_QWEN3_8_27B_WEIGHTS" \
+  --output .local/tiered-cache-validation.json
+
 python3 tools/bench/run_tiered_cache_replay.py \
   --serve build-agent-verify/apps/ninfer-serve \
+  --baseline-serve .local/tiered-cache-baseline-c7/build/apps/ninfer-serve \
+  --baseline-build-identity .local/tiered-cache-baseline-c7/baseline-build.json \
+  --validation-evidence .local/tiered-cache-validation.json \
   --samples 3
 ```
 
 The harness fixes `max-context=128000`, `max-concurrency=4`, `kv-capacity=auto`, RK4V4-E8 KV,
 MTP draft window 3, and the optimized draft head. It runs cache-disabled cold, current
-existing-cache, Device, forced-Host, restart SSD, all serving-boundary, and four-way overlap arms.
-It writes the numeric material-improvement threshold before starting any optimized arm. The
-threshold is the larger of 10% and three times the largest relative MAD observed in the two
-baseline arms. Exit status 3 means the campaign completed but one or more tier arms missed that
-pre-frozen threshold; it is measurement evidence, not a harness failure.
+existing-cache from the separately built and hash-pinned recorded revision, Device, forced-Host,
+restart SSD, all serving-boundary, and four-way overlap arms. The current binary is never labeled as
+the recorded baseline. It writes the numeric material-improvement threshold before starting any
+optimized arm. The threshold is the larger of 10% and three times the largest relative MAD observed
+in the two baseline arms. Exit status 3 means the campaign completed but performance failed its
+frozen threshold or correctness remains failed/unverified; inspect the generated verdict instead of
+treating status 3 as a speed result alone.
 
 Every output directory contains `threshold.json`, `evidence.json`, `report.md`, per-profile server
 logs, and the unabridged structured request/throughput JSONL. The server-start records are the
@@ -49,6 +63,29 @@ authority for build/artifact/config identity, resolved capacity, quotas, GPU ide
 memory layout. Request and throughput records supply queue delay, TTFT, total/makespan/throughput,
 tier/frontier, evaluated/reused tokens, MTP counters, physical transfer costs, actual reclaimed
 capacity, occupancy, evictions, SSD I/O/checksum/adoption cost, and peak staging.
+
+Schema-v20 request records carry the public-wire response identity and exact generated token IDs.
+Concurrent responses are joined to completion-order-independent `request_done` rows by that
+identity. Measured Device/Host/SSD continuations are fixture-hash aligned with cache-disabled cold;
+target token IDs and MTP round/drafted/accepted/fallback counters receive separate verdicts, and any
+counter difference is retained with its per-field and accepted-per-position deltas. Exact target
+output does not by itself make a speculative-counter mismatch pass.
+
+Serve throughput transfer fields and pressure/eviction fields are interval deltas, so reports sum
+them. Only live occupancy and explicit high-water metrics use maxima. Reclaimed-capacity totals come
+from the alias-aware runtime counters. Validation rows are PASS only when named, executable-pinned
+evidence is supplied; the identified validation case map is embedded into `evidence.json` so
+derived verdicts do not depend on an ignored side file. Missing evidence—including
+official-tokenizer fixture lineage without an authorized identity-pinned local tokenizer
+artifact—remains UNVERIFIED; the tools never download a tokenizer or model.
+
+Derived verdict/report logic can be replayed without rerunning the model; raw measurements and the
+frozen threshold remain unchanged:
+
+```bash
+python3 tools/bench/run_tiered_cache_replay.py \
+  --reanalyze-evidence profiles/bench/tiered-cache/RUN/evidence.json
+```
 
 ## Build
 

@@ -264,6 +264,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{
         .model                             = request.prompt.model,
+        .response_id                       = id,
         .stream                            = request.stream,
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,

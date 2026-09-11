@@ -68,7 +68,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity(request_id, request.model);
     const RequestLogMetadata metadata{.model                  = request.model,
+                                      .response_id            = identity.message_id,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
@@ -94,8 +97,6 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    const AnthropicResponseIdentity identity =
-        make_anthropic_response_identity(request_id, request.model);
     const int input_tokens = prepared.prompt_tokens;
 
     auto lifecycle = begin_request(make_request_log_context(

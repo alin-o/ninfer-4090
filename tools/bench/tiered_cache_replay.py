@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 MANIFEST_TYPE = "ninfer_tiered_cache_fixture_manifest"
 MANIFEST_VERSION = 1
 EVIDENCE_TYPE = "ninfer_tiered_cache_evidence"
-EVIDENCE_VERSION = 1
+EVIDENCE_VERSION = 2
 
 
 class ReplayError(RuntimeError):
@@ -230,6 +230,7 @@ def request_measurement(
     speculative = event.get("speculative", {})
     durable = result.get("durable_restore", {})
     materialization = event.get("materialization", {})
+    request = event.get("request", {})
     try:
         prompt_tokens = int(result["prompt_tokens"])
         reused_tokens = int(result["prefix_cache_hit_tokens"])
@@ -239,8 +240,40 @@ def request_measurement(
         queue_delay_ms = float(engine["queue_wait_seconds"]) * 1000.0
     except (KeyError, TypeError, ValueError) as error:
         raise ReplayError(f"{label} request log is missing required metrics: {error}") from error
+    generated_token_ids = result.get("generated_token_ids")
+    if generated_token_ids is not None and (
+        not isinstance(generated_token_ids, list)
+        or any(not isinstance(token, int) for token in generated_token_ids)
+    ):
+        raise ReplayError(f"{label} generated token IDs are malformed")
+    if generated_token_ids is not None and len(generated_token_ids) != completion_tokens:
+        raise ReplayError(
+            f"{label} logged {len(generated_token_ids)} generated token IDs for "
+            f"{completion_tokens} completion tokens"
+        )
+    speculative_values = {
+        "rounds": speculative.get("rounds"),
+        "drafted_tokens": speculative.get("drafted_tokens"),
+        "accepted_tokens": speculative.get("accepted_tokens"),
+        "fallback_steps": speculative.get("fallback_steps"),
+    }
+    if any(not isinstance(value, int) or value < 0 for value in speculative_values.values()):
+        raise ReplayError(f"{label} speculative counters are missing or malformed")
+    draft_window = speculative.get("draft_window")
+    accepted_per_position = speculative.get("accepted_per_position")
+    if (
+        not isinstance(draft_window, int)
+        or draft_window < 0
+        or not isinstance(accepted_per_position, list)
+        or any(not isinstance(value, int) or value < 0 for value in accepted_per_position)
+        or len(accepted_per_position) != draft_window
+        or sum(accepted_per_position) != speculative_values["accepted_tokens"]
+    ):
+        raise ReplayError(f"{label} per-position speculative counters are missing or malformed")
     return {
         "label": label,
+        "request_id": request.get("request_id"),
+        "response_id": request.get("response_id"),
         "payload_sha256": payload_sha256,
         "external_ttft_ms": external_ttft_ms,
         "server_ttft_ms": server_ttft_ms,
@@ -250,6 +283,17 @@ def request_measurement(
         "evaluated_tokens": max(prompt_tokens - reused_tokens, 0),
         "reused_tokens": reused_tokens,
         "completion_tokens": completion_tokens,
+        "generated_token_ids": generated_token_ids,
+        "generated_token_ids_sha256": (
+            hashlib.sha256(
+                b"".join(
+                    int(token).to_bytes(4, "little", signed=True)
+                    for token in generated_token_ids
+                )
+            ).hexdigest()
+            if generated_token_ids is not None
+            else None
+        ),
         "selected_tier": (
             "ssd"
             if durable.get("ssd_loaded")
@@ -261,10 +305,9 @@ def request_measurement(
         "materialization": materialization,
         "speculative": {
             "backend": speculative.get("backend"),
-            "rounds": speculative.get("rounds"),
-            "drafted_tokens": speculative.get("drafted_tokens"),
-            "accepted_tokens": speculative.get("accepted_tokens"),
-            "fallback_steps": speculative.get("fallback_steps"),
+            "draft_window": draft_window,
+            **speculative_values,
+            "accepted_per_position": accepted_per_position,
         },
     }
 

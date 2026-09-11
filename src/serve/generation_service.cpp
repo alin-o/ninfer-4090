@@ -468,8 +468,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.completion_tokens   = static_cast<int>(outcome.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;

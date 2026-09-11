@@ -54,6 +54,10 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
+    // Retained for the opt-in JSONL measurement log. Protocol renderers continue to expose only
+    // decoded output, but correctness campaigns need the exact model continuation rather than a
+    // lossy text comparison.
+    std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     int prompt_tokens     = 0;
     int completion_tokens = 0;

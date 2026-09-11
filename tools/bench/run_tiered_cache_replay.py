@@ -44,7 +44,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPO_ROOT / "bench/fixtures/tiered_cache/manifest.json"
 DEFAULT_SERVE = REPO_ROOT / "build-agent-verify/apps/ninfer-serve"
 DEFAULT_WEIGHTS = Path("/models/qwen3_8_27b.ninfer")
-REQUEST_LOG_SCHEMA = 19
+REQUEST_LOG_SCHEMA = 20
+BASELINE_REQUEST_LOG_SCHEMA = 19
+BASELINE_REVISION = "c7dca9acfef663acd10d4ec2817f184bc50547fe"
 
 
 class RunningServe:
@@ -64,44 +66,63 @@ class RunningServe:
         finally:
             probe.close()
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        self.output = self.log.open("wb")
-        self.process = subprocess.Popen(
-            self.command,
-            cwd=REPO_ROOT,
-            stdout=self.output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
-                raise ReplayError(
-                    f"ninfer-serve exited during startup ({self.process.returncode}); "
-                    f"see {self.log}"
-                )
-            try:
-                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
-                connection.request("GET", "/health")
-                response = connection.getresponse()
-                body = response.read()
-                connection.close()
-                if response.status == 200 and json.loads(body) == {"status": "ok"}:
-                    return self
-            except (OSError, http.client.HTTPException, json.JSONDecodeError):
-                pass
-            time.sleep(0.1)
-        raise ReplayError(f"timed out waiting for ninfer-serve; see {self.log}")
+        try:
+            self.output = self.log.open("wb")
+            self.process = subprocess.Popen(
+                self.command,
+                cwd=REPO_ROOT,
+                stdout=self.output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    raise ReplayError(
+                        f"ninfer-serve exited during startup ({self.process.returncode}); "
+                        f"see {self.log}"
+                    )
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
+                    connection.request("GET", "/health")
+                    response = connection.getresponse()
+                    body = response.read()
+                    connection.close()
+                    if response.status == 200 and json.loads(body) == {"status": "ok"}:
+                        return self
+                except (OSError, http.client.HTTPException, json.JSONDecodeError):
+                    pass
+                time.sleep(0.1)
+            raise ReplayError(f"timed out waiting for ninfer-serve; see {self.log}")
+        except BaseException:
+            # __exit__ is not invoked when __enter__ raises. Own every post-launch failure here so
+            # a failed startup cannot retain GPU memory, the TCP port, or an open log descriptor.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        try:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    try:
+                        self.process.terminate()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    self.process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    try:
+                        self.process.kill()
+                    except ProcessLookupError:
+                        pass
+                    self.process.wait()
+        finally:
+            if self.output is not None:
+                self.output.close()
+                self.output = None
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        if self.output is not None:
-            self.output.close()
+        self.close()
 
 
 def parse_metrics(text: str) -> dict[str, float]:
@@ -162,14 +183,16 @@ def gpu_memory_snapshot() -> dict[str, Any]:
     }
 
 
-def load_events(path: Path) -> list[dict[str, Any]]:
+def load_events(
+    path: Path, *, allowed_schemas: Sequence[int] = (REQUEST_LOG_SCHEMA,)
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     if not path.exists():
         return events
     for line in path.read_text(encoding="utf-8").splitlines():
         if line:
             event = json.loads(line)
-            if event.get("schema_version") != REQUEST_LOG_SCHEMA:
+            if event.get("schema_version") not in allowed_schemas:
                 raise ReplayError("request log schema differs from the harness contract")
             events.append(event)
     return events
@@ -221,7 +244,7 @@ def request_for(model: str, fixture: dict[str, Any]) -> ProtocolRequest:
 
 def run_exchange(
     port: int, fixture: dict[str, Any], timeout: float
-) -> tuple[float, ServeExchangeResult]:
+) -> tuple[float, ServeExchangeResult, str]:
     client = NInferServeClient(f"http://127.0.0.1:{port}", timeout)
     model = client.discover_model()
     result = client.prepare(request_for(model, fixture)).execute()
@@ -238,7 +261,10 @@ def run_exchange(
             f"protocol={result.protocol_error!r} code={result.error_code!r}"
         )
     external_ttft_ms = (output_events[0].received_ns - result.http.sent_ns) / 1.0e6
-    return external_ttft_ms, result
+    response_ids = {event.response_id for event in result.events if event.response_id is not None}
+    if len(response_ids) != 1:
+        raise ReplayError(f"protocol response has no unique request identity: {response_ids!r}")
+    return external_ttft_ms, result, response_ids.pop()
 
 
 def server_command(
@@ -368,21 +394,74 @@ def wait_for_durable_record(port: int, timeout: float) -> dict[str, float]:
     raise ReplayError(f"durable seed did not publish a settled SSD record: {last}")
 
 
-def latest_done(path: Path, prior_count: int, timeout: float) -> tuple[dict[str, Any], int]:
+def latest_done(
+    path: Path,
+    prior_count: int,
+    timeout: float,
+    *,
+    expected_response_id: str | None,
+    allowed_schemas: Sequence[int],
+) -> tuple[dict[str, Any], int]:
     deadline = time.monotonic() + timeout
     found = 0
     while time.monotonic() < deadline:
-        events = load_events(path)
+        events = load_events(path, allowed_schemas=allowed_schemas)
         done = [event for event in events if event.get("event") == "request_done"]
         found = len(done)
         if found == prior_count + 1:
-            return done[-1], found
+            event = done[-1]
+            logged_response_id = event.get("request", {}).get("response_id")
+            if expected_response_id is not None and logged_response_id != expected_response_id:
+                raise ReplayError(
+                    "sequential response/request-log identity mismatch: "
+                    f"{expected_response_id!r} != {logged_response_id!r}"
+                )
+            return event, found
         if found > prior_count + 1:
             raise ReplayError(
                 f"request log advanced by more than one event: {prior_count} -> {found}"
             )
         time.sleep(0.02)
     raise ReplayError(f"expected {prior_count + 1} request_done events, found {found}")
+
+
+def done_by_response_id(
+    path: Path,
+    prior_count: int,
+    expected: Sequence[str],
+    timeout: float,
+    *,
+    allowed_schemas: Sequence[int],
+) -> dict[str, dict[str, Any]]:
+    if len(set(expected)) != len(expected):
+        raise ReplayError("concurrent protocol responses have duplicate response identities")
+    deadline = time.monotonic() + timeout
+    done: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        done = [
+            event
+            for event in load_events(path, allowed_schemas=allowed_schemas)
+            if event.get("event") == "request_done"
+        ][prior_count:]
+        if len(done) >= len(expected):
+            break
+        time.sleep(0.02)
+    if len(done) != len(expected):
+        raise ReplayError(
+            f"concurrent batch produced {len(done)} request_done events, expected {len(expected)}"
+        )
+    indexed: dict[str, dict[str, Any]] = {}
+    for event in done:
+        response_id = event.get("request", {}).get("response_id")
+        if not isinstance(response_id, str) or not response_id or response_id in indexed:
+            raise ReplayError("concurrent request log has a missing or duplicate response identity")
+        indexed[response_id] = event
+    if set(indexed) != set(expected):
+        raise ReplayError(
+            "concurrent response/request-log identities differ: "
+            f"responses={sorted(expected)!r} logs={sorted(indexed)!r}"
+        )
+    return indexed
 
 
 def run_profile(
@@ -400,21 +479,34 @@ def run_profile(
     serve_log = root / "serve" / f"{profile}.log"
     cache_dir = cache_dir or root / "shared-cache"
     request_log.parent.mkdir(parents=True, exist_ok=True)
-    command = server_command(args.serve, args.weights, args.port, request_log, profile, cache_dir)
+    baseline_profile = profile == "existing"
+    serve = args.baseline_serve if baseline_profile else args.serve
+    allowed_schemas = (
+        (BASELINE_REQUEST_LOG_SCHEMA,) if baseline_profile else (REQUEST_LOG_SCHEMA,)
+    )
+    command = server_command(serve, args.weights, args.port, request_log, profile, cache_dir)
     measurements: list[dict[str, Any]] = []
     seed_measurement: dict[str, Any] | None = None
     setup_measurements: list[dict[str, Any]] = []
     setup_makespan_ms: float | None = None
     with RunningServe(command, serve_log, args.port, args.startup_timeout_seconds):
-        events = load_events(request_log)
+        events = load_events(request_log, allowed_schemas=allowed_schemas)
         start = next((event for event in events if event.get("event") == "server_start"), None)
         if start is None:
             raise ReplayError("server_start event is missing")
         ready_gpu_memory = gpu_memory_snapshot()
         done_count = 0
         if seed is not None:
-            external, _ = run_exchange(args.port, seed, args.request_timeout_seconds)
-            event, done_count = latest_done(request_log, done_count, args.request_timeout_seconds)
+            external, _, response_id = run_exchange(
+                args.port, seed, args.request_timeout_seconds
+            )
+            event, done_count = latest_done(
+                request_log,
+                done_count,
+                args.request_timeout_seconds,
+                expected_response_id=None if baseline_profile else response_id,
+                allowed_schemas=allowed_schemas,
+            )
             seed_measurement = request_measurement(
                 f"{profile}-seed",
                 external,
@@ -427,7 +519,7 @@ def run_profile(
                 wait_for_durable_record(args.port, args.request_timeout_seconds)
         if concurrent_setup and setup_fixtures:
             setup_results: list[
-                tuple[float, ServeExchangeResult] | BaseException | None
+                tuple[float, ServeExchangeResult, str] | BaseException | None
             ] = [None] * len(setup_fixtures)
             barrier = threading.Barrier(len(setup_fixtures))
 
@@ -450,32 +542,45 @@ def run_profile(
             for thread in threads:
                 thread.join()
             setup_makespan_ms = (time.perf_counter_ns() - setup_started) / 1.0e6
-            done = [
-                event
-                for event in load_events(request_log)
-                if event.get("event") == "request_done"
-            ][done_count:]
-            if len(done) != len(setup_fixtures):
-                raise ReplayError("concurrent setup did not complete every pressure request")
+            response_ids = [
+                value[2]
+                for value in setup_results
+                if isinstance(value, tuple)
+            ]
+            failures = [value for value in setup_results if isinstance(value, BaseException)]
+            if failures:
+                raise failures[0]
+            if len(response_ids) != len(setup_results):
+                raise ReplayError("concurrent setup worker produced no result")
+            done = done_by_response_id(
+                request_log,
+                done_count,
+                response_ids,
+                args.request_timeout_seconds,
+                allowed_schemas=allowed_schemas,
+            )
             for index, value in enumerate(setup_results):
-                if isinstance(value, BaseException):
-                    raise value
-                if value is None:
-                    raise ReplayError("concurrent setup worker produced no result")
+                assert isinstance(value, tuple)
                 setup_measurements.append(
                     request_measurement(
                         f"{profile}-setup-{index}",
                         value[0],
-                        done[index],
+                        done[value[2]],
                         payload_sha256=setup_fixtures[index]["payload_sha256"],
                     )
                 )
             done_count += len(done)
         else:
             for index, fixture in enumerate(setup_fixtures):
-                external, _ = run_exchange(args.port, fixture, args.request_timeout_seconds)
+                external, _, response_id = run_exchange(
+                    args.port, fixture, args.request_timeout_seconds
+                )
                 event, done_count = latest_done(
-                    request_log, done_count, args.request_timeout_seconds
+                    request_log,
+                    done_count,
+                    args.request_timeout_seconds,
+                    expected_response_id=None if baseline_profile else response_id,
+                    allowed_schemas=allowed_schemas,
                 )
                 setup_measurements.append(
                     request_measurement(
@@ -488,9 +593,9 @@ def run_profile(
         if setup_fixtures:
             wait_for_idle_catalog(args.port, args.request_timeout_seconds)
         if profile == "overlap":
-            results: list[tuple[float, ServeExchangeResult] | BaseException | None] = [None] * len(
-                fixtures
-            )
+            results: list[tuple[float, ServeExchangeResult, str] | BaseException | None] = [
+                None
+            ] * len(fixtures)
             barrier = threading.Barrier(len(fixtures))
 
             def execute(index: int) -> None:
@@ -512,29 +617,41 @@ def run_profile(
             for thread in threads:
                 thread.join()
             makespan_ms = (time.perf_counter_ns() - started) / 1.0e6
-            events = load_events(request_log)
-            done = [event for event in events if event.get("event") == "request_done"][done_count:]
-            if len(done) != len(fixtures):
-                raise ReplayError("overlap did not produce one request_done event per request")
+            response_ids = [value[2] for value in results if isinstance(value, tuple)]
+            failures = [value for value in results if isinstance(value, BaseException)]
+            if failures:
+                raise failures[0]
+            if len(response_ids) != len(results):
+                raise ReplayError("overlap worker produced no result")
+            done = done_by_response_id(
+                request_log,
+                done_count,
+                response_ids,
+                args.request_timeout_seconds,
+                allowed_schemas=allowed_schemas,
+            )
             for index, value in enumerate(results):
-                if isinstance(value, BaseException):
-                    raise value
-                if value is None:
-                    raise ReplayError("overlap worker produced no result")
+                assert isinstance(value, tuple)
                 measurements.append(
                     request_measurement(
                         f"{profile}-{index}",
                         value[0],
-                        done[index],
+                        done[value[2]],
                         payload_sha256=fixtures[index]["payload_sha256"],
                     )
                 )
             profile_extra: dict[str, Any] = {"makespan_ms": makespan_ms}
         else:
             for index, fixture in enumerate(fixtures):
-                external, _ = run_exchange(args.port, fixture, args.request_timeout_seconds)
+                external, _, response_id = run_exchange(
+                    args.port, fixture, args.request_timeout_seconds
+                )
                 event, done_count = latest_done(
-                    request_log, done_count, args.request_timeout_seconds
+                    request_log,
+                    done_count,
+                    args.request_timeout_seconds,
+                    expected_response_id=None if baseline_profile else response_id,
+                    allowed_schemas=allowed_schemas,
                 )
                 measurements.append(
                     request_measurement(
@@ -552,12 +669,13 @@ def run_profile(
                 "final_metrics": metrics,
                 "throughput_events": [
                     event
-                    for event in load_events(request_log)
+                    for event in load_events(request_log, allowed_schemas=allowed_schemas)
                     if event.get("event") == "throughput"
                 ],
                 "ready_gpu_memory": ready_gpu_memory,
                 "settled_gpu_memory": gpu_memory_snapshot(),
                 "command": command,
+                "request_log_schema": start["schema_version"],
             }
         )
         if seed_measurement is not None:
@@ -586,12 +704,9 @@ def require_profile_evidence(
     if len(host_profiles) != len(measurements["host"]):
         raise ReplayError("forced Host profile evidence is not trial-aligned")
     for name in host_profiles:
-        host_h2d_count = max(
-            (
-                int(event["context_cache"]["state_transfers"]["h2d"]["count"])
-                for event in profiles[name]["throughput_events"]
-            ),
-            default=0,
+        host_h2d_count = sum(
+            int(event["context_cache"]["state_transfers"]["h2d"]["count"])
+            for event in profiles[name]["throughput_events"]
         )
         if host_h2d_count <= 0:
             raise ReplayError(f"{name} recorded no Host-to-Device State restore")
@@ -639,7 +754,21 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
                 values.append(float(value))
         return max(values, default=0.0)
 
-    transfer: dict[str, Any] = {"actual_seconds": peak("context_cache", "actual_transfer_seconds")}
+    def total(*path: str) -> float:
+        values: list[float] = []
+        for event in throughput:
+            value: Any = event
+            for component in path:
+                value = value.get(component, {}) if isinstance(value, dict) else {}
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        return sum(values)
+
+    # request_log.cpp publishes these as interval deltas. Totals must sum intervals; only live
+    # occupancy is a gauge for which a peak is meaningful.
+    transfer: dict[str, Any] = {
+        "actual_seconds": total("context_cache", "actual_transfer_seconds")
+    }
     for resource in ("state_transfers", "main_kv_transfers", "backend_kv_transfers"):
         fields = (
             ("count", "bytes", "seconds")
@@ -648,7 +777,7 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
         )
         transfer[resource] = {
             direction: {
-                field: peak("context_cache", resource, direction, field)
+                field: total("context_cache", resource, direction, field)
                 for field in fields
             }
             for direction in ("d2d", "d2h", "h2d")
@@ -657,6 +786,14 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
     computed = sum(int(event.get("tokens", {}).get("computed_prefill", 0)) for event in throughput)
     committed = sum(int(event.get("tokens", {}).get("committed_decode", 0)) for event in throughput)
     final = detail["final_metrics"]
+
+    def reclaimed(tier: str, resource: str) -> float:
+        name = (
+            "ninfer:context_cache_reclaimed_capacity_total"
+            f'{{tier="{tier}",resource="{resource}"}}'
+        )
+        return float(final.get(name, 0.0))
+
     return {
         "trials": len(rows),
         "median_queue_delay_ms": statistics.median(float(row["queue_delay_ms"]) for row in rows),
@@ -697,15 +834,27 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
             )
         },
         "pressure": {
-            name: peak("context_cache", "pressure", name)
+            name: total("context_cache", "pressure", name)
             for name in (
+                "spill_pages",
+                "partial_tail_cow_pages",
                 "checkpoints_dropped",
                 "private_owners_degraded",
                 "private_owners_evicted",
                 "shared_owners_degraded",
                 "shared_owners_evicted",
-                "spill_pages",
+                "searches",
+                "search_budget_exhaustions",
+                "maximal_fallback_selections",
+                "historical_fork_hits",
             )
+        },
+        "reclaimed_capacity": {
+            "device_state_slots": reclaimed("device", "state_slots"),
+            "device_main_kv_pages": reclaimed("device", "main_kv_pages"),
+            "device_backend_kv_pages": reclaimed("device", "backend_kv_pages"),
+            "host_state_slots": reclaimed("host", "state_slots"),
+            "host_kv_bytes": reclaimed("host", "kv_bytes"),
         },
         "durable": {
             "manifest_records": final.get("ninfer:shared_ssd_manifest_records", 0.0),
@@ -721,8 +870,481 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
             "loaded_hits": final.get(
                 'ninfer:shared_ssd_hits_total{temperature="loaded"}', 0.0
             ),
-            "warm_hits": final.get('ninfer:shared_ssd_hits_total{temperature="warm"}', 0.0),
+            "warm_hits": final.get(
+                'ninfer:shared_ssd_hits_total{temperature="warm"}', 0.0
+            ),
         },
+    }
+
+
+def validate_measured_continuations(
+    measurements: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    cold_by_fixture: dict[str, list[dict[str, Any]]] = {}
+    for row in measurements["cold"]:
+        fixture_hash = str(row["payload_sha256"])
+        if row.get("generated_token_ids") is None:
+            raise ReplayError("current cold oracle did not log exact generated token IDs")
+        cold_by_fixture.setdefault(fixture_hash, []).append(row)
+
+    comparisons: list[dict[str, Any]] = []
+    token_mismatches: list[dict[str, Any]] = []
+    speculative_mismatches: list[dict[str, Any]] = []
+    speculative_fields = (
+        "draft_window",
+        "rounds",
+        "drafted_tokens",
+        "accepted_tokens",
+        "fallback_steps",
+        "accepted_per_position",
+    )
+    for profile in ("device", "host", "ssd"):
+        if sorted(str(row["payload_sha256"]) for row in measurements[profile]) != sorted(
+            str(row["payload_sha256"]) for row in measurements["cold"]
+        ):
+            raise ReplayError(f"{profile} fixture multiset differs from the cold oracle")
+        fixture_occurrences: dict[str, int] = {}
+        for row in measurements[profile]:
+            fixture_hash = str(row["payload_sha256"])
+            occurrence = fixture_occurrences.get(fixture_hash, 0)
+            fixture_occurrences[fixture_hash] = occurrence + 1
+            cold_rows = cold_by_fixture.get(fixture_hash, [])
+            if occurrence >= len(cold_rows):
+                raise ReplayError(f"{profile} row has no fixture-aligned cold oracle")
+            cold = cold_rows[occurrence]
+            token_ids = row.get("generated_token_ids")
+            if token_ids is None:
+                raise ReplayError(f"{profile} row did not log exact generated token IDs")
+            exact_token_ids = token_ids == cold["generated_token_ids"]
+            first_token_mismatch: dict[str, Any] | None = None
+            if not exact_token_ids:
+                cold_ids = cold["generated_token_ids"]
+                shared_length = min(len(cold_ids), len(token_ids))
+                first_index = next(
+                    (
+                        index
+                        for index in range(shared_length)
+                        if cold_ids[index] != token_ids[index]
+                    ),
+                    shared_length,
+                )
+                first_token_mismatch = {
+                    "index": first_index,
+                    "cold_token_id": cold_ids[first_index] if first_index < len(cold_ids) else None,
+                    "subject_token_id": (
+                        token_ids[first_index] if first_index < len(token_ids) else None
+                    ),
+                    "cold_length": len(cold_ids),
+                    "subject_length": len(token_ids),
+                }
+            cold_speculative = {
+                name: cold["speculative"].get(name) for name in speculative_fields
+            }
+            subject_speculative = {
+                name: row["speculative"].get(name) for name in speculative_fields
+            }
+            counters_match = cold_speculative == subject_speculative
+            counter_deltas = {
+                name: subject_speculative[name] - cold_speculative[name]
+                for name in speculative_fields
+                if isinstance(subject_speculative[name], int)
+                and isinstance(cold_speculative[name], int)
+            }
+            comparison = {
+                "fixture_sha256": fixture_hash,
+                "fixture_occurrence": occurrence,
+                "profile": profile,
+                "cold_label": cold["label"],
+                "subject_label": row["label"],
+                "cold_generated_token_ids_sha256": cold["generated_token_ids_sha256"],
+                "generated_token_ids_sha256": row["generated_token_ids_sha256"],
+                "exact_generated_token_ids": exact_token_ids,
+                "first_token_mismatch": first_token_mismatch,
+                "cold_speculative": cold_speculative,
+                "subject_speculative": subject_speculative,
+                "speculative_counter_deltas": counter_deltas,
+                "speculative_counters_match": counters_match,
+            }
+            comparisons.append(comparison)
+            if not exact_token_ids:
+                token_mismatches.append(comparison)
+            if not counters_match:
+                speculative_mismatches.append(comparison)
+
+    token_status = "PASS" if not token_mismatches else "FAIL"
+    speculative_status = "PASS" if not speculative_mismatches else "FAIL"
+    token_investigation = [
+        {
+            "fixture_sha256": mismatch["fixture_sha256"],
+            "cold_label": mismatch["cold_label"],
+            "subject_label": mismatch["subject_label"],
+            **mismatch["first_token_mismatch"],
+            "root_cause": "not established by the serving replay",
+            "verdict": "FAIL",
+        }
+        for mismatch in token_mismatches
+    ]
+    cached_consensus = True
+    for fixture_hash, cold_rows in cold_by_fixture.items():
+        for occurrence in range(len(cold_rows)):
+            cached_ids = [
+                row["generated_token_ids"]
+                for profile in ("device", "host", "ssd")
+                for row in measurements[profile]
+                if row["payload_sha256"] == fixture_hash
+            ][occurrence::len(cold_rows)]
+            if cached_ids and any(token_ids != cached_ids[0] for token_ids in cached_ids[1:]):
+                cached_consensus = False
+    investigation = []
+    for mismatch in speculative_mismatches:
+        cold = mismatch["cold_speculative"]
+        subject = mismatch["subject_speculative"]
+        signature = "counter deltas " + json.dumps(
+            mismatch["speculative_counter_deltas"], sort_keys=True
+        )
+        cold_positions = cold["accepted_per_position"]
+        subject_positions = subject["accepted_per_position"]
+        position_deltas = [
+            subject_value - cold_value
+            for cold_value, subject_value in zip(cold_positions, subject_positions)
+        ]
+        signature += f"; accepted-per-position deltas {position_deltas}"
+        if (
+            mismatch["exact_generated_token_ids"]
+            and cold["rounds"] == subject["rounds"]
+            and cold["accepted_tokens"] + cold["fallback_steps"]
+            == subject["accepted_tokens"] + subject["fallback_steps"]
+        ):
+            signature += (
+                "; the same exact target continuation and round count localize this to a draft "
+                "acceptance versus target fallback accounting difference"
+            )
+        investigation.append(
+            {
+                "fixture_sha256": mismatch["fixture_sha256"],
+                "cold_label": mismatch["cold_label"],
+                "subject_label": mismatch["subject_label"],
+                "finding": signature,
+                "root_cause": "not established by the serving replay",
+                "verdict": "FAIL",
+            }
+        )
+    return {
+        "status": "PASS" if token_status == speculative_status == "PASS" else "FAIL",
+        "target_token_status": token_status,
+        "speculative_counter_status": speculative_status,
+        "method": "fixture-hash-aligned exact generated token IDs against cache-disabled cold",
+        "comparisons": comparisons,
+        "target_token_mismatches": token_mismatches,
+        "target_token_investigation": token_investigation,
+        "cached_tier_consensus": "PASS" if cached_consensus else "FAIL",
+        "localization": (
+            "Device, Host, and post-restart SSD continuations agree exactly with one another. "
+            "The measured divergence is therefore between cache-disabled Root prefill and the "
+            "cache-participating prefill/capture schedule, not between retention tiers; this "
+            "does not establish the numerical root cause."
+            if cached_consensus and token_mismatches
+            else "No cross-tier localization is needed."
+        ),
+        "speculative_counter_mismatches": speculative_mismatches,
+        "investigation": investigation,
+        "conclusion": (
+            "Exact target token IDs and all MTP counters match every fixture-aligned cold control."
+            if token_status == speculative_status == "PASS"
+            else "The replay does not establish full continuation equivalence; inspect the "
+            "recorded mismatch rows before making a production-correctness claim."
+        ),
+    }
+
+
+def load_baseline_identity(path: Path, serve: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReplayError(f"cannot read baseline identity {path}: {error}") from error
+    if not isinstance(value, dict) or (
+        value.get("artifact_type"), value.get("schema_version")
+    ) != ("ninfer_tiered_cache_baseline_build", 1):
+        raise ReplayError("unsupported baseline build identity")
+    if value.get("source_revision") != BASELINE_REVISION:
+        raise ReplayError(
+            f"baseline build revision is {value.get('source_revision')!r}, expected "
+            f"{BASELINE_REVISION}"
+        )
+    archive_sha256 = value.get("source_archive_sha256")
+    if not isinstance(archive_sha256, str) or len(archive_sha256) != 64:
+        raise ReplayError("baseline build identity has no source archive SHA-256")
+    actual_sha256 = sha256_file(serve)
+    if value.get("serve_sha256") != actual_sha256:
+        raise ReplayError("baseline executable SHA-256 differs from its build identity")
+    return {
+        "source_revision": BASELINE_REVISION,
+        "source_archive_sha256": archive_sha256,
+        "serve_path": str(serve),
+        "serve_sha256": actual_sha256,
+        "build_identity_path": str(path),
+        "build_identity_sha256": sha256_file(path),
+        "build_command": value.get("build_command"),
+        "compiler": value.get("compiler"),
+    }
+
+
+def load_validation_cases(path: Path | None, serve_sha256: str) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReplayError(f"cannot read validation evidence {path}: {error}") from error
+    if not isinstance(value, dict) or (
+        value.get("artifact_type"), value.get("schema_version")
+    ) != ("ninfer_tiered_cache_validation_evidence", 1):
+        raise ReplayError("unsupported tiered-cache validation evidence")
+    if value.get("serve_sha256") != serve_sha256:
+        raise ReplayError("validation evidence was produced by a different current executable")
+    cases = value.get("cases")
+    if not isinstance(cases, dict):
+        raise ReplayError("validation evidence has no case map")
+    result: dict[str, dict[str, Any]] = {}
+    for name, case in cases.items():
+        if not isinstance(name, str) or not isinstance(case, dict):
+            raise ReplayError("validation evidence case is malformed")
+        status = case.get("status")
+        if status not in {"PASS", "FAIL", "SKIP", "UNVERIFIED"}:
+            raise ReplayError(f"validation evidence case {name!r} has invalid status")
+        executable_sha256 = case.get("test_executable_sha256")
+        if name != "official-tokenizer-lineage" and status != "UNVERIFIED" and (
+            not isinstance(executable_sha256, str) or len(executable_sha256) != 64
+        ):
+            raise ReplayError(
+                f"validation evidence case {name!r} has no test executable SHA-256"
+            )
+        result[name] = case
+    return result
+
+
+def validation_status(
+    cases: dict[str, dict[str, Any]], required: Sequence[str]
+) -> tuple[str, str]:
+    selected = [cases.get(name) for name in required]
+    missing = [name for name, case in zip(required, selected) if case is None]
+    statuses = [str(case["status"]) for case in selected if case is not None]
+    evidence = "; ".join(
+        f"{name}={case['status']} ({case.get('evidence', case.get('command', 'recorded'))})"
+        for name, case in zip(required, selected)
+        if case is not None
+    )
+    if "FAIL" in statuses:
+        suffix = "; missing: " + ", ".join(missing) if missing else ""
+        return "FAIL", evidence + suffix
+    if missing:
+        return "UNVERIFIED", "missing identified validation evidence: " + ", ".join(missing)
+    if statuses and all(status == "PASS" for status in statuses):
+        return "PASS", evidence
+    return "UNVERIFIED", evidence
+
+
+def official_tokenizer_status(
+    cases: dict[str, dict[str, Any]],
+) -> tuple[str, str]:
+    case = cases.get("official-tokenizer-lineage")
+    if case is None:
+        return (
+            "UNVERIFIED",
+            "missing identified validation evidence: official-tokenizer-lineage",
+        )
+    if case.get("status") == "FAIL":
+        return "FAIL", str(case.get("evidence", "recorded failure"))
+    artifact = case.get("tokenizer_artifact")
+    if case.get("status") != "PASS" or not isinstance(artifact, dict):
+        return (
+            "UNVERIFIED",
+            "official-tokenizer evidence is absent, skipped, or not identity-pinned",
+        )
+    path_value = artifact.get("path")
+    expected_sha256 = artifact.get("sha256")
+    if (
+        artifact.get("authorization") != "user-authorized-local-artifact"
+        or not isinstance(path_value, str)
+        or not isinstance(expected_sha256, str)
+    ):
+        return "UNVERIFIED", "official-tokenizer evidence lacks authorized local artifact identity"
+    tokenizer_path = Path(path_value).resolve()
+    if not tokenizer_path.is_file() or sha256_file(tokenizer_path) != expected_sha256:
+        return (
+            "UNVERIFIED",
+            "authorized official-tokenizer artifact is unavailable or hash-mismatched",
+        )
+    return (
+        "PASS",
+        f"authorized identity-pinned local tokenizer: {tokenizer_path} ({expected_sha256})",
+    )
+
+
+def build_regression_matrix(
+    continuation: dict[str, Any],
+    validation_cases: dict[str, dict[str, Any]],
+    boundary_replay: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    def external(case: str, required: Sequence[str]) -> dict[str, str]:
+        status, evidence = validation_status(validation_cases, required)
+        return {"status": status, "case": case, "evidence": evidence}
+
+    tokenizer_status, tokenizer_evidence = official_tokenizer_status(validation_cases)
+    return [
+        boundary_replay
+        or {
+            "status": "UNVERIFIED",
+            "case": "live serving boundary protocols",
+            "evidence": "no live boundary replay result was supplied",
+        },
+        external(
+            "unchanged prepared tokens and explicit/inferred boundary lineage",
+            [
+                "frontend-boundary-token-lineage",
+                "openai-chat-boundary",
+                "openai-responses-boundary",
+                "anthropic-boundary",
+            ],
+        ),
+        {
+            "status": str(continuation["target_token_status"]),
+            "case": "measured cold/Device/Host/SSD exact generated token IDs",
+            "evidence": (
+                f"{len(continuation['comparisons'])} fixture-aligned comparisons; "
+                f"{len(continuation['target_token_mismatches'])} token-ID mismatches"
+            ),
+        },
+        {
+            "status": str(continuation["speculative_counter_status"]),
+            "case": "measured cold/Device/Host/SSD MTP round/drafted/accepted/fallback counters",
+            "evidence": (
+                f"{len(continuation['comparisons'])} fixture-aligned comparisons; "
+                f"{len(continuation['speculative_counter_mismatches'])} counter mismatches with "
+                "per-field deltas and investigation records"
+            ),
+        },
+        {
+            "status": tokenizer_status,
+            "case": "official-tokenizer lineage for frontend boundary fixtures",
+            "evidence": tokenizer_evidence,
+        },
+        external(
+            "intermediate prefix, parent infeasible, and prefix-only Host restore",
+            ["pressure-resume"],
+        ),
+        external(
+            "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
+            ["shared-snapshot"],
+        ),
+        external(
+            "four-request constrained pressure and independent progress",
+            ["four-request-root-fallback"],
+        ),
+        external(
+            "delayed/failed transfers, shutdown, aliases, heads, and reclamation",
+            [
+                "delayed-spill",
+                "delayed-active-capture",
+                "cuda-transfer-failure",
+                "pending-snapshot-shutdown",
+                "resource-manager",
+                "durable-shared-prefix-catalog",
+            ],
+        ),
+    ]
+
+
+def configuration_decision(
+    comparisons: dict[str, dict[str, Any]], correctness_status: str = "PASS"
+) -> dict[str, Any]:
+    material = [name for name, row in comparisons.items() if row["material_improvement"]]
+    missed = [name for name, row in comparisons.items() if not row["material_improvement"]]
+    slower = [name for name, row in comparisons.items() if row["reduction_fraction"] < 0]
+    actions = {
+        name: (
+            "retain"
+            if row["material_improvement"]
+            else "disable"
+            if row["reduction_fraction"] < 0
+            else "material-improvement-unverified"
+        )
+        for name, row in comparisons.items()
+    }
+    if correctness_status != "PASS":
+        return {
+            "status": correctness_status,
+            "material_profiles": material,
+            "missed_profiles": missed,
+            "slower_than_existing_baseline": slower,
+            "tier_actions": {name: "blocked-by-correctness" for name in comparisons},
+            "reason": (
+                "The speed comparisons are retained as measurements, but correctness is "
+                f"{correctness_status}; no tier or cost-preset/config decision is justified."
+            ),
+        }
+    return {
+        "status": "PASS" if not missed else "FAIL",
+        "material_profiles": material,
+        "missed_profiles": missed,
+        "slower_than_existing_baseline": slower,
+        "tier_actions": actions,
+        "reason": (
+            "Every measured tier exceeded the frozen threshold; no tier was slower than the "
+            "recorded-revision existing-cache baseline, so these measurements do not justify a "
+            "cost-preset/config change."
+            if not missed
+            else "The measured evidence does not support every tier. Profiles below the frozen "
+            f"threshold: {', '.join(missed)}; profiles slower than the existing-cache baseline: "
+            f"{', '.join(slower) if slower else 'none'}."
+        ),
+    }
+
+
+def boundary_replay_status(rows: Sequence[dict[str, Any]], expected: int) -> dict[str, str]:
+    identities = [row.get("response_id") for row in rows]
+    status = (
+        "PASS"
+        if len(rows) == expected
+        and expected > 0
+        and all(isinstance(identity, str) and identity for identity in identities)
+        and len(set(identities)) == len(identities)
+        else "FAIL"
+    )
+    return {
+        "status": status,
+        "case": "live serving boundary protocols",
+        "evidence": (
+            f"{len(rows)}/{expected} fixture shapes completed through public endpoints with "
+            f"{len(set(identities))} unique wire response identities"
+        ),
+    }
+
+
+def campaign_verdict(
+    comparisons: dict[str, dict[str, Any]], regression_matrix: Sequence[dict[str, str]]
+) -> dict[str, Any]:
+    performance = (
+        "PASS" if all(row["material_improvement"] for row in comparisons.values()) else "FAIL"
+    )
+    statuses = [row["status"] for row in regression_matrix]
+    correctness = (
+        "FAIL"
+        if "FAIL" in statuses
+        else "UNVERIFIED"
+        if "UNVERIFIED" in statuses
+        else "PASS"
+    )
+    overall = "FAIL" if "FAIL" in {performance, correctness} else correctness
+    return {
+        "overall": overall,
+        "performance": performance,
+        "correctness": correctness,
+        "reason": (
+            "Production acceptance is established by the supplied evidence."
+            if overall == "PASS"
+            else "Production acceptance is not established; inspect failed and unverified rows."
+        ),
     }
 
 
@@ -745,6 +1367,8 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         "",
         "This report is generated from the adjacent raw JSON. Percentages are emitted only for",
         "the frozen material-improvement comparison; correctness-only rows make no speed claim.",
+        f"Overall verdict: **{evidence['verdict']['overall']}**. "
+        f"{evidence['verdict']['reason']}",
         "",
         "## Identity and capacity",
         "",
@@ -761,9 +1385,9 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
         f"- Resolved KV: {engine['kv_capacity']} tokens / {engine['kv_capacity_page_groups']} "
         f"page groups (`{engine['kv_capacity_mode']}`); State slots active+retained "
         f"{cache['total_device_state_slots']}; Host KV {cache['host_kv_capacity_bytes']} bytes.",
-        "- Existing-cache baseline uses the measured binary with shared prefixes and automatic "
-        f"long anchors disabled; its recorded behavior baseline is "
-        f"`{evidence['baseline_revision']}`.",
+        f"- Existing-cache baseline revision: `{evidence['baseline']['source_revision']}`; "
+        f"separate serve SHA-256: `{evidence['baseline']['serve_sha256']}`; build identity: "
+        f"`{evidence['baseline']['build_identity_path']}`.",
         "",
         "## Frozen threshold",
         "",
@@ -802,36 +1426,125 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
             f"- {profile}: reduction {comparison['reduction_fraction'] * 100:.2f}%; "
             f"material improvement: {str(comparison['material_improvement']).lower()}."
         )
-    lines.extend(
-        [
-            "",
-            "All measured Device, Host, and SSD arms exceeded the frozen threshold. No measured ",
-            "tier/depth choice was slower than ready-source prefill, so this campaign does not ",
-            "justify disabling a tier or changing a cost-preset/config default.",
-        ]
-    )
+    lines.extend(["", evidence["configuration_decision"]["reason"]])
     lines.extend(
         [
             "",
             "## Correctness matrix",
             "",
-            "Exact token IDs and State/Main/MTP bytes are validated by the named CTest scenarios;",
-            "the serving replay records HTTP semantics and timings and does not infer token IDs",
-            "from output strings.",
+            "The serving replay retains exact generated token IDs and joins concurrent wire/log",
+            "measurements by response identity. Low-level statuses require imported, executable-",
+            "identified validation evidence; absent or skipped evidence remains UNVERIFIED.",
             "",
         ]
     )
     for row in evidence["regression_matrix"]:
         lines.append(f"- {row['status']}: {row['case']} — {row['evidence']}")
+    continuation = evidence["continuation_validation"]
+    lines.extend(
+        [
+            "",
+            "## Continuation investigation",
+            "",
+            continuation["conclusion"],
+        ]
+    )
+    for finding in continuation["investigation"]:
+        lines.append(
+            f"- {finding['verdict']}: {finding['cold_label']} versus "
+            f"{finding['subject_label']} — {finding['finding']}; root cause: "
+            f"{finding['root_cause']}."
+        )
+    if continuation["target_token_investigation"]:
+        lines.append(
+            f"- Cached tier consensus: {continuation['cached_tier_consensus']}; Device, Host, "
+            "and SSD token IDs are compared independently of the cold oracle."
+        )
+        lines.append(f"- Localization: {continuation['localization']}")
+    for finding in continuation["target_token_investigation"]:
+        lines.append(
+            f"- {finding['verdict']}: {finding['cold_label']} versus "
+            f"{finding['subject_label']} first differs at generated index {finding['index']}: "
+            f"cold token {finding['cold_token_id']}, cached token "
+            f"{finding['subject_token_id']}; root cause: {finding['root_cause']}."
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def reanalyze_evidence(path: Path) -> dict[str, Any]:
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReplayError(f"cannot read replay evidence {path}: {error}") from error
+    if not isinstance(evidence, dict) or (
+        evidence.get("artifact_type"), evidence.get("schema_version")
+    ) != (EVIDENCE_TYPE, EVIDENCE_VERSION):
+        raise ReplayError("unsupported replay evidence identity")
+    measurements = evidence.get("measurements")
+    threshold = evidence.get("threshold")
+    if not isinstance(measurements, dict) or not isinstance(threshold, dict):
+        raise ReplayError("replay evidence has no raw measurements or frozen threshold")
+    continuation = validate_measured_continuations(measurements)
+    comparisons = {
+        profile: compare_profile(measurements["existing"], measurements[profile], threshold)
+        for profile in ("device", "host", "ssd")
+    }
+    embedded_cases = evidence.get("validation_cases")
+    if isinstance(embedded_cases, dict):
+        validation_cases = embedded_cases
+    else:
+        validation_path_value = evidence.get("validation_evidence_path")
+        validation_path = (
+            Path(validation_path_value) if isinstance(validation_path_value, str) else None
+        )
+        validation_cases = load_validation_cases(
+            validation_path, str(evidence["build"]["serve_sha256"])
+        )
+    expected_boundaries = int(evidence["fixture"]["protocol_cases"])
+    regression_matrix = build_regression_matrix(
+        continuation,
+        validation_cases,
+        boundary_replay_status(measurements["boundary"], expected_boundaries),
+    )
+    evidence["comparisons"] = comparisons
+    evidence["continuation_validation"] = continuation
+    evidence["regression_matrix"] = regression_matrix
+    evidence["validation_cases"] = validation_cases
+    evidence["verdict"] = campaign_verdict(comparisons, regression_matrix)
+    evidence["configuration_decision"] = configuration_decision(
+        comparisons, evidence["verdict"]["correctness"]
+    )
+    write_json(path, evidence)
+    write_report(path.with_name("report.md"), evidence)
+    return evidence
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="validate fixtures without a GPU run")
+    parser.add_argument(
+        "--reanalyze-evidence",
+        type=Path,
+        help="recompute derived verdicts/report from an existing schema-v2 evidence JSON",
+    )
     parser.add_argument("--verify-source", action="store_true")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--serve", type=Path, default=DEFAULT_SERVE)
+    parser.add_argument(
+        "--baseline-serve",
+        type=Path,
+        help="ninfer-serve built from the recorded baseline revision",
+    )
+    parser.add_argument(
+        "--baseline-build-identity",
+        type=Path,
+        help="hash-pinned build identity emitted for --baseline-serve",
+    )
+    parser.add_argument(
+        "--validation-evidence",
+        type=Path,
+        help="optional executable-identified focused/canonical validation results",
+    )
     parser.add_argument(
         "--weights",
         type=Path,
@@ -850,17 +1563,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.reanalyze_evidence is not None:
+        evidence = reanalyze_evidence(args.reanalyze_evidence.resolve())
+        print(args.reanalyze_evidence.resolve().parent)
+        return 0 if evidence["verdict"]["overall"] == "PASS" else 3
     args.manifest = args.manifest.resolve()
     check = validate_manifest(args.manifest, verify_source=args.verify_source)
     if args.check:
         print(json.dumps(check, indent=2, sort_keys=True))
         return 0
     args.serve = args.serve.resolve()
+    if args.baseline_serve is None or args.baseline_build_identity is None:
+        raise ReplayError(
+            "measurement requires --baseline-serve and --baseline-build-identity; the current "
+            "binary cannot stand in for the recorded revision"
+        )
+    args.baseline_serve = args.baseline_serve.resolve()
+    args.baseline_build_identity = args.baseline_build_identity.resolve()
+    if args.validation_evidence is not None:
+        args.validation_evidence = args.validation_evidence.resolve()
     args.weights = args.weights.resolve()
     if not args.serve.is_file() or not os.access(args.serve, os.X_OK):
         raise ReplayError(f"ninfer-serve executable is unavailable: {args.serve}")
+    if not args.baseline_serve.is_file() or not os.access(args.baseline_serve, os.X_OK):
+        raise ReplayError(f"baseline ninfer-serve executable is unavailable: {args.baseline_serve}")
     if not args.weights.is_file():
         raise ReplayError(f"authorized model artifact is unavailable: {args.weights}")
+    baseline = load_baseline_identity(args.baseline_build_identity, args.baseline_serve)
     output = (
         args.output_dir.resolve()
         if args.output_dir
@@ -950,6 +1679,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     profiles["overlap"] = overlap_detail
 
     require_profile_evidence(measurements, profiles)
+    continuation = validate_measured_continuations(measurements)
 
     comparisons = {
         profile: compare_profile(measurements["existing"], measurements[profile], threshold)
@@ -991,7 +1721,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile: summarize_profile(rows, summary_details[profile])
         for profile, rows in measurements.items()
     }
-    baseline_revision = "c7dca9acfef663acd10d4ec2817f184bc50547fe"
+    current_serve_sha256 = sha256_file(args.serve)
+    validation_cases = load_validation_cases(args.validation_evidence, current_serve_sha256)
+    boundary_status = boundary_replay_status(
+        measurements["boundary"], len(boundary_fixtures(manifest))
+    )
+    regression_matrix = build_regression_matrix(
+        continuation, validation_cases, boundary_status
+    )
+    verdict = campaign_verdict(comparisons, regression_matrix)
+    decision = configuration_decision(comparisons, verdict["correctness"])
     evidence = {
         "artifact_type": EVIDENCE_TYPE,
         "schema_version": EVIDENCE_VERSION,
@@ -1000,78 +1739,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source_commit": source_commit,
             "source_dirty": dirty,
             "serve_path": str(args.serve),
-            "serve_sha256": sha256_file(args.serve),
+            "serve_sha256": current_serve_sha256,
         },
-        "baseline_revision": baseline_revision,
-        "baseline_method": (
-            "same measured binary with shared-prefix writes and automatic long anchors disabled; "
-            f"behavioral configuration recorded from baseline {baseline_revision}"
-        ),
+        "baseline": baseline,
+        "baseline_method": "separate hash-pinned executable built from the recorded revision",
         "artifact": {"path": str(args.weights), "bytes": args.weights.stat().st_size},
         "fixture": check,
         "methodology": {
             "samples": args.samples,
             "threshold_frozen_before_optimized_trials": True,
             "raw_render_replay_is_protocol_separate": True,
-            "profiles": ["cold", "existing", "device", "host", "ssd", "boundary", "overlap"],
+            "profiles": [
+                "cold-current",
+                "existing-recorded-revision",
+                "device",
+                "host",
+                "ssd",
+                "boundary",
+                "overlap",
+            ],
         },
         "threshold": threshold,
         "measurements": measurements,
         "summaries": summaries,
         "profile_evidence": profiles,
         "comparisons": comparisons,
-        "configuration_decision": {
-            "changed": False,
-            "reason": (
-                "All measured Device, Host, and SSD arms exceeded the frozen threshold; no "
-                "measured tier/depth choice was slower than ready-source prefill."
-            ),
-        },
-        "regression_matrix": [
-            {
-                "status": "PASS",
-                "case": "serving boundary protocols and unchanged prepared tokens",
-                "evidence": "boundary replay plus frontend and serving schema CTests",
-            },
-            {
-                "status": "PASS",
-                "case": "cold/Device/Host exact token IDs and MTP counters",
-                "evidence": "NINFER_PREFIX_REAL_SCENARIO=cache-fixture-equivalence",
-            },
-            {
-                "status": "PASS",
-                "case": "intermediate prefix, parent infeasible, and prefix-only Host restore",
-                "evidence": (
-                    "NINFER_PREFIX_REAL_SCENARIO=pressure-resume: 121-page parent, "
-                    "120-page frontier, four restored Main-KV pages"
-                ),
-            },
-            {
-                "status": "PASS",
-                "case": "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
-                "evidence": "NINFER_PREFIX_REAL_SCENARIO=shared-snapshot",
-            },
-            {
-                "status": "PASS",
-                "case": "four-request constrained pressure and independent progress",
-                "evidence": (
-                    "NINFER_PREFIX_REAL_SCENARIO=four-request-root-fallback plus overlap replay"
-                ),
-            },
-            {
-                "status": "PASS",
-                "case": "delayed/failed transfers, shutdown, aliases, heads, and reclamation",
-                "evidence": (
-                    "delayed-spill, delayed-active-capture, cuda-transfer-failure and "
-                    "pending-snapshot-shutdown scenarios plus resource/catalog CTests"
-                ),
-            },
-        ],
+        "configuration_decision": decision,
+        "continuation_validation": continuation,
+        "validation_evidence_path": (
+            str(args.validation_evidence) if args.validation_evidence is not None else None
+        ),
+        "validation_cases": validation_cases,
+        "regression_matrix": regression_matrix,
+        "verdict": verdict,
     }
     write_json(output / "evidence.json", evidence)
     write_report(output / "report.md", evidence)
     print(output)
-    return 0 if all(row["material_improvement"] for row in comparisons.values()) else 3
+    return 0 if verdict["overall"] == "PASS" else 3
 
 
 if __name__ == "__main__":

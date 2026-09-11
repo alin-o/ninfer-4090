@@ -1,0 +1,18 @@
+{
+  "baseline_groups": [
+    {
+      "mad_ms": 51.64668599999959,
+      "median_ms": 3003.744586,
+      "relative_mad": 0.017194100404114582
+    },
+    {
+      "mad_ms": 109.38481900000033,
+      "median_ms": 3252.88804,
+      "relative_mad": 0.03362698551407885
+    }
+  ],
+  "floor_fraction": 0.1,
+  "method": "max(10%, three times the largest baseline relative MAD)",
+  "noise_fraction": 0.10088095654223654,
+  "required_reduction_fraction": 0.10088095654223654
+}

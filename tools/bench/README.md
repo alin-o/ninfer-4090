@@ -3,6 +3,10 @@
 Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
 client. Correctness is owned by the affected suites under [`tests/`](../../tests/README.md).
 
+The production-profile tiered shared-prefix replay, its recorded-revision baseline builder, and its
+executable-pinned validation importer are documented in
+[`../../bench/README.md`](../../bench/README.md#tiered-shared-prefix-replay).
+
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner
@@ -140,7 +144,7 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v19 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v20 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

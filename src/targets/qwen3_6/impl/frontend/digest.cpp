@@ -84,6 +84,64 @@ void process_block(std::array<std::uint32_t, 8>& state, const std::uint8_t* bloc
 
 } // namespace
 
+Sha256Hasher::Sha256Hasher() noexcept
+    : state_{0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+             0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U} {}
+
+void Sha256Hasher::update(std::span<const std::uint8_t> input) {
+    if (finalized_) { throw std::logic_error("SHA-256 hasher is already finalized"); }
+    constexpr std::uint64_t kMaximumBytes = std::numeric_limits<std::uint64_t>::max() / 8ULL;
+    if (total_bytes_ > kMaximumBytes || input.size() > kMaximumBytes - total_bytes_) {
+        throw std::invalid_argument("payload is too large to fingerprint");
+    }
+    total_bytes_ += input.size();
+    std::size_t offset = 0;
+    if (tail_size_ != 0) {
+        const std::size_t copied = std::min(input.size(), tail_.size() - tail_size_);
+        std::copy_n(input.data(), copied, tail_.data() + tail_size_);
+        tail_size_ += copied;
+        offset += copied;
+        if (tail_size_ == tail_.size()) {
+            process_block(state_, tail_.data());
+            tail_size_ = 0;
+        }
+    }
+    while (input.size() - offset >= tail_.size()) {
+        process_block(state_, input.data() + offset);
+        offset += tail_.size();
+    }
+    if (offset != input.size()) {
+        tail_size_ = input.size() - offset;
+        std::copy_n(input.data() + offset, tail_size_, tail_.data());
+    }
+}
+
+void Sha256Hasher::update(std::string_view input) {
+    update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(input.data()),
+                                         input.size()));
+}
+
+Sha256Digest Sha256Hasher::finalize() {
+    if (finalized_) { throw std::logic_error("SHA-256 hasher is already finalized"); }
+    finalized_ = true;
+    std::array<std::uint8_t, 128> padded{};
+    std::copy_n(tail_.data(), tail_size_, padded.data());
+    padded[tail_size_]            = 0x80U;
+    const std::size_t padded_size = tail_size_ < 56 ? 64 : 128;
+    const std::uint64_t bits      = total_bytes_ * 8ULL;
+    for (std::size_t index = 0; index < 8; ++index) {
+        padded[padded_size - 1 - index] = static_cast<std::uint8_t>(bits >> (8U * index));
+    }
+    process_block(state_, padded.data());
+    if (padded_size == 128) { process_block(state_, padded.data() + 64); }
+
+    Sha256Digest digest{};
+    for (std::size_t index = 0; index < state_.size(); ++index) {
+        store_be32(state_[index], digest.data() + 4 * index);
+    }
+    return digest;
+}
+
 Sha256Digest sha256(std::span<const std::uint8_t> input) { return sha256(input, {}); }
 
 Sha256Digest sha256(std::span<const std::uint8_t> input, const std::function<void()>& checkpoint) {

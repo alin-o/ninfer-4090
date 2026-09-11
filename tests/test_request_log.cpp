@@ -1,5 +1,6 @@
 #include "serve/operational_log.h"
 #include "serve/request_log.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <nlohmann/json.hpp>
 
@@ -138,6 +139,7 @@ int main() {
     memory.cuda_graph_allowance_bytes        = 600;
     memory.kv_payload_bytes                  = 400;
     memory.gdn_state_bytes                   = 8192;
+    memory.checkpoint_state_image_bytes      = 8192;
     memory.device_main_kv_capacity_pages     = 100;
     memory.device_main_kv_occupied_pages     = 25;
     memory.device_main_kv_page_bytes         = 4096;
@@ -328,11 +330,20 @@ int main() {
               "request-scoped media preparation diagnostics missing");
 
     ApiError preparation_error;
-    preparation_error.status                          = 400;
-    preparation_error.type                            = "invalid_request_error";
-    preparation_error.param                           = "messages";
-    preparation_error.code                            = "context_length_exceeded";
-    preparation_error.message                         = "sentinel-client-value\nsecond-record";
+    preparation_error.status               = 400;
+    preparation_error.type                 = "invalid_request_error";
+    preparation_error.param                = "messages";
+    preparation_error.code                 = "context_length_exceeded";
+    preparation_error.message              = "sentinel-client-value\nsecond-record";
+    preparation_error.checkpoint_lifecycle = {
+        ninfer::CheckpointLifecycleFact{
+            .frontier         = 128,
+            .operation        = ninfer::CheckpointLifecycleOperation::Restored,
+            .source_tier      = ninfer::CheckpointLifecycleTier::Ssd,
+            .destination_tier = ninfer::CheckpointLifecycleTier::Host,
+            .status           = ninfer::CheckpointLifecycleStatus::Committed,
+        },
+    };
     GenerationRequest rejected_request                = request;
     rejected_request.reasoning_effort                 = RequestedReasoningEffort::High;
     const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
@@ -342,10 +353,12 @@ int main() {
     failures +=
         check(rejected.at("event") == "request_rejected" && rejected.at("phase") == "prepare",
               "preparation rejection event or phase mismatch");
-    failures += check(rejected.at("request").at("request_id") == 8 &&
-                          rejected.at("request").at("media_item_count") == 1 &&
-                          rejected.at("request").at("message_count") == 2,
-                      "preparation rejection request shape missing");
+    failures +=
+        check(rejected.at("request").at("request_id") == 8 &&
+                  rejected.at("request").at("response_id") == "chatcmpl-correlation-fixture" &&
+                  rejected.at("request").at("media_item_count") == 1 &&
+                  rejected.at("request").at("message_count") == 2,
+              "preparation rejection request shape missing");
     failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
                           rejected.at("request").at("resolved_reasoning_effort").is_null(),
                       "rejection log fabricated a resolved reasoning effort");
@@ -354,6 +367,9 @@ int main() {
                           rejected.at("error").at("param") == "messages" &&
                           rejected.at("error").at("message") == preparation_error.message,
                       "preparation rejection API error missing");
+    failures += check(rejected.at("checkpoint_summary").at("reuse_loaded") == true &&
+                          rejected.at("checkpoint_summary").at("restore_committed") == true,
+                      "preparation rejection lost a committed durable restore summary");
     const OperationalRecord client_rejection = render_request_rejected(rejected_context);
     failures +=
         check(client_rejection.severity == OperationalSeverity::Info &&
@@ -420,15 +436,30 @@ int main() {
                           .selected_degradation_units = 2,
                           .selected_maximal_fallback  = false,
     };
-    outcome.thinking    = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
-                                                      .model_thinking_tokens = 256,
-                                                      .injected_tokens       = 19,
-                                                      .applied               = true};
-    outcome.checkpoints = {.reuse_loaded      = true,
-                           .restore_committed = true,
-                           .offload_committed = true,
-                           .created_committed = 2,
-                           .capture_aborted   = 1};
+    outcome.thinking           = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+                                                             .model_thinking_tokens = 256,
+                                                             .injected_tokens       = 19,
+                                                             .applied               = true};
+    outcome.checkpoints        = {.reuse_loaded      = true,
+                                  .restore_committed = true,
+                                  .offload_committed = true,
+                                  .created_committed = 2,
+                                  .capture_aborted   = 1};
+    const auto checkpoint_fact = [](ninfer::CheckpointLifecycleOperation operation,
+                                    ninfer::CheckpointLifecycleStatus status =
+                                        ninfer::CheckpointLifecycleStatus::Committed) {
+        return ninfer::CheckpointLifecycleFact{
+            .frontier = 64, .operation = operation, .status = status};
+    };
+    outcome.checkpoint_lifecycle = {
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Loaded),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Restored),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Offloaded),
+        checkpoint_fact(ninfer::CheckpointLifecycleOperation::Created,
+                        ninfer::CheckpointLifecycleStatus::Aborted),
+    };
 
     // Fork-local fields on the operational request line: upstream's restructure dropped
     // speculative decoding and host timings, and this fork restated them. The fixture above
@@ -577,11 +608,16 @@ int main() {
                           media_prompt.find("data:") == std::string::npos,
                       "prompt Markdown lost safe media metadata or included a media source");
 
-    const Json error =
-        Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
+    const Json error = Json::parse(
+        format_request_error_json("serve-test", 4000, context, "generation failed",
+                                  summarize_checkpoint_lifecycle(outcome.checkpoint_lifecycle)));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
+    failures += check(error.at("checkpoint_summary").at("created_committed") == 2 &&
+                          error.at("checkpoint_summary").at("restore_committed") == true &&
+                          error.at("checkpoint_summary").at("capture_aborted") == 1,
+                      "request error omitted its lifecycle-derived checkpoint summary");
 
     const OperationalRecord internal_failure = render_request_failure(
         context,
@@ -754,8 +790,9 @@ int main() {
         "<|im_start|>user\nrendered prompt secret, not raw JSON<|im_end|>\n";
     captured_context.rendered_prompt   = std::make_shared<const std::string>(rendered_prompt);
     GenerationOutcome captured_outcome = outcome;
-    captured_outcome.reasoning         = "private chain of thought";
-    captured_outcome.text              = "final assistant content";
+    captured_outcome.checkpoint_lifecycle.clear();
+    captured_outcome.reasoning  = "private chain of thought";
+    captured_outcome.text       = "final assistant content";
     captured_outcome.tool_calls = {{.name = "lookup", .arguments_json = R"({"key":"secret"})"}};
     std::string first_prompt_file;
     {
@@ -792,6 +829,13 @@ int main() {
                       "prompt Markdown is not the exact Frontend-rendered text");
     std::ifstream response_input(content_dir / response_file, std::ios::binary);
     const std::string stored_response((std::istreambuf_iterator<char>(response_input)), {});
+    const auto sha256_hex = [](std::string_view value) {
+        return ninfer::targets::qwen3_6::frontend_internal::sha256_hex(
+            ninfer::targets::qwen3_6::frontend_internal::sha256(value));
+    };
+    failures += check(prompt_meta.at("sha256") == sha256_hex(stored_prompt) &&
+                          response_meta.at("sha256") == sha256_hex(stored_response),
+                      "JSONL digest does not match the atomically published Markdown file");
     failures += check(stored_response == format_response_markdown(captured_outcome) &&
                           stored_response.find("private chain of thought") != std::string::npos &&
                           stored_response.find("final assistant content") != std::string::npos &&
@@ -862,12 +906,22 @@ int main() {
     failed_context.rendered_prompt = std::make_shared<const std::string>("still infer this");
     const std::filesystem::path failure_log = capture_root / "failures.jsonl";
     {
-        JsonlRequestLog writer(failure_log.string(), {}, {}, failure_dir);
-        const std::string suffix =
-            writer.server_instance_id() + "-request-" + std::to_string(failed_context.id) + ".md";
-        std::filesystem::create_directories(failure_dir / ("prompt" + suffix));
+        bool prompt_fragment_failed = false;
+        JsonlRequestLog writer(failure_log.string(), {}, {}, failure_dir,
+                               [&](std::string_view stage, const std::filesystem::path&,
+                                   const std::filesystem::path& final) {
+                                   const std::string filename = final.filename().string();
+                                   if (stage == "fragment_written" &&
+                                       filename.starts_with("prompt") && !prompt_fragment_failed) {
+                                       prompt_fragment_failed = true;
+                                       throw std::runtime_error("injected fragment failure");
+                                   }
+                                   if (stage == "before_rename" &&
+                                       filename.starts_with("response")) {
+                                       std::filesystem::create_directory(final);
+                                   }
+                               });
         writer.write_request_start(failed_context);
-        std::filesystem::create_directories(failure_dir / ("response" + suffix));
         writer.write_request_done(failed_context, captured_outcome);
     }
     std::ifstream failure_input(failure_log);
@@ -877,12 +931,17 @@ int main() {
     std::getline(failure_input, failed_done_line);
     const Json failed_start = Json::parse(failed_start_line);
     const Json failed_done  = Json::parse(failed_done_line);
-    failures += check(failed_start.at("content_files").at("prompt").at("status") == "failed" &&
-                          failed_start.at("content_files").at("prompt").at("file").is_null() &&
-                          failed_done.at("event") == "request_done" &&
-                          failed_done.at("content_files").at("response").at("status") == "failed" &&
-                          failed_done.at("content_files").at("response").at("file").is_null(),
-                      "content write failure emitted a false reference or failed inference");
+    failures +=
+        check(failed_start.at("content_files").at("prompt").at("status") == "failed" &&
+                  failed_start.at("content_files").at("prompt").at("file").is_null() &&
+                  failed_start.at("content_files").at("prompt").at("error_class") ==
+                      "format_or_io_failure" &&
+                  failed_done.at("event") == "request_done" &&
+                  failed_done.at("content_files").at("response").at("status") == "failed" &&
+                  failed_done.at("content_files").at("response").at("file").is_null() &&
+                  failed_done.at("content_files").at("response").at("error_class") ==
+                      "atomic_rename_failed",
+              "injected write/rename failure emitted a false reference or failed inference");
     bool partial_found = false;
     for (const auto& entry : std::filesystem::directory_iterator(failure_dir)) {
         if (entry.path().filename().string().find(".tmp") != std::string::npos) {

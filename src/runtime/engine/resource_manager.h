@@ -230,8 +230,6 @@ public:
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
         std::optional<PublishedActivation> activation;
         MaterializationDiagnostics diagnostics;
-        bool restore_committed = false;
-        bool offload_committed = false;
         std::vector<CheckpointLifecycleFact> lifecycle;
     };
 
@@ -248,8 +246,6 @@ public:
 
     struct ActiveCaptureOutcome {
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
-        std::uint32_t created_committed = 0;
-        bool offload_committed          = false;
         std::vector<CheckpointLifecycleFact> lifecycle;
     };
 
@@ -1116,6 +1112,7 @@ public:
             throw std::logic_error("Program returned an invalid terminal continuation");
         }
 
+        const ContinuationSummary before = publication.summary;
         release_active_references(lane);
         publication.state = CatalogState::Catalogued;
         assign_continuation_summary(publication.summary, result.summary);
@@ -1132,6 +1129,18 @@ public:
                 publication.retention = RetentionClass::RecentPrivate;
             }
         }
+        const auto append_created = [&](const auto& checkpoint) {
+            if (continuation_contains_checkpoint_identity(before, checkpoint)) { return; }
+            result.lifecycle.push_back(lifecycle_fact(
+                checkpoint, CheckpointLifecycleOperation::Created, CheckpointLifecycleTier::None,
+                checkpoint.state_residency == ReplicaResidency::HostOnly
+                    ? CheckpointLifecycleTier::Host
+                    : CheckpointLifecycleTier::Device,
+                CheckpointLifecycleStatus::Committed));
+        };
+        if (result.summary.endpoint) { append_created(*result.summary.endpoint); }
+        if (result.summary.rewrite) { append_created(*result.summary.rewrite); }
+        for (const auto& anchor : result.summary.long_anchors) { append_created(anchor); }
         reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
@@ -1391,6 +1400,10 @@ public:
     struct SharedImportAdoptionResult {
         SharedImportDisposition disposition = SharedImportDisposition::Cancelled;
         std::uint32_t slot                  = kInvalidCatalogSlot;
+        // Filled by Engine while it still owns the execution lock. ResourceManager owns the
+        // adoption decision; Engine owns publication of this immutable identity/snapshot.
+        std::optional<SharedPrefixSummary> summary;
+        std::optional<CheckpointLifecycleFact> checkpoint;
     };
 
     // Transactional adoption of a Program-validated Host import. Exact semantic coalescing is
@@ -2995,6 +3008,13 @@ private:
         return found == summary.long_anchors.end() ? nullptr : &*found;
     }
 
+    [[nodiscard]] static bool
+    continuation_contains_checkpoint_identity(const ContinuationSummary& summary,
+                                              const CheckpointSummary& checkpoint) noexcept {
+        const CheckpointSummary* prior = find_checkpoint(summary, checkpoint.ref);
+        return prior != nullptr && prior->shortlist_key == checkpoint.shortlist_key;
+    }
+
     [[nodiscard]] static CheckpointLifecycleRole lifecycle_role(CheckpointKind kind) noexcept {
         switch (kind) {
         case CheckpointKind::SessionEndpoint:
@@ -3697,18 +3717,12 @@ private:
         }
         StartResult start = std::move(*result.published);
         result.published.reset();
-        const bool restore_committed =
-            has_transfer_direction(result, ContextTransferDirection::HostToDevice);
-        const bool offload_committed =
-            has_transfer_direction(result, ContextTransferDirection::DeviceToHost);
         commit_demand(std::move(record->demand));
         return MaterializationOutcome{
-            .status            = ContextTransactionStatus::Published,
-            .activation        = PublishedActivation(*this, std::move(start), record->destination),
-            .diagnostics       = record->diagnostics,
-            .restore_committed = restore_committed,
-            .offload_committed = offload_committed,
-            .lifecycle         = std::move(lifecycle),
+            .status      = ContextTransactionStatus::Published,
+            .activation  = PublishedActivation(*this, std::move(start), record->destination),
+            .diagnostics = record->diagnostics,
+            .lifecycle   = std::move(lifecycle),
         };
     }
 
@@ -3847,7 +3861,7 @@ private:
             const ActiveEntry& current_active = active_[record->lane.value];
             const ContinuationSummary& before = catalog_[current_active.publication_slot].summary;
             const auto append_created         = [&](const auto& checkpoint) {
-                if (!continuation_contains_checkpoint(before, checkpoint.ref)) {
+                if (!continuation_contains_checkpoint_identity(before, checkpoint)) {
                     lifecycle.push_back(lifecycle_fact(
                         checkpoint, CheckpointLifecycleOperation::Created,
                         CheckpointLifecycleTier::None, CheckpointLifecycleTier::Device,
@@ -3934,19 +3948,11 @@ private:
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));
         }
-        const std::uint32_t created_committed =
-            static_cast<std::uint32_t>(record->publishes_private) +
-            static_cast<std::uint32_t>(record->publishes_shared);
-        const bool offload_committed =
-            has_transfer_direction(result, ContextTransferDirection::DeviceToHost);
         observe_transfers(result);
         observe_operations(result);
         transaction_.template emplace<std::monostate>();
         program.finalize_context_transaction();
-        return {.status            = ContextTransactionStatus::Published,
-                .created_committed = created_committed,
-                .offload_committed = offload_committed,
-                .lifecycle         = std::move(lifecycle)};
+        return {.status = ContextTransactionStatus::Published, .lifecycle = std::move(lifecycle)};
     }
 
     void release_active_references(LaneId lane) {

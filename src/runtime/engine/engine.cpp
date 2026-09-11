@@ -834,7 +834,7 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                 std::uint64_t adoption_nanoseconds   = 0;
                 bool validation_completed            = false;
                 try {
-                    const auto result = core->import_shared_prefix(
+                    auto result = core->import_shared_prefix(
                         std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
                         &adoption_nanoseconds,
                         [&] {
@@ -844,49 +844,17 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                             }
                         },
                         bytes, true, candidate, &validation_completed);
-                    const auto summary = core->shared_prefix_slot_summary(result.slot);
-                    if (!summary) {
-                        throw std::logic_error("durable shared import has no catalogued summary");
+                    if (!result.summary || !result.checkpoint) {
+                        throw std::logic_error(
+                            "durable shared import has no locked publication identity");
                     }
-                    const MemorySummary memory = core->memory_summary();
                     return {
                             .disposition            = static_cast<std::uint32_t>(result.disposition),
                             .slot                   = result.slot,
-                            .frontier               = summary->checkpoint.ref.frontier,
+                            .frontier               = result.summary->checkpoint.ref.frontier,
                             .validation_nanoseconds = validation_nanoseconds,
                             .adoption_nanoseconds   = adoption_nanoseconds,
-                            .checkpoint =
-                            CheckpointLifecycleFact{
-                                    .key_digests      = summary->checkpoint.shortlist_key.digests,
-                                    .frontier         = summary->checkpoint.ref.frontier,
-                                    .identity_tag     = summary->checkpoint.shortlist_key.identity_tag,
-                                    .ordinal          = summary->checkpoint.ref.ordinal,
-                                    .role             = CheckpointLifecycleRole::SharedStablePrefix,
-                                    .scope            = CheckpointLifecycleScope::Shared,
-                                    .state_images     = 1,
-                                    .main_kv_pages    = summary->checkpoint.required_kv.main_pages,
-                                    .backend_kv_pages = summary->checkpoint.required_kv.backend_pages,
-                                    .kv_snapshot =
-                                    CheckpointKvCapacitySnapshot{
-                                            .device_main_capacity_pages =
-                                            memory.device_main_kv_capacity_pages,
-                                            .device_main_used_pages =
-                                            memory.device_main_kv_occupied_pages,
-                                            .device_main_page_bytes = memory.device_main_kv_page_bytes,
-                                            .device_backend_capacity_pages =
-                                            memory.device_backend_kv_capacity_pages,
-                                            .device_backend_used_pages =
-                                            memory.device_backend_kv_occupied_pages,
-                                            .device_backend_page_bytes =
-                                            memory.device_backend_kv_page_bytes,
-                                            .state_image_bytes    = memory.gdn_state_bytes,
-                                            .host_main_page_bytes = memory.host_main_kv_page_bytes,
-                                            .host_backend_page_bytes =
-                                            memory.host_backend_kv_page_bytes,
-                                            .host_capacity_bytes = memory.host_kv_capacity_bytes,
-                                            .host_used_bytes     = memory.host_kv_occupied_bytes,
-                                    },
-                            },
+                            .checkpoint             = std::move(*result.checkpoint),
                     };
                 } catch (const RequestError&) {
                     throw;
@@ -899,11 +867,9 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
             }
         },
         engine.impl_->core);
-    if (cancellation.requested()) {
-        // Adoption is atomic and remains a valid warm source. Cancellation only prevents the
-        // caller from continuing to submission; it never tears down a committed shared owner.
-        throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
-    }
+    // A cancellation observed after the locked adoption boundary is handled by the caller's
+    // next preparation checkpoint. Returning the committed identity lets that failure retain the
+    // SSD lifecycle fact instead of making a completed adoption disappear from observability.
     return imported;
 }
 
@@ -1036,17 +1002,16 @@ runtime::testing::SharedSnapshotTestAccess::import(Engine& engine,
                               core->import_shared_prefix(bytes, binding);
                               core->shared_prefix_slot_summary(std::uint32_t{});
                           }) {
-                const auto result  = core->import_shared_prefix(bytes, binding);
-                const auto summary = core->shared_prefix_slot_summary(result.slot);
-                if (!summary) {
-                    throw std::logic_error("shared import result has no catalogued summary");
+                auto result = core->import_shared_prefix(bytes, binding);
+                if (!result.summary) {
+                    throw std::logic_error("shared import result has no locked summary");
                 }
                 return {.disposition      = static_cast<std::uint32_t>(result.disposition),
                         .slot             = result.slot,
-                        .frontier         = summary->checkpoint.ref.frontier,
-                        .main_frontier    = summary->checkpoint.required_kv.main_frontier,
-                        .backend_frontier = summary->checkpoint.required_kv.backend_frontier,
-                        .state_residency  = summary->checkpoint.state_residency};
+                        .frontier         = result.summary->checkpoint.ref.frontier,
+                        .main_frontier    = result.summary->checkpoint.required_kv.main_frontier,
+                        .backend_frontier = result.summary->checkpoint.required_kv.backend_frontier,
+                        .state_residency  = result.summary->checkpoint.state_residency};
             } else {
                 throw std::logic_error("shared snapshots require a generation Engine");
             }

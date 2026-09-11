@@ -1078,7 +1078,14 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                              &imported.checkpoint);
             return observation;
         } catch (const RequestError& error) {
-            if (error.kind() == RequestErrorKind::Cancelled) { throw; }
+            if (error.kind() == RequestErrorKind::Cancelled) {
+                append_lifecycle(
+                    candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   Clock::now() - restore_started)
+                                                   .count()));
+                throw RequestError(error.kind(), error.what(), std::move(observation.lifecycle));
+            }
             observation.fallback_reason = "ssd-adoption-unavailable";
         } catch (const runtime::DurableSharedSnapshotAccess::ValidationError&) {
             {

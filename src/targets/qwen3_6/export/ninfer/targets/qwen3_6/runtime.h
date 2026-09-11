@@ -968,6 +968,7 @@ struct FinishResult {
     SpeculativeStats speculative;
     ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
+    std::vector<CheckpointLifecycleFact> lifecycle;
 };
 
 template <class Variant>

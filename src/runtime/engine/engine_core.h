@@ -292,7 +292,7 @@ public:
             .device_backend_capacity_pages = memory.device_backend_kv_capacity_pages,
             .device_backend_used_pages     = memory.device_backend_kv_occupied_pages,
             .device_backend_page_bytes     = memory.device_backend_kv_page_bytes,
-            .state_image_bytes             = memory.gdn_state_bytes,
+            .state_image_bytes             = memory.checkpoint_state_image_bytes,
             .host_main_page_bytes          = memory.host_main_kv_page_bytes,
             .host_backend_page_bytes       = memory.host_backend_kv_page_bytes,
             .host_capacity_bytes           = memory.host_kv_capacity_bytes,
@@ -530,6 +530,46 @@ public:
                     ssd_backed);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
+                }
+                if (result.disposition == ResourceManagement::SharedImportDisposition::Cancelled) {
+                    throw RequestError(RequestErrorKind::Cancelled,
+                                       "shared snapshot import was cancelled");
+                }
+                {
+                    const auto view = resources_.shared_catalog_slot(result.slot);
+                    if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+                        view.handle == nullptr) {
+                        throw std::logic_error(
+                            "shared import adoption lost its catalogued owner under lock");
+                    }
+                    result.summary             = view.summary;
+                    const auto& checkpoint     = view.summary.checkpoint;
+                    const MemorySummary memory = instance_.program->memory_summary();
+                    const CheckpointKvCapacitySnapshot kv_snapshot{
+                        .device_main_capacity_pages    = memory.device_main_kv_capacity_pages,
+                        .device_main_used_pages        = memory.device_main_kv_occupied_pages,
+                        .device_main_page_bytes        = memory.device_main_kv_page_bytes,
+                        .device_backend_capacity_pages = memory.device_backend_kv_capacity_pages,
+                        .device_backend_used_pages     = memory.device_backend_kv_occupied_pages,
+                        .device_backend_page_bytes     = memory.device_backend_kv_page_bytes,
+                        .state_image_bytes             = memory.checkpoint_state_image_bytes,
+                        .host_main_page_bytes          = memory.host_main_kv_page_bytes,
+                        .host_backend_page_bytes       = memory.host_backend_kv_page_bytes,
+                        .host_capacity_bytes           = memory.host_kv_capacity_bytes,
+                        .host_used_bytes               = memory.host_kv_occupied_bytes,
+                    };
+                    result.checkpoint = CheckpointLifecycleFact{
+                        .key_digests      = checkpoint.shortlist_key.digests,
+                        .frontier         = checkpoint.ref.frontier,
+                        .identity_tag     = checkpoint.shortlist_key.identity_tag,
+                        .ordinal          = checkpoint.ref.ordinal,
+                        .role             = CheckpointLifecycleRole::SharedStablePrefix,
+                        .scope            = CheckpointLifecycleScope::Shared,
+                        .state_images     = 1,
+                        .main_kv_pages    = checkpoint.required_kv.main_pages,
+                        .backend_kv_pages = checkpoint.required_kv.backend_pages,
+                        .kv_snapshot      = kv_snapshot,
+                    };
                 }
                 return result;
             },
@@ -1416,6 +1456,13 @@ private:
                 resources_.lane_publication_slot(LaneId{lane});
             auto finished =
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
+            attach_checkpoint_snapshot(finished.lifecycle);
+            request->checkpoint_lifecycle.insert(
+                request->checkpoint_lifecycle.end(),
+                std::make_move_iterator(finished.lifecycle.begin()),
+                std::make_move_iterator(finished.lifecycle.end()));
+            request->checkpoint_summary =
+                summarize_checkpoint_lifecycle(request->checkpoint_lifecycle);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             if (finished.disposition == FinishDisposition::Catalogued && publication) {
@@ -1984,11 +2031,9 @@ private:
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
-                    request->checkpoint_summary.reuse_loaded =
-                        control.summary.prefix_reuse_path != PrefixReusePath::Root;
-                    request->checkpoint_summary.restore_committed = terminal.restore_committed;
-                    request->checkpoint_summary.offload_committed = terminal.offload_committed;
-                    request->model_state                          = EngineRequestState::Prefill;
+                    request->checkpoint_summary =
+                        summarize_checkpoint_lifecycle(request->checkpoint_lifecycle);
+                    request->model_state = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;
@@ -2012,16 +2057,13 @@ private:
                         std::make_move_iterator(terminal.lifecycle.end()));
                     if (terminal.status == ContextTransactionStatus::Published) {
                         ++cumulative_stats_.active_captures_completed;
-                        capture->checkpoint_summary.created_committed += terminal.created_committed;
-                        capture->checkpoint_summary.offload_committed =
-                            capture->checkpoint_summary.offload_committed ||
-                            terminal.offload_committed;
                     } else if (terminal.status == ContextTransactionStatus::Aborted) {
                         ++cumulative_stats_.active_captures_aborted;
-                        ++capture->checkpoint_summary.capture_aborted;
                     } else {
                         throw std::logic_error("active capture returned an invalid terminal state");
                     }
+                    capture->checkpoint_summary =
+                        summarize_checkpoint_lifecycle(capture->checkpoint_lifecycle);
                     capture->capture_pending = false;
                     capture->model_state     = capture->post_capture_state;
                     request_admission_check();

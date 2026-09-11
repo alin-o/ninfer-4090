@@ -9336,6 +9336,10 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     }
     try {
         out.summary.long_anchors.reserve(state.long_anchors.size());
+        // ResourceManager publishes at most endpoint + rewrite + every long anchor after the
+        // physical freeze. Reserve before mutation so observability cannot introduce a
+        // post-commit allocation failure at terminal retention.
+        out.lifecycle.reserve(state.long_anchors.size() + 2U);
     } catch (...) { return out; }
     try {
         if (state.state.fork_pending) {
@@ -12470,6 +12474,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.text_kv_bytes                = text_kv_bytes;
     out.mtp_kv_bytes                 = mtp_kv_bytes;
     out.gdn_state_bytes              = gdn_state_bytes;
+    out.checkpoint_state_image_bytes = state_images ? state_images->host_layout().image_bytes : 0;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
     const auto device_page_bytes     = [](const DeviceKVPagePool& pool) {

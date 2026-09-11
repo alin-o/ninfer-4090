@@ -26,7 +26,7 @@ KvCapacitySnapshot make_kv_capacity_snapshot(const ninfer::MemorySummary& memory
         .device_backend =
             device(memory.device_backend_kv_capacity_pages, memory.device_backend_kv_occupied_pages,
                    memory.device_backend_kv_page_bytes),
-        .state_image_bytes       = memory.gdn_state_bytes,
+        .state_image_bytes       = memory.checkpoint_state_image_bytes,
         .host_main_page_bytes    = memory.host_main_kv_page_bytes,
         .host_backend_page_bytes = memory.host_backend_kv_page_bytes,
         .host_capacity_bytes     = host_capacity,
@@ -103,6 +103,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               ApiError error) {
     RequestRejectionLogContext context;
     context.id                                 = id;
+    context.response_id                        = metadata.response_id;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
     context.stream                             = metadata.stream;

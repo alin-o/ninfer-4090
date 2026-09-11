@@ -382,21 +382,23 @@ Json preparation_json(const RequestLogContext& context) {
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
-    return Json{{"request_id", context.id},
-                {"protocol", context.protocol},
-                {"model", context.model},
-                {"stream", context.stream},
-                {"message_count", context.message_count},
-                {"media_item_count", context.media_item_count},
-                {"requested_output_tokens", context.requested_output_tokens},
-                {"requested_output_tokens_source",
-                 context.requested_output_tokens_client_set ? "client" : "server_default"},
-                {"tool_count", context.tool_count},
-                {"tool_choice", tool_choice_name(context.tool_choice)},
-                {"has_tool_history", context.has_tool_history},
-                {"requested_reasoning_effort",
-                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
-                {"resolved_reasoning_effort", nullptr}};
+    return Json{
+        {"request_id", context.id},
+        {"response_id", context.response_id.empty() ? Json(nullptr) : Json(context.response_id)},
+        {"protocol", context.protocol},
+        {"model", context.model},
+        {"stream", context.stream},
+        {"message_count", context.message_count},
+        {"media_item_count", context.media_item_count},
+        {"requested_output_tokens", context.requested_output_tokens},
+        {"requested_output_tokens_source",
+         context.requested_output_tokens_client_set ? "client" : "server_default"},
+        {"tool_count", context.tool_count},
+        {"tool_choice", tool_choice_name(context.tool_choice)},
+        {"has_tool_history", context.has_tool_history},
+        {"requested_reasoning_effort",
+         requested_reasoning_effort_json(context.requested_reasoning_effort)},
+        {"resolved_reasoning_effort", nullptr}};
 }
 
 Json error_json(const ApiError& error) {
@@ -687,6 +689,13 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
     record["phase"]   = "prepare";
     record["request"] = rejected_request_json(context);
     record["error"]   = error_json(context.error);
+    const ninfer::RequestCheckpointSummary checkpoints =
+        summarize_checkpoint_lifecycle(context.error.checkpoint_lifecycle);
+    record["checkpoint_summary"] = Json{{"reuse_loaded", checkpoints.reuse_loaded},
+                                        {"restore_committed", checkpoints.restore_committed},
+                                        {"created_committed", checkpoints.created_committed},
+                                        {"offload_committed", checkpoints.offload_committed},
+                                        {"capture_aborted", checkpoints.capture_aborted}};
     return record.dump();
 }
 
@@ -716,16 +725,17 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
          {"thinking_control_tokens", outcome.thinking.injected_tokens},
          {"thinking_control_applied", outcome.thinking.applied},
          {"tool_call_count", outcome.tool_calls.size()}};
-    record["checkpoint_summary"] =
-        Json{{"reuse_loaded", outcome.checkpoints.reuse_loaded},
-             {"restore_committed", outcome.checkpoints.restore_committed},
-             {"created_committed", outcome.checkpoints.created_committed},
-             {"offload_committed", outcome.checkpoints.offload_committed},
-             {"capture_aborted", outcome.checkpoints.capture_aborted}};
-    record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
-        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
-        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
+    const ninfer::RequestCheckpointSummary checkpoints =
+        summarize_checkpoint_lifecycle(outcome.checkpoint_lifecycle);
+    record["checkpoint_summary"] = Json{{"reuse_loaded", checkpoints.reuse_loaded},
+                                        {"restore_committed", checkpoints.restore_committed},
+                                        {"created_committed", checkpoints.created_committed},
+                                        {"offload_committed", checkpoints.offload_committed},
+                                        {"capture_aborted", checkpoints.capture_aborted}};
+    record["timings_seconds"]    = Json{
+           {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
+           {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
+           {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
@@ -736,10 +746,16 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
 
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp, const RequestLogContext& context,
-                                      const std::string& message) {
-    Json record       = event_base(server_instance_id, timestamp, "request_error");
-    record["request"] = request_json(context);
-    record["error"]   = Json{{"message", message}};
+                                      const std::string& message,
+                                      const ninfer::RequestCheckpointSummary& checkpoints) {
+    Json record                  = event_base(server_instance_id, timestamp, "request_error");
+    record["request"]            = request_json(context);
+    record["error"]              = Json{{"message", message}};
+    record["checkpoint_summary"] = Json{{"reuse_loaded", checkpoints.reuse_loaded},
+                                        {"restore_committed", checkpoints.restore_committed},
+                                        {"created_committed", checkpoints.created_committed},
+                                        {"offload_committed", checkpoints.offload_committed},
+                                        {"capture_aborted", checkpoints.capture_aborted}};
     add_content_json(record, context);
     add_kv_snapshot_json(record, context);
     return record.dump();
@@ -797,7 +813,7 @@ std::string format_checkpoint_lifecycle_json(const std::string& server_instance_
 
 namespace {
 
-std::string markdown_fence(std::string_view text) {
+std::size_t markdown_fence_size(std::string_view text) noexcept {
     std::size_t longest = 0;
     std::size_t run     = 0;
     for (const char value : text) {
@@ -807,71 +823,213 @@ std::string markdown_fence(std::string_view text) {
             run = 0;
         }
     }
-    return std::string(std::max<std::size_t>(4, longest + 1), '~');
+    return std::max<std::size_t>(4, longest + 1);
 }
 
-void append_markdown_block(std::string& out, std::string_view heading, std::string_view language,
-                           std::string_view value) {
-    out += "## ";
-    out += heading;
-    out += "\n\nBytes: ";
-    out += std::to_string(value.size());
-    out += "\n\n";
-    const std::string fence = markdown_fence(value);
-    out += fence;
-    out += language;
-    out += '\n';
-    out.append(value);
-    if (!value.empty() && value.back() != '\n') { out += '\n'; }
-    out += fence;
-    out += "\n\n";
+template <class Sink>
+void emit_markdown_block(Sink& out, std::string_view heading, std::string_view language,
+                         std::string_view value) {
+    out.write("## ");
+    out.write(heading);
+    out.write("\n\nBytes: ");
+    out.write(std::to_string(value.size()));
+    out.write("\n\n");
+    const std::size_t fence_size = markdown_fence_size(value);
+    out.repeat('~', fence_size);
+    out.write(language);
+    out.write("\n");
+    out.write(value);
+    if (!value.empty() && value.back() != '\n') { out.write("\n"); }
+    out.repeat('~', fence_size);
+    out.write("\n\n");
+}
+
+std::string safe_media_type(std::string_view media_type) {
+    std::string safe;
+    safe.reserve(std::min<std::size_t>(media_type.size(), 128));
+    for (const unsigned char value : media_type.substr(0, 128)) {
+        safe += value >= 0x20 && value != 0x7f && value != '`' ? static_cast<char>(value) : ' ';
+    }
+    return safe;
+}
+
+template <class Sink>
+void emit_prompt_markdown(Sink& out, std::string_view rendered_prompt,
+                          std::span<const CapturedMediaMetadata> media) {
+    out.write(rendered_prompt);
+    if (media.empty()) { return; }
+    out.write("\n\n---\n\n## Non-text media metadata\n\n");
+    for (std::size_t index = 0; index < media.size(); ++index) {
+        const CapturedMediaMetadata& item = media[index];
+        const std::string safe_type       = safe_media_type(item.media_type);
+        out.write("- item ");
+        out.write(std::to_string(index + 1));
+        out.write(": kind=`");
+        out.write(item.kind == ninfer::MediaKind::Image ? "image" : "video");
+        out.write("`, media_type=`");
+        out.write(safe_type.empty() ? "unknown" : safe_type);
+        out.write("`, bytes=`");
+        out.write(std::to_string(item.bytes));
+        out.write("`, sha256=`");
+        out.write(item.sha256);
+        out.write("`\n");
+    }
+}
+
+template <class Sink>
+void emit_response_markdown(Sink& out, const GenerationOutcome& outcome) {
+    out.write("# Final model response\n\n");
+    emit_markdown_block(out, "Reasoning / thinking", "text", outcome.reasoning);
+    emit_markdown_block(out, "Assistant content", "text", outcome.text);
+    out.write("## Tool calls\n\n");
+    if (outcome.tool_calls.empty()) {
+        out.write("None.\n");
+        return;
+    }
+    for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        const std::string label               = "Tool call " + std::to_string(index + 1);
+        emit_markdown_block(out, label + " name", "text", call.name);
+        emit_markdown_block(out, label + " arguments", "json", call.arguments_json);
+    }
+}
+
+class StringMarkdownSink {
+public:
+    explicit StringMarkdownSink(std::string& value) : value_(&value) {}
+
+    void write(std::string_view fragment) { value_->append(fragment); }
+
+    void repeat(char value, std::size_t count) { value_->append(count, value); }
+
+private:
+    std::string* value_;
+};
+
+class FileMarkdownSink {
+public:
+    FileMarkdownSink(std::ofstream& output, const RequestLogContentCheckpoint& checkpoint,
+                     const std::filesystem::path& temporary, const std::filesystem::path& final)
+        : output_(&output), checkpoint_(&checkpoint), temporary_(&temporary), final_(&final) {}
+
+    void write(std::string_view fragment) {
+        constexpr std::size_t kChunk = 1U << 20;
+        while (!fragment.empty()) {
+            const std::size_t count = std::min(fragment.size(), kChunk);
+            output_->write(fragment.data(), static_cast<std::streamsize>(count));
+            if (!*output_) { throw std::ios_base::failure("request content write failed"); }
+            hasher_.update(fragment.substr(0, count));
+            bytes_ += count;
+            fragment.remove_prefix(count);
+            if (*checkpoint_) { (*checkpoint_)("fragment_written", *temporary_, *final_); }
+        }
+    }
+
+    void repeat(char value, std::size_t count) {
+        const std::array<char, 256> fragment = [value] {
+            std::array<char, 256> result{};
+            result.fill(value);
+            return result;
+        }();
+        while (count != 0) {
+            const std::size_t current = std::min(count, fragment.size());
+            write(std::string_view(fragment.data(), current));
+            count -= current;
+        }
+    }
+
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+
+    [[nodiscard]] std::string digest() {
+        return targets::qwen3_6::frontend_internal::sha256_hex(hasher_.finalize());
+    }
+
+private:
+    std::ofstream* output_;
+    targets::qwen3_6::frontend_internal::Sha256Hasher hasher_;
+    std::uint64_t bytes_ = 0;
+    const RequestLogContentCheckpoint* checkpoint_;
+    const std::filesystem::path* temporary_;
+    const std::filesystem::path* final_;
+};
+
+template <class Emit>
+RequestLogContext::ContentFile
+publish_content_file(const std::filesystem::path& content_dir,
+                     const std::string& server_instance_id, std::string_view prefix,
+                     std::uint64_t request_id, const RequestLogContentCheckpoint& checkpoint,
+                     Emit&& emit) noexcept {
+    RequestLogContext::ContentFile result;
+    result.status = "failed";
+    std::filesystem::path temporary;
+    try {
+        const std::string suffix   = server_instance_id + "-request-" + std::to_string(request_id);
+        const std::string filename = std::string(prefix) + suffix + ".md";
+        const std::filesystem::path final = content_dir / filename;
+        temporary                         = content_dir / ("." + filename + ".tmp");
+        std::error_code error;
+        if (std::filesystem::exists(final, error) || error) {
+            result.error_class = error ? "destination_check_failed" : "destination_collision";
+            return result;
+        }
+        std::ofstream output(temporary, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output) {
+            result.error_class = "temporary_open_failed";
+            return result;
+        }
+        FileMarkdownSink sink(output, checkpoint, temporary, final);
+        emit(sink);
+        output.flush();
+        if (!output) {
+            output.close();
+            error.clear();
+            std::filesystem::remove(temporary, error);
+            result.error_class = error ? "temporary_cleanup_failed" : "temporary_write_failed";
+            return result;
+        }
+        output.close();
+        const std::string digest = sink.digest();
+        if (checkpoint) { checkpoint("before_rename", temporary, final); }
+        std::filesystem::rename(temporary, final, error);
+        if (error) {
+            std::error_code cleanup;
+            std::filesystem::remove(temporary, cleanup);
+            result.error_class = cleanup ? "temporary_cleanup_failed" : "atomic_rename_failed";
+            return result;
+        }
+        result.status = "written";
+        result.file   = filename;
+        result.bytes  = sink.bytes();
+        result.sha256 = digest;
+        return result;
+    } catch (...) {
+        if (!temporary.empty()) {
+            std::error_code cleanup;
+            std::filesystem::remove(temporary, cleanup);
+            if (cleanup) {
+                result.error_class = "temporary_cleanup_failed";
+                return result;
+            }
+        }
+        result.error_class = "format_or_io_failure";
+        return result;
+    }
 }
 
 } // namespace
 
 std::string format_prompt_markdown(std::string_view rendered_prompt,
                                    std::span<const CapturedMediaMetadata> media) {
-    std::string result(rendered_prompt);
-    if (media.empty()) { return result; }
-    result += "\n\n---\n\n## Non-text media metadata\n\n";
-    for (std::size_t index = 0; index < media.size(); ++index) {
-        const CapturedMediaMetadata& item = media[index];
-        std::string safe_type;
-        safe_type.reserve(std::min<std::size_t>(item.media_type.size(), 128));
-        for (const unsigned char value : item.media_type.substr(0, 128)) {
-            safe_type +=
-                value >= 0x20 && value != 0x7f && value != '`' ? static_cast<char>(value) : ' ';
-        }
-        result += "- item ";
-        result += std::to_string(index + 1);
-        result += ": kind=`";
-        result += item.kind == ninfer::MediaKind::Image ? "image" : "video";
-        result += "`, media_type=`";
-        result += safe_type.empty() ? "unknown" : safe_type;
-        result += "`, bytes=`";
-        result += std::to_string(item.bytes);
-        result += "`, sha256=`";
-        result += item.sha256;
-        result += "`\n";
-    }
+    std::string result;
+    StringMarkdownSink sink(result);
+    emit_prompt_markdown(sink, rendered_prompt, media);
     return result;
 }
 
 std::string format_response_markdown(const GenerationOutcome& outcome) {
-    std::string result = "# Final model response\n\n";
-    append_markdown_block(result, "Reasoning / thinking", "text", outcome.reasoning);
-    append_markdown_block(result, "Assistant content", "text", outcome.text);
-    result += "## Tool calls\n\n";
-    if (outcome.tool_calls.empty()) {
-        result += "None.\n";
-        return result;
-    }
-    for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
-        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
-        const std::string label               = "Tool call " + std::to_string(index + 1);
-        append_markdown_block(result, label + " name", "text", call.name);
-        append_markdown_block(result, label + " arguments", "json", call.arguments_json);
-    }
+    std::string result;
+    StringMarkdownSink sink(result);
+    emit_response_markdown(sink, outcome);
     return result;
 }
 
@@ -1092,8 +1250,10 @@ ServerLogEnvironment query_server_log_environment(int device) {
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
                                  std::shared_ptr<spdlog::logger> logger,
-                                 const std::filesystem::path& content_dir)
-    : path_(path), content_dir_(content_dir), logger_(std::move(logger)) {
+                                 const std::filesystem::path& content_dir,
+                                 RequestLogContentCheckpoint content_checkpoint)
+    : path_(path), content_dir_(content_dir), logger_(std::move(logger)),
+      content_checkpoint_(std::move(content_checkpoint)) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
         normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
@@ -1151,9 +1311,7 @@ void JsonlRequestLog::write_request_start(RequestLogContext& context) {
     if (!content_dir_.empty()) {
         context.prompt_file =
             context.rendered_prompt
-                ? write_content(
-                      "prompt", context.id,
-                      format_prompt_markdown(*context.rendered_prompt, context.captured_media))
+                ? write_prompt_content(context.id, *context.rendered_prompt, context.captured_media)
                 : RequestLogContext::ContentFile{.status      = "failed",
                                                  .error_class = "rendered_prompt_missing"};
         context.response_file.status = "pending";
@@ -1173,8 +1331,7 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
     if (!enabled()) { return; }
     RequestLogContext terminal = context;
     if (!content_dir_.empty()) {
-        terminal.response_file =
-            write_content("response", context.id, format_response_markdown(outcome));
+        terminal.response_file = write_response_content(context.id, outcome);
     }
     for (const ninfer::CheckpointLifecycleFact& fact : outcome.checkpoint_lifecycle) {
         append(
@@ -1183,14 +1340,16 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
     append(format_request_done_json(server_instance_id_, unix_time_ms(), terminal, outcome));
 }
 
-void JsonlRequestLog::write_request_error(const RequestLogContext& context,
-                                          const std::string& message) {
+void JsonlRequestLog::write_request_error(
+    const RequestLogContext& context, const std::string& message,
+    std::span<const ninfer::CheckpointLifecycleFact> checkpoint_lifecycle) {
     if (!enabled()) { return; }
     RequestLogContext terminal = context;
     if (!content_dir_.empty()) {
         terminal.response_file = {.status = "not_available", .error_class = "generation_failed"};
     }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), terminal, message));
+    append(format_request_error_json(server_instance_id_, unix_time_ms(), terminal, message,
+                                     summarize_checkpoint_lifecycle(checkpoint_lifecycle)));
 }
 
 void JsonlRequestLog::write_checkpoint_lifecycle(const ninfer::CheckpointLifecycleFact& fact,
@@ -1207,59 +1366,20 @@ void JsonlRequestLog::write_checkpoint_lifecycle(const RequestLogContext& contex
     append(format_checkpoint_lifecycle_json(server_instance_id_, unix_time_ms(), context, fact));
 }
 
-RequestLogContext::ContentFile JsonlRequestLog::write_content(std::string_view prefix,
-                                                              std::uint64_t request_id,
-                                                              std::string_view content) noexcept {
-    RequestLogContext::ContentFile result;
-    result.status = "failed";
-    std::filesystem::path temporary;
-    try {
-        const std::string suffix   = server_instance_id_ + "-request-" + std::to_string(request_id);
-        const std::string filename = std::string(prefix) + suffix + ".md";
-        const std::filesystem::path final = content_dir_ / filename;
-        temporary                         = content_dir_ / ("." + filename + ".tmp");
-        std::error_code error;
-        if (std::filesystem::exists(final, error) || error) {
-            result.error_class = error ? "destination_check_failed" : "destination_collision";
-            return result;
-        }
-        const std::string digest = targets::qwen3_6::frontend_internal::sha256_hex(
-            targets::qwen3_6::frontend_internal::sha256(content));
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::out | std::ios::trunc);
-            if (!output) {
-                result.error_class = "temporary_open_failed";
-                return result;
-            }
-            output.write(content.data(), static_cast<std::streamsize>(content.size()));
-            output.flush();
-            if (!output) {
-                output.close();
-                std::filesystem::remove(temporary, error);
-                result.error_class = "temporary_write_failed";
-                return result;
-            }
-        }
-        std::filesystem::rename(temporary, final, error);
-        if (error) {
-            std::error_code cleanup;
-            std::filesystem::remove(temporary, cleanup);
-            result.error_class = "atomic_rename_failed";
-            return result;
-        }
-        result.status = "written";
-        result.file   = filename;
-        result.bytes  = content.size();
-        result.sha256 = digest;
-        return result;
-    } catch (...) {
-        if (!temporary.empty()) {
-            std::error_code cleanup;
-            std::filesystem::remove(temporary, cleanup);
-        }
-        result.error_class = "unexpected_io_failure";
-        return result;
-    }
+RequestLogContext::ContentFile
+JsonlRequestLog::write_prompt_content(std::uint64_t request_id, std::string_view rendered_prompt,
+                                      std::span<const CapturedMediaMetadata> media) noexcept {
+    return publish_content_file(
+        content_dir_, server_instance_id_, "prompt", request_id, content_checkpoint_,
+        [&](auto& sink) { emit_prompt_markdown(sink, rendered_prompt, media); });
+}
+
+RequestLogContext::ContentFile
+JsonlRequestLog::write_response_content(std::uint64_t request_id,
+                                        const GenerationOutcome& outcome) noexcept {
+    return publish_content_file(content_dir_, server_instance_id_, "response", request_id,
+                                content_checkpoint_,
+                                [&](auto& sink) { emit_response_markdown(sink, outcome); });
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {

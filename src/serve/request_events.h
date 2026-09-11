@@ -99,6 +99,7 @@ struct RequestLogMetadata {
 // separate shape because sampler and prompt semantics may not have resolved.
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
+    std::string response_id;
     std::string protocol;
     std::string model;
     bool stream                             = false;

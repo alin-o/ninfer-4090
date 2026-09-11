@@ -113,6 +113,9 @@ the versioned request log so every persisted body is request-correlated. Gateway
 file publication; Frontend supplies the exact rendered prompt; Engine/GenerationService supplies
 the final logical response. Operators own permissions, retention, and rotation for this sensitive
 directory.
+The publisher emits and hashes bounded fragments from those existing buffers; formatting and I/O
+exceptions are capture failures and must never escape after the request lifecycle has claimed its
+terminal state.
 
 Checkpoint lifecycle JSONL records follow the same ownership boundaries. ResourceManager supplies
 validated logical retention/tier facts, Program supplies physical State/Main/backend-KV quantities,
@@ -122,6 +125,10 @@ request/response correlation unless an owning request is explicitly carried. Pro
 manufacture lifecycle records by subtracting global counters or label an incomplete transfer as
 committed. Tier values are `device`, `host`, `ssd`, and `none`; status values are `committed`,
 `failed`, and `aborted`.
+Terminal summaries, including request-error and post-adoption preparation-rejection summaries, are
+reductions of the same immutable fact list. Program publishes the complete per-image State transfer
+layout; the aggregate linear State pool is not a valid checkpoint byte quantity. Durable import
+identity and occupancy must be captured before releasing the Engine execution lock.
 
 Filesystem paths are permitted only when they are operator-selected local configuration or output
 paths and are necessary to diagnose the operation. A component that cannot prove a resident-service

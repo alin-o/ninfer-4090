@@ -921,6 +921,10 @@ byte, and digest fields; generation failure reports the response as `not_availab
 entry contains only the relative filename, byte count, and SHA-256 digest. No captured body is
 embedded in JSONL or operational stderr. When the option is absent, `content_files` is absent and
 the existing content-free behavior is unchanged.
+Production publication renders and hashes bounded fragments directly from the Frontend and final
+outcome buffers; it does not construct a second request-sized Markdown string. Formatting,
+hashing, write, flush, and rename failures all remain inside the capture failure classification,
+so they cannot suppress the request's terminal record.
 
 Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
@@ -933,9 +937,9 @@ payload-size fields; they do not infer request behavior from process-global coun
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, boundary-consistent KV capacity/used/free, and optional prompt-file publication metadata |
-| `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
+| `request_rejected` | parsed request shape and response identity, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, the exact HTTP status/type/code/parameter/message, and any lifecycle-derived checkpoint summary for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, exact generated token IDs, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, complete speculative-decoding counters, terminal KV capacity/used/free, and optional response-file metadata |
-| `request_error` | the resolved request configuration, generation/cancellation/pre-outcome transport terminal message, terminal KV capacity/used/free, and optional content-file status |
+| `request_error` | the resolved request configuration, generation/cancellation/pre-outcome transport terminal message, lifecycle-derived checkpoint summary, terminal KV capacity/used/free, and optional content-file status |
 | `checkpoint_lifecycle` | stable checkpoint key/content digest and frontier, role/scope, operation/status, source/destination tier, exact State/Main/backend-KV quantities, measured elapsed nanoseconds when available, request/response correlation or explicit null background correlation, and a boundary-coherent KV snapshot |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
@@ -945,13 +949,16 @@ Checkpoint lifecycle operations are `created`, `loaded`, `restored`, `offloaded`
 Engine carries attributable facts with the owning request, and the Gateway emits asynchronous SSD
 publication facts with null request/response IDs. A committed fact means that operation crossed its
 own publication boundary; partial or cancelled work is never promoted to committed. `state.images`
-counts StateImage objects and `state.bytes` uses the Program-published StateImage size. Main and
+counts StateImage objects and `state.bytes` uses the Program-published, per-image physical transfer
+layout (linear State plus continuation-hidden and optional DFlash components), never the complete
+multi-slot linear State pool. Main and
 backend KV report pages separately and derive bytes from their distinct Program-published page
 sizes. `serialized_bytes` is meaningful for SSD records.
 
-`request_done.checkpoint_summary` is a compact view derived from those transaction facts: whether
-reuse selected a checkpoint, whether a Host/SSD restore committed, and how many request captures or
-offloads committed or aborted. It is not computed from global throughput counter deltas.
+`request_done.checkpoint_summary` and the corresponding error/rejection summaries are compact views
+derived from those immutable facts: whether reuse selected a checkpoint, whether a Host/SSD restore
+committed, and how many request captures or offloads committed or aborted. They are not computed
+from global throughput counter deltas.
 
 Request-start, request-terminal, and checkpoint lifecycle `kv_capacity` objects use authoritative
 physical pool/store values. Device Main and backend pools each report capacity/used/free in pages

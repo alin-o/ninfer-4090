@@ -1,15 +1,22 @@
 #include "serve/generation_service.h"
+#include "serve/anthropic_messages.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_responses.h"
+#include "serve/request_events.h"
+#include "serve/request_log.h"
 
 #include <cuda_runtime.h>
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -160,8 +167,8 @@ void exercise_harness(const char* artifact) {
                   << " prompt_tokens=" << continued.prompt_tokens
                   << " reused_tokens=" << continued.metrics.prefix_cache_hit_tokens
                   << " path=" << static_cast<int>(continued.metrics.prefix_reuse_path)
-                  << " state_h2d=" << after_continue.state_h2d_count - before_continue.state_h2d_count
-                  << '\n';
+                  << " state_h2d="
+                  << after_continue.state_h2d_count - before_continue.state_h2d_count << '\n';
         require(continued.metrics.prefix_reuse_path == PrefixReusePath::PrivateEndpoint &&
                     continued.metrics.prefix_cache_hit_tokens >= completed_tokens - 1,
                 "Responses continuation lost the completed assistant response");
@@ -189,6 +196,123 @@ void exercise_harness(const char* artifact) {
     std::cout << "openai_continuation exact_cold_match=true\n";
 }
 
+struct TemporaryDirectory {
+    TemporaryDirectory() {
+        std::string pattern = "/tmp/ninfer-request-capture-real-XXXXXX";
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const char* created = ::mkdtemp(writable.data());
+        if (created == nullptr) { throw std::runtime_error("capture mkdtemp failed"); }
+        path = created;
+    }
+
+    ~TemporaryDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+
+    std::filesystem::path path;
+};
+
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(input)), {});
+}
+
+struct CapturedGeneration {
+    GenerationOutcome outcome;
+    std::string prompt;
+    std::string response;
+};
+
+CapturedGeneration capture_generation(GenerationService& service, JsonlRequestLog& writer,
+                                      GenerationRequest request, std::string protocol,
+                                      std::uint64_t request_id, bool stream) {
+    PreparedRequest prepared  = service.prepare(request, stream ? GenerationConsumerMode::Streaming
+                                                                : GenerationConsumerMode::Aggregate);
+    RequestLogContext context = make_request_log_context(
+        request_id, std::move(protocol), request,
+        RequestLogMetadata{.model       = "qwen3.8",
+                           .response_id = "capture-response-" + std::to_string(request_id),
+                           .stream      = stream,
+                           .output_tokens_explicit = true},
+        prepared);
+    writer.write_request_start(context);
+    StreamSink sink;
+    GenerationOutcome outcome = service.run(prepared, stream ? &sink : nullptr);
+    writer.write_request_done(context, outcome);
+    const std::string suffix =
+        writer.server_instance_id() + "-request-" + std::to_string(request_id) + ".md";
+    return {.outcome = std::move(outcome),
+            .prompt  = read_file(service.options().request_log_content_dir / ("prompt" + suffix)),
+            .response =
+                read_file(service.options().request_log_content_dir / ("response" + suffix))};
+}
+
+void exercise_protocol_content_capture(const char* artifact) {
+    TemporaryDirectory temporary;
+    ServeOptions configured            = options(artifact);
+    configured.request_log_jsonl       = temporary.path / "requests.jsonl";
+    configured.request_log_content_dir = temporary.path / "content";
+    configured.context_cache.enabled   = false;
+    GenerationService service(configured);
+    JsonlRequestLog writer(configured.request_log_jsonl, artifact, {},
+                           configured.request_log_content_dir);
+
+    const Json chat_body{
+        {"model", "qwen3.8"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "capture-chat-sentinel"}}})},
+        {"max_tokens", 4}};
+    GenerationRequest chat = parse_chat_completion_request(chat_body, RequestLimits{}).generation;
+    const CapturedGeneration chat_aggregate =
+        capture_generation(service, writer, chat, "openai_chat_completions", 1, false);
+    GenerationRequest chat_stream =
+        parse_chat_completion_request(chat_body, RequestLimits{}).generation;
+    const CapturedGeneration streamed = capture_generation(service, writer, std::move(chat_stream),
+                                                           "openai_chat_completions", 2, true);
+
+    OpenAIResponsesStore store(4, 1ULL << 20);
+    const auto responses_request =
+        parse_openai_responses_create_request(Json{{"model", "qwen3.8"},
+                                                   {"input", "capture-responses-sentinel"},
+                                                   {"store", false},
+                                                   {"max_output_tokens", 4}},
+                                              RequestLimits{});
+    auto responses = resolve_openai_responses_prompt(responses_request.prompt, store,
+                                                     "capture-responses", false);
+    const CapturedGeneration responses_capture = capture_generation(
+        service, writer, std::move(responses.generation), "openai_responses", 3, false);
+
+    AnthropicThinkingSigner::Key signing_key{};
+    AnthropicThinkingSigner signer(signing_key);
+    GenerationRequest anthropic =
+        parse_anthropic_messages_request(
+            Json{{"model", "qwen3.8"},
+                 {"messages",
+                  Json::array({Json{{"role", "user"}, {"content", "capture-anthropic-sentinel"}}})},
+                 {"max_tokens", 4}},
+            RequestLimits{}, signer)
+            .generation;
+    const CapturedGeneration anthropic_capture =
+        capture_generation(service, writer, std::move(anthropic), "anthropic_messages", 4, false);
+
+    require(chat_aggregate.prompt.find("capture-chat-sentinel") != std::string::npos &&
+                responses_capture.prompt.find("capture-responses-sentinel") != std::string::npos &&
+                anthropic_capture.prompt.find("capture-anthropic-sentinel") != std::string::npos,
+            "protocol capture did not persist Frontend-rendered prompt semantics");
+    require(chat_aggregate.prompt.find("\"messages\"") == std::string::npos &&
+                responses_capture.prompt.find("\"input\"") == std::string::npos,
+            "protocol capture persisted raw HTTP JSON instead of rendered prompt text");
+    require(streamed.outcome.text == chat_aggregate.outcome.text &&
+                streamed.outcome.reasoning == chat_aggregate.outcome.reasoning &&
+                streamed.response == chat_aggregate.response,
+            "streaming and aggregate generation produced different final Markdown");
+    require(chat_aggregate.response == format_response_markdown(chat_aggregate.outcome) &&
+                responses_capture.response == format_response_markdown(responses_capture.outcome) &&
+                anthropic_capture.response == format_response_markdown(anthropic_capture.outcome),
+            "a protocol capture did not preserve the final logical response");
+}
+
 } // namespace
 
 int main() {
@@ -201,6 +325,7 @@ int main() {
     }
     try {
         exercise_harness(artifact);
+        exercise_protocol_content_capture(artifact);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

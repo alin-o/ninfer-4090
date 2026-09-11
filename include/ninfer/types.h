@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -750,6 +752,41 @@ struct RequestCheckpointSummary {
     std::uint32_t capture_aborted   = 0;
 };
 
+[[nodiscard]] inline RequestCheckpointSummary
+summarize_checkpoint_lifecycle(std::span<const CheckpointLifecycleFact> facts) noexcept {
+    RequestCheckpointSummary summary;
+    for (const CheckpointLifecycleFact& fact : facts) {
+        if (fact.status == CheckpointLifecycleStatus::Committed) {
+            switch (fact.operation) {
+            case CheckpointLifecycleOperation::Loaded:
+                summary.reuse_loaded = true;
+                break;
+            case CheckpointLifecycleOperation::Restored:
+                summary.reuse_loaded      = true;
+                summary.restore_committed = true;
+                break;
+            case CheckpointLifecycleOperation::Created:
+                if (summary.created_committed != std::numeric_limits<std::uint32_t>::max()) {
+                    ++summary.created_committed;
+                }
+                break;
+            case CheckpointLifecycleOperation::Offloaded:
+                summary.offload_committed = true;
+                break;
+            case CheckpointLifecycleOperation::Persisted:
+            case CheckpointLifecycleOperation::Evicted:
+                break;
+            }
+        } else if (fact.status == CheckpointLifecycleStatus::Aborted &&
+                   (fact.operation == CheckpointLifecycleOperation::Created ||
+                    fact.operation == CheckpointLifecycleOperation::Offloaded) &&
+                   summary.capture_aborted != std::numeric_limits<std::uint32_t>::max()) {
+            ++summary.capture_aborted;
+        }
+    }
+    return summary;
+}
+
 enum class PrefixReusePath : std::uint8_t {
     Root,
     PrivateEndpoint,
@@ -890,19 +927,23 @@ struct MemorySummary {
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
-    std::size_t minimum_runtime_reservation_bytes  = 0;
-    std::size_t kv_capacity_increment_bytes        = 0;
-    std::size_t runtime_reservation_bytes          = 0;
-    std::size_t available_after_weights_bytes      = 0;
-    std::size_t available_after_startup_bytes      = 0;
-    std::size_t kv_capacity_headroom_bytes         = 0;
-    std::size_t planned_slack_bytes                = 0;
-    std::size_t workspace_logical_peak_bytes       = 0;
-    std::size_t cuda_graph_allowance_bytes         = 0;
-    std::size_t kv_payload_bytes                   = 0;
-    std::size_t text_kv_bytes                      = 0;
-    std::size_t mtp_kv_bytes                       = 0;
-    std::size_t gdn_state_bytes                    = 0;
+    std::size_t minimum_runtime_reservation_bytes = 0;
+    std::size_t kv_capacity_increment_bytes       = 0;
+    std::size_t runtime_reservation_bytes         = 0;
+    std::size_t available_after_weights_bytes     = 0;
+    std::size_t available_after_startup_bytes     = 0;
+    std::size_t kv_capacity_headroom_bytes        = 0;
+    std::size_t planned_slack_bytes               = 0;
+    std::size_t workspace_logical_peak_bytes      = 0;
+    std::size_t cuda_graph_allowance_bytes        = 0;
+    std::size_t kv_payload_bytes                  = 0;
+    std::size_t text_kv_bytes                     = 0;
+    std::size_t mtp_kv_bytes                      = 0;
+    std::size_t gdn_state_bytes                   = 0;
+    // One complete checkpoint StateImage in the authoritative physical transfer layout. Unlike
+    // gdn_state_bytes, this includes continuation-hidden and optional DFlash components and is
+    // not multiplied by the number of Device slots.
+    std::size_t checkpoint_state_image_bytes       = 0;
     std::size_t dflash_kv_bytes                    = 0;
     std::size_t replay_records_bytes               = 0;
     std::uint32_t device_main_kv_capacity_pages    = 0;

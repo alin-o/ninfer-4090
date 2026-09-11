@@ -281,6 +281,15 @@ void HttpServer::record_request_start(RequestLogContext& context) {
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
+    RequestLogContext lifecycle_context;
+    lifecycle_context.id          = context.id;
+    lifecycle_context.response_id = context.response_id;
+    if (service_ != nullptr) {
+        lifecycle_context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
+    }
+    for (const ninfer::CheckpointLifecycleFact& fact : context.error.checkpoint_lifecycle) {
+        request_jsonl_.write_checkpoint_lifecycle(lifecycle_context, fact);
+    }
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
 }
@@ -298,7 +307,8 @@ void HttpServer::record_request_failure(RequestLogContext& context, const Reques
     for (const ninfer::CheckpointLifecycleFact& fact : failure.checkpoint_lifecycle) {
         request_jsonl_.write_checkpoint_lifecycle(context, fact);
     }
-    request_jsonl_.write_request_error(context, failure.machine_message);
+    request_jsonl_.write_request_error(context, failure.machine_message,
+                                       failure.checkpoint_lifecycle);
     operational_log_.request_failure(context, failure);
     metrics_.end_request(context.id);
 }

@@ -557,6 +557,7 @@ struct FakeFinishResult {
     FakeSpeculativeStats speculative;
     FakeContinuationSummary summary;
     std::optional<FakeContinuationHandle> continuation;
+    std::vector<ninfer::CheckpointLifecycleFact> lifecycle;
 };
 
 struct FakeAbortResult {
@@ -2651,6 +2652,13 @@ void test_root_lifecycle_and_prefix_reuse() {
     require(finish.status == ConsumeStatus::Consumed &&
                 finish.disposition == FinishDisposition::Catalogued,
             "terminal continuation was not catalogued");
+    require(finish.lifecycle.size() == 1 &&
+                finish.lifecycle.front().operation ==
+                    ninfer::CheckpointLifecycleOperation::Created &&
+                finish.lifecycle.front().status == ninfer::CheckpointLifecycleStatus::Committed &&
+                finish.lifecycle.front().role == ninfer::CheckpointLifecycleRole::SessionEndpoint &&
+                finish.lifecycle.front().frontier == 16,
+            "terminal retention did not publish its created endpoint fact");
     require(manager.lane_state(first.lane) == ninfer::runtime::LogicalLaneState::Free,
             "terminal lane did not return to Free");
 

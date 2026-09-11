@@ -194,6 +194,13 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     throw ApiException(request_error_to_api_error(exception));
 }
 
+[[noreturn]] void throw_with_durable_lifecycle(
+    ApiError error, const std::vector<ninfer::CheckpointLifecycleFact>& durable_lifecycle) {
+    error.checkpoint_lifecycle.insert(error.checkpoint_lifecycle.begin(), durable_lifecycle.begin(),
+                                      durable_lifecycle.end());
+    throw ApiException(std::move(error));
+}
+
 void check_preparation_control(Clock::time_point deadline,
                                const std::function<bool()>& is_cancelled) {
     if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
@@ -421,10 +428,18 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                   : ninfer::OutputConsumerMode::Aggregate,
                                               prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception);
+    } catch (const ApiException& exception) {
+        throw_with_durable_lifecycle(exception.error(), prepared.durable_lifecycle);
+    } catch (const ninfer::RequestError& exception) {
+        throw_with_durable_lifecycle(request_error_to_api_error(exception),
+                                     prepared.durable_lifecycle);
     } catch (const std::invalid_argument& exception) {
-        throw_invalid_input(exception, "invalid_prompt");
+        ApiError error;
+        error.status  = 400;
+        error.param   = "messages";
+        error.code    = "invalid_prompt";
+        error.message = exception.what();
+        throw_with_durable_lifecycle(std::move(error), prepared.durable_lifecycle);
     }
     return prepared;
 }
@@ -479,7 +494,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     ninfer::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
-    } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    } catch (const ninfer::RequestError& exception) {
+        throw_with_durable_lifecycle(request_error_to_api_error(exception),
+                                     prepared.durable_lifecycle);
+    }
     if (durable_catalog_) {
         durable_catalog_->observe_hit(
             DurableSharedPrefixRestore{.frontier         = prepared.durable_restore_frontier,
@@ -504,11 +522,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.matched_stop_string  = std::move(result.matched_stop_string);
     outcome.id_slot              = result.slot;
     outcome.session_digest       = std::move(result.session_digest);
-    outcome.checkpoints          = result.checkpoints;
-    outcome.checkpoint_lifecycle = std::move(result.checkpoint_lifecycle);
-    outcome.checkpoint_lifecycle.insert(outcome.checkpoint_lifecycle.end(),
-                                        std::make_move_iterator(prepared.durable_lifecycle.begin()),
-                                        std::make_move_iterator(prepared.durable_lifecycle.end()));
+    outcome.checkpoint_lifecycle = std::move(prepared.durable_lifecycle);
+    outcome.checkpoint_lifecycle.insert(
+        outcome.checkpoint_lifecycle.end(),
+        std::make_move_iterator(result.checkpoint_lifecycle.begin()),
+        std::make_move_iterator(result.checkpoint_lifecycle.end()));
+    outcome.checkpoints = summarize_checkpoint_lifecycle(outcome.checkpoint_lifecycle);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =
@@ -520,18 +539,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
-    outcome.metrics.engine_timing            = result.engine_timing;
-    outcome.metrics.prefix_cache_hit_tokens  = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path        = result.prefix_reuse_path;
-    outcome.metrics.materialization          = result.materialization;
-    outcome.metrics.durable_restore_frontier = prepared.durable_restore_frontier;
-    outcome.metrics.durable_loaded_from_ssd  = prepared.durable_loaded_from_ssd;
-    outcome.metrics.durable_warm_available   = prepared.durable_warm_available;
-    outcome.metrics.durable_fallback_reason  = prepared.durable_fallback_reason;
-    if (prepared.durable_loaded_from_ssd) {
-        outcome.checkpoints.reuse_loaded      = true;
-        outcome.checkpoints.restore_committed = true;
-    }
+    outcome.metrics.engine_timing               = result.engine_timing;
+    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
+    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.materialization             = result.materialization;
+    outcome.metrics.durable_restore_frontier    = prepared.durable_restore_frontier;
+    outcome.metrics.durable_loaded_from_ssd     = prepared.durable_loaded_from_ssd;
+    outcome.metrics.durable_warm_available      = prepared.durable_warm_available;
+    outcome.metrics.durable_fallback_reason     = prepared.durable_fallback_reason;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

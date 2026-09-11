@@ -5,6 +5,7 @@
 #include "runtime/engine/shared_snapshot_test_access.h"
 #include "serve/durable_shared_prefix_catalog.h"
 #include "serve/openai_responses.h"
+#include "serve/request_events.h"
 #include "serve/translate.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
@@ -956,13 +957,23 @@ int exercise_last_private_alias_eviction(const char* artifact) {
     const ninfer::GenerationResult branch = engine.generate(
         engine.prepare(input("last-alias-branch", ninfer::CacheRetentionHint::Disposable)),
         one_token);
+    const bool source_created_endpoint =
+        std::any_of(source.checkpoint_lifecycle.begin(), source.checkpoint_lifecycle.end(),
+                    [](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Created &&
+                               fact.status == ninfer::CheckpointLifecycleStatus::Committed &&
+                               fact.role == ninfer::CheckpointLifecycleRole::SessionEndpoint &&
+                               fact.kv_snapshot && fact.kv_snapshot->state_image_bytes != 0;
+                    });
     if (source.generated_token_ids.size() != 1 || branch.generated_token_ids.size() != 1 ||
+        !source_created_endpoint || source.checkpoints.created_committed == 0 ||
         branch.reused_prompt_tokens == 0 ||
         (branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
          branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint)) {
         std::cerr << "last-alias fixture did not establish two private prefix aliases: path="
                   << static_cast<int>(branch.prefix_reuse_path)
-                  << " reused=" << branch.reused_prompt_tokens << '\n';
+                  << " reused=" << branch.reused_prompt_tokens
+                  << " created=" << source.checkpoints.created_committed << '\n';
         return 1;
     }
 
@@ -974,20 +985,33 @@ int exercise_last_private_alias_eviction(const char* artifact) {
     const ninfer::GenerationResult consumed         = engine.generate(
         engine.prepare(input("last-alias-source", ninfer::CacheRetentionHint::LiveSession)),
         full_capacity);
-    const ninfer::RuntimeStats after = engine.runtime_stats();
+    const ninfer::RuntimeStats after   = engine.runtime_stats();
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    const ninfer::serve::KvCapacitySnapshot capacity =
+        ninfer::serve::make_kv_capacity_snapshot(memory);
     if (consumed.generated_token_ids.size() != 1 || consumed.reused_prompt_tokens == 0 ||
         (consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
          consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) ||
         after.pressure_private_owners_evicted <= before.pressure_private_owners_evicted ||
         after.device_main_kv_occupied_pages == 0 || after.device_main_kv_occupied_pages > 8 ||
-        after.device_backend_kv_occupied_pages == 0 || after.device_backend_kv_occupied_pages > 8) {
+        after.device_backend_kv_occupied_pages == 0 || after.device_backend_kv_occupied_pages > 8 ||
+        memory.device_main_kv_occupied_pages != after.device_main_kv_occupied_pages ||
+        memory.device_backend_kv_occupied_pages != after.device_backend_kv_occupied_pages ||
+        memory.host_kv_occupied_bytes != after.host_kv_occupied_bytes ||
+        capacity.device_main.used_pages != memory.device_main_kv_occupied_pages ||
+        capacity.device_main.free_pages + capacity.device_main.used_pages !=
+            capacity.device_main.capacity_pages ||
+        capacity.device_backend.free_pages + capacity.device_backend.used_pages !=
+            capacity.device_backend.capacity_pages ||
+        capacity.host_free_bytes + capacity.host_used_bytes != capacity.host_capacity_bytes) {
         std::cerr << "last private prefix alias did not transfer into the active entitlement: path="
                   << static_cast<int>(consumed.prefix_reuse_path)
                   << " reused=" << consumed.reused_prompt_tokens
                   << " evictions=" << before.pressure_private_owners_evicted << '/'
                   << after.pressure_private_owners_evicted
                   << " main=" << after.device_main_kv_occupied_pages
-                  << " backend=" << after.device_backend_kv_occupied_pages << '\n';
+                  << " backend=" << after.device_backend_kv_occupied_pages
+                  << " host=" << after.host_kv_occupied_bytes << '\n';
         return 1;
     }
     return 0;
@@ -2428,7 +2452,9 @@ int exercise_target_cache_calibration(const char* artifact) {
         effective.context_cache.max_long_anchors_per_continuation != 2 ||
         memory.kv_capacity_mode != ninfer::KvCapacityMode::Automatic || memory.kv_capacity == 0 ||
         memory.kv_capacity >= 4U * 128000U || memory.host_state_capacity_slots != 8 ||
-        memory.host_kv_capacity_bytes != (8ULL << 30) || memory.gdn_state_bytes == 0) {
+        memory.host_kv_capacity_bytes != (8ULL << 30) || memory.gdn_state_bytes == 0 ||
+        memory.checkpoint_state_image_bytes == 0 ||
+        memory.checkpoint_state_image_bytes >= memory.gdn_state_bytes) {
         std::cerr << "target cache calibration resolved an unexpected workload profile: context="
                   << effective.max_context << " concurrency=" << effective.max_concurrency
                   << " kv_mode=" << static_cast<int>(effective.kv_capacity.mode)
@@ -2443,7 +2469,8 @@ int exercise_target_cache_calibration(const char* artifact) {
                   << " resolved_kv=" << memory.kv_capacity
                   << " resolved_host_state=" << memory.host_state_capacity_slots
                   << " resolved_host_kv=" << memory.host_kv_capacity_bytes
-                  << " gdn=" << memory.gdn_state_bytes << '\n';
+                  << " gdn=" << memory.gdn_state_bytes
+                  << " checkpoint_state_image=" << memory.checkpoint_state_image_bytes << '\n';
         return 1;
     }
     std::cout << "target_cache_calibration"
@@ -2451,6 +2478,7 @@ int exercise_target_cache_calibration(const char* artifact) {
               << " kv_page_groups=" << memory.kv_capacity_page_groups
               << " kv_max_page_groups=" << memory.kv_capacity_max_page_groups
               << " gdn_state=" << memory.gdn_state_bytes
+              << " checkpoint_state_image=" << memory.checkpoint_state_image_bytes
               << " device_state_active=4 device_state_cache=4 device_state_total=8"
               << " host_state_slots=" << memory.host_state_capacity_slots
               << " host_kv=" << memory.host_kv_capacity_bytes

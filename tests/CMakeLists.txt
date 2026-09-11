@@ -147,6 +147,10 @@ add_test(NAME ninfer_qwen3_8_responses_host_continuation_test
   COMMAND ${CMAKE_COMMAND} -E env NINFER_PREFIX_REAL_SCENARIO=responses-host-continuation
           $<TARGET_FILE:ninfer_qwen3_6_27b_prefix_real_test>)
 set_tests_properties(ninfer_qwen3_8_responses_host_continuation_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_openai_cache_real_test
+  SOURCES test_openai_cache_real.cpp
+  LIBRARIES ninfer_serve CUDA::cudart)
+set_tests_properties(ninfer_openai_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)

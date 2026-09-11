@@ -997,6 +997,11 @@ int test_previous_response_call_graph() {
                           resolved.generation.messages[2].tool_call_id == "call_a" &&
                           resolved.generation.messages[3].tool_call_id == "call_b",
                       "complete tool results are normalized to declaration order");
+    const auto& automatic = resolved.generation.messages.back().content.back().cache_boundary_after;
+    failures += check(automatic &&
+                          automatic->evidence == ninfer::SharedCandidateEvidence::DefaultAutomatic &&
+                          !resolved.generation.messages[2].content.back().cache_boundary_after,
+                      "automatic cache boundary follows normalized parent/tool history order");
     failures += check(resolved.session_key == "responses-session" &&
                           resolved.generation.preserve_thinking == true &&
                           !resolved.preserve_thinking_semantic_change,

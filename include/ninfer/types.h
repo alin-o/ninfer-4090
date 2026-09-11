@@ -416,6 +416,8 @@ enum class SharedCandidateEvidence : std::uint8_t {
     DefaultAutomatic   = 1U << 2U,
     EngineStructural   = 1U << 3U,
     EngineObserved     = 1U << 4U,
+    // Frontend-selected bounded harness/project anchor before the first volatile token.
+    EngineStableAnchor = 1U << 5U,
 };
 
 [[nodiscard]] constexpr SharedCandidateEvidence operator|(SharedCandidateEvidence left,
@@ -462,8 +464,8 @@ struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
-    // Protocols with their own automatic/explicit write policy disable the Engine's structural
-    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    // Enables Engine structural/observed candidates in addition to protocol markers. A protocol
+    // can disable automatic writes (e.g. OpenAI explicit-only mode); exact shared reads remain.
     bool allow_engine_automatic_shared_prefixes = true;
     // Advance the named session lineage when session_key is present. This does not require an
     // anonymous content-matched source to be retained.

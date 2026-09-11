@@ -1786,6 +1786,15 @@ int test_structural_boundary_preparation_contract() {
                           checkpoint->role == ninfer::targets::qwen3_6::SharedPrefixRole::Harness &&
                           checkpoint->ssd_eligible && cutoff_after_checkpoint,
                       "coincident structural origins, role, or volatility eligibility were lost");
+    failures += check(
+        std::any_of(data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
+                    [&](const auto& item) {
+                        return checkpoint != data.context_cache.structural_checkpoints.end() &&
+                               item.frontier == checkpoint->frontier &&
+                               ninfer::has_shared_candidate_evidence(
+                                   item.evidence, ninfer::SharedCandidateEvidence::EngineStableAnchor);
+                    }),
+        "selected stable harness did not receive its independent capture prior");
     failures +=
         check(std::none_of(data.context_cache.structural_checkpoints.begin(),
                            data.context_cache.structural_checkpoints.end(),
@@ -1809,6 +1818,26 @@ int test_structural_boundary_preparation_contract() {
                            item.frontier == transient->frontier && item.ssd_eligible;
                 }),
         "unselected stable structural checkpoint remained SSD eligible");
+    for (const auto& item : data.context_cache.opportunities) {
+        if (ninfer::has_shared_candidate_evidence(
+                item.evidence, ninfer::SharedCandidateEvidence::EngineStableAnchor)) {
+            failures += check(
+                item.structural_role != ninfer::targets::qwen3_6::SharedPrefixRole::Transient &&
+                    (!data.context_cache.first_volatile_token ||
+                     item.frontier < *data.context_cache.first_volatile_token),
+                "transient or volatile boundary acquired a stable capture prior");
+        }
+    }
+
+    auto repeated = make_input(true);
+    for (unsigned index = 0; index < 12; ++index) {
+        repeated.messages[0].parts[0].text += "\n=== CACHE_BREAKPOINT ===";
+    }
+    const auto bounded = frontend.prepare(std::move(repeated));
+    const auto& bounded_cache = FrontendFactory::inspect(bounded).context_cache;
+    failures += check(bounded_cache.structural_checkpoints.size() > 9 &&
+                          bounded_cache.opportunities.size() <= 9,
+                      "recognition-only structural markers exceeded the bounded capture policy");
     return failures;
 }
 

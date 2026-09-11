@@ -828,7 +828,7 @@ PreparedContextCache prepare_context_cache(
         }
     }
 
-    out.opportunities.reserve(7U + hints.automatic_private_anchors);
+    out.opportunities.reserve(9U + hints.automatic_private_anchors);
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
@@ -925,20 +925,6 @@ PreparedContextCache prepare_context_cache(
             existing->origins |= checkpoint.origins;
             existing->ssd_eligible |= checkpoint.ssd_eligible;
         }
-        if (hints.allow_engine_automatic_shared_prefixes) {
-            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                            SharedCandidateEvidence::EngineStructural, *source.frontier,
-                            engine_order++);
-            auto opportunity = std::find_if(
-                out.opportunities.rbegin(), out.opportunities.rend(), [&](const auto& value) {
-                    return value.kind == PromptCacheMarkerKind::SharedStablePrefix &&
-                           value.frontier == *source.frontier;
-                });
-            if (opportunity != out.opportunities.rend()) {
-                opportunity->structural_origins |= source.origins;
-                opportunity->ssd_eligible = eligible;
-            }
-        }
     }
     std::uint32_t project_frontier = 0;
     bool has_project_frontier      = false;
@@ -1003,6 +989,16 @@ PreparedContextCache prepare_context_cache(
     for (auto& checkpoint : out.structural_checkpoints) {
         checkpoint.ssd_eligible =
             checkpoint.ssd_eligible && checkpoint.role != SharedPrefixRole::Transient;
+        // Recognition can contain many markers and volatile boundaries. Only the selected
+        // stable harness/project pair adds capture opportunities and receives a reuse prior;
+        // a deeper conversation-specific candidate must not erase this shared fallback's value.
+        if (hints.allow_engine_automatic_shared_prefixes &&
+            checkpoint.role != SharedPrefixRole::Transient) {
+            add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
+                            SharedCandidateEvidence::EngineStructural |
+                                SharedCandidateEvidence::EngineStableAnchor,
+                            checkpoint.frontier, engine_order++);
+        }
     }
     for (auto& opportunity : out.opportunities) {
         for (const auto& checkpoint : out.structural_checkpoints) {

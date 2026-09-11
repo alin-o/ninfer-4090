@@ -463,9 +463,10 @@ Shared prefix 的三个状态不能混为一谈：
 - **candidate** 是 Frontend 已解析到 exact token frontier 的可选写入机会；
 - **owner** 是 Program 已发布、具有完整 State/KV identity 与 placement 的 immutable checkpoint。
 
-外部协议或 C++ `PromptInput` 每个请求最多提交四个显式 markers。Frontend 还可以生成最多三个 Engine
-candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
-因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
+外部协议或 C++ `PromptInput` 每个请求最多提交四个显式 markers。Frontend 还可以生成最多三个普通 Engine
+candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt；另外最多保留两个
+选定的 stable harness/project anchors。相同 frontier 合并，因此每个请求最多九个 prepared shared
+candidates。这个固定上限不是启动配置；其他识别出的 structural boundaries 仅保留元数据。
 
 Candidate 保存 evidence flags。策略含义为：
 
@@ -475,6 +476,7 @@ Candidate 保存 evidence flags。策略含义为：
 | `RequestedAutomatic` | 可以参与 pressure，但仍须有严格正净收益 |
 | `DefaultAutomatic` | 只能使用不降低现有 owner 的空余终态 |
 | `EngineStructural` | 只能使用不降低现有 owner 的空余终态 |
+| `EngineStableAnchor` | 选定的稳定 harness/project，带一次 reuse credit；可参与 pressure，仍须有严格正净收益 |
 | `EngineObserved` | 至少两个独立 reuse domains 观测到相同 key 后才可创建 |
 
 Marker、evidence 和 shortlist key 都不证明命中；Program 对 read、dedup 和 publication 重新验证完整
@@ -625,9 +627,15 @@ PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
 | RecentPrivate | 4 |
 | LiveSession | 16 |
 
-Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
+Shared owner 没有固定 retention multiplier。`ExplicitBoundary`、`RequestedAutomatic` 或
+Frontend 选定的 `EngineStableAnchor` 在 publication 时带来
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
 同一 frontier 的多个 evidence 不叠加 credit。
+
+`EngineStableAnchor` 只用于首个 volatile token 之前选定的 harness/project 两个边界；
+普通 `EngineStructural` 观察不获得独立 credit。这样完整 conversation checkpoint 的较深 frontier
+不会掩盖共享 harness 对下一个 conversation 的价值。识别出的其他 structural boundaries 仅保留元数据，
+不增加 capture opportunities。
 
 对 mandatory materialization 的 candidate identity state \(I_c\) 和 pressure target \(T\)：
 

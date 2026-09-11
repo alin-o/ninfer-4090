@@ -171,9 +171,12 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             *automatic_target = CacheBoundary{.evidence = evidence};
         }
     }
-    // OpenAI already defines the automatic/explicit write policy for every request. Existing
-    // exact shared residents are still considered by the Engine independently of this switch.
-    request.allow_engine_automatic_shared_prefixes = false;
+    // The latest content boundary is conversation-specific. Implicit caching also needs the
+    // Frontend's structural harness/tool candidates so another conversation (or a rewritten
+    // volatile suffix) can reuse its stable prefix. Explicit-only mode suppresses automatic
+    // writes, while exact reads of existing shared residents remain available in either mode.
+    request.allow_engine_automatic_shared_prefixes =
+        policy.automatic != OpenAIPromptCacheAutomatic::Disabled;
 }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,

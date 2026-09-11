@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
+#include "serve/openai_responses.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -204,6 +205,53 @@ int test_constrained_decoding_extensions() {
     neutral["guided_grammar"]     = nullptr;
     failures += check(parse(neutral).generation.messages.size() == 1,
                       "neutral constrained-decoding extension values are accepted");
+    return failures;
+}
+
+int test_prompt_cache_policy() {
+    int failures = 0;
+    for (const bool responses : {false, true}) {
+        for (const Json mode : {Json(nullptr), Json("implicit"), Json("explicit")}) {
+            Json history = Json::array();
+            for (int index = 0; index < 7; ++index) {
+                Json part{{"type", responses ? "input_text" : "text"},
+                          {"text", "message " + std::to_string(index)}};
+                if (index < 6) {
+                    part["prompt_cache_breakpoint"] = Json{{"mode", "explicit"}};
+                }
+                history.push_back(Json{{"role", "user"}, {"content", Json::array({part})}});
+            }
+            Json body{{"model", "qwen"}, {responses ? "input" : "messages", history}};
+            if (!mode.is_null()) { body["prompt_cache_options"] = Json{{"mode", mode}}; }
+            GenerationRequest generation;
+            if (responses) {
+                const auto request = parse_openai_responses_create_request(body, limits());
+                OpenAIResponsesStore store(8, 1ULL << 20);
+                generation = resolve_openai_responses_prompt(request.prompt, store, "resp_cache",
+                                                               false)
+                                 .generation;
+            } else {
+                generation = parse(body).generation;
+            }
+            const auto input = prompt(generation);
+            const bool automatic = mode != "explicit";
+            const auto& markers = input.context_cache.markers;
+            const auto automatic_evidence =
+                mode.is_null() ? ninfer::SharedCandidateEvidence::DefaultAutomatic
+                               : ninfer::SharedCandidateEvidence::RequestedAutomatic;
+            failures += check(input.context_cache.allow_engine_automatic_shared_prefixes ==
+                                  automatic,
+                              "OpenAI implicit policy preserves engine harness candidates");
+            failures += check(markers.size() == 4 &&
+                                  markers.front().after_message_count == (automatic ? 4U : 3U) &&
+                                  markers.back().after_message_count == (automatic ? 7U : 6U) &&
+                                  markers.back().evidence ==
+                                      (automatic ? automatic_evidence
+                                                 : ninfer::SharedCandidateEvidence::ExplicitBoundary),
+                              "OpenAI policy selects the last four protocol boundaries after "
+                              "message assembly, reserving the automatic content boundary");
+        }
+    }
     return failures;
 }
 
@@ -734,6 +782,7 @@ int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
+    failures += test_prompt_cache_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();

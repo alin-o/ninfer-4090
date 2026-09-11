@@ -2049,47 +2049,56 @@ void test_portfolio_demand_and_owner_aggregation() {
 void test_shared_capture_subtracts_private_transition_loss() {
     using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
 
-    FakeProgram program;
-    program.required_pressure_actions             = 1;
-    program.require_evictions                     = true;
-    program.pressure_target_immediate_ns_override = 0;
-    FakeCaptureAssessment capture{
-        .shared_evidence     = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-        .publishes_shared    = true,
-        .physically_feasible = false,
-    };
-    FakeContinuationHandle owner{7, 0};
-    const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
-    const std::array<PlanningOwnerId, 1> private_owner_ids{PlanningOwnerId{.value = 0}};
-    const std::array<Planner::OwnerPolicy, 1> owner_policies{
-        Planner::OwnerPolicy{.owner = PlanningOwnerId{.value = 0}, .private_retention_weight = 4},
-    };
-    const std::array<Planner::CheckpointPolicy, 1> checkpoint_policies{
-        Planner::CheckpointPolicy{
-            .owner                = PlanningOwnerId{.value = 0},
-            .checkpoint           = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
-                                                  .frontier = 16,
-                                                  .ordinal  = 0},
-            .rebuild_ns           = 1000,
-            .baseline_recovery_ns = 0,
-        },
-    };
+    for (const auto evidence : {ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                                ninfer::SharedCandidateEvidence::EngineStableAnchor,
+                                ninfer::SharedCandidateEvidence::EngineStructural}) {
+        FakeProgram program;
+        program.required_pressure_actions             = 1;
+        program.require_evictions                     = true;
+        program.pressure_target_immediate_ns_override = 0;
+        FakeCaptureAssessment capture{
+            .shared_evidence     = evidence,
+            .publishes_shared    = true,
+            .physically_feasible = false,
+        };
+        FakeContinuationHandle owner{7, 0};
+        const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
+        const std::array<PlanningOwnerId, 1> private_owner_ids{PlanningOwnerId{.value = 0}};
+        const std::array<Planner::OwnerPolicy, 1> owner_policies{
+            Planner::OwnerPolicy{.owner                    = PlanningOwnerId{.value = 0},
+                                 .private_retention_weight = 4},
+        };
+        const std::array<Planner::CheckpointPolicy, 1> checkpoint_policies{
+            Planner::CheckpointPolicy{
+                .owner                = PlanningOwnerId{.value = 0},
+                .checkpoint           = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                                      .frontier = 16,
+                                                      .ordinal  = 0},
+                .rebuild_ns           = 1000,
+                .baseline_recovery_ns = 0,
+            },
+        };
 
-    Planner planner;
-    const auto result = planner.plan(program, test_cost_model(),
-                                     Planner::Input{
-                                         .capture              = &capture,
-                                         .private_owners       = private_owners,
-                                         .private_owner_ids    = private_owner_ids,
-                                         .shared_owners        = {},
-                                         .shared_owner_ids     = {},
-                                         .owner_policies       = owner_policies,
-                                         .checkpoint_policies  = checkpoint_policies,
-                                         .candidate_rebuild_ns = 1000,
-                                     });
-    require(result && result->baseline_value == 0 && result->target_value == 1000 &&
-                result->immediate_ns == 0 && result->net_gain == 600,
-            "shared capture gain did not subtract the private capability transition loss");
+        Planner planner;
+        const auto result = planner.plan(program, test_cost_model(),
+                                         Planner::Input{
+                                             .capture              = &capture,
+                                             .private_owners       = private_owners,
+                                             .private_owner_ids    = private_owner_ids,
+                                             .shared_owners        = {},
+                                             .shared_owner_ids     = {},
+                                             .owner_policies       = owner_policies,
+                                             .checkpoint_policies  = checkpoint_policies,
+                                             .candidate_rebuild_ns = 1000,
+                                         });
+        if (evidence == ninfer::SharedCandidateEvidence::EngineStructural) {
+            require(!result, "transient structural observation acquired an unobserved reuse prior");
+            continue;
+        }
+        require(result && result->baseline_value == 0 && result->target_value == 1000 &&
+                    result->immediate_ns == 0 && result->net_gain == 600,
+                "shared capture gain did not subtract the private capability transition loss");
+    }
 }
 
 void test_shared_capture_budget_bounds_committed_canonical_targets() {
@@ -3195,25 +3204,34 @@ void test_in_progress_adoption_and_private_capture() {
 }
 
 void test_projected_nested_shared_candidates_use_marginal_value() {
-    FakeManager manager = make_manager(1, 2, 2);
-    FakeProgram program;
-    FakeRequestBasePlan base = make_base(61);
-    base.cache.opportunities = {
-        FakeContextCache::Opportunity{
-            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
-            .frontier = 32,
-        },
-        FakeContextCache::Opportunity{
-            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
-            .frontier = 64,
-        },
-    };
-    const ActiveRequest active = start_active(manager, program, 61, base, 1);
-    require(program.selected_shared_capture_frontiers == std::vector<std::uint32_t>{64},
-            "nested shared candidates were selected independently instead of by marginal value");
-    (void)finish_active(manager, program, active);
+    for (const bool stable_harness : {false, true}) {
+        FakeManager manager = make_manager(1, 2, 2);
+        FakeProgram program;
+        FakeRequestBasePlan base = make_base(61);
+        auto harness_evidence    = ninfer::SharedCandidateEvidence::EngineStructural;
+        if (stable_harness) {
+            harness_evidence |= ninfer::SharedCandidateEvidence::EngineStableAnchor;
+        }
+        base.cache.opportunities = {
+            FakeContextCache::Opportunity{
+                .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence = harness_evidence,
+                .frontier = 32,
+            },
+            FakeContextCache::Opportunity{
+                .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+                .frontier = 64,
+            },
+        };
+        const ActiveRequest active = start_active(manager, program, 61, base, 1);
+        const std::vector<std::uint32_t> expected =
+            stable_harness ? std::vector<std::uint32_t>{32, 64} : std::vector<std::uint32_t>{64};
+        require(program.selected_shared_capture_frontiers == expected,
+                "stable harness lost its independent reuse prior, or nested transient candidates "
+                "were credited independently");
+        (void)finish_active(manager, program, active);
+    }
 }
 
 void test_observed_shared_candidate_requires_independent_domains() {

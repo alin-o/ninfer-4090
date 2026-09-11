@@ -359,14 +359,25 @@ candidates:
 - omitted `prompt_cache_options` creates a default implicit candidate at the latest representable
   content boundary;
 - `mode:"implicit"` requests the same automatic candidate explicitly;
-- `mode:"explicit"` disables that implicit write for the request;
+- `mode:"explicit"` disables automatic shared-prefix writes for the request;
 - `prompt_cache_breakpoint:{"mode":"explicit"}` on supported content creates an explicit
   candidate.
 
-One request carries at most four distinct writes. An implicit target occupies one slot unless it
-coincides with an explicit target; the remaining slots contain the latest explicit boundaries.
+One request carries at most four protocol-selected write candidates. An implicit target occupies
+one slot unless it coincides with an explicit target; the remaining slots contain the latest
+explicit boundaries.
 Earlier schema-valid historical breakpoints are accepted but are not new write candidates. Exact
 reads of already-published prefixes do not require the request to repeat a marker.
+
+Default and implicit modes also allow Engine automatic candidates, including Frontend-recognized
+stable harness/tool/project boundaries. These do not consume protocol marker slots and remain
+subject to the Engine's bounded admission and retention policy. They preserve a shared fallback
+when the conversation or volatile instruction suffix changes. The selected stable harness/project
+anchors receive one expiring reuse credit at publication, so a longer conversation checkpoint
+does not hide their value before the first reuse by a different conversation. Responses applies the
+protocol policy after assembling instructions, parent history, and current input, so its automatic content
+boundary and latest explicit markers refer to the complete prompt. Explicit-only mode suppresses
+these automatic writes but can still read an existing exact prefix.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an

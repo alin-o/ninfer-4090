@@ -135,6 +135,16 @@ offloaded with State/Main/MTP under pressure, then restored for the next user tu
 inferred head advancement, reuse through the assistant response (allowing the final pending token),
 and exact generated-token and MTP-counter agreement with a cold continuation.
 
+`ninfer_openai_cache_real_test` exercises the full OpenAI parsing/resolution/GenerationService
+path with SSD disabled. A Responses request seeds a stable harness, and a Chat Completions request
+with a different volatile instruction suffix and conversation restores it from RAM. It checks
+explicit-only write suppression and existing-prefix reads, rejects a changed harness, and compares
+generated tokens and MTP counters with a cold run. It then continues the completed assistant reply
+through Responses, requiring reuse through that reply (allowing the final pending token) and another
+exact cold comparison. The separate `responses-host-continuation` scenario forces the completed
+private endpoint into RAM and requires at least 99% reuse of its longer prompt.
+It uses `NINFER_QWEN3_8_27B_WEIGHTS`.
+
 The calibration comparison and constrained four-request fallback are direct scenario invocations
 so their stdout (including fixture hashes) remains available:
 

@@ -710,10 +710,7 @@ public:
         std::vector<PlanningOwnerRecord> capture_owner_records;
         if (candidate.publishes_shared) {
             const bool pressure_evidence =
-                has_shared_candidate_evidence(candidate.shared_evidence,
-                                              SharedCandidateEvidence::ExplicitBoundary) ||
-                has_shared_candidate_evidence(candidate.shared_evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic) ||
+                shared_candidate_has_credit(candidate.shared_evidence) ||
                 matching_reuse_domains(candidate.shortlist_key) >= 2U;
 
             std::vector<CaptureScenario> scenarios;
@@ -1463,10 +1460,7 @@ public:
         entry.observation = RetentionObservation{.retention_class = RetentionClass::SharedStable};
         merge_shared_metadata(entry, imported.metadata());
         entry.ssd_backed      = ssd_backed;
-        entry.explicit_credit = has_shared_candidate_evidence(
-                                    entry.evidence, SharedCandidateEvidence::ExplicitBoundary) ||
-                                has_shared_candidate_evidence(
-                                    entry.evidence, SharedCandidateEvidence::RequestedAutomatic);
+        entry.explicit_credit = shared_candidate_has_credit(entry.evidence);
         entry.credit_expiry_epoch =
             entry.explicit_credit
                 ? (demand_epoch_ > std::numeric_limits<std::uint64_t>::max() - kDemandWindowCapacity
@@ -2230,11 +2224,7 @@ private:
                           provisional_demand.exact_resident_keys.end(),
                           *key) != provisional_demand.exact_resident_keys.end();
             if (exact_shared_resident || (exact_resident && !selected_private_base)) { continue; }
-            const bool declared =
-                has_shared_candidate_evidence(opportunity.evidence,
-                                              SharedCandidateEvidence::ExplicitBoundary) ||
-                has_shared_candidate_evidence(opportunity.evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic);
+            const bool credited = shared_candidate_has_credit(opportunity.evidence);
             const bool repeated = matching_reuse_domains(*key, provisional_demand) >= 2U;
             const bool surplus_candidate =
                 vacant_shared_slots != 0 &&
@@ -2242,7 +2232,7 @@ private:
                                                SharedCandidateEvidence::DefaultAutomatic) ||
                  has_shared_candidate_evidence(opportunity.evidence,
                                                SharedCandidateEvidence::EngineStructural));
-            if (!declared && !repeated && !surplus_candidate) { continue; }
+            if (!credited && !repeated && !surplus_candidate) { continue; }
             const std::optional<PrefillWork> rebuild =
                 base.shared_candidate_rebuild_work(opportunity.frontier);
             if (!rebuild) {
@@ -2254,7 +2244,7 @@ private:
                 .frontier         = opportunity.frontier,
                 .demand_mask      = demand_mask_for(*key, provisional_demand),
                 .rebuild_ns       = cost_model_.prefill_ns(*rebuild),
-                .pressure_capable = declared || repeated,
+                .pressure_capable = credited || repeated,
             });
         }
 
@@ -2313,7 +2303,10 @@ private:
         std::vector<std::uint32_t> selected_frontiers;
         std::uint64_t selected_gain = 0;
         ContextPortfolioValue projected_value;
-        if (shared_candidates.size() > 7U) {
+        // At most four protocol markers, three generic automatic candidates and the two
+        // Frontend-selected stable harness/project anchors. Recognition-only markers do not
+        // enter this bounded subset search.
+        if (shared_candidates.size() > 9U) {
             throw std::logic_error("prepared shared candidates exceeded the fixed subset bound");
         }
         const std::uint32_t subset_count = 1U << shared_candidates.size();
@@ -2332,11 +2325,7 @@ private:
                 frontiers.push_back(candidate.frontier);
                 const PlanningOwnerId owner{.value = next_projected_owner +
                                                      static_cast<std::uint32_t>(index)};
-                const bool credit =
-                    has_shared_candidate_evidence(candidate.evidence,
-                                                  SharedCandidateEvidence::ExplicitBoundary) ||
-                    has_shared_candidate_evidence(candidate.evidence,
-                                                  SharedCandidateEvidence::RequestedAutomatic);
+                const bool credit = shared_candidate_has_credit(candidate.evidence);
                 owners.push_back(ContextPortfolioOwnerPolicy{
                     .owner                  = owner,
                     .explicit_shared_credit = credit,
@@ -3695,10 +3684,7 @@ private:
                 RetentionObservation{.retention_class = RetentionClass::SharedStable};
             publication.transaction_pins = 0;
             publication.explicit_credit =
-                has_shared_candidate_evidence(record->shared_evidence,
-                                              SharedCandidateEvidence::ExplicitBoundary) ||
-                has_shared_candidate_evidence(record->shared_evidence,
-                                              SharedCandidateEvidence::RequestedAutomatic);
+                shared_candidate_has_credit(record->shared_evidence);
             publication.credit_expiry_epoch =
                 publication.explicit_credit
                     ? (demand_epoch_ >

@@ -12,6 +12,15 @@
 
 namespace ninfer::runtime {
 
+// Stable harness/project anchors predict a different conversation reusing the prefix even
+// before that demand has been observed. Give each the same single, expiring publication credit
+// as a declared protocol boundary; ordinary nested structural observations get no such prior.
+[[nodiscard]] inline bool shared_candidate_has_credit(SharedCandidateEvidence evidence) noexcept {
+    return has_shared_candidate_evidence(evidence, SharedCandidateEvidence::ExplicitBoundary) ||
+           has_shared_candidate_evidence(evidence, SharedCandidateEvidence::RequestedAutomatic) ||
+           has_shared_candidate_evidence(evidence, SharedCandidateEvidence::EngineStableAnchor);
+}
+
 struct ContextPortfolioOwnerPolicy {
     PlanningOwnerId owner;
     std::uint32_t private_retention_weight = 0;

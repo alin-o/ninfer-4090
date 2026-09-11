@@ -316,10 +316,7 @@ private:
         }
         const PlanningOwnerId candidate_owner = next_candidate_owner(input.owner_policies);
         const bool candidate_credit =
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::ExplicitBoundary) ||
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::RequestedAutomatic);
+            shared_candidate_has_credit(input.capture->shared_evidence);
         owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
             .owner                    = candidate_owner,
             .private_retention_weight = 0,

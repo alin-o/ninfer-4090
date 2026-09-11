@@ -141,6 +141,39 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    static_cast<std::uint64_t>(live.auto_save_reserved_jobs));
     append_counter(out, "ninfer:auto_save_reserved_bytes", live.auto_save_reserved_bytes);
     append_counter(out, "ninfer:auto_save_rejected_jobs_total", live.auto_save_rejected_jobs);
+    append_counter(out, "ninfer:shared_ssd_manifest_records",
+                   static_cast<std::uint64_t>(live.shared_ssd_manifest_records));
+    append_counter(out, "ninfer:shared_ssd_manifest_bytes", live.shared_ssd_manifest_bytes);
+    append_counter(out, "ninfer:shared_ssd_transfer_jobs{state=\"queued\"}",
+                   static_cast<std::uint64_t>(live.shared_ssd_queued_jobs));
+    append_counter(out, "ninfer:shared_ssd_transfer_jobs{state=\"active\"}",
+                   static_cast<std::uint64_t>(live.shared_ssd_active_jobs));
+    append_counter(out, "ninfer:shared_ssd_staging_bytes", live.shared_ssd_staging_bytes);
+    append_counter(out, "ninfer:shared_ssd_peak_staging_bytes", live.shared_ssd_peak_staging_bytes);
+    append_counter(out, "ninfer:shared_ssd_writes_total{result=\"completed\"}",
+                   live.shared_ssd_writes_completed);
+    append_counter(out, "ninfer:shared_ssd_writes_total{result=\"failed\"}",
+                   live.shared_ssd_writes_failed);
+    append_counter(out, "ninfer:shared_ssd_writes_total{result=\"coalesced\"}",
+                   live.shared_ssd_writes_coalesced);
+    append_counter(out, "ninfer:shared_ssd_loads_total{result=\"completed\"}",
+                   live.shared_ssd_loads_completed);
+    append_counter(out, "ninfer:shared_ssd_loads_total{result=\"failed\"}",
+                   live.shared_ssd_loads_failed);
+    append_counter(out, "ninfer:shared_ssd_loads_total{result=\"coalesced\"}",
+                   live.shared_ssd_loads_coalesced);
+    append_counter(out, "ninfer:shared_ssd_hits_total{temperature=\"loaded\"}",
+                   live.shared_ssd_loaded_hits);
+    append_counter(out, "ninfer:shared_ssd_hits_total{temperature=\"warm\"}",
+                   live.shared_ssd_warm_hits);
+    append_counter(out, "ninfer:shared_ssd_quota_rejections_total",
+                   live.shared_ssd_quota_rejections);
+    append_counter(out, "ninfer:shared_ssd_corrupt_records_total", live.shared_ssd_corrupt_records);
+    append_counter(out, "ninfer:shared_ssd_io_nanoseconds_total", live.shared_ssd_io_nanoseconds);
+    append_counter(out, "ninfer:shared_ssd_validation_nanoseconds_total",
+                   live.shared_ssd_validation_nanoseconds);
+    append_counter(out, "ninfer:shared_ssd_adoption_nanoseconds_total",
+                   live.shared_ssd_adoption_nanoseconds);
     append_counter(out, "ninfer:session_publications_total{identity=\"explicit\"}",
                    live.session_publications_explicit_total);
     append_counter(out, "ninfer:session_publications_total{identity=\"initial_prefix\"}",

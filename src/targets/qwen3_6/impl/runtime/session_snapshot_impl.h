@@ -247,12 +247,17 @@ struct SharedSnapshotBoundary {
 };
 
 struct SharedImportBacking {
-    std::vector<std::uint8_t> storage;
+    std::vector<std::uint8_t> owned_storage;
+    std::shared_ptr<const std::vector<std::uint8_t>> retained_storage;
     std::shared_ptr<const PreparedCaptureIdentity> identity;
     SharedSnapshotBoundary boundary;
     std::size_t state_offset   = 0;
     std::size_t text_offset    = 0;
     std::size_t backend_offset = 0;
+
+    [[nodiscard]] const std::uint8_t* data() const noexcept {
+        return retained_storage ? retained_storage->data() : owned_storage.data();
+    }
 };
 
 void write_config(SnapshotWriter& writer, const SnapshotConfig& config);
@@ -1366,6 +1371,92 @@ ProgramImplCore::export_shared_prefix(const SharedPrefixHandle& handle,
     return snapshot;
 }
 
+std::vector<qwen3_6::DurableSharedPrefixCandidate>
+ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prompt) const {
+    std::vector<qwen3_6::DurableSharedPrefixCandidate> candidates;
+    if (!context_cache.enabled || speculative_backend == SpeculativeBackend::DFlash ||
+        !prompt.vision_items.empty() || prompt.token_types.size() != prompt.token_ids.size() ||
+        prompt.positions.size() != 3U * prompt.token_ids.size()) {
+        return candidates;
+    }
+
+    for (const qwen3_6::PreparedCacheOpportunity& opportunity :
+         prompt.context_cache.opportunities) {
+        if (opportunity.kind != PromptCacheMarkerKind::SharedStablePrefix ||
+            opportunity.frontier == 0 || opportunity.frontier > prompt.token_ids.size()) {
+            continue;
+        }
+        const qwen3_6::SharedPrefixPersistenceMetadata metadata{
+            .evidence             = opportunity.evidence,
+            .structural_origins   = opportunity.structural_origins,
+            .structural_role      = static_cast<std::uint8_t>(opportunity.structural_role),
+            .ssd_eligible         = opportunity.ssd_eligible,
+            .first_volatile_token = prompt.context_cache.first_volatile_token,
+        };
+        try {
+            validate_durable_metadata(metadata, opportunity.frontier);
+        } catch (const std::invalid_argument&) { continue; }
+
+        std::vector<std::uint8_t> identity_bytes;
+        SnapshotWriter writer(identity_bytes);
+        write_span(writer, std::span<const TokenId>(prompt.token_ids).first(opportunity.frontier));
+        write_span(writer,
+                   std::span<const std::uint8_t>(prompt.token_types).first(opportunity.frontier));
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            write_span(writer, std::span<const std::int32_t>(prompt.positions)
+                                   .subspan(axis * prompt.token_ids.size(), opportunity.frontier));
+        }
+        write_vision_items(writer, {});
+        const auto rewrite_end = std::upper_bound(
+            prompt.identity.rewrite_execution_frontiers.begin(),
+            prompt.identity.rewrite_execution_frontiers.end(), opportunity.frontier);
+        write_span(writer, std::span<const std::uint32_t>(
+                               prompt.identity.rewrite_execution_frontiers.begin(), rewrite_end));
+        candidates.push_back(qwen3_6::DurableSharedPrefixCandidate{
+            .content_digest =
+                frontend_internal::sha256_hex(frontend_internal::sha256(identity_bytes)),
+            .frontier = opportunity.frontier,
+        });
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& left, const auto& right) { return left.frontier > right.frontier; });
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
+}
+
+bool ProgramImplCore::durable_shared_prefix_matches(
+    const qwen3_6::DurableSharedPrefixCandidate& candidate,
+    const SharedPrefixHandle& resident) const {
+    if (!valid_shared_prefix(resident) || candidate.content_digest.size() != 64) { return false; }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(resident)];
+    if (candidate.frontier == 0 || shared.frontier != candidate.frontier || !shared.identity ||
+        shared.identity->ledger().size() != candidate.frontier) {
+        return false;
+    }
+    const auto* identity = shared.identity->prefix_identity();
+    if (identity == nullptr || identity->size() < candidate.frontier ||
+        !identity->vision_items().empty()) {
+        return false;
+    }
+    std::vector<std::uint8_t> identity_bytes;
+    SnapshotWriter writer(identity_bytes);
+    write_span(writer, shared.identity->ledger());
+    write_span(writer,
+               std::span<const std::uint8_t>(identity->token_types()).first(candidate.frontier));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        write_span(
+            writer,
+            std::span<const std::int32_t>(identity->position_axis(axis)).first(candidate.frontier));
+    }
+    write_vision_items(writer, {});
+    const auto& rewrite_frontiers = identity->rewrite_execution_frontiers();
+    const auto rewrite_end =
+        std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), candidate.frontier);
+    write_span(writer, std::span<const std::uint32_t>(rewrite_frontiers.begin(), rewrite_end));
+    return frontend_internal::sha256_hex(frontend_internal::sha256(identity_bytes)) ==
+           candidate.content_digest;
+}
+
 qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     const SharedPrefixHandle& handle, std::string_view model_binding,
     const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
@@ -1723,10 +1814,10 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     return snapshot;
 }
 
-qwen3_6::ValidatedSharedPrefixImport<Variant>
-ProgramImplCore::parse_shared_prefix(std::span<const std::uint8_t> snapshot,
-                                     std::string_view model_binding,
-                                     const std::function<void()>& cancellation_checkpoint) const {
+qwen3_6::ValidatedSharedPrefixImport<Variant> ProgramImplCore::parse_shared_prefix(
+    std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+    const std::function<void()>& cancellation_checkpoint,
+    std::shared_ptr<const std::vector<std::uint8_t>> retained_storage) const {
     if (snapshot.size() < kSharedEnvelopeHeaderBytes) {
         throw std::invalid_argument("shared snapshot is truncated");
     }
@@ -1901,7 +1992,12 @@ ProgramImplCore::parse_shared_prefix(std::span<const std::uint8_t> snapshot,
     });
 
     auto backing = std::make_shared<SharedImportBacking>();
-    backing->storage.assign(snapshot.begin(), snapshot.end());
+    if (retained_storage && retained_storage->data() == snapshot.data() &&
+        retained_storage->size() == snapshot.size()) {
+        backing->retained_storage = std::move(retained_storage);
+    } else {
+        backing->owned_storage.assign(snapshot.begin(), snapshot.end());
+    }
     backing->identity                         = std::move(capture_identity);
     backing->boundary                         = boundary;
     const std::size_t consumed_before_payload = snapshot.size() - reader.remaining();
@@ -1991,7 +2087,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     bool shared_populated = false;
     try {
         state = state_store->adopt_host_image(qwen3_6::HostStateImageConstView{
-            reinterpret_cast<const std::byte*>(backing->storage.data() + backing->state_offset),
+            reinterpret_cast<const std::byte*>(backing->data() + backing->state_offset),
             &state_layout});
         if (!state) {
             throw std::invalid_argument("shared snapshot does not fit the Host State capacity");
@@ -2056,15 +2152,15 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
                 throw;
             }
         };
-        text_address = build_address(*text_kv_addresses, *text_kv_pages, text_layout,
-                                     backing->boundary.frontier,
-                                     backing->storage.data() + backing->text_offset);
+        text_address =
+            build_address(*text_kv_addresses, *text_kv_pages, text_layout,
+                          backing->boundary.frontier, backing->data() + backing->text_offset);
         runtime::testing::shared_snapshot_import_checkpoint(
             runtime::testing::SharedSnapshotImportStage::MainKvAllocated);
         if (backing->boundary.backend_frontier != 0) {
             backend_address = build_address(*backend_kv_addresses, *backend_kv_pages,
                                             *backend_layout, backing->boundary.backend_frontier,
-                                            backing->storage.data() + backing->backend_offset);
+                                            backing->data() + backing->backend_offset);
         }
 
         SharedPrefixState& shared = shared_prefix_states[*shared_index];

@@ -18,9 +18,9 @@
 #include <utility>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace ninfer::serve {
@@ -260,7 +260,11 @@ Json preparation_json(const RequestLogContext& context) {
                 {"cache_misses", stats.media_cache_misses},
                 {"singleflight_waits", stats.media_singleflight_waits},
                 {"built_patch_bytes", stats.built_patch_bytes},
-                {"reused_patch_bytes", stats.reused_patch_bytes}};
+                {"reused_patch_bytes", stats.reused_patch_bytes},
+                {"stable_boundaries_recognized", stats.stable_boundaries_recognized},
+                {"stable_boundaries_capturable", stats.stable_boundaries_capturable},
+                {"stable_boundary_mapping_skips", stats.stable_boundary_mapping_skips},
+                {"ssd_eligible_boundaries", stats.ssd_eligible_boundaries}};
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
@@ -496,8 +500,14 @@ std::string format_server_start_json(
                    {"max_shared_prefixes", cache.max_shared_prefixes.value()},
                    {"max_long_anchors_per_continuation",
                     cache.max_long_anchors_per_continuation.value()},
-                   {"automatic_private_anchors",
-                    resolve_automatic_private_anchors(options, cache)}}}};
+                   {"automatic_private_anchors", resolve_automatic_private_anchors(options, cache)},
+                   {"shared_ssd", Json{{"enabled", !options.shared_prefix_cache_dir.empty()},
+                                       {"directory", options.shared_prefix_cache_dir.string()},
+                                       {"max_records", options.shared_prefix_cache_max_records},
+                                       {"max_bytes", options.shared_prefix_cache_max_bytes},
+                                       {"staging_bytes", options.shared_prefix_cache_staging_bytes},
+                                       {"workers", options.shared_prefix_cache_workers},
+                                       {"max_jobs", options.shared_prefix_cache_jobs}}}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -559,22 +569,26 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      const GenerationOutcome& outcome) {
     Json record       = event_base(server_instance_id, timestamp, "request_done");
     record["request"] = request_json(context);
-    record["result"] =
-        Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
-             {"prompt_tokens", outcome.prompt_tokens},
-             {"completion_tokens", outcome.completion_tokens},
-             {"computed_prefill_tokens",
-              std::max(0, outcome.prompt_tokens -
-                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
-             {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
-             {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
-             {"thinking_budget", outcome.thinking.configured_budget
-                                     ? Json(*outcome.thinking.configured_budget)
-                                     : Json(nullptr)},
-             {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
-             {"thinking_control_tokens", outcome.thinking.injected_tokens},
-             {"thinking_control_applied", outcome.thinking.applied},
-             {"tool_call_count", outcome.tool_calls.size()}};
+    record["result"]  = Json{
+         {"finish_reason", finish_reason_name(outcome.finish_reason)},
+         {"prompt_tokens", outcome.prompt_tokens},
+         {"completion_tokens", outcome.completion_tokens},
+         {"computed_prefill_tokens",
+          std::max(0, outcome.prompt_tokens -
+                          static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+         {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+         {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+         {"durable_restore", Json{{"frontier_tokens", outcome.metrics.durable_restore_frontier},
+                                  {"ssd_loaded", outcome.metrics.durable_loaded_from_ssd},
+                                  {"warm_available", outcome.metrics.durable_warm_available},
+                                  {"fallback_reason", outcome.metrics.durable_fallback_reason}}},
+         {"thinking_budget", outcome.thinking.configured_budget
+                                 ? Json(*outcome.thinking.configured_budget)
+                                 : Json(nullptr)},
+         {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
+         {"thinking_control_tokens", outcome.thinking.injected_tokens},
+         {"thinking_control_applied", outcome.thinking.applied},
+         {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},

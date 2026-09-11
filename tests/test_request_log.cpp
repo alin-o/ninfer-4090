@@ -14,9 +14,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <process.h>
+#    include <process.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace {
@@ -262,6 +262,10 @@ int main() {
     prepared.preparation.media_items                   = 1;
     prepared.preparation.media_cache_misses            = 1;
     prepared.preparation.built_patch_bytes             = 49152;
+    prepared.preparation.stable_boundaries_recognized  = 3;
+    prepared.preparation.stable_boundaries_capturable  = 2;
+    prepared.preparation.stable_boundary_mapping_skips = 1;
+    prepared.preparation.ssd_eligible_boundaries       = 1;
 
     const RequestLogMetadata metadata{
         .model                             = "qwen3.6-27b",
@@ -288,12 +292,15 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
-    failures += check(started.at("request").at("media_item_count") == 1 &&
-                          started.at("preparation_seconds").at("acquisition") == 0.004 &&
-                          started.at("preparation_seconds").at("media_preprocess_work") == 0.31 &&
-                          started.at("preparation_seconds").at("tokenize") == 0.02 &&
-                          started.at("preparation_seconds").at("cache_misses") == 1,
-                      "request-scoped media preparation diagnostics missing");
+    failures +=
+        check(started.at("request").at("media_item_count") == 1 &&
+                  started.at("preparation_seconds").at("acquisition") == 0.004 &&
+                  started.at("preparation_seconds").at("media_preprocess_work") == 0.31 &&
+                  started.at("preparation_seconds").at("tokenize") == 0.02 &&
+                  started.at("preparation_seconds").at("cache_misses") == 1 &&
+                  started.at("preparation_seconds").at("stable_boundaries_recognized") == 3 &&
+                  started.at("preparation_seconds").at("ssd_eligible_boundaries") == 1,
+              "request-scoped media preparation diagnostics missing");
 
     ApiError preparation_error;
     preparation_error.status                          = 400;
@@ -339,30 +346,33 @@ int main() {
               "operational overload rejection is not warning severity");
 
     GenerationOutcome outcome;
-    outcome.prompt_tokens                   = 401;
-    outcome.completion_tokens               = 1024;
-    outcome.finish_reason                   = ninfer::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds         = 0.1234567890123;
-    outcome.metrics.ttft_seconds            = 0.3580246791357;
-    outcome.metrics.vision_seconds          = 0.0;
-    outcome.metrics.prefill_seconds         = 0.2345678901234;
-    outcome.metrics.decode_seconds          = 5.3456789012345;
-    outcome.metrics.total_seconds           = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
-    outcome.metrics.engine_timing           = {
-                  .queue_wait_seconds                   = 0.001,
-                  .engine_boundary_exposed_seconds      = 0.001,
-                  .program_submit_exposed_seconds       = 0.002,
-                  .program_post_exposed_seconds         = 0.003,
-                  .engine_commit_output_exposed_seconds = 0.004,
-                  .engine_maintenance_exposed_seconds   = 0.005,
-                  .device_wait_exposed_seconds          = 0.3,
-                  .decode_host_exposed_seconds          = 0.01,
-                  .decode_device_wait_exposed_seconds   = 0.2,
-                  .prefill_units                        = 4,
-                  .decode_rounds                        = 2,
-                  .control_units                        = 1,
+    outcome.prompt_tokens                    = 401;
+    outcome.completion_tokens                = 1024;
+    outcome.finish_reason                    = ninfer::FinishReason::OutputLimit;
+    outcome.metrics.prepare_seconds          = 0.1234567890123;
+    outcome.metrics.ttft_seconds             = 0.3580246791357;
+    outcome.metrics.vision_seconds           = 0.0;
+    outcome.metrics.prefill_seconds          = 0.2345678901234;
+    outcome.metrics.decode_seconds           = 5.3456789012345;
+    outcome.metrics.total_seconds            = 5.7037035803702;
+    outcome.metrics.prefix_cache_hit_tokens  = 101;
+    outcome.metrics.prefix_reuse_path        = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.metrics.durable_restore_frontier = 101;
+    outcome.metrics.durable_loaded_from_ssd  = true;
+    outcome.metrics.durable_fallback_reason  = "";
+    outcome.metrics.engine_timing            = {
+                   .queue_wait_seconds                   = 0.001,
+                   .engine_boundary_exposed_seconds      = 0.001,
+                   .program_submit_exposed_seconds       = 0.002,
+                   .program_post_exposed_seconds         = 0.003,
+                   .engine_commit_output_exposed_seconds = 0.004,
+                   .engine_maintenance_exposed_seconds   = 0.005,
+                   .device_wait_exposed_seconds          = 0.3,
+                   .decode_host_exposed_seconds          = 0.01,
+                   .decode_device_wait_exposed_seconds   = 0.2,
+                   .prefill_units                        = 4,
+                   .decode_rounds                        = 2,
+                   .control_units                        = 1,
     };
     outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window          = 3;
@@ -395,11 +405,11 @@ int main() {
     // at 0.8 acceptance, the five host-exposed components sum to 15 ms, and 2 decode rounds
     // split 0.01 s of decode host work and 0.2 s of device wait.
     const std::string operational = render_request_done(context, outcome).message;
-    failures += check(operational.find(" speculative_backend=mtp") != std::string::npos &&
-                          operational.find(" speculative_tokens_per_round=3.400") !=
-                              std::string::npos &&
-                          operational.find(" speculative_acceptance=0.800") != std::string::npos,
-                      "operational request line lost the speculative fields");
+    failures +=
+        check(operational.find(" speculative_backend=mtp") != std::string::npos &&
+                  operational.find(" speculative_tokens_per_round=3.400") != std::string::npos &&
+                  operational.find(" speculative_acceptance=0.800") != std::string::npos,
+              "operational request line lost the speculative fields");
     // The fixture configures a 256-token budget with 256 model tokens, 19 injected control
     // tokens and applied=true, so every field on the thinking group is pinned.
     failures += check(operational.find(" thinking_budget_tokens=256") != std::string::npos &&
@@ -421,6 +431,9 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("durable_restore").at("frontier_tokens") == 101 &&
+                          done.at("result").at("durable_restore").at("ssd_loaded") == true,
+                      "durable restore classification missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
@@ -579,15 +592,14 @@ int main() {
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
 
-    const std::filesystem::path log_path =
-        std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" +
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() /
+                                           ("ninfer-request-log-test-" +
 #ifdef _WIN32
-         std::to_string(static_cast<long long>(::_getpid())) +
+                                            std::to_string(static_cast<long long>(::_getpid())) +
 #else
-         std::to_string(static_cast<long long>(::getpid())) +
+                                            std::to_string(static_cast<long long>(::getpid())) +
 #endif
-         ".jsonl");
+                                            ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

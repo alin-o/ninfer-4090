@@ -293,6 +293,13 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   hits, MTP draft/acceptance totals, and bounded auto-save queued, active-writer, reserved and
   rejected work. Reserved jobs/bytes remain visible until Program-side source-pin retirement,
   even when both the pending queue and active writer are empty.
+- **Durable shared anchors.** `--shared-prefix-cache-dir DIR` keeps complete, Frontend-classified
+  stable harness/project prefixes across server restarts. Records are content-addressed, bounded by
+  record/byte/staging/job limits, written with file and directory sync before an atomic manifest
+  commit, and read lazily only for an exact prepared-prompt candidate. Program validates checksum,
+  model/configuration, identity, State and Main/MTP KV before Engine adoption; invalid records fall
+  back to an available warm source or ordinary prefill. Media, volatile, unclassified and DFlash
+  prefixes are not durable. Private `/slots` files and auto-save behavior are unchanged.
 - **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
   slots report their request's prompt and reused-prefix sizes, idle retained slots report the
   resident session's depth and its identifying `session_digest`. Truthful per-slot attribution

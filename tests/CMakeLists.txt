@@ -139,7 +139,7 @@ set_tests_properties(ninfer_qwen3_6_context_store_test PROPERTIES SKIP_RETURN_CO
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
           targets/qwen3_6_27b/test_context_transfer_failure.cu
-  LIBRARIES ninfer_engine CUDA::cudart CUDA::cuda_driver)
+  LIBRARIES ninfer_engine ninfer_serve CUDA::cudart CUDA::cuda_driver)
 target_include_directories(ninfer_qwen3_6_27b_prefix_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -200,6 +200,11 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_slot_files_test
   SOURCES test_slot_files.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_durable_shared_prefix_catalog_test
+  SOURCES test_durable_shared_prefix_catalog.cpp
+  LIBRARIES ninfer_serve ninfer_core)
+target_include_directories(ninfer_durable_shared_prefix_catalog_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_slot_spill_guard_test
   SOURCES test_slot_spill_guard.cpp
   LIBRARIES ninfer_core)

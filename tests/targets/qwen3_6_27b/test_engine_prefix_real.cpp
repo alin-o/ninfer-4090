@@ -2,6 +2,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/context_transfer_test_gate.h"
 #include "runtime/engine/shared_snapshot_test_access.h"
+#include "serve/durable_shared_prefix_catalog.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <cuda.h>
@@ -3731,6 +3732,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
 
     std::vector<std::uint8_t> bytes;
     std::vector<ninfer::TokenId> expected_tokens;
+    std::uint32_t durable_frontier = 0;
     ninfer::runtime::testing::SealedSharedSnapshotTestImport source_validated;
     {
         ninfer::Engine source(shared_snapshot_engine_options(artifact));
@@ -3818,7 +3820,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
             std::cerr << "shared snapshot export produced an invalid envelope\n";
             return 1;
         }
-        bytes = std::move(snapshot.bytes);
+        bytes            = std::move(snapshot.bytes);
+        durable_frontier = snapshot.tokens;
         snapshot.release_storage();
         source_validated = Access::parse(source, bytes);
     }
@@ -4213,6 +4216,61 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
                       << " healthy=" << failed.healthy() << '\n';
             return 1;
         }
+    }
+    {
+        const std::filesystem::path directory =
+            std::filesystem::temp_directory_path() / "ninfer-durable-shared-restart";
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        ninfer::serve::DurableSharedPrefixCatalogOptions catalog_options{
+            .directory     = directory,
+            .max_records   = 2,
+            .max_bytes     = 4ULL << 30U,
+            .workers       = 1,
+            .max_jobs      = 1,
+            .staging_bytes = 4ULL << 30U,
+        };
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine publisher(shared_snapshot_engine_options(artifact));
+            const ninfer::GenerationResult published =
+                publisher.generate(publisher.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (published.generated_token_ids != expected_tokens) {
+                std::cerr << "durable publisher changed the deterministic continuation\n";
+                return 1;
+            }
+            const std::uint64_t pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            catalog.schedule_exports(publisher);
+            catalog.drain();
+            if (catalog.stats().writes_completed != 1 ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() != pins_before) {
+                std::cerr
+                    << "durable shared snapshot did not settle its manifest and source pins\n";
+                return 1;
+            }
+        }
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto restored             = catalog.restore_matching(
+                restarted, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30));
+            const ninfer::GenerationResult continued =
+                restarted.generate(std::move(prepared), fixed_output(3));
+            if (!restored.loaded_from_ssd || restored.frontier != durable_frontier ||
+                continued.generated_token_ids != expected_tokens ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier) {
+                std::cerr << "restart lazy durable reuse did not restore the exact shared boundary"
+                          << " loaded=" << restored.loaded_from_ssd
+                          << " restored=" << restored.frontier
+                          << " reused=" << continued.reused_prompt_tokens << '\n';
+                return 1;
+            }
+        }
+        std::filesystem::remove_all(directory, ignored);
     }
     return 0;
 }

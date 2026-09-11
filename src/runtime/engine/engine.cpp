@@ -8,6 +8,7 @@
 #include "runtime/engine/auto_save_writer.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/durable_shared_snapshot_access.h"
 #include "runtime/engine/shared_snapshot_test_access.h"
 #include "targets/registry.h"
 
@@ -731,6 +732,155 @@ void Engine::reset_memory_peaks() noexcept {
             }
         },
         impl_->core);
+}
+
+std::vector<runtime::DurableSharedSnapshotAccess::Candidate>
+runtime::DurableSharedSnapshotAccess::candidates(Engine& engine, const PreparedPrompt& prompt) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    if (!prompt.impl_) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    return std::visit(
+        [&](auto& core) -> std::vector<Candidate> {
+            if constexpr (requires {
+                              core->durable_shared_prefix_candidates(prompt.impl_->value);
+                          }) {
+                return core->durable_shared_prefix_candidates(prompt.impl_->value);
+            } else {
+                return {};
+            }
+        },
+        engine.impl_->core);
+}
+
+runtime::DurableSharedSnapshotAccess::ImportResult
+runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& candidate,
+                                             std::shared_ptr<const std::vector<std::uint8_t>> bytes,
+                                             const CancellationView& cancellation) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    if (!bytes) { throw std::invalid_argument("durable shared snapshot payload is empty"); }
+    if (cancellation.requested()) {
+        throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
+    }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    ImportResult imported     = std::visit(
+        [&](auto& core) -> ImportResult {
+            if constexpr (requires { core->shared_prefix_slot_summary(std::uint32_t{}); }) {
+                std::uint64_t validation_nanoseconds = 0;
+                std::uint64_t adoption_nanoseconds   = 0;
+                const auto result                    = core->import_shared_prefix(
+                    std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
+                    &adoption_nanoseconds,
+                    [&] {
+                        if (cancellation.requested()) {
+                            throw RequestError(RequestErrorKind::Cancelled,
+                                                                      "shared snapshot import was cancelled");
+                        }
+                    },
+                    bytes, true, candidate);
+                const auto summary = core->shared_prefix_slot_summary(result.slot);
+                if (!summary) {
+                    throw std::logic_error("durable shared import has no catalogued summary");
+                }
+                return {.disposition            = static_cast<std::uint32_t>(result.disposition),
+                            .slot                   = result.slot,
+                            .frontier               = summary->checkpoint.ref.frontier,
+                            .validation_nanoseconds = validation_nanoseconds,
+                            .adoption_nanoseconds   = adoption_nanoseconds};
+            } else {
+                throw std::logic_error("durable shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+    if (cancellation.requested()) {
+        // Adoption is atomic and remains a valid warm source. Cancellation only prevents the
+        // caller from continuing to submission; it never tears down a committed shared owner.
+        throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
+    }
+    return imported;
+}
+
+bool runtime::DurableSharedSnapshotAccess::resident(Engine& engine, const Candidate& candidate) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->durable_shared_prefix_resident(candidate); }) {
+                return core->durable_shared_prefix_resident(candidate);
+            }
+            return false;
+        },
+        engine.impl_->core);
+}
+
+bool runtime::DurableSharedSnapshotAccess::settle_export(Engine& engine, std::uint32_t slot,
+                                                         std::uint64_t owner, bool committed) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->settle_durable_shared_prefix_export(slot, owner, committed);
+                          }) {
+                return core->settle_durable_shared_prefix_export(slot, owner, committed);
+            }
+            return false;
+        },
+        engine.impl_->core);
+}
+
+std::vector<runtime::DurableSharedSnapshotAccess::Export>
+runtime::DurableSharedSnapshotAccess::begin_exports(
+    Engine& engine, const std::function<std::shared_ptr<void>(std::size_t)>& reserve,
+    const std::function<bool(std::uint32_t, std::uint64_t)>& claim,
+    const std::function<void(std::uint32_t, std::uint64_t)>& relinquish) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::uint32_t capacity =
+        engine.impl_->options.context_cache.max_shared_prefixes.value_or(0);
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    std::vector<Export> exports;
+    exports.reserve(capacity);
+    for (std::uint32_t slot = 0; slot < capacity; ++slot) {
+        std::optional<std::uint64_t> owner;
+        try {
+            owner = std::visit(
+                [&](auto& core) -> std::optional<std::uint64_t> {
+                    if constexpr (requires { core->durable_shared_prefix_owner(slot); }) {
+                        return core->durable_shared_prefix_owner(slot);
+                    }
+                    return std::nullopt;
+                },
+                engine.impl_->core);
+            if (!owner || (claim && !claim(slot, *owner))) { continue; }
+            Snapshot snapshot = std::visit(
+                [&](auto& core) -> Snapshot {
+                    if constexpr (requires {
+                                      core->begin_export_shared_prefix(slot, binding, reserve,
+                                                                       *owner);
+                                  }) {
+                        return core->begin_export_shared_prefix(slot, binding, reserve, *owner);
+                    } else {
+                        return {};
+                    }
+                },
+                engine.impl_->core);
+            if (snapshot.queue_reservation) {
+                exports.push_back(Export{
+                    .snapshot = std::move(snapshot),
+                    .slot     = slot,
+                    .owner    = *owner,
+                });
+            } else if (relinquish) {
+                relinquish(slot, *owner);
+            }
+        } catch (const RequestError& error) {
+            if (owner && relinquish) { relinquish(slot, *owner); }
+            if (error.kind() != RequestErrorKind::Overloaded) { throw; }
+        } catch (const std::invalid_argument&) {
+            // Vacant and non-durable shared entries are ordinary bounded-catalog misses.
+            if (owner && relinquish) { relinquish(slot, *owner); }
+        } catch (...) {
+            if (owner && relinquish) { relinquish(slot, *owner); }
+            throw;
+        }
+    }
+    return exports;
 }
 
 std::pair<std::uint32_t, targets::qwen3_6::RetainedSessionSnapshot>

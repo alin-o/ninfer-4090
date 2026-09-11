@@ -42,29 +42,28 @@ template <class Instance>
 class EngineCore {
 
 public:
-    using Package            = typename Instance::Package;
-    using Program            = typename Package::Program;
-    using BasePlan           = typename Package::RequestBasePlan;
-    using Plan               = typename Package::AdmissionCandidate;
-    using SequenceHandle     = typename Package::SequenceHandle;
-    using CaptureOffer       = typename Package::CaptureOffer;
-    using PendingBatch       = typename Package::PendingBatch;
-    using PreparedPrompt     = typename Package::PreparedPrompt;
-    using OutputSession      = typename Package::OutputSession;
-    using PublishedOutput    = typename Package::PublishedOutput;
-    using Request            = RequestRecord<Package>;
-    using Scheduling         = Scheduler<Request>;
-    using FifoSnapshot       = typename Scheduling::FifoSnapshot;
-    using RoundMembership    = typename Scheduling::RoundMembership;
-    using ControlMembership  = typename Scheduling::ControlMembership;
-    using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
-    using ExecutionAction    = typename Scheduling::ExecutionAction;
-    using AdmissionGrant     = typename Scheduling::AdmissionGrant;
-    using ResourceManagement = ResourceManager<Package>;
-    using ResourceInspection = typename ResourceManagement::Inspection;
-    using ValidatedSharedPrefixImport =
-        typename ResourceManagement::ValidatedSharedPrefixImport;
-    using Clock              = std::chrono::steady_clock;
+    using Package                     = typename Instance::Package;
+    using Program                     = typename Package::Program;
+    using BasePlan                    = typename Package::RequestBasePlan;
+    using Plan                        = typename Package::AdmissionCandidate;
+    using SequenceHandle              = typename Package::SequenceHandle;
+    using CaptureOffer                = typename Package::CaptureOffer;
+    using PendingBatch                = typename Package::PendingBatch;
+    using PreparedPrompt              = typename Package::PreparedPrompt;
+    using OutputSession               = typename Package::OutputSession;
+    using PublishedOutput             = typename Package::PublishedOutput;
+    using Request                     = RequestRecord<Package>;
+    using Scheduling                  = Scheduler<Request>;
+    using FifoSnapshot                = typename Scheduling::FifoSnapshot;
+    using RoundMembership             = typename Scheduling::RoundMembership;
+    using ControlMembership           = typename Scheduling::ControlMembership;
+    using ActiveAdmissionSet          = typename Scheduling::ActiveAdmissionSet;
+    using ExecutionAction             = typename Scheduling::ExecutionAction;
+    using AdmissionGrant              = typename Scheduling::AdmissionGrant;
+    using ResourceManagement          = ResourceManager<Package>;
+    using ResourceInspection          = typename ResourceManagement::Inspection;
+    using ValidatedSharedPrefixImport = typename ResourceManagement::ValidatedSharedPrefixImport;
+    using Clock                       = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
@@ -364,7 +363,8 @@ public:
     // work in Program. They intentionally do not address or evict private session slots.
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot begin_export_shared_prefix(
         std::uint32_t slot, std::string_view model_binding,
-        const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {}) {
+        const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {},
+        std::optional<std::uint64_t> expected_owner                      = std::nullopt) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (instance_.program->has_context_transaction()) {
@@ -373,8 +373,8 @@ public:
         }
         const auto view = resources_.shared_catalog_slot(slot);
         if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
-            view.handle == nullptr) {
-            throw std::invalid_argument("shared catalog slot holds no prefix");
+            view.handle == nullptr || (expected_owner && view.id != *expected_owner)) {
+            throw std::invalid_argument("shared catalog slot holds no matching prefix");
         }
         return run_shared_snapshot_operation([&] {
             return instance_.program->begin_export_shared_prefix(
@@ -389,9 +389,57 @@ public:
         });
     }
 
-    [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult
-    import_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
-                         runtime::CancellationFlagView cancellation = {}) {
+    [[nodiscard]] std::vector<targets::qwen3_6::DurableSharedPrefixCandidate>
+    durable_shared_prefix_candidates(const PreparedPrompt& prompt) const {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        return instance_.program->durable_shared_prefix_candidates(prompt);
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t>
+    durable_shared_prefix_owner(std::uint32_t slot) const {
+        std::scoped_lock lock(execution_mutex_);
+        const auto view = resources_.shared_catalog_slot(slot);
+        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            view.handle == nullptr || view.id == 0 || !view.metadata.ssd_eligible ||
+            view.metadata.ssd_backed) {
+            return std::nullopt;
+        }
+        return view.id;
+    }
+
+    [[nodiscard]] bool settle_durable_shared_prefix_export(std::uint32_t slot,
+                                                           std::uint64_t expected_owner,
+                                                           bool committed) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->retire_completed_snapshot_sources();
+        return committed && resources_.mark_shared_ssd_backed(slot, expected_owner);
+    }
+
+    [[nodiscard]] bool durable_shared_prefix_resident(
+        const targets::qwen3_6::DurableSharedPrefixCandidate& candidate) const {
+        std::scoped_lock lock(execution_mutex_);
+        for (std::uint32_t slot = 0; slot < resources_.shared_catalog_capacity(); ++slot) {
+            const auto view = resources_.shared_catalog_slot(slot);
+            if (view.metadata.state == ResourceManagement::SharedCatalogState::Catalogued &&
+                view.handle != nullptr &&
+                instance_.program->durable_shared_prefix_matches(candidate, *view.handle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult import_shared_prefix(
+        std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+        runtime::CancellationFlagView cancellation                        = {},
+        std::uint64_t* validation_nanoseconds                             = nullptr,
+        std::uint64_t* adoption_nanoseconds                               = nullptr,
+        const std::function<void()>& external_checkpoint                  = {},
+        std::shared_ptr<const std::vector<std::uint8_t>> retained_storage = {},
+        bool ssd_backed                                                   = false,
+        std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
+            std::nullopt) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
@@ -402,6 +450,7 @@ public:
                                "shared catalog is busy with a resource transaction");
         }
         const auto checkpoint = [&] {
+            if (external_checkpoint) { external_checkpoint(); }
             if (cancellation.requested()) {
                 throw RequestError(RequestErrorKind::Cancelled,
                                    "shared snapshot import was cancelled");
@@ -409,14 +458,30 @@ public:
         };
         return run_shared_snapshot_operation(
             [&] {
-                auto imported =
-                    instance_.program->parse_shared_prefix(snapshot, model_binding, checkpoint);
-                return resources_.adopt_imported_shared(
+                const Clock::time_point validation_started = Clock::now();
+                auto imported                              = instance_.program->parse_shared_prefix(
+                    snapshot, model_binding, checkpoint, std::move(retained_storage));
+                if (expected_candidate &&
+                    (imported.content_digest() != expected_candidate->content_digest ||
+                     imported.summary().checkpoint.ref.frontier != expected_candidate->frontier)) {
+                    throw std::invalid_argument(
+                        "durable shared snapshot does not match its catalog identity");
+                }
+                if (validation_nanoseconds != nullptr) {
+                    *validation_nanoseconds = elapsed_ns(validation_started, Clock::now());
+                }
+                const Clock::time_point adoption_started = Clock::now();
+                auto result                              = resources_.adopt_imported_shared(
                     *instance_.program, imported, cancellation,
                     [] {
                         testing::shared_snapshot_import_checkpoint(
                             testing::SharedSnapshotImportStage::BeforeCatalogPublication);
-                    });
+                    },
+                    ssd_backed);
+                if (adoption_nanoseconds != nullptr) {
+                    *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
+                }
+                return result;
             },
             true);
     }

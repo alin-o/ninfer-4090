@@ -24,6 +24,7 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
+class DurableSharedPrefixCatalog;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
@@ -44,6 +45,10 @@ struct GenerationMetrics {
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;
+    std::uint32_t durable_restore_frontier = 0;
+    bool durable_loaded_from_ssd           = false;
+    bool durable_warm_available            = false;
+    std::string durable_fallback_reason;
 };
 
 struct GenerationOutcome {
@@ -91,7 +96,11 @@ struct PreparedRequest {
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
-    bool preserve_thinking = false;
+    bool preserve_thinking                 = false;
+    std::uint32_t durable_restore_frontier = 0;
+    bool durable_loaded_from_ssd           = false;
+    bool durable_warm_available            = false;
+    std::string durable_fallback_reason;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -101,6 +110,7 @@ public:
     // that line is the only production evidence that eviction spills actually happen.
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
                                std::shared_ptr<spdlog::logger> logger = {});
+    ~GenerationService();
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -120,7 +130,7 @@ public:
 
     [[nodiscard]] bool healthy() const { return engine_->healthy(); }
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const;
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
@@ -189,6 +199,7 @@ private:
     ServeOptions options_;
     std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
+    mutable std::unique_ptr<DurableSharedPrefixCatalog> durable_catalog_;
     std::uint32_t automatic_private_anchors_ = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

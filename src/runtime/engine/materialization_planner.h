@@ -30,6 +30,9 @@ struct MaterializationCheckpointPolicy {
 
 struct MaterializationOwnerPolicy {
     PlanningOwnerId owner;
+    // Guided pressure search visits complete durable recovery, complete Device recovery and then
+    // RAM-only owners in that order. Final selection still uses the measured transition cost.
+    std::uint8_t recovery_preference       = 2;
     RetentionClass retention_class         = RetentionClass::RecentPrivate;
     std::uint64_t selected_hit_count       = 0;
     std::uint64_t last_hit_epoch           = 0;
@@ -431,12 +434,14 @@ public:
         std::sort(preferred_owners.begin(), preferred_owners.end(),
                   [](const auto* left, const auto* right) {
                       return std::tuple{
+                                 left->recovery_preference,
                                  left->selected_hit_count,
                                  left->explicit_shared_credit ? 1U : 0U,
                                  left->private_retention_weight,
                                  left->last_hit_epoch,
                                  left->owner.value,
                              } < std::tuple{
+                                     right->recovery_preference,
                                      right->selected_hit_count,
                                      right->explicit_shared_credit ? 1U : 0U,
                                      right->private_retention_weight,

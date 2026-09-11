@@ -1,4 +1,5 @@
 #include "serve/generation_service.h"
+#include "serve/durable_shared_prefix_catalog.h"
 
 #include "product/media_acquire/acquire.h"
 #include <spdlog/logger.h>
@@ -227,19 +228,19 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
                                      std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), logger_(std::move(logger)) {
     ninfer::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.device                   = options_.device;
-    engine_options.max_context              = options_.max_context;
-    engine_options.kv_capacity              = options_.kv_capacity;
-    engine_options.max_concurrency          = options_.max_concurrency;
-    engine_options.max_pending_requests     = options_.max_pending_requests;
-    engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.turn_checkpoint_ring     = options_.turn_checkpoint_ring;
-    engine_options.auto_save_evicted        = options_.auto_save_evicted;
+    engine_options.artifact_path        = options_.artifact_path;
+    engine_options.device               = options_.device;
+    engine_options.max_context          = options_.max_context;
+    engine_options.kv_capacity          = options_.kv_capacity;
+    engine_options.max_concurrency      = options_.max_concurrency;
+    engine_options.max_pending_requests = options_.max_pending_requests;
+    engine_options.pending_timeout_ms   = options_.pending_timeout_ms;
+    engine_options.prefill_chunk        = options_.prefill_chunk;
+    engine_options.turn_checkpoint_ring = options_.turn_checkpoint_ring;
+    engine_options.auto_save_evicted    = options_.auto_save_evicted;
     if (options_.auto_save_evicted) {
-        engine_options.auto_save_listener = [logger = logger_](
-                                                const ninfer::SlotAutoSaveEvent& event) {
+        engine_options.auto_save_listener = [logger =
+                                                 logger_](const ninfer::SlotAutoSaveEvent& event) {
             if (!logger) { return; }
             if (event.skipped_behind_tokens) {
                 logger->info("{}", "slot auto-save SKIPPED file=" + event.path +
@@ -251,8 +252,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
                                        " n_saved=" + std::to_string(event.tokens) +
                                        " bytes=" + std::to_string(event.bytes));
             } else {
-                logger->warn("{}",
-                             "slot auto-save FAILED file=" + event.path + ": " + event.error);
+                logger->warn("{}", "slot auto-save FAILED file=" + event.path + ": " + event.error);
             }
         };
     }
@@ -267,13 +267,26 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
-    engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    if (!options_.shared_prefix_cache_dir.empty()) {
+        durable_catalog_ =
+            std::make_unique<DurableSharedPrefixCatalog>(DurableSharedPrefixCatalogOptions{
+                .directory     = options_.shared_prefix_cache_dir,
+                .max_records   = options_.shared_prefix_cache_max_records,
+                .max_bytes     = options_.shared_prefix_cache_max_bytes,
+                .workers       = options_.shared_prefix_cache_workers,
+                .max_jobs      = options_.shared_prefix_cache_jobs,
+                .staging_bytes = options_.shared_prefix_cache_staging_bytes,
+            });
+    }
     prompt_capabilities_ = engine_->prompt_capabilities();
     automatic_private_anchors_ =
         resolve_automatic_private_anchors(options_, engine_->options().context_cache);
-    request_capacity_    = std::make_shared<RequestCapacity>(
+    request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
+
+GenerationService::~GenerationService() = default;
 
 std::shared_ptr<RequestLifetime>
 GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
@@ -364,6 +377,15 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        if (durable_catalog_ && cache_participation == CacheParticipation::ReadWrite) {
+            const DurableSharedPrefixRestore restore = durable_catalog_->restore_matching(
+                *engine_, prompt, prepared.lifetime->deadline, control.cancellation);
+            prepared.durable_restore_frontier = restore.frontier;
+            prepared.durable_loaded_from_ssd  = restore.loaded_from_ssd;
+            prepared.durable_warm_available   = restore.warm_available;
+            prepared.durable_fallback_reason  = restore.fallback_reason;
+            check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
@@ -433,6 +455,15 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    if (durable_catalog_) {
+        durable_catalog_->observe_hit(
+            DurableSharedPrefixRestore{.frontier        = prepared.durable_restore_frontier,
+                                       .loaded_from_ssd = prepared.durable_loaded_from_ssd,
+                                       .warm_available  = prepared.durable_warm_available,
+                                       .fallback_reason = prepared.durable_fallback_reason},
+            result.reused_prompt_tokens, result.prefix_reuse_path);
+        durable_catalog_->schedule_exports(*engine_);
+    }
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
@@ -459,6 +490,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.materialization             = result.materialization;
+    outcome.metrics.durable_restore_frontier    = prepared.durable_restore_frontier;
+    outcome.metrics.durable_loaded_from_ssd     = prepared.durable_loaded_from_ssd;
+    outcome.metrics.durable_warm_available      = prepared.durable_warm_available;
+    outcome.metrics.durable_fallback_reason     = prepared.durable_fallback_reason;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;
@@ -470,6 +505,32 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     outcome.tool_calls = std::move(result.tool_calls);
     return outcome;
+}
+
+ninfer::RuntimeStats GenerationService::runtime_stats() const {
+    ninfer::RuntimeStats result = engine_->runtime_stats();
+    if (!durable_catalog_) { return result; }
+    const DurableSharedPrefixCatalogStats durable = durable_catalog_->stats();
+    result.shared_ssd_manifest_records            = durable.manifest_records;
+    result.shared_ssd_manifest_bytes              = durable.manifest_bytes;
+    result.shared_ssd_queued_jobs                 = durable.queued_jobs;
+    result.shared_ssd_active_jobs                 = durable.active_jobs;
+    result.shared_ssd_staging_bytes               = durable.staging_bytes;
+    result.shared_ssd_peak_staging_bytes          = durable.peak_staging_bytes;
+    result.shared_ssd_writes_completed            = durable.writes_completed;
+    result.shared_ssd_writes_failed               = durable.writes_failed;
+    result.shared_ssd_writes_coalesced            = durable.writes_coalesced;
+    result.shared_ssd_loads_completed             = durable.loads_completed;
+    result.shared_ssd_loads_failed                = durable.loads_failed;
+    result.shared_ssd_loads_coalesced             = durable.loads_coalesced;
+    result.shared_ssd_quota_rejections            = durable.quota_rejections;
+    result.shared_ssd_corrupt_records             = durable.corrupt_records;
+    result.shared_ssd_io_nanoseconds              = durable.io_nanoseconds;
+    result.shared_ssd_validation_nanoseconds      = durable.validation_nanoseconds;
+    result.shared_ssd_adoption_nanoseconds        = durable.adoption_nanoseconds;
+    result.shared_ssd_loaded_hits                 = durable.loaded_hits;
+    result.shared_ssd_warm_hits                   = durable.warm_hits;
+    return result;
 }
 
 void GenerationService::warmup() {

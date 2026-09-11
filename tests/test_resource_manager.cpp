@@ -2174,6 +2174,87 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
             "equal lower bound bypassed the pressure target that wins the stable tie-break");
 }
 
+void test_guided_pressure_prefers_complete_durable_recovery() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions         = 1;
+    program.pressure_action_immediate_ns      = 0;
+    program.pressure_action_degradation_units = 0;
+
+    FakeAdmissionCandidate candidate;
+    set_fake_machine_costs(candidate.identity.machine_work, 1'000'000'000, 1'000'000'000);
+    candidate.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    candidate.identity.source_mode     = PrivateSourceMode::ConsumeToActive;
+    candidate.identity.expandable      = true;
+    candidate.identity.assessment_digest = 31;
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate               = &candidate,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+    };
+
+    std::array<FakeContinuationHandle, 3> handles{
+        FakeContinuationHandle{11, 0},
+        FakeContinuationHandle{22, 0},
+        FakeContinuationHandle{33, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 3> owners{&handles[0], &handles[1],
+                                                              &handles[2]};
+    const std::array<PlanningOwnerId, 3> owner_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 3> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner               = owner_ids[0],
+                                                    .recovery_preference = 2},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner               = owner_ids[1],
+                                                    .recovery_preference = 0},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner               = owner_ids[2],
+                                                    .recovery_preference = 1},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = owner_ids[0],
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 100},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = owner_ids[1],
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 100},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = owner_ids[2],
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 100},
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = owners,
+            .private_owner_ids = owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    const auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates,
+                                     0, pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->plan && result->plan->private_owner_ids == std::vector{22U},
+            "guided pressure did not prefer the complete durable recovery owner");
+}
+
 void test_machine_cost_changes_selection_without_changing_physical_assessment() {
     using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
 
@@ -3301,9 +3382,10 @@ void test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity
     };
 
     const auto first        = imported(501, 0x02, 1, 96);
-    const auto first_result = manager.adopt_imported_shared(program, first);
+    const auto first_result = manager.adopt_imported_shared(program, first, {}, {}, true);
     require(first_result.disposition == FakeManager::SharedImportDisposition::Published &&
-                first_result.slot == 0 && program.shared_import_adoptions == 1,
+                first_result.slot == 0 && program.shared_import_adoptions == 1 &&
+                manager.shared_catalog_metadata(0).ssd_backed,
             "first shared import was not published into a vacant shared cell");
 
     const auto richer    = imported(501, 0x08, 2, 80);
@@ -3326,8 +3408,14 @@ void test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity
     cancelled.store(false);
     const auto second_result = manager.adopt_imported_shared(program, cancelled_import);
     require(second_result.disposition == FakeManager::SharedImportDisposition::Published &&
-                second_result.slot == 1 && program.shared_import_adoptions == 2,
+                second_result.slot == 1 && program.shared_import_adoptions == 2 &&
+                !manager.shared_catalog_metadata(1).ssd_backed,
             "second exact shared owner was not published independently");
+    const auto second_slot = manager.shared_catalog_slot(1);
+    require(!manager.mark_shared_ssd_backed(1, second_slot.id + 1U) &&
+                manager.mark_shared_ssd_backed(1, second_slot.id) &&
+                manager.shared_catalog_metadata(1).ssd_backed,
+            "durable commit did not bind SSD recovery to the exact shared owner");
 
     const auto overflow = imported(503, 0x08, 2);
     bool rejected       = false;
@@ -3342,7 +3430,7 @@ void test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity
             "shared catalog capacity failure changed a valid owner or reserved Program state");
 }
 
-void test_exact_shared_capture_merges_richer_structural_metadata() {
+void test_exact_shared_capture_cannot_relabel_durable_eligibility() {
     FakeManager manager = make_manager(1, 2, 1);
     FakeProgram program;
     const auto publish = [&](std::uint32_t origins, std::uint8_t role, bool eligible,
@@ -3383,8 +3471,8 @@ void test_exact_shared_capture_merges_richer_structural_metadata() {
     const auto metadata = manager.shared_catalog_metadata(0);
     require(metadata.state == FakeManager::SharedCatalogState::Catalogued &&
                 metadata.structural_origins == 0x1a && metadata.structural_role == 2 &&
-                metadata.ssd_eligible,
-            "exact shared-owner reuse did not merge richer structural metadata");
+                !metadata.ssd_eligible,
+            "exact shared-owner reuse relabelled an ineligible owner as durable");
 }
 
 void test_shared_capture_combines_two_pressure_owners() {
@@ -3919,6 +4007,8 @@ int main() {
              test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
+    run_test("durable recovery pressure preference",
+             test_guided_pressure_prefers_complete_durable_recovery);
     run_test("machine cost is selection-only",
              test_machine_cost_changes_selection_without_changing_physical_assessment);
     run_test("candidate-stratified reuse closure",
@@ -3974,8 +4064,8 @@ int main() {
              test_shared_republication_replaces_catalog_metadata_with_owner);
     run_test("shared snapshot transactional adoption",
              test_shared_snapshot_adoption_is_transactional_and_coalesces_exact_identity);
-    run_test("exact shared capture metadata merge",
-             test_exact_shared_capture_merges_richer_structural_metadata);
+    run_test("exact shared capture durable relabelling",
+             test_exact_shared_capture_cannot_relabel_durable_eligibility);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
     run_test("capture eviction observer physical reservation",

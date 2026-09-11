@@ -1238,6 +1238,7 @@ public:
         std::uint32_t structural_origins = 0;
         std::uint8_t structural_role     = 0;
         bool ssd_eligible                = false;
+        bool ssd_backed                  = false;
         std::optional<std::uint32_t> first_volatile_token;
     };
 
@@ -1249,6 +1250,7 @@ public:
                 .structural_origins   = entry.structural_origins,
                 .structural_role      = entry.structural_role,
                 .ssd_eligible         = entry.ssd_eligible,
+                .ssd_backed           = entry.ssd_backed,
                 .first_volatile_token = entry.first_volatile_token};
     }
 
@@ -1256,6 +1258,7 @@ public:
         SharedCatalogMetadata metadata;
         SharedPrefixSummary summary;
         const SharedPrefixHandle* handle = nullptr;
+        std::uint64_t id                 = 0;
     };
 
     [[nodiscard]] std::uint32_t shared_catalog_capacity() const noexcept {
@@ -1267,7 +1270,8 @@ public:
         const SharedCatalogEntry& entry = shared_catalog_[slot];
         return {.metadata = shared_catalog_metadata(slot),
                 .summary  = entry.summary,
-                .handle   = entry.handle ? &*entry.handle : nullptr};
+                .handle   = entry.handle ? &*entry.handle : nullptr,
+                .id       = entry.id};
     }
 
     enum class SharedImportDisposition : std::uint8_t { Published, Coalesced, Cancelled };
@@ -1283,8 +1287,9 @@ public:
     // catalog cell participates in this path.
     [[nodiscard]] SharedImportAdoptionResult
     adopt_imported_shared(Program& program, const ValidatedSharedPrefixImport& imported,
-                          CancellationFlagView cancellation = {},
-                          const std::function<void()>& before_publication = {}) {
+                          CancellationFlagView cancellation               = {},
+                          const std::function<void()>& before_publication = {},
+                          bool ssd_backed                                 = false) {
         if (!std::holds_alternative<std::monostate>(transaction_)) {
             throw std::logic_error("shared snapshot adoption requires a settled resource catalog");
         }
@@ -1304,6 +1309,7 @@ public:
                 continue;
             }
             merge_shared_metadata(entry, imported.metadata());
+            entry.ssd_backed = entry.ssd_backed || ssd_backed;
             return {.disposition = SharedImportDisposition::Coalesced, .slot = slot};
         }
         std::uint32_t slot = kInvalidCatalogSlot;
@@ -1348,6 +1354,7 @@ public:
         entry.handle.emplace(std::move(publication.handle));
         entry.observation = RetentionObservation{.retention_class = RetentionClass::SharedStable};
         merge_shared_metadata(entry, imported.metadata());
+        entry.ssd_backed      = ssd_backed;
         entry.explicit_credit = has_shared_candidate_evidence(
                                     entry.evidence, SharedCandidateEvidence::ExplicitBoundary) ||
                                 has_shared_candidate_evidence(
@@ -1361,6 +1368,18 @@ public:
         advance_revision(entry.revision);
         rebuild_prefix_index();
         return {.disposition = SharedImportDisposition::Published, .slot = slot};
+    }
+
+    [[nodiscard]] bool mark_shared_ssd_backed(std::uint32_t slot,
+                                              std::uint64_t expected_owner) noexcept {
+        if (slot >= shared_catalog_count_) { return false; }
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+            entry.id != expected_owner) {
+            return false;
+        }
+        entry.ssd_backed = true;
+        return true;
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {
@@ -1505,23 +1524,35 @@ private:
         SharedPrefixSummary summary;
         std::optional<SharedPrefixHandle> handle;
         RetentionObservation observation{.retention_class = RetentionClass::SharedStable};
-        std::uint32_t transaction_pins    = 0;
-        bool explicit_credit              = false;
-        std::uint64_t credit_expiry_epoch = 0;
-        std::uint32_t structural_origins  = 0;
-        std::uint8_t structural_role      = 0;
-        bool ssd_eligible                 = false;
-        SharedCandidateEvidence evidence  = SharedCandidateEvidence::None;
+        std::uint32_t transaction_pins        = 0;
+        bool explicit_credit                  = false;
+        std::uint64_t credit_expiry_epoch     = 0;
+        std::uint32_t structural_origins      = 0;
+        std::uint8_t structural_role          = 0;
+        bool ssd_eligible                     = false;
+        bool ssd_backed                       = false;
+        bool persistence_metadata_initialized = false;
+        SharedCandidateEvidence evidence      = SharedCandidateEvidence::None;
         std::optional<std::uint32_t> first_volatile_token;
     };
 
     static void merge_shared_metadata(SharedCatalogEntry& entry,
                                       const SharedPrefixPersistenceMetadata& candidate) noexcept {
-        entry.structural_origins |= candidate.structural_origins;
-        entry.evidence |= candidate.evidence;
-        // Role ordering is durability ordered: Transient < Harness < Project.
-        entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
-        entry.ssd_eligible    = entry.ssd_eligible || candidate.ssd_eligible;
+        if (!entry.persistence_metadata_initialized) {
+            entry.structural_origins               = candidate.structural_origins;
+            entry.evidence                         = candidate.evidence;
+            entry.structural_role                  = candidate.structural_role;
+            entry.ssd_eligible                     = candidate.ssd_eligible;
+            entry.persistence_metadata_initialized = true;
+        } else {
+            entry.structural_origins |= candidate.structural_origins;
+            entry.evidence |= candidate.evidence;
+            // Richer recognition may improve observability, but durable eligibility is a
+            // cumulative safety property: an unknown/ineligible incarnation cannot be relabelled
+            // into an SSD record by a later view of the same semantic owner.
+            entry.structural_role = std::max(entry.structural_role, candidate.structural_role);
+            entry.ssd_eligible    = entry.ssd_eligible && candidate.ssd_eligible;
+        }
         if (candidate.first_volatile_token) {
             entry.first_volatile_token =
                 entry.first_volatile_token
@@ -1976,13 +2007,15 @@ private:
         entry.handle.reset();
         entry.summary     = {};
         entry.observation = RetentionObservation{.retention_class = RetentionClass::SharedStable};
-        entry.transaction_pins    = 0;
-        entry.explicit_credit     = false;
-        entry.credit_expiry_epoch = 0;
-        entry.structural_origins  = 0;
-        entry.structural_role     = 0;
-        entry.ssd_eligible        = false;
-        entry.evidence            = SharedCandidateEvidence::None;
+        entry.transaction_pins                 = 0;
+        entry.explicit_credit                  = false;
+        entry.credit_expiry_epoch              = 0;
+        entry.structural_origins               = 0;
+        entry.structural_role                  = 0;
+        entry.ssd_eligible                     = false;
+        entry.ssd_backed                       = false;
+        entry.persistence_metadata_initialized = false;
+        entry.evidence                         = SharedCandidateEvidence::None;
         entry.first_volatile_token.reset();
         advance_revision(entry.revision);
     }
@@ -2280,6 +2313,20 @@ private:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
 
+            const auto shared_recovery_preference = [&](const SharedCatalogEntry& entry) {
+                if (entry.ssd_backed) { return std::uint8_t{0}; }
+                const auto alternatives =
+                    program.checkpoint_recovery_work(*entry.handle, entry.summary.checkpoint.ref);
+                const bool complete_device = std::any_of(
+                    alternatives.begin(), alternatives.end(), [](const auto& alternative) {
+                        return alternative.prefill == PrefillWork{} &&
+                               std::all_of(
+                                   alternative.transfers.begin(), alternative.transfers.end(),
+                                   [](const auto& transfer) { return transfer == TransferWork{}; });
+                    });
+                return complete_device ? std::uint8_t{1} : std::uint8_t{2};
+            };
+
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -2363,6 +2410,7 @@ private:
                 });
                 owner_policies.push_back(MaterializationOwnerPolicy{
                     .owner                    = owner,
+                    .recovery_preference      = shared_recovery_preference(entry),
                     .retention_class          = RetentionClass::SharedStable,
                     .selected_hit_count       = entry.observation.selected_hit_count,
                     .last_hit_epoch           = entry.observation.last_hit_epoch,
@@ -3550,11 +3598,13 @@ private:
                            ? std::numeric_limits<std::uint64_t>::max()
                            : demand_epoch_ + kDemandWindowCapacity)
                     : 0;
-            publication.structural_origins   = record->structural_origins;
-            publication.structural_role      = record->structural_role;
-            publication.ssd_eligible         = record->ssd_eligible;
-            publication.evidence             = record->shared_evidence;
-            publication.first_volatile_token = record->first_volatile_token;
+            publication.structural_origins               = record->structural_origins;
+            publication.structural_role                  = record->structural_role;
+            publication.ssd_eligible                     = record->ssd_eligible;
+            publication.ssd_backed                       = false;
+            publication.persistence_metadata_initialized = true;
+            publication.evidence                         = record->shared_evidence;
+            publication.first_volatile_token             = record->first_volatile_token;
             advance_revision(publication.revision);
             active.shared_sources.push_back(
                 active_edge(shared_capability(record->publication_slot)));

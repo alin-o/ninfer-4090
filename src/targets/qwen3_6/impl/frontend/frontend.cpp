@@ -1160,7 +1160,13 @@ PromptSummary PreparedPrompt::summary() const {
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     if (data_ == nullptr) { return {}; }
-    const PrepareStats& stats = data_->prepare;
+    const PrepareStats& stats         = data_->prepare;
+    const PreparedContextCache& cache = data_->context_cache;
+    const std::uint32_t eligible      = static_cast<std::uint32_t>(std::count_if(
+        cache.opportunities.begin(), cache.opportunities.end(), [](const auto& opportunity) {
+            return opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix &&
+                   opportunity.ssd_eligible;
+        }));
     return PromptPreparationStats{
         .seconds                       = stats.seconds,
         .media_preprocess_seconds      = stats.media_preprocess_seconds,
@@ -1176,6 +1182,11 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .media_singleflight_waits      = stats.media_singleflight_waits,
         .built_patch_bytes             = stats.built_patch_bytes,
         .reused_patch_bytes            = stats.reused_patch_bytes,
+        .stable_boundaries_recognized  = cache.structural_boundaries_accepted,
+        .stable_boundaries_capturable =
+            cache.structural_boundaries_accepted - cache.structural_boundaries_noncapturable,
+        .stable_boundary_mapping_skips = cache.structural_boundaries_skipped_not_token_boundary,
+        .ssd_eligible_boundaries       = eligible,
     };
 }
 

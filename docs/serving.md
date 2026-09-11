@@ -62,6 +62,31 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 
+### Durable shared-prefix persistence
+
+`--shared-prefix-cache-dir DIR` enables a server-owned catalog distinct from private slot files.
+Only complete stable harness/project boundaries ending strictly before the cumulative first
+volatile token are eligible. Classification remains a Frontend decision; Program produces and
+validates opaque `NINFSHR1` records; Engine owns publication/adoption; serving owns the filesystem.
+
+Startup reads only the bounded manifest. For a prepared prompt, serving asks Program for exact
+content digests, checks deepest candidates first, and loads a matching payload on demand. A selected
+load completes (or falls back) before that request is submitted for prefill and uses the existing
+pending deadline. Same-boundary memory availability avoids the SSD read. Corrupt, truncated,
+wrong-model/configuration and over-budget records receive no hit credit or Device reservation.
+
+Publication holds Program's immutable source pins through bounded assembly and write settlement.
+The record is written to a temporary file, synced, renamed and followed by a parent-directory sync;
+the separately written manifest is published last and is the commit marker. Failed or pending writes
+never count as durable recovery. Content-addressed duplicate reads and writes coalesce, startup
+removes a bounded number of temporary/unindexed orphans, and full quotas reject new work without
+altering a committed record. Metrics use `ninfer:shared_ssd_*`; request JSONL adds
+`result.durable_restore` with frontier, loaded/warm classification and fallback reason.
+Once publication commits, Engine marks that exact shared owner as safely SSD-backed. Guided Host
+pressure considers those complete owners before complete Device-backed and RAM-only shared owners;
+active edges and transfer pins remain ineligible, and the measured materialization cost makes the
+final choice.
+
 ### Session persistence
 
 `--slot-save-path DIR` enables llama.cpp-compatible slot persistence. `save` writes slot
@@ -752,6 +777,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
+| `--shared-prefix-cache-dir DIR` | enable lazy durable stable harness/project prefixes | disabled |
+| `--shared-prefix-cache-max-records N` | maximum committed records and startup manifest entries | `16` |
+| `--shared-prefix-cache-max-mib N` | committed shared-prefix directory byte quota | `65536` |
+| `--shared-prefix-cache-staging-mib N` | aggregate load/write payload and double-residency staging budget | `4096` |
+| `--shared-prefix-cache-workers N` | bounded filesystem worker count (`1..64`) | `2` |
+| `--shared-prefix-cache-jobs N` | total queued/in-flight load and write reservations | `4` |
 | `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |

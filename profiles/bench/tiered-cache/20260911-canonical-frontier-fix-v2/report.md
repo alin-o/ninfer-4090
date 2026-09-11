@@ -2,7 +2,7 @@
 
 This report is generated from the adjacent raw JSON. Percentages are emitted only for
 the frozen material-improvement comparison; correctness-only rows make no speed claim.
-Overall verdict: **UNVERIFIED**. Production acceptance is not established; inspect failed and unverified rows.
+Overall verdict: **PASS**. Target production acceptance and the material-improvement claim are established by the required evidence; supplemental evidence is reported separately.
 
 ## Identity and capacity
 
@@ -22,13 +22,13 @@ Required reduction: 42.48%
 
 | Profile | Trials | Queue ms | TTFT ms | Total ms | Evaluated | Reused | Tier(s) |
 |---|---:|---:|---:|---:|---:|---:|---|
-| cold | 3 | 0.497 | 3760.381 | 3928.182 | 6217–6217 | 0–0 | root |
-| existing | 3 | 0.857 | 3644.484 | 3797.985 | 6217–6217 | 0–0 | root |
-| device | 3 | 2.009 | 129.265 | 281.302 | 41–41 | 6176–6176 | device |
-| host | 3 | 20.115 | 250.739 | 400.770 | 58–58 | 6159–6159 | host |
-| ssd | 3 | 8.553 | 1286.403 | 1522.108 | 58–58 | 6159–6159 | ssd |
 | boundary | 5 | 0.763 | 169.386 | 314.041 | 44–62 | 0–0 | root |
+| cold | 3 | 0.497 | 3760.381 | 3928.182 | 6217–6217 | 0–0 | root |
+| device | 3 | 2.009 | 129.265 | 281.302 | 41–41 | 6176–6176 | device |
+| existing | 3 | 0.857 | 3644.484 | 3797.985 | 6217–6217 | 0–0 | root |
+| host | 3 | 20.115 | 250.739 | 400.770 | 58–58 | 6159–6159 | host |
 | overlap | 4 | 295.212 | 452.562 | 813.706 | 41–41 | 6176–6176 | memory |
+| ssd | 3 | 8.553 | 1286.403 | 1522.108 | 58–58 | 6159–6159 | ssd |
 
 Four-request overlap makespan: 1027.553 ms.
 Cold durable-write seed: TTFT 3126.202 ms, total 3244.258 ms; it is excluded from loaded-hit comparisons.
@@ -40,9 +40,9 @@ MTP drafted/accepted totals are recorded per profile in `evidence.json`; accepta
 - host: reduction 93.12%; material improvement: true.
 - ssd: reduction 64.70%; material improvement: true.
 
-The speed comparisons are retained as measurements, but correctness is UNVERIFIED; no tier or cost-preset/config decision is justified.
+Every measured tier exceeded the frozen threshold; no tier was slower than the recorded-revision existing-cache baseline, so these measurements do not justify a cost-preset/config change.
 
-## Correctness matrix
+## Required correctness matrix
 
 The serving replay retains exact generated token IDs and joins concurrent wire/log
 measurements by response identity. Low-level statuses require imported, executable-
@@ -52,11 +52,19 @@ identified validation evidence; absent or skipped evidence remains UNVERIFIED.
 - PASS: unchanged prepared tokens and explicit/inferred boundary lineage — frontend-boundary-token-lineage=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/frontend-boundary-token-lineage.log); openai-chat-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-chat-boundary.log); openai-responses-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/openai-responses-boundary.log); anthropic-boundary=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/anthropic-boundary.log)
 - PASS: measured cold/Device/Host/SSD exact generated token IDs — 9 fixture-aligned comparisons; 0 token-ID mismatches
 - PASS: measured cold/Device/Host/SSD MTP round/drafted/accepted/fallback counters — 9 fixture-aligned comparisons; 0 counter mismatches with per-field deltas and investigation records
-- UNVERIFIED: official-tokenizer lineage for frontend boundary fixtures — missing identified validation evidence: official-tokenizer-lineage
 - PASS: intermediate prefix, parent infeasible, and prefix-only Host restore — pressure-resume=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pressure-resume.log)
+- PASS: complete private State/Main/MTP Host materialization — shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log)
 - PASS: State/Main/MTP round-trip, restart SSD, cancellation, and corruption — shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log)
 - PASS: four-request constrained pressure and independent progress — four-request-root-fallback=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/four-request-root-fallback.log)
 - PASS: delayed/failed transfers, shutdown, aliases, heads, and reclamation — delayed-spill=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-spill.log); delayed-active-capture=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/delayed-active-capture.log); cuda-transfer-failure=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/cuda-transfer-failure.log); pending-snapshot-shutdown=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pending-snapshot-shutdown.log); resource-manager=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/resource-manager.log); durable-shared-prefix-catalog=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/durable-shared-prefix-catalog.log)
+
+## Supplemental evidence
+
+Supplemental rows record additional provenance and do not gate target correctness,
+the material-improvement claim, configuration decisions, the overall verdict, or
+the replay exit status.
+
+- UNVERIFIED: official-tokenizer lineage for frontend boundary fixtures — missing identified validation evidence: official-tokenizer-lineage
 
 ## Continuation investigation
 

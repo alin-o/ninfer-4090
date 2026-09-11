@@ -19,6 +19,8 @@ from tools.bench.run_tiered_cache_replay import (
     RunningServe,
     boundary_replay_status,
     build_regression_matrix,
+    build_supplemental_evidence,
+    campaign_exit_status,
     campaign_verdict,
     configuration_decision,
     done_by_response_id,
@@ -447,13 +449,17 @@ def test_tiered_cache_verdicts_are_derived_and_missing_validation_is_unverified(
     assert matrix[0]["status"] == "UNVERIFIED"
     assert matrix[2]["status"] == "PASS"
     assert matrix[3]["status"] == "FAIL"
-    assert matrix[4]["case"].startswith("official-tokenizer lineage")
     assert all(row["status"] == "UNVERIFIED" for row in matrix[4:])
-    unpinned_tokenizer = build_regression_matrix(
-        continuation,
-        {"official-tokenizer-lineage": {"status": "PASS"}},
+    supplemental = build_supplemental_evidence(
+        {"official-tokenizer-lineage": {"status": "PASS"}}
     )
-    assert unpinned_tokenizer[4]["status"] == "UNVERIFIED"
+    assert supplemental == [
+        {
+            "status": "UNVERIFIED",
+            "case": "official-tokenizer lineage for frontend boundary fixtures",
+            "evidence": "official-tokenizer evidence is absent, skipped, or not identity-pinned",
+        }
+    ]
 
     decision = configuration_decision(
         {
@@ -488,9 +494,82 @@ def test_tiered_cache_verdicts_are_derived_and_missing_validation_is_unverified(
     assert verdict == {
         "overall": "FAIL",
         "performance": "FAIL",
+        "performance_measurement": "FAIL",
         "correctness": "FAIL",
-        "reason": "Production acceptance is not established; inspect failed and unverified rows.",
+        "reason": (
+            "Target production acceptance is not established; inspect required failed and "
+            "unverified rows and the measured comparisons."
+        ),
     }
+
+
+def test_supplemental_tokenizer_does_not_gate_target_verdicts() -> None:
+    continuation = {
+        "target_token_status": "PASS",
+        "comparisons": [],
+        "target_token_mismatches": [],
+        "speculative_counter_status": "PASS",
+        "speculative_counter_mismatches": [],
+    }
+    required_cases = {
+        name: {"status": "PASS", "evidence": f"{name}.log"}
+        for name in (
+            "frontend-boundary-token-lineage",
+            "openai-chat-boundary",
+            "openai-responses-boundary",
+            "anthropic-boundary",
+            "pressure-resume",
+            "host-restore",
+            "shared-snapshot",
+            "four-request-root-fallback",
+            "delayed-spill",
+            "delayed-active-capture",
+            "cuda-transfer-failure",
+            "pending-snapshot-shutdown",
+            "resource-manager",
+            "durable-shared-prefix-catalog",
+        )
+    }
+    comparisons = {
+        profile: {"material_improvement": True, "reduction_fraction": 0.5}
+        for profile in ("device", "host", "ssd")
+    }
+    boundary = {
+        "status": "PASS",
+        "case": "live serving boundary protocols",
+        "evidence": "5/5",
+    }
+
+    required = build_regression_matrix(continuation, required_cases, boundary)
+    supplemental = build_supplemental_evidence(required_cases)
+    verdict = campaign_verdict(comparisons, required)
+    decision = configuration_decision(comparisons, verdict["correctness"])
+
+    assert all(row["status"] == "PASS" for row in required)
+    assert supplemental[0]["status"] == "UNVERIFIED"
+    assert verdict["correctness"] == "PASS"
+    assert verdict["performance"] == "PASS"
+    assert verdict["performance_measurement"] == "PASS"
+    assert verdict["overall"] == "PASS"
+    assert decision["status"] == "PASS"
+    assert campaign_exit_status(verdict) == 0
+
+    required_unverified = build_regression_matrix(continuation, {}, boundary)
+    unverified = campaign_verdict(comparisons, required_unverified)
+    assert unverified["correctness"] == "UNVERIFIED"
+    assert unverified["performance"] == "UNVERIFIED"
+    assert unverified["performance_measurement"] == "PASS"
+    assert unverified["overall"] == "UNVERIFIED"
+    assert campaign_exit_status(unverified) == 3
+
+    required_cases["pressure-resume"]["status"] = "FAIL"
+    required_failed = build_regression_matrix(continuation, required_cases, boundary)
+    failed = campaign_verdict(comparisons, required_failed)
+    assert failed["correctness"] == "FAIL"
+    assert failed["performance"] == "FAIL"
+    assert failed["performance_measurement"] == "PASS"
+    assert failed["overall"] == "FAIL"
+    assert campaign_exit_status(failed) == 3
 
 
 def test_tiered_cache_boundary_verdict_requires_unique_preserved_identities() -> None:

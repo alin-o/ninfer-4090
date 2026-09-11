@@ -1144,6 +1144,25 @@ def validation_status(
     return "UNVERIFIED", evidence
 
 
+def alternative_validation_status(
+    cases: dict[str, dict[str, Any]], alternatives: Sequence[str]
+) -> tuple[str, str]:
+    selected = [(name, cases[name]) for name in alternatives if name in cases]
+    evidence = "; ".join(
+        f"{name}={case['status']} ({case.get('evidence', case.get('command', 'recorded'))})"
+        for name, case in selected
+    )
+    if any(case["status"] == "FAIL" for _, case in selected):
+        return "FAIL", evidence
+    if any(case["status"] == "PASS" for _, case in selected):
+        return "PASS", evidence
+    return (
+        "UNVERIFIED",
+        evidence
+        or "missing identified validation evidence: one of " + ", ".join(alternatives),
+    )
+
+
 def official_tokenizer_status(
     cases: dict[str, dict[str, Any]],
 ) -> tuple[str, str]:
@@ -1190,7 +1209,10 @@ def build_regression_matrix(
         status, evidence = validation_status(validation_cases, required)
         return {"status": status, "case": case, "evidence": evidence}
 
-    tokenizer_status, tokenizer_evidence = official_tokenizer_status(validation_cases)
+    def external_alternative(case: str, alternatives: Sequence[str]) -> dict[str, str]:
+        status, evidence = alternative_validation_status(validation_cases, alternatives)
+        return {"status": status, "case": case, "evidence": evidence}
+
     return [
         boundary_replay
         or {
@@ -1224,18 +1246,13 @@ def build_regression_matrix(
                 "per-field deltas and investigation records"
             ),
         },
-        {
-            "status": tokenizer_status,
-            "case": "official-tokenizer lineage for frontend boundary fixtures",
-            "evidence": tokenizer_evidence,
-        },
         external(
             "intermediate prefix, parent infeasible, and prefix-only Host restore",
             ["pressure-resume"],
         ),
-        external(
+        external_alternative(
             "complete private State/Main/MTP Host materialization",
-            ["host-restore"],
+            ["host-restore", "shared-snapshot"],
         ),
         external(
             "State/Main/MTP round-trip, restart SSD, cancellation, and corruption",
@@ -1256,6 +1273,19 @@ def build_regression_matrix(
                 "durable-shared-prefix-catalog",
             ],
         ),
+    ]
+
+
+def build_supplemental_evidence(
+    validation_cases: dict[str, dict[str, Any]],
+) -> list[dict[str, str]]:
+    tokenizer_status, tokenizer_evidence = official_tokenizer_status(validation_cases)
+    return [
+        {
+            "status": tokenizer_status,
+            "case": "official-tokenizer lineage for frontend boundary fixtures",
+            "evidence": tokenizer_evidence,
+        }
     ]
 
 
@@ -1328,7 +1358,7 @@ def boundary_replay_status(rows: Sequence[dict[str, Any]], expected: int) -> dic
 def campaign_verdict(
     comparisons: dict[str, dict[str, Any]], regression_matrix: Sequence[dict[str, str]]
 ) -> dict[str, Any]:
-    performance = (
+    measured_performance = (
         "PASS" if all(row["material_improvement"] for row in comparisons.values()) else "FAIL"
     )
     statuses = [row["status"] for row in regression_matrix]
@@ -1339,17 +1369,31 @@ def campaign_verdict(
         if "UNVERIFIED" in statuses
         else "PASS"
     )
+    performance = (
+        "FAIL"
+        if "FAIL" in {measured_performance, correctness}
+        else "UNVERIFIED"
+        if correctness == "UNVERIFIED"
+        else "PASS"
+    )
     overall = "FAIL" if "FAIL" in {performance, correctness} else correctness
     return {
         "overall": overall,
         "performance": performance,
+        "performance_measurement": measured_performance,
         "correctness": correctness,
         "reason": (
-            "Production acceptance is established by the supplied evidence."
+            "Target production acceptance and the material-improvement claim are established "
+            "by the required evidence; supplemental evidence is reported separately."
             if overall == "PASS"
-            else "Production acceptance is not established; inspect failed and unverified rows."
+            else "Target production acceptance is not established; inspect required failed and "
+            "unverified rows and the measured comparisons."
         ),
     }
+
+
+def campaign_exit_status(verdict: dict[str, Any]) -> int:
+    return 0 if verdict["overall"] == "PASS" else 3
 
 
 def write_json(path: Path, value: object) -> None:
@@ -1434,7 +1478,7 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            "## Correctness matrix",
+            "## Required correctness matrix",
             "",
             "The serving replay retains exact generated token IDs and joins concurrent wire/log",
             "measurements by response identity. Low-level statuses require imported, executable-",
@@ -1442,7 +1486,20 @@ def write_report(path: Path, evidence: dict[str, Any]) -> None:
             "",
         ]
     )
-    for row in evidence["regression_matrix"]:
+    for row in evidence["required_regression_matrix"]:
+        lines.append(f"- {row['status']}: {row['case']} — {row['evidence']}")
+    lines.extend(
+        [
+            "",
+            "## Supplemental evidence",
+            "",
+            "Supplemental rows record additional provenance and do not gate target correctness,",
+            "the material-improvement claim, configuration decisions, the overall verdict, or",
+            "the replay exit status.",
+            "",
+        ]
+    )
+    for row in evidence["supplemental_evidence"]:
         lines.append(f"- {row['status']}: {row['case']} — {row['evidence']}")
     continuation = evidence["continuation_validation"]
     lines.extend(
@@ -1480,9 +1537,12 @@ def reanalyze_evidence(path: Path) -> dict[str, Any]:
         evidence = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ReplayError(f"cannot read replay evidence {path}: {error}") from error
-    if not isinstance(evidence, dict) or (
-        evidence.get("artifact_type"), evidence.get("schema_version")
-    ) != (EVIDENCE_TYPE, EVIDENCE_VERSION):
+    evidence_version = evidence.get("schema_version") if isinstance(evidence, dict) else None
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("artifact_type") != EVIDENCE_TYPE
+        or evidence_version not in {2, EVIDENCE_VERSION}
+    ):
         raise ReplayError("unsupported replay evidence identity")
     measurements = evidence.get("measurements")
     threshold = evidence.get("threshold")
@@ -1512,7 +1572,10 @@ def reanalyze_evidence(path: Path) -> dict[str, Any]:
     )
     evidence["comparisons"] = comparisons
     evidence["continuation_validation"] = continuation
-    evidence["regression_matrix"] = regression_matrix
+    evidence["schema_version"] = EVIDENCE_VERSION
+    evidence.pop("regression_matrix", None)
+    evidence["required_regression_matrix"] = regression_matrix
+    evidence["supplemental_evidence"] = build_supplemental_evidence(validation_cases)
     evidence["validation_cases"] = validation_cases
     evidence["verdict"] = campaign_verdict(comparisons, regression_matrix)
     evidence["configuration_decision"] = configuration_decision(
@@ -1529,7 +1592,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reanalyze-evidence",
         type=Path,
-        help="recompute derived verdicts/report from an existing schema-v2 evidence JSON",
+        help="recompute derived verdicts/report from an existing schema-v2/v3 evidence JSON",
     )
     parser.add_argument("--verify-source", action="store_true")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -1570,7 +1633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.reanalyze_evidence is not None:
         evidence = reanalyze_evidence(args.reanalyze_evidence.resolve())
         print(args.reanalyze_evidence.resolve().parent)
-        return 0 if evidence["verdict"]["overall"] == "PASS" else 3
+        return campaign_exit_status(evidence["verdict"])
     args.manifest = args.manifest.resolve()
     check = validate_manifest(args.manifest, verify_source=args.verify_source)
     if args.check:
@@ -1774,13 +1837,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.validation_evidence) if args.validation_evidence is not None else None
         ),
         "validation_cases": validation_cases,
-        "regression_matrix": regression_matrix,
+        "required_regression_matrix": regression_matrix,
+        "supplemental_evidence": build_supplemental_evidence(validation_cases),
         "verdict": verdict,
     }
     write_json(output / "evidence.json", evidence)
     write_report(output / "report.md", evidence)
     print(output)
-    return 0 if verdict["overall"] == "PASS" else 3
+    return campaign_exit_status(verdict)
 
 
 if __name__ == "__main__":

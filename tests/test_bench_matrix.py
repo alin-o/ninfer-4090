@@ -140,3 +140,11 @@ def test_tiered_cache_matrix_requires_complete_private_host_materialization() ->
             }
         }
     )["status"] == "PASS"
+    assert host_row(
+        {
+            "shared-snapshot": {
+                "status": "PASS",
+                "evidence": "shared-snapshot.log",
+            }
+        }
+    )["status"] == "PASS"

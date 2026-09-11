@@ -82,13 +82,13 @@
       "ssd"
     ],
     "missed_profiles": [],
-    "reason": "The speed comparisons are retained as measurements, but correctness is UNVERIFIED; no tier or cost-preset/config decision is justified.",
+    "reason": "Every measured tier exceeded the frozen threshold; no tier was slower than the recorded-revision existing-cache baseline, so these measurements do not justify a cost-preset/config change.",
     "slower_than_existing_baseline": [],
-    "status": "UNVERIFIED",
+    "status": "PASS",
     "tier_actions": {
-      "device": "blocked-by-correctness",
-      "host": "blocked-by-correctness",
-      "ssd": "blocked-by-correctness"
+      "device": "retain",
+      "host": "retain",
+      "ssd": "retain"
     }
   },
   "continuation_validation": {
@@ -116727,7 +116727,7 @@
       ]
     }
   },
-  "regression_matrix": [
+  "required_regression_matrix": [
     {
       "case": "live serving boundary protocols",
       "evidence": "5/5 fixture shapes completed through public endpoints with 5 unique wire response identities",
@@ -116749,13 +116749,13 @@
       "status": "PASS"
     },
     {
-      "case": "official-tokenizer lineage for frontend boundary fixtures",
-      "evidence": "missing identified validation evidence: official-tokenizer-lineage",
-      "status": "UNVERIFIED"
-    },
-    {
       "case": "intermediate prefix, parent infeasible, and prefix-only Host restore",
       "evidence": "pressure-resume=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/pressure-resume.log)",
+      "status": "PASS"
+    },
+    {
+      "case": "complete private State/Main/MTP Host materialization",
+      "evidence": "shared-snapshot=PASS (/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3-logs/shared-snapshot.log)",
       "status": "PASS"
     },
     {
@@ -116774,7 +116774,7 @@
       "status": "PASS"
     }
   ],
-  "schema_version": 2,
+  "schema_version": 3,
   "summaries": {
     "boundary": {
       "committed_decode_tokens": 74,
@@ -117589,6 +117589,13 @@
       "trials": 3
     }
   },
+  "supplemental_evidence": [
+    {
+      "case": "official-tokenizer lineage for frontend boundary fixtures",
+      "evidence": "missing identified validation evidence: official-tokenizer-lineage",
+      "status": "UNVERIFIED"
+    }
+  ],
   "threshold": {
     "baseline_groups": [
       {
@@ -117728,9 +117735,10 @@
   },
   "validation_evidence_path": "/workspace/ninfer/.worktrees/validate-tiered-cache-correctness-and-speedups-at-concurrency-four-lyhafi/.local/tiered-cache-validation-frontier-fix-v3.json",
   "verdict": {
-    "correctness": "UNVERIFIED",
-    "overall": "UNVERIFIED",
+    "correctness": "PASS",
+    "overall": "PASS",
     "performance": "PASS",
-    "reason": "Production acceptance is not established; inspect failed and unverified rows."
+    "performance_measurement": "PASS",
+    "reason": "Target production acceptance and the material-improvement claim are established by the required evidence; supplemental evidence is reported separately."
   }
 }

@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 MANIFEST_TYPE = "ninfer_tiered_cache_fixture_manifest"
 MANIFEST_VERSION = 1
 EVIDENCE_TYPE = "ninfer_tiered_cache_evidence"
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 3
 
 
 class ReplayError(RuntimeError):

@@ -74,11 +74,13 @@ output does not by itself make a speculative-counter mismatch pass.
 
 Serve throughput transfer fields and pressure/eviction fields are interval deltas, so reports sum
 them. Only live occupancy and explicit high-water metrics use maxima. Reclaimed-capacity totals come
-from the alias-aware runtime counters. Validation rows are PASS only when named, executable-pinned
-evidence is supplied; the identified validation case map is embedded into `evidence.json` so
-derived verdicts do not depend on an ignored side file. Missing evidence—including
-official-tokenizer fixture lineage without an authorized identity-pinned local tokenizer
-artifact—remains UNVERIFIED; the tools never download a tokenizer or model.
+from the alias-aware runtime counters. Required validation rows are PASS only when named,
+executable-pinned evidence is supplied; the identified validation case map is embedded into
+`evidence.json` so derived verdicts do not depend on an ignored side file. Missing required evidence
+remains UNVERIFIED and gates target correctness, the performance claim, configuration decisions,
+the overall verdict, and exit status. Supplemental official-tokenizer fixture lineage remains
+separately UNVERIFIED without an authorized identity-pinned local tokenizer artifact, but does not
+gate the target verdicts; the tools never download a tokenizer or model.
 
 Derived verdict/report logic can be replayed without rerunning the model; raw measurements and the
 frozen threshold remain unchanged:

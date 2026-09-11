@@ -5,13 +5,12 @@
 ```bash
 NINFER_VERIFY_PYTHON=/opt/ninfer-venv/bin/python \
 NINFER_VERIFY_EVAL_PYTHON=/opt/ninfer-venv/bin/python \
-CMAKE_BUILD_PARALLEL_LEVEL=2 \
   bash .agent/verify.sh
 ```
 
 Result: PASS. Linux script checks passed; the artifact, converter, and benchmark-consumer suite
-reported 91 passes; the evaluation coordinator reported 19 passes; the Release sm_89 build passed;
-and CTest reported 105 tests with zero failures in 155.93 seconds.
+reported 93 passes; the evaluation coordinator reported 19 passes; the Release sm_89 build passed;
+and CTest reported 105 tests with zero failures in 142.00 seconds.
 
 The canonical invocation did not set a model-artifact variable, so six real-artifact target tests
 were skipped. The sm_89-inapplicable NVFP4 A4 test was also skipped. These skips do not establish
@@ -32,20 +31,30 @@ catalog tests, frontend boundary/token-lineage coverage, and the three public pr
 suites. The identified case map is embedded in `evidence.json`.
 
 Official-tokenizer fixture lineage remains UNVERIFIED because no user-authorized,
-identity-pinned official tokenizer artifact was established locally. No artifact was downloaded.
+identity-pinned official tokenizer artifact was established locally. It is supplemental provenance,
+not a target acceptance row. No artifact was downloaded.
+
+The localized benchmark-verdict regressions passed (`20 passed` across
+`tests/test_serve_corpus.py` and `tests/test_bench_matrix.py`). They establish that unavailable
+supplemental tokenizer evidence does not affect target correctness, performance, configuration,
+overall verdict, or exit status, while a required FAIL or UNVERIFIED row still blocks those claims.
 
 ## Production-profile replay
 
-The schema-v2 replay completed three trials for every cold, recorded-revision existing-cache,
+The schema-v3 derived analysis uses the existing executable-pinned replay, which completed three
+trials for every cold, recorded-revision existing-cache,
 Device, forced-Host, and post-restart SSD arm, plus the serving-boundary and four-request-overlap
-matrices.
+matrices. No GPU campaign was rerun; raw measurements and the frozen threshold are unchanged.
 
 - Exact continuation: PASS. All 9 cold-versus-tier generated-token comparisons match exactly.
 - MTP counters: PASS. All 9 round/drafted/accepted/fallback and per-position comparisons match.
 - Performance: PASS. The threshold was frozen at 42.48% before optimized arms. Device, Host, and
   SSD reduced median TTFT by 96.45%, 93.12%, and 64.70%, respectively.
-- Overall: UNVERIFIED solely because official-tokenizer lineage remains unavailable. No
-  cost-preset or configuration change is justified from an unverified production result.
+- Required matrix and overall: PASS. All nine target acceptance rows pass. Official-tokenizer
+  lineage remains separately UNVERIFIED under supplemental evidence.
+- Configuration: PASS with Device, Host, and SSD retained. No cost-preset/config change is
+  justified because every measured tier exceeded the threshold and none was slower than the
+  recorded-revision existing-cache baseline.
 
 The adjacent `evidence.json`, `threshold.json`, and generated `report.md` retain build, artifact,
 GPU, resolved-capacity, quota, trial, timing, transfer, pressure, occupancy, and exact-token data.

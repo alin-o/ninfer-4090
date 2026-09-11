@@ -378,8 +378,9 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         if (durable_catalog_ && cache_participation == CacheParticipation::ReadWrite) {
-            const DurableSharedPrefixRestore restore = durable_catalog_->restore_matching(
-                *engine_, prompt, prepared.lifetime->deadline, control.cancellation);
+            const DurableSharedPrefixRestore restore =
+                durable_catalog_->restore_matching(*engine_, prompt, prepared.lifetime->deadline,
+                                                   control.cancellation, request_options);
             prepared.durable_restore_frontier = restore.frontier;
             prepared.durable_loaded_from_ssd  = restore.loaded_from_ssd;
             prepared.durable_warm_available   = restore.warm_available;
@@ -530,6 +531,9 @@ ninfer::RuntimeStats GenerationService::runtime_stats() const {
     result.shared_ssd_adoption_nanoseconds        = durable.adoption_nanoseconds;
     result.shared_ssd_loaded_hits                 = durable.loaded_hits;
     result.shared_ssd_warm_hits                   = durable.warm_hits;
+    result.shared_ssd_pending_export_claims       = durable.pending_export_claims;
+    result.shared_ssd_unpublished_records         = durable.unpublished_records;
+    result.shared_ssd_unpublished_bytes           = durable.unpublished_bytes;
     return result;
 }
 

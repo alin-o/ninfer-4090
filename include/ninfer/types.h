@@ -1017,6 +1017,9 @@ struct RuntimeStats {
     std::uint64_t shared_ssd_io_nanoseconds         = 0;
     std::uint64_t shared_ssd_validation_nanoseconds = 0;
     std::uint64_t shared_ssd_adoption_nanoseconds   = 0;
+    std::uint32_t shared_ssd_pending_export_claims  = 0;
+    std::uint32_t shared_ssd_unpublished_records    = 0;
+    std::uint64_t shared_ssd_unpublished_bytes      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

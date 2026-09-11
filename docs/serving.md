@@ -70,17 +70,25 @@ volatile token are eligible. Classification remains a Frontend decision; Program
 validates opaque `NINFSHR1` records; Engine owns publication/adoption; serving owns the filesystem.
 
 Startup reads only the bounded manifest. For a prepared prompt, serving asks Program for exact
-content digests, checks deepest candidates first, and loads a matching payload on demand. A selected
-load completes (or falls back) before that request is submitted for prefill and uses the existing
-pending deadline. Same-boundary memory availability avoids the SSD read. Corrupt, truncated,
-wrong-model/configuration and over-budget records receive no hit credit or Device reservation.
+content digests, checks deepest candidates first, and loads a matching payload on demand. Before
+I/O, Engine evaluates exact private/shared memory sources with its physical readiness assessment
+and measured context cost model. A same-or-deeper ready Device/Host source wins over SSD; an SSD
+load is attempted only when adoption is currently feasible. A selected load completes (or falls
+back) before that request is submitted for prefill and uses the existing pending deadline. Corrupt,
+truncated, wrong-model/configuration and over-budget records receive no hit credit or Device
+reservation.
 
 Publication holds Program's immutable source pins through bounded assembly and write settlement.
-The record is written to a temporary file, synced, renamed and followed by a parent-directory sync;
-the separately written manifest is published last and is the commit marker. Failed or pending writes
-never count as durable recovery. Content-addressed duplicate reads and writes coalesce, startup
-removes a bounded number of temporary/unindexed orphans, and full quotas reject new work without
-altering a committed record. Metrics use `ninfer:shared_ssd_*`; request JSONL adds
+Each replacement uses a new record filename: it is written to a temporary file, synced, renamed and
+followed by a parent-directory sync; the separately written manifest is published last and is the
+commit marker. An interrupted replacement therefore leaves the previous manifest and record
+usable. Existing records coalesce only after byte-exact comparison with a current Program export;
+validation failures are removed from the committed index before regeneration. Failed or pending
+writes never count as durable recovery. Content-addressed duplicate reads and writes coalesce,
+startup removes a bounded number of temporary/unindexed orphans, and directory quotas charge
+unpublished payloads until deletion is synced. Full quotas reject new work without altering a
+committed record. Metrics use `ninfer:shared_ssd_*`, including pending export claims and
+unpublished directory bytes/records; request JSONL adds
 `result.durable_restore` with frontier, loaded/warm classification and fallback reason.
 Once publication commits, Engine marks that exact shared owner as safely SSD-backed. Guided Host
 pressure considers those complete owners before complete Device-backed and RAM-only shared owners;
@@ -778,8 +786,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--shared-prefix-cache-dir DIR` | enable lazy durable stable harness/project prefixes | disabled |
-| `--shared-prefix-cache-max-records N` | maximum committed records and startup manifest entries | `16` |
-| `--shared-prefix-cache-max-mib N` | committed shared-prefix directory byte quota | `65536` |
+| `--shared-prefix-cache-max-records N` | maximum committed plus unpublished shared-prefix records | `16` |
+| `--shared-prefix-cache-max-mib N` | committed plus unpublished shared-prefix payload byte quota | `65536` |
 | `--shared-prefix-cache-staging-mib N` | aggregate load/write payload and double-residency staging budget | `4096` |
 | `--shared-prefix-cache-workers N` | bounded filesystem worker count (`1..64`) | `2` |
 | `--shared-prefix-cache-jobs N` | total queued/in-flight load and write reservations | `4` |

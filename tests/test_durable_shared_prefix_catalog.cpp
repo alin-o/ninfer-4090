@@ -1,6 +1,7 @@
 #include "serve/durable_shared_prefix_catalog.h"
 
 #include <atomic>
+#include <barrier>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -61,6 +62,16 @@ DurableSharedPrefixCatalogOptions options(const std::filesystem::path& path) {
             .workers       = 1,
             .max_jobs      = 2,
             .staging_bytes = 4096};
+}
+
+std::filesystem::path record_path(const std::filesystem::path& directory, std::string_view digest) {
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
+         it.increment(error)) {
+        const std::string name = it->path().filename().string();
+        if (name.starts_with(digest) && name.ends_with(".nsh")) { return it->path(); }
+    }
+    return {};
 }
 
 void test_restart_lazy_load_and_duplicate_write() {
@@ -136,7 +147,7 @@ void test_truncation_quota_and_cancelled_load_cleanup() {
         expect(catalog.stats().manifest_records == 1 && catalog.stats().quota_rejections >= 1,
                "full record quota published an additional record");
     }
-    std::filesystem::resize_file(temporary.path / (std::string(64, 'b') + ".nsh"), 2);
+    std::filesystem::resize_file(record_path(temporary.path, std::string(64, 'b')), 2);
     {
         DurableSharedPrefixCatalog catalog(configured);
         // Size mismatch is rejected while loading startup metadata, so the truncated payload is
@@ -199,6 +210,96 @@ void test_interrupted_manifest_preserves_previous_commit() {
     }
 }
 
+void test_first_load_registration_race_releases_loser_outside_mutex() {
+    TemporaryDirectory temporary;
+    const auto candidate = DurableSharedPrefixCatalog::Candidate{
+        .content_digest = std::string(64, '7'), .frontier = 23};
+    const std::vector<std::uint8_t> payload(128, 7);
+    {
+        DurableSharedPrefixCatalog catalog(options(temporary.path));
+        catalog.enqueue(snapshot('7', candidate.frontier, payload));
+        catalog.drain();
+    }
+
+    std::barrier registration_race(2);
+    auto configured                     = options(temporary.path);
+    configured.max_jobs                 = 2;
+    configured.before_load_registration = [&] { registration_race.arrive_and_wait(); };
+    DurableSharedPrefixCatalog catalog(std::move(configured));
+    std::atomic<std::uint32_t> loaded{0};
+    const auto load_once = [&] {
+        const auto result = catalog.load(candidate, DurableSharedPrefixCatalog::Clock::now() +
+                                                        std::chrono::seconds(2));
+        if (result && *result == payload) { ++loaded; }
+    };
+    std::thread first(load_once);
+    std::thread second(load_once);
+    first.join();
+    second.join();
+    catalog.drain();
+    const auto stats = catalog.stats();
+    expect(loaded.load() == 2 && stats.loads_completed == 1 && stats.loads_coalesced == 1,
+           "simultaneous first loads did not coalesce without deadlocking");
+    expect(stats.staging_bytes == 0,
+           "redundant first-load reservation was not released after catalog unlock");
+}
+
+void test_replacement_and_repeated_manifest_failures_stay_bounded() {
+    TemporaryDirectory temporary;
+    auto configured        = options(temporary.path);
+    configured.max_records = 3;
+    configured.max_bytes   = 64;
+    const std::string digest(64, '8');
+    {
+        DurableSharedPrefixCatalog catalog(configured);
+        catalog.enqueue(snapshot('8', 24, {1, 2, 3, 4}));
+        catalog.drain();
+    }
+    {
+        auto interrupted                    = configured;
+        interrupted.before_manifest_publish = [] { throw std::runtime_error("injected crash"); };
+        DurableSharedPrefixCatalog catalog(std::move(interrupted));
+        catalog.enqueue(snapshot('8', 24, {4, 3, 2, 1}));
+        for (char value = '1'; value <= '6'; ++value) {
+            catalog.enqueue(snapshot(value, 24, std::vector<std::uint8_t>(8, value)));
+            catalog.drain();
+        }
+        catalog.drain();
+        const auto stats = catalog.stats();
+        expect(stats.manifest_records == 1 && stats.manifest_bytes == 4 &&
+                   stats.unpublished_records == 0 && stats.unpublished_bytes == 0,
+               "failed manifest publications escaped directory quota accounting");
+        std::uint32_t record_files = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(temporary.path)) {
+            if (entry.path().filename().string().ends_with(".nsh")) { ++record_files; }
+        }
+        expect(record_files == 1,
+               "failed replacement/publications left unbounded committed-looking payloads");
+    }
+    {
+        DurableSharedPrefixCatalog catalog(configured);
+        auto prior =
+            catalog.load({.content_digest = digest, .frontier = 24},
+                         DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+        expect(prior && *prior == std::vector<std::uint8_t>({1, 2, 3, 4}),
+               "interrupted replacement did not preserve the prior committed record");
+        prior.reset();
+        catalog.drain();
+        catalog.enqueue(snapshot('8', 24, {4, 3, 2, 1}));
+        catalog.drain();
+    }
+    {
+        DurableSharedPrefixCatalog catalog(configured);
+        auto replaced =
+            catalog.load({.content_digest = digest, .frontier = 24},
+                         DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+        expect(replaced && *replaced == std::vector<std::uint8_t>({4, 3, 2, 1}),
+               "validated replacement did not survive restart");
+        replaced.reset();
+        catalog.drain();
+    }
+}
+
 void test_orphan_cleanup_preserves_unrelated_files() {
     TemporaryDirectory temporary;
     const std::filesystem::path unrelated_temporary = temporary.path / "keep.tmp.user";
@@ -218,6 +319,8 @@ int main() {
     test_restart_lazy_load_and_duplicate_write();
     test_truncation_quota_and_cancelled_load_cleanup();
     test_interrupted_manifest_preserves_previous_commit();
+    test_first_load_registration_race_releases_loser_outside_mutex();
+    test_replacement_and_repeated_manifest_failures_stay_bounded();
     test_orphan_cleanup_preserves_unrelated_files();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

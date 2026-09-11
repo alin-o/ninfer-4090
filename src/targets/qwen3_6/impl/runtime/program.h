@@ -736,6 +736,7 @@ public:
     [[nodiscard]] bool
     durable_shared_prefix_matches(const qwen3_6::DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle& resident) const;
+    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
                          const qwen3_6::SharedPrefixPersistenceMetadata& metadata);

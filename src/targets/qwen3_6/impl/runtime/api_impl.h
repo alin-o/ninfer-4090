@@ -656,6 +656,11 @@ bool Program<Variant>::durable_shared_prefix_matches(
 }
 
 template <>
+bool Program<Variant>::durable_shared_prefix_import_feasible(std::uint32_t frontier) const {
+    return impl_->durable_shared_prefix_import_feasible(frontier);
+}
+
+template <>
 RetainedSessionSnapshot
 Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared,
                                        std::string_view model_binding,

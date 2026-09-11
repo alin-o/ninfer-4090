@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -33,8 +34,31 @@ struct DurableSharedSnapshotAccess {
         std::uint64_t adoption_nanoseconds   = 0;
     };
 
+    enum class RecoverySource : std::uint8_t {
+        None,
+        Memory,
+        Ssd,
+    };
+
+    struct RecoveryDecision {
+        RecoverySource source = RecoverySource::None;
+        Candidate candidate;
+        std::uint32_t frontier                 = 0;
+        std::uint64_t estimated_memory_cost_ns = 0;
+        std::string reason;
+    };
+
+    class ValidationError final : public std::invalid_argument {
+    public:
+        using std::invalid_argument::invalid_argument;
+    };
+
     [[nodiscard]] static std::vector<Candidate> candidates(Engine& engine,
                                                            const PreparedPrompt& prompt);
+    [[nodiscard]] static RecoveryDecision
+    decide_recovery(Engine& engine, const PreparedPrompt& prompt,
+                    const RequestOptions& request_options,
+                    std::span<const Candidate> available_ssd_candidates);
     [[nodiscard]] static ImportResult import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
                                              const CancellationView& cancellation = {});

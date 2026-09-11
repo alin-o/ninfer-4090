@@ -1457,6 +1457,54 @@ bool ProgramImplCore::durable_shared_prefix_matches(
            candidate.content_digest;
 }
 
+bool ProgramImplCore::durable_shared_prefix_import_feasible(std::uint32_t frontier) const {
+    if (frontier == 0 || frontier > capacity || speculative_backend == SpeculativeBackend::DFlash ||
+        pending_transaction_ || has_context_transaction() || !host_state_images || !host_kv_arena ||
+        !host_kv_extents || state_store->occupied() == state_store->capacity() ||
+        host_state_images->occupied() == host_state_images->capacity() ||
+        std::none_of(shared_prefix_slots.begin(), shared_prefix_slots.end(),
+                     [](const auto& slot) { return slot.role == SharedPrefixSlotRole::Free; }) ||
+        std::none_of(requests.begin(), requests.begin() + max_concurrency,
+                     [](const auto& request) { return request.lifecycle == Lifecycle::Empty; })) {
+        return false;
+    }
+
+    const std::uint32_t text_pages = kv_pages_for_frontier(frontier);
+    const std::uint32_t backend_frontier =
+        speculative_backend == SpeculativeBackend::Mtp ? frontier - 1U : 0U;
+    const std::uint32_t backend_pages = kv_pages_for_frontier(backend_frontier);
+    const auto address_fits = [](const auto& addresses, const auto& pages, std::uint32_t required) {
+        return addresses && pages && addresses->occupied() < addresses->capacity() &&
+               required <= pages->capacity() - pages->occupied() &&
+               required <= pages->physical_pool().available_pages();
+    };
+    if (!address_fits(text_kv_addresses, text_kv_pages, text_pages) ||
+        (backend_pages != 0 &&
+         !address_fits(backend_kv_addresses, backend_kv_pages, backend_pages))) {
+        return false;
+    }
+    const std::uint32_t required_extents = 1U + (backend_pages != 0 ? 1U : 0U);
+    if (required_extents > host_kv_extents->capacity() - host_kv_extents->occupied()) {
+        return false;
+    }
+    const HostKVPageLayout text_layout =
+        plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+    std::optional<HostKVPageLayout> backend_layout;
+    std::array<HostKVAllocationRequest, 2> allocations{};
+    allocations[0]               = {.layout = &text_layout, .pages = text_pages};
+    std::size_t allocation_count = 1;
+    if (backend_pages != 0) {
+        backend_layout = plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+        allocations[allocation_count++] = {.layout = &*backend_layout, .pages = backend_pages};
+    }
+    try {
+        return host_kv_arena
+            ->plan_after_releases(
+                {}, std::span<const HostKVAllocationRequest>(allocations.data(), allocation_count))
+            .has_value();
+    } catch (...) { return false; }
+}
+
 qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     const SharedPrefixHandle& handle, std::string_view model_binding,
     const qwen3_6::SharedPrefixPersistenceMetadata& metadata,

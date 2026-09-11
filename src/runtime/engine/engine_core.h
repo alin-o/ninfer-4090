@@ -396,6 +396,20 @@ public:
         return instance_.program->durable_shared_prefix_candidates(prompt);
     }
 
+    [[nodiscard]] typename ResourceManagement::DurableRecoveryInspection
+    inspect_durable_shared_prefix_recovery(
+        const PreparedPrompt& prompt, const ResolvedExecutionOptions& options,
+        std::span<const targets::qwen3_6::DurableSharedPrefixCandidate> ssd_candidates) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        if (materializing_) { return {}; }
+        return run_shared_snapshot_operation([&] {
+            BasePlan base = instance_.program->plan_request(prompt, options);
+            return resources_.inspect_durable_recovery(*instance_.program, prompt, base,
+                                                       ssd_candidates);
+        });
+    }
+
     [[nodiscard]] std::optional<std::uint64_t>
     durable_shared_prefix_owner(std::uint32_t slot) const {
         std::scoped_lock lock(execution_mutex_);
@@ -439,7 +453,8 @@ public:
         std::shared_ptr<const std::vector<std::uint8_t>> retained_storage = {},
         bool ssd_backed                                                   = false,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
-            std::nullopt) {
+            std::nullopt,
+        bool* validation_completed = nullptr) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
@@ -467,6 +482,7 @@ public:
                     throw std::invalid_argument(
                         "durable shared snapshot does not match its catalog identity");
                 }
+                if (validation_completed != nullptr) { *validation_completed = true; }
                 if (validation_nanoseconds != nullptr) {
                     *validation_nanoseconds = elapsed_ns(validation_started, Clock::now());
                 }
@@ -584,6 +600,14 @@ private:
             auto result = std::forward<Operation>(operation)();
             if (publish_on_success) { publish_runtime_stats(); }
             return result;
+        } catch (const RequestError& error) {
+            // Request-scoped cancellation during checksum/identity validation is an expected
+            // recoverable outcome. It must not enter the invariant-failure catch-all and poison
+            // unrelated requests or the Engine. RequestError is the Engine's recoverable control
+            // family; fatal Program/ResourceManager invariants use their native exception types.
+            (void)error;
+            publish_recoverable_shared_snapshot_stats();
+            throw;
         } catch (const std::invalid_argument&) {
             publish_recoverable_shared_snapshot_stats();
             throw;

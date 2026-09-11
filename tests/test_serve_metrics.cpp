@@ -111,6 +111,9 @@ int main() {
     live.shared_ssd_warm_hits                               = 2;
     live.shared_ssd_validation_nanoseconds                  = 3000;
     live.shared_ssd_adoption_nanoseconds                    = 4000;
+    live.shared_ssd_pending_export_claims                   = 3;
+    live.shared_ssd_unpublished_records                     = 1;
+    live.shared_ssd_unpublished_bytes                       = 8192;
     live.session_publications_explicit_total                = 4;
     live.session_publications_initial_prefix_total          = 2;
     live.session_supersessions_total                        = 3;
@@ -144,7 +147,10 @@ int main() {
                   values.at("ninfer:shared_ssd_hits_total{temperature=\"loaded\"}") == 1.0 &&
                   values.at("ninfer:shared_ssd_hits_total{temperature=\"warm\"}") == 2.0 &&
                   values.at("ninfer:shared_ssd_validation_nanoseconds_total") == 3000.0 &&
-                  values.at("ninfer:shared_ssd_adoption_nanoseconds_total") == 4000.0,
+                  values.at("ninfer:shared_ssd_adoption_nanoseconds_total") == 4000.0 &&
+                  values.at("ninfer:shared_ssd_export_claims{state=\"pending\"}") == 3.0 &&
+                  values.at("ninfer:shared_ssd_directory_records{state=\"unpublished\"}") == 1.0 &&
+                  values.at("ninfer:shared_ssd_directory_bytes{state=\"unpublished\"}") == 8192.0,
               "durable shared-prefix residency and timing metrics");
     failures += check(
         values.at("ninfer:session_publications_total{identity=\"explicit\"}") == 4.0 &&

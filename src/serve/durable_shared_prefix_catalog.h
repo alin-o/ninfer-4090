@@ -27,6 +27,8 @@ struct DurableSharedPrefixCatalogOptions {
     std::function<void()> before_manifest_publish;
     // Deterministic single-flight/queue seam. Production leaves it empty.
     std::function<void()> before_payload_read;
+    // Deterministic first-load registration race seam. Production leaves it empty.
+    std::function<void()> before_load_registration;
 };
 
 struct DurableSharedPrefixCatalogStats {
@@ -49,6 +51,9 @@ struct DurableSharedPrefixCatalogStats {
     std::uint64_t io_nanoseconds         = 0;
     std::uint64_t validation_nanoseconds = 0;
     std::uint64_t adoption_nanoseconds   = 0;
+    std::uint32_t pending_export_claims  = 0;
+    std::uint32_t unpublished_records    = 0;
+    std::uint64_t unpublished_bytes      = 0;
 };
 
 struct DurableSharedPrefixRestore {
@@ -74,7 +79,8 @@ public:
 
     [[nodiscard]] DurableSharedPrefixRestore
     restore_matching(Engine& engine, const PreparedPrompt& prompt, Clock::time_point deadline,
-                     const CancellationView& cancellation = {});
+                     const CancellationView& cancellation  = {},
+                     const RequestOptions& request_options = {});
     void schedule_exports(Engine& engine);
     void observe_hit(const DurableSharedPrefixRestore& restore, std::uint32_t reused_tokens,
                      PrefixReusePath path) noexcept;

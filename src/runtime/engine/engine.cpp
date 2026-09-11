@@ -751,6 +751,56 @@ runtime::DurableSharedSnapshotAccess::candidates(Engine& engine, const PreparedP
         engine.impl_->core);
 }
 
+runtime::DurableSharedSnapshotAccess::RecoveryDecision
+runtime::DurableSharedSnapshotAccess::decide_recovery(
+    Engine& engine, const PreparedPrompt& prompt, const RequestOptions& request_options,
+    std::span<const Candidate> available_ssd_candidates) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    if (!prompt.impl_) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    RequestOptions copied                 = request_options;
+    const ResolvedRequestOptions resolved = resolve_request_options(
+        engine.impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(copied));
+    return std::visit(
+        [&](auto& core) -> RecoveryDecision {
+            if constexpr (requires {
+                              core->inspect_durable_shared_prefix_recovery(
+                                  prompt.impl_->value, resolved.execution,
+                                  available_ssd_candidates);
+                          }) {
+                const auto inspected = core->inspect_durable_shared_prefix_recovery(
+                    prompt.impl_->value, resolved.execution, available_ssd_candidates);
+                const Candidate* deepest_ssd =
+                    available_ssd_candidates.empty() ? nullptr : &available_ssd_candidates.front();
+                if (inspected.warm_frontier != 0 &&
+                    (deepest_ssd == nullptr || inspected.warm_frontier >= deepest_ssd->frontier)) {
+                    return {.source                   = RecoverySource::Memory,
+                            .frontier                 = inspected.warm_frontier,
+                            .estimated_memory_cost_ns = inspected.warm_cost_ns,
+                            .reason                   = deepest_ssd != nullptr &&
+                                              inspected.warm_frontier == deepest_ssd->frontier
+                                                            ? "same-boundary-memory-ready"
+                                                            : "deeper-memory-ready"};
+                }
+                if (deepest_ssd != nullptr && inspected.ssd_feasible) {
+                    return {.source    = RecoverySource::Ssd,
+                            .candidate = *deepest_ssd,
+                            .frontier  = deepest_ssd->frontier,
+                            .reason    = "ssd-deeper-feasible"};
+                }
+                if (inspected.warm_frontier != 0) {
+                    return {.source                   = RecoverySource::Memory,
+                            .frontier                 = inspected.warm_frontier,
+                            .estimated_memory_cost_ns = inspected.warm_cost_ns,
+                            .reason                   = "ssd-adoption-infeasible-memory-ready"};
+                }
+                return {.reason =
+                            deepest_ssd == nullptr ? "ssd-unavailable" : "ssd-adoption-infeasible"};
+            }
+            return {.reason = "ssd-engine-unsupported"};
+        },
+        engine.impl_->core);
+}
+
 runtime::DurableSharedSnapshotAccess::ImportResult
 runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
@@ -766,25 +816,35 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
             if constexpr (requires { core->shared_prefix_slot_summary(std::uint32_t{}); }) {
                 std::uint64_t validation_nanoseconds = 0;
                 std::uint64_t adoption_nanoseconds   = 0;
-                const auto result                    = core->import_shared_prefix(
-                    std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
-                    &adoption_nanoseconds,
-                    [&] {
-                        if (cancellation.requested()) {
-                            throw RequestError(RequestErrorKind::Cancelled,
-                                                                      "shared snapshot import was cancelled");
-                        }
-                    },
-                    bytes, true, candidate);
-                const auto summary = core->shared_prefix_slot_summary(result.slot);
-                if (!summary) {
-                    throw std::logic_error("durable shared import has no catalogued summary");
-                }
-                return {.disposition            = static_cast<std::uint32_t>(result.disposition),
+                bool validation_completed            = false;
+                try {
+                    const auto result = core->import_shared_prefix(
+                        std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
+                        &adoption_nanoseconds,
+                        [&] {
+                            if (cancellation.requested()) {
+                                throw RequestError(RequestErrorKind::Cancelled,
+                                                       "shared snapshot import was cancelled");
+                            }
+                        },
+                        bytes, true, candidate, &validation_completed);
+                    const auto summary = core->shared_prefix_slot_summary(result.slot);
+                    if (!summary) {
+                        throw std::logic_error("durable shared import has no catalogued summary");
+                    }
+                    return {
+                            .disposition            = static_cast<std::uint32_t>(result.disposition),
                             .slot                   = result.slot,
                             .frontier               = summary->checkpoint.ref.frontier,
                             .validation_nanoseconds = validation_nanoseconds,
-                            .adoption_nanoseconds   = adoption_nanoseconds};
+                            .adoption_nanoseconds   = adoption_nanoseconds,
+                    };
+                } catch (const RequestError&) {
+                    throw;
+                } catch (const std::invalid_argument& error) {
+                    if (!validation_completed) { throw ValidationError(error.what()); }
+                    throw;
+                }
             } else {
                 throw std::logic_error("durable shared snapshots require a generation Engine");
             }

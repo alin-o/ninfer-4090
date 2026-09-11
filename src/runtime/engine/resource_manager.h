@@ -253,6 +253,109 @@ public:
         std::optional<Choice> choice;
     };
 
+    enum class WarmRecoveryTier : std::uint8_t {
+        None,
+        Device,
+        Host,
+    };
+
+    struct DurableRecoveryInspection {
+        std::uint32_t warm_frontier = 0;
+        std::uint64_t warm_cost_ns  = 0;
+        WarmRecoveryTier warm_tier  = WarmRecoveryTier::None;
+        bool ssd_feasible           = false;
+    };
+
+    template <class DurableCandidate>
+    [[nodiscard]] DurableRecoveryInspection
+    inspect_durable_recovery(Program& program, const PreparedPrompt& prompt,
+                             const RequestBasePlan& base,
+                             std::span<const DurableCandidate> ssd_candidates) {
+        DurableRecoveryInspection result;
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            program.has_context_transaction()) {
+            return result;
+        }
+        std::optional<LaneId> destination;
+        for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
+            if (lanes_[lane] == LogicalLaneState::Free) {
+                destination = LaneId{lane};
+                break;
+            }
+        }
+        if (!destination) { return result; }
+
+        rebuild_prefix_index();
+        const auto consider = [&](std::optional<AdmissionCandidate> plan,
+                                  ReplicaResidency residency) {
+            if (!plan || plan->summary().reusable_prompt_tokens == 0 ||
+                plan->identity_assessment().physical_status !=
+                    MaterializationPhysicalStatus::Feasible) {
+                return;
+            }
+            const std::uint32_t frontier = plan->summary().reusable_prompt_tokens;
+            const std::uint64_t cost     = price_materialization_machine_work(
+                                           cost_model_, plan->identity_assessment().machine_work)
+                                           .immediate_ns;
+            const WarmRecoveryTier tier = residency == ReplicaResidency::HostOnly
+                                              ? WarmRecoveryTier::Host
+                                              : WarmRecoveryTier::Device;
+            if (frontier > result.warm_frontier ||
+                (frontier == result.warm_frontier &&
+                 std::tie(cost, tier) < std::tie(result.warm_cost_ns, result.warm_tier))) {
+                result.warm_frontier = frontier;
+                result.warm_cost_ns  = cost;
+                result.warm_tier     = tier;
+            }
+        };
+        for (const PrefixIndexEntry& index : prefix_index_) {
+            if (!valid_prefix_index_entry(index)) { continue; }
+            const std::optional<PrefixShortlistKey> incoming =
+                base.prefix_shortlist_key(index.key.frontier);
+            if (!incoming || *incoming != index.key) { continue; }
+            if (!index.shared) {
+                const CatalogEntry& entry = catalog_[index.slot];
+                if (private_has_active_edge(index.slot)) { continue; }
+                const bool retain          = entry.session.has_value();
+                ReplicaResidency residency = ReplicaResidency::DeviceOnly;
+                const auto take_residency  = [&](const auto& checkpoint) {
+                    if (checkpoint && checkpoint->ref == index.checkpoint) {
+                        residency = checkpoint->state_residency;
+                        return true;
+                    }
+                    return false;
+                };
+                bool found_residency =
+                    take_residency(entry.summary.endpoint) || take_residency(entry.summary.rewrite);
+                if (!found_residency) {
+                    const auto found = std::find_if(
+                        entry.summary.long_anchors.begin(), entry.summary.long_anchors.end(),
+                        [&](const auto& checkpoint) { return checkpoint.ref == index.checkpoint; });
+                    if (found != entry.summary.long_anchors.end()) {
+                        residency = found->state_residency;
+                    }
+                }
+                consider(program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                   nullptr, index.checkpoint, retain),
+                         residency);
+                continue;
+            }
+            const SharedCatalogEntry& entry = shared_catalog_[index.slot];
+            consider(program.inspect_admission(prompt, base, *destination, nullptr, &*entry.handle,
+                                               index.checkpoint, false),
+                     entry.summary.checkpoint.state_residency);
+        }
+
+        const bool vacant_logical =
+            std::any_of(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
+                return entry.state == SharedCatalogState::Vacant && !entry.handle;
+            });
+        result.ssd_feasible =
+            !ssd_candidates.empty() && vacant_logical &&
+            program.durable_shared_prefix_import_feasible(ssd_candidates.front().frontier);
+        return result;
+    }
+
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
                     std::uint32_t max_long_anchors, ContextMachineCostModel cost_model)

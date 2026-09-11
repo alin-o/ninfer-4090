@@ -1129,6 +1129,7 @@ public:
     [[nodiscard]] bool
     durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle<Variant>& resident) const;
+    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
                          const SharedPrefixPersistenceMetadata& metadata);

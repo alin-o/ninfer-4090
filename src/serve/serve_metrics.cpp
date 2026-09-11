@@ -174,6 +174,12 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
                    live.shared_ssd_validation_nanoseconds);
     append_counter(out, "ninfer:shared_ssd_adoption_nanoseconds_total",
                    live.shared_ssd_adoption_nanoseconds);
+    append_counter(out, "ninfer:shared_ssd_export_claims{state=\"pending\"}",
+                   static_cast<std::uint64_t>(live.shared_ssd_pending_export_claims));
+    append_counter(out, "ninfer:shared_ssd_directory_records{state=\"unpublished\"}",
+                   static_cast<std::uint64_t>(live.shared_ssd_unpublished_records));
+    append_counter(out, "ninfer:shared_ssd_directory_bytes{state=\"unpublished\"}",
+                   live.shared_ssd_unpublished_bytes);
     append_counter(out, "ninfer:session_publications_total{identity=\"explicit\"}",
                    live.session_publications_explicit_total);
     append_counter(out, "ninfer:session_publications_total{identity=\"initial_prefix\"}",

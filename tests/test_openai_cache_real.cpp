@@ -254,7 +254,7 @@ void exercise_protocol_content_capture(const char* artifact) {
     ServeOptions configured            = options(artifact);
     configured.request_log_jsonl       = temporary.path / "requests.jsonl";
     configured.request_log_content_dir = temporary.path / "content";
-    configured.context_cache.enabled   = false;
+    configured.context_cache           = ContextCacheOptions{.enabled = false};
     GenerationService service(configured);
     JsonlRequestLog writer(configured.request_log_jsonl, artifact, {},
                            configured.request_log_content_dir);

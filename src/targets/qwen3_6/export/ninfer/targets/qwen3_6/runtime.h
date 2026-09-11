@@ -126,6 +126,17 @@ struct SharedPrefixPersistenceMetadata {
                                          const SharedPrefixPersistenceMetadata&) noexcept = default;
 };
 
+// Opaque durable-catalog lookup identity for one stable prefix in a prepared prompt. The digest
+// is the same exact-identity SHA-256 carried by NINFSHR1; Gateway code may index it but never
+// interprets or reconstructs target-private identity fields.
+struct DurableSharedPrefixCandidate {
+    std::string content_digest;
+    std::uint32_t frontier = 0;
+
+    [[nodiscard]] friend bool operator==(const DurableSharedPrefixCandidate&,
+                                         const DurableSharedPrefixCandidate&) noexcept = default;
+};
+
 // Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
 // the context-cache transactions, so their pages never appear in the transaction-observed stats;
 // the Engine adds this on top when it publishes runtime stats.
@@ -1113,12 +1124,22 @@ public:
         const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
         const SharedPrefixPersistenceMetadata& metadata,
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
+    [[nodiscard]] std::vector<DurableSharedPrefixCandidate>
+    durable_shared_prefix_candidates(const PreparedPrompt& prompt) const;
+    [[nodiscard]] bool
+    durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
+                                  const SharedPrefixHandle<Variant>& resident) const;
+    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
                          const SharedPrefixPersistenceMetadata& metadata);
-    [[nodiscard]] ValidatedSharedPrefixImport<Variant>
-    parse_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
-                        const std::function<void()>& cancellation_checkpoint = {}) const;
+    // Engine worker boundary for an asynchronous export whose producer event has settled.
+    // Program, never the filesystem worker, mutates State/KV source-pin ownership.
+    void retire_completed_snapshot_sources();
+    [[nodiscard]] ValidatedSharedPrefixImport<Variant> parse_shared_prefix(
+        std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+        const std::function<void()>& cancellation_checkpoint              = {},
+        std::shared_ptr<const std::vector<std::uint8_t>> retained_storage = {}) const;
     [[nodiscard]] bool shared_prefix_matches(const ValidatedSharedPrefixImport<Variant>& imported,
                                              const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] SharedPrefixPublication<Variant>

@@ -1,7 +1,9 @@
 #include "ninfer/engine.h"
 #include "runtime/contract/types.h"
+#include "runtime/engine/durable_shared_snapshot_access.h"
 #include "runtime/engine/context_transfer_test_gate.h"
 #include "runtime/engine/shared_snapshot_test_access.h"
+#include "serve/durable_shared_prefix_catalog.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <cuda.h>
@@ -15,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -3731,6 +3734,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
 
     std::vector<std::uint8_t> bytes;
     std::vector<ninfer::TokenId> expected_tokens;
+    std::uint32_t durable_frontier = 0;
+    std::string durable_digest;
     ninfer::runtime::testing::SealedSharedSnapshotTestImport source_validated;
     {
         ninfer::Engine source(shared_snapshot_engine_options(artifact));
@@ -3818,9 +3823,34 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
             std::cerr << "shared snapshot export produced an invalid envelope\n";
             return 1;
         }
-        bytes = std::move(snapshot.bytes);
+        bytes            = std::move(snapshot.bytes);
+        durable_frontier = snapshot.tokens;
+        durable_digest   = snapshot.content_digest;
         snapshot.release_storage();
         source_validated = Access::parse(source, bytes);
+    }
+
+    {
+        ninfer::Engine target(shared_snapshot_engine_options(artifact));
+        std::atomic<std::uint32_t> checks{0};
+        const auto retained = std::shared_ptr<const std::vector<std::uint8_t>>(
+            &bytes, [](const std::vector<std::uint8_t>*) {});
+        bool cancelled = false;
+        try {
+            (void)ninfer::runtime::DurableSharedSnapshotAccess::import(
+                target, {.content_digest = durable_digest, .frontier = durable_frontier}, retained,
+                ninfer::CancellationView(
+                    [&] { return checks.fetch_add(1, std::memory_order_acq_rel) >= 1U; }));
+        } catch (const ninfer::RequestError& error) {
+            cancelled = error.kind() == ninfer::RequestErrorKind::Cancelled;
+        }
+        const ninfer::GenerationResult continued =
+            target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
+        if (!cancelled || !target.healthy() || continued.generated_token_ids != expected_tokens) {
+            std::cerr << "shared snapshot validation cancellation poisoned subsequent generation"
+                      << " cancelled=" << cancelled << " healthy=" << target.healthy() << '\n';
+            return 1;
+        }
     }
 
     {
@@ -4213,6 +4243,171 @@ int exercise_shared_snapshot_round_trip(const char* artifact,
                       << " healthy=" << failed.healthy() << '\n';
             return 1;
         }
+    }
+    {
+        const std::filesystem::path directory =
+            std::filesystem::temp_directory_path() / "ninfer-durable-shared-restart";
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        ninfer::serve::DurableSharedPrefixCatalogOptions catalog_options{
+            .directory     = directory,
+            .max_records   = 2,
+            .max_bytes     = 4ULL << 30U,
+            .workers       = 1,
+            .max_jobs      = 1,
+            .staging_bytes = 4ULL << 30U,
+        };
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine publisher(shared_snapshot_engine_options(artifact));
+            const ninfer::GenerationResult published =
+                publisher.generate(publisher.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (published.generated_token_ids != expected_tokens) {
+                std::cerr << "durable publisher changed the deterministic continuation\n";
+                return 1;
+            }
+            const std::uint64_t pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            catalog.schedule_exports(publisher);
+            catalog.drain();
+            catalog.schedule_exports(publisher);
+            catalog.schedule_exports(publisher);
+            catalog.drain();
+            if (catalog.stats().writes_completed != 1 ||
+                catalog.stats().pending_export_claims != 0 ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() != pins_before) {
+                std::cerr
+                    << "durable shared snapshot did not settle claims, manifest and source pins\n";
+                return 1;
+            }
+        }
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::EngineOptions insufficient          = shared_snapshot_engine_options(artifact);
+            insufficient.context_cache.host_state_slots = 0;
+            insufficient.context_cache.host_kv_capacity_bytes = 0;
+            ninfer::Engine engine(std::move(insufficient));
+            ninfer::PreparedPrompt prepared = engine.prepare(shared_snapshot_prompt());
+            const auto rejected             = catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            const ninfer::GenerationResult generated =
+                engine.generate(std::move(prepared), fixed_output(3));
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-adoption-infeasible" ||
+                catalog.stats().loads_completed != 0 ||
+                generated.generated_token_ids != expected_tokens) {
+                std::cerr << "infeasible SSD adoption performed I/O or blocked root fallback\n";
+                return 1;
+            }
+        }
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto restored             = catalog.restore_matching(
+                restarted, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            const ninfer::GenerationResult continued =
+                restarted.generate(std::move(prepared), fixed_output(3));
+            ninfer::PreparedPrompt warm_prompt = restarted.prepare(shared_snapshot_prompt());
+            const std::uint64_t loads_before   = catalog.stats().loads_completed;
+            const auto warm                    = catalog.restore_matching(
+                restarted, warm_prompt,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            if (!restored.loaded_from_ssd || restored.frontier != durable_frontier ||
+                continued.generated_token_ids != expected_tokens ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier || !warm.warm_available ||
+                warm.loaded_from_ssd || warm.frontier < durable_frontier ||
+                catalog.stats().loads_completed != loads_before) {
+                std::cerr << "restart lazy durable reuse did not restore the exact shared boundary"
+                          << " loaded=" << restored.loaded_from_ssd
+                          << " restored=" << restored.frontier
+                          << " reused=" << continued.reused_prompt_tokens
+                          << " warm=" << warm.warm_available << '\n';
+                return 1;
+            }
+        }
+        const auto mutate_record = [&](const auto& mutation) {
+            std::filesystem::path record;
+            for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                const std::string name = entry.path().filename().string();
+                if (name.starts_with(durable_digest) && name.ends_with(".nsh")) {
+                    record = entry.path();
+                    break;
+                }
+            }
+            if (record.empty()) { throw std::runtime_error("durable record is missing"); }
+            std::ifstream input(record, std::ios::binary | std::ios::ate);
+            const std::streamsize size = input.tellg();
+            std::vector<std::uint8_t> record_bytes(static_cast<std::size_t>(size));
+            input.seekg(0);
+            input.read(reinterpret_cast<char*>(record_bytes.data()), size);
+            if (!input) { throw std::runtime_error("durable record read failed"); }
+            mutation(record_bytes);
+            std::ofstream output(record, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(record_bytes.data()),
+                         static_cast<std::streamsize>(record_bytes.size()));
+            if (!output) { throw std::runtime_error("durable record rewrite failed"); }
+        };
+        const auto reject_regenerate_publish_restart = [&](std::string_view label) {
+            {
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::Engine regenerated(shared_snapshot_engine_options(artifact));
+                ninfer::PreparedPrompt prepared = regenerated.prepare(shared_snapshot_prompt());
+                const auto rejected             = catalog.restore_matching(
+                    regenerated, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                const ninfer::GenerationResult generated =
+                    regenerated.generate(std::move(prepared), fixed_output(3));
+                catalog.schedule_exports(regenerated);
+                catalog.drain();
+                if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-validation" ||
+                    generated.generated_token_ids != expected_tokens ||
+                    catalog.stats().corrupt_records != 1 || catalog.stats().writes_completed != 1 ||
+                    catalog.stats().pending_export_claims != 0) {
+                    std::cerr << "durable " << label
+                              << " record did not invalidate, regenerate and publish\n";
+                    return false;
+                }
+            }
+            {
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+                ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+                const auto restored             = catalog.restore_matching(
+                    restarted, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                if (!restored.loaded_from_ssd || restored.frontier != durable_frontier) {
+                    std::cerr << "durable " << label
+                              << " replacement was not reusable after restart\n";
+                    return false;
+                }
+            }
+            return true;
+        };
+        mutate_record([](std::vector<std::uint8_t>& record_bytes) {
+            const std::uint32_t binding_size =
+                snapshot_pod<std::uint32_t>(record_bytes, kSharedSnapshotHeaderBytes);
+            constexpr std::size_t snapshot_config_bytes = 56;
+            const std::size_t identity_tag_offset =
+                64U + binding_size + snapshot_config_bytes + 16U;
+            const std::uint32_t identity_tag =
+                snapshot_pod<std::uint32_t>(record_bytes, identity_tag_offset);
+            set_snapshot_pod(record_bytes, identity_tag_offset, identity_tag ^ 1U);
+            refresh_shared_snapshot_checksum(record_bytes);
+        });
+        if (!reject_regenerate_publish_restart("wrong-configuration")) { return 1; }
+        mutate_record([](std::vector<std::uint8_t>& record_bytes) { record_bytes.back() ^= 1U; });
+        if (!reject_regenerate_publish_restart("checksum-invalid")) { return 1; }
+        std::filesystem::remove_all(directory, ignored);
     }
     return 0;
 }

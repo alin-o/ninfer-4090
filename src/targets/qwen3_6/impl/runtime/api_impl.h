@@ -643,6 +643,24 @@ RetainedSessionSnapshot Program<Variant>::begin_export_shared_prefix(
 }
 
 template <>
+std::vector<DurableSharedPrefixCandidate>
+Program<Variant>::durable_shared_prefix_candidates(const PreparedPrompt& prompt) const {
+    return impl_->durable_shared_prefix_candidates(PreparedPromptAccess::view(prompt));
+}
+
+template <>
+bool Program<Variant>::durable_shared_prefix_matches(
+    const DurableSharedPrefixCandidate& candidate,
+    const SharedPrefixHandle<Variant>& resident) const {
+    return impl_->durable_shared_prefix_matches(candidate, resident);
+}
+
+template <>
+bool Program<Variant>::durable_shared_prefix_import_feasible(std::uint32_t frontier) const {
+    return impl_->durable_shared_prefix_import_feasible(frontier);
+}
+
+template <>
 RetainedSessionSnapshot
 Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared,
                                        std::string_view model_binding,
@@ -651,11 +669,17 @@ Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared
 }
 
 template <>
-ValidatedSharedPrefixImport<Variant>
-Program<Variant>::parse_shared_prefix(std::span<const std::uint8_t> snapshot,
-                                      std::string_view model_binding,
-                                      const std::function<void()>& cancellation_checkpoint) const {
-    auto imported = impl_->parse_shared_prefix(snapshot, model_binding, cancellation_checkpoint);
+void Program<Variant>::retire_completed_snapshot_sources() {
+    impl_->retire_completed_snapshot_sources();
+}
+
+template <>
+ValidatedSharedPrefixImport<Variant> Program<Variant>::parse_shared_prefix(
+    std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+    const std::function<void()>& cancellation_checkpoint,
+    std::shared_ptr<const std::vector<std::uint8_t>> retained_storage) const {
+    auto imported = impl_->parse_shared_prefix(snapshot, model_binding, cancellation_checkpoint,
+                                               std::move(retained_storage));
     imported.validating_program_ = shared_import_identity_;
     return imported;
 }

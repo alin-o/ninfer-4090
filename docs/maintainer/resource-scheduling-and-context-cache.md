@@ -845,6 +845,23 @@ publication.  Their result is adopted by the Engine at a unit boundary.  Full qu
 request's existing deadline/backpressure path; they are never an unbounded alternate cache or an
 admission path.
 
+Before a durable load, Engine builds the request base plan and asks ResourceManager to inspect exact
+private/shared memory sources with Program's ordinary identity and physical-readiness assessment.
+The deepest ready source is priced with the configured context cost model. A same-or-deeper memory
+source prevents SSD I/O; SSD is eligible only when the logical catalog, Host State/KV stores,
+temporary Device page capacity, address spaces, and an execution lane can accept the import. The
+Gateway receives only this bounded decision and never duplicates materialization policy.
+
+Durable replacement uses a versioned payload filename and publishes the manifest last. Until the
+manifest commits, both the old record and new payload are charged to the directory quota. A failed
+publish unlinks and syncs the new payload before releasing its charge; if cleanup cannot be made
+crash-durable, the charge remains. A failed-cleanup manifest temporary is likewise charged until
+unlink and parent sync are confirmed. Because manifest writes are serialized, one such unsettled
+temporary blocks another manifest write and bounds repeated publication/invalidation failures until
+startup orphan cleanup settles it. Validation-rejected records are invalidated with the same
+manifest-first authority transition, and successful export claims are always released after Engine
+settlement.
+
 `Program::begin_save_continuation` follows the same rule for an eviction spill: it returns an
 opaque snapshot whose `await_transfer` producer-event callback must run before a Host worker reads
 `bytes`.  Its queue reservation covers two complete images: pinned D2H backing plus either the

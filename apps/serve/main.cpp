@@ -71,6 +71,14 @@ void log_engine_capacity(const std::shared_ptr<spdlog::logger>& logger,
                  *cache.max_private_continuations, *cache.max_shared_prefixes,
                  *cache.max_long_anchors_per_continuation, service.automatic_private_anchors());
     logger->info(
+        "engine shared_ssd enabled={} directory={} max_records={} max_bytes={} staging_bytes={} "
+        "workers={} max_jobs={}",
+        !options.shared_prefix_cache_dir.empty(),
+        ninfer::product::quote_log_value(options.shared_prefix_cache_dir.string()),
+        options.shared_prefix_cache_max_records, options.shared_prefix_cache_max_bytes,
+        options.shared_prefix_cache_staging_bytes, options.shared_prefix_cache_workers,
+        options.shared_prefix_cache_jobs);
+    logger->info(
         "engine context_cost transfer_source={} prefill_source={} hardware_class={} model_id={} "
         "weights_id={}",
         ninfer::context_cost_preset_source_name(context_cost.transfer_source),

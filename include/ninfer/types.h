@@ -514,20 +514,24 @@ struct PromptSummary {
 };
 
 struct PromptPreparationStats {
-    double seconds                       = 0.0;
-    double media_preprocess_seconds      = 0.0;
-    double media_preprocess_work_seconds = 0.0;
-    double tokenize_seconds              = 0.0;
-    std::size_t media_items              = 0;
-    std::size_t media_bytes              = 0;
-    std::uint64_t raw_patches            = 0;
-    std::uint64_t vision_tokens          = 0;
-    std::size_t patch_bytes              = 0;
-    std::size_t media_cache_hits         = 0;
-    std::size_t media_cache_misses       = 0;
-    std::size_t media_singleflight_waits = 0;
-    std::size_t built_patch_bytes        = 0;
-    std::size_t reused_patch_bytes       = 0;
+    double seconds                              = 0.0;
+    double media_preprocess_seconds             = 0.0;
+    double media_preprocess_work_seconds        = 0.0;
+    double tokenize_seconds                     = 0.0;
+    std::size_t media_items                     = 0;
+    std::size_t media_bytes                     = 0;
+    std::uint64_t raw_patches                   = 0;
+    std::uint64_t vision_tokens                 = 0;
+    std::size_t patch_bytes                     = 0;
+    std::size_t media_cache_hits                = 0;
+    std::size_t media_cache_misses              = 0;
+    std::size_t media_singleflight_waits        = 0;
+    std::size_t built_patch_bytes               = 0;
+    std::size_t reused_patch_bytes              = 0;
+    std::uint32_t stable_boundaries_recognized  = 0;
+    std::uint32_t stable_boundaries_capturable  = 0;
+    std::uint32_t stable_boundary_mapping_skips = 0;
+    std::uint32_t ssd_eligible_boundaries       = 0;
 };
 
 struct MediaCacheSummary {
@@ -992,6 +996,30 @@ struct RuntimeStats {
     std::uint32_t auto_save_reserved_jobs  = 0;
     std::uint64_t auto_save_reserved_bytes = 0;
     std::uint64_t auto_save_rejected_jobs  = 0;
+    // Gateway-owned durable shared-prefix catalog. These gauges/counters are folded by serving;
+    // the Engine itself never performs filesystem I/O.
+    std::uint32_t shared_ssd_manifest_records       = 0;
+    std::uint64_t shared_ssd_manifest_bytes         = 0;
+    std::uint32_t shared_ssd_queued_jobs            = 0;
+    std::uint32_t shared_ssd_active_jobs            = 0;
+    std::uint64_t shared_ssd_staging_bytes          = 0;
+    std::uint64_t shared_ssd_peak_staging_bytes     = 0;
+    std::uint64_t shared_ssd_writes_completed       = 0;
+    std::uint64_t shared_ssd_writes_failed          = 0;
+    std::uint64_t shared_ssd_writes_coalesced       = 0;
+    std::uint64_t shared_ssd_loads_completed        = 0;
+    std::uint64_t shared_ssd_loads_failed           = 0;
+    std::uint64_t shared_ssd_loads_coalesced        = 0;
+    std::uint64_t shared_ssd_quota_rejections       = 0;
+    std::uint64_t shared_ssd_corrupt_records        = 0;
+    std::uint64_t shared_ssd_loaded_hits            = 0;
+    std::uint64_t shared_ssd_warm_hits              = 0;
+    std::uint64_t shared_ssd_io_nanoseconds         = 0;
+    std::uint64_t shared_ssd_validation_nanoseconds = 0;
+    std::uint64_t shared_ssd_adoption_nanoseconds   = 0;
+    std::uint32_t shared_ssd_pending_export_claims  = 0;
+    std::uint32_t shared_ssd_unpublished_records    = 0;
+    std::uint64_t shared_ssd_unpublished_bytes      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

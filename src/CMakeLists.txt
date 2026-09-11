@@ -368,6 +368,7 @@ if(NINFER_BUILD_SERVE)
     serve/anthropic_messages_http.cpp
     serve/openai_responses_store.cpp
     serve/translate.cpp
+    serve/durable_shared_prefix_catalog.cpp
     serve/generation_service.cpp
     serve/request_events.cpp
     serve/operational_log.cpp
@@ -378,7 +379,8 @@ if(NINFER_BUILD_SERVE)
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET})

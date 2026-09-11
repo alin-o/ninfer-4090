@@ -731,12 +731,22 @@ public:
         const SharedPrefixHandle& shared, std::string_view model_binding,
         const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
+    [[nodiscard]] std::vector<qwen3_6::DurableSharedPrefixCandidate>
+    durable_shared_prefix_candidates(const PreparedPromptData& prompt) const;
+    [[nodiscard]] bool
+    durable_shared_prefix_matches(const qwen3_6::DurableSharedPrefixCandidate& candidate,
+                                  const SharedPrefixHandle& resident) const;
+    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
                          const qwen3_6::SharedPrefixPersistenceMetadata& metadata);
-    [[nodiscard]] qwen3_6::ValidatedSharedPrefixImport<Variant>
-    parse_shared_prefix(std::span<const std::uint8_t> snapshot, std::string_view model_binding,
-                        const std::function<void()>& cancellation_checkpoint = {}) const;
+
+    void retire_completed_snapshot_sources() { retire_ready_snapshot_sources(); }
+
+    [[nodiscard]] qwen3_6::ValidatedSharedPrefixImport<Variant> parse_shared_prefix(
+        std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+        const std::function<void()>& cancellation_checkpoint              = {},
+        std::shared_ptr<const std::vector<std::uint8_t>> retained_storage = {}) const;
     [[nodiscard]] bool
     shared_prefix_matches(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
                           const SharedPrefixHandle& resident) const;

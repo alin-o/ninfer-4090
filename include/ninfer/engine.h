@@ -15,6 +15,10 @@ namespace runtime::testing {
 struct SharedSnapshotTestAccess;
 }
 
+namespace runtime {
+struct DurableSharedSnapshotAccess;
+}
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -36,6 +40,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class Engine;
+    friend struct runtime::DurableSharedSnapshotAccess;
 };
 
 class GenerationHandle {
@@ -138,6 +143,7 @@ private:
     std::shared_ptr<Impl> impl_;
 
     friend struct runtime::testing::SharedSnapshotTestAccess;
+    friend struct runtime::DurableSharedSnapshotAccess;
 };
 
 } // namespace ninfer

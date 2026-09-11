@@ -23,16 +23,22 @@ struct ServeOptions {
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                          // empty => no auth
-    std::optional<std::string> model_id_override; // unset => artifact identity.model_id
-    std::string request_log_jsonl;                // empty => structured request logging disabled
-    std::string slot_save_path;        // empty => /slots save/restore/erase disabled
-    std::uint32_t max_context          = 8192;
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency      = 1;
-    std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::string api_key;                           // empty => no auth
+    std::optional<std::string> model_id_override;  // unset => artifact identity.model_id
+    std::string request_log_jsonl;                 // empty => structured request logging disabled
+    std::string slot_save_path;                    // empty => /slots save/restore/erase disabled
+    std::filesystem::path shared_prefix_cache_dir; // empty => durable shared catalog disabled
+    std::uint32_t shared_prefix_cache_max_records   = 16;
+    std::uint64_t shared_prefix_cache_max_bytes     = 64ULL << 30U;
+    std::uint64_t shared_prefix_cache_staging_bytes = 4ULL << 30U;
+    std::uint32_t shared_prefix_cache_workers       = 2;
+    std::uint32_t shared_prefix_cache_jobs          = 4;
+    std::uint32_t max_context                       = 8192;
+    KvCapacityPolicy kv_capacity                    = KvCapacityPolicy::explicit_capacity(8192);
+    std::uint32_t max_concurrency                   = 1;
+    std::uint32_t max_pending_requests              = 16;
+    std::uint32_t pending_timeout_ms                = 30000;
+    std::uint32_t prefill_chunk                     = 1024;
     // Retired with the upstream merge: per-sequence rewrite checkpoints and long anchors
     // supersede the host turn-checkpoint ring. The field is dead everywhere and goes away
     // with the flag one release after the deprecation warning ships.
@@ -59,7 +65,7 @@ struct ServeOptions {
     bool enable_vision              = false;
     std::uint32_t vision_max_tokens = 8192;
     bool use_cuda_graph             = true;
-    bool allow_prefix_reuse = true;
+    bool allow_prefix_reuse         = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

@@ -82,6 +82,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
+           "[--shared-prefix-cache-dir DIR] [--shared-prefix-cache-max-records N] "
+           "[--shared-prefix-cache-max-mib N] [--shared-prefix-cache-staging-mib N] "
+           "[--shared-prefix-cache-workers N] [--shared-prefix-cache-jobs N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
            "[--spec mtp|dflash --draft-tokens N] "
@@ -117,6 +120,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
+           "       --shared-prefix-cache-dir enables bounded, lazy, crash-consistent SSD reuse "
+           "for complete stable harness/project prefixes; defaults are 16 records, 65536 MiB "
+           "directory bytes, 4096 MiB staging, 2 workers and 4 total jobs\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -284,6 +290,48 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.slot_save_path.empty()) {
                 throw std::invalid_argument("--slot-save-path must not be empty");
             }
+        } else if (arg == "--shared-prefix-cache-dir") {
+            options.shared_prefix_cache_dir = require_value("--shared-prefix-cache-dir");
+            if (options.shared_prefix_cache_dir.empty()) {
+                throw std::invalid_argument("--shared-prefix-cache-dir must not be empty");
+            }
+        } else if (arg == "--shared-prefix-cache-max-records") {
+            const int value =
+                parse_nonnegative_int(require_value("--shared-prefix-cache-max-records"),
+                                      "shared-prefix-cache-max-records");
+            if (value == 0) {
+                throw std::invalid_argument("--shared-prefix-cache-max-records must be positive");
+            }
+            options.shared_prefix_cache_max_records = static_cast<std::uint32_t>(value);
+        } else if (arg == "--shared-prefix-cache-max-mib") {
+            const std::uint64_t value = parse_u64(require_value("--shared-prefix-cache-max-mib"),
+                                                  "shared-prefix-cache-max-mib");
+            if (value == 0 || value > UINT64_MAX / (1ULL << 20U)) {
+                throw std::invalid_argument("--shared-prefix-cache-max-mib is out of range");
+            }
+            options.shared_prefix_cache_max_bytes = value << 20U;
+        } else if (arg == "--shared-prefix-cache-staging-mib") {
+            const std::uint64_t value =
+                parse_u64(require_value("--shared-prefix-cache-staging-mib"),
+                          "shared-prefix-cache-staging-mib");
+            if (value == 0 || value > UINT64_MAX / (1ULL << 20U)) {
+                throw std::invalid_argument("--shared-prefix-cache-staging-mib is out of range");
+            }
+            options.shared_prefix_cache_staging_bytes = value << 20U;
+        } else if (arg == "--shared-prefix-cache-workers") {
+            const int value = parse_nonnegative_int(require_value("--shared-prefix-cache-workers"),
+                                                    "shared-prefix-cache-workers");
+            if (value == 0 || value > 64) {
+                throw std::invalid_argument("--shared-prefix-cache-workers must be in [1,64]");
+            }
+            options.shared_prefix_cache_workers = static_cast<std::uint32_t>(value);
+        } else if (arg == "--shared-prefix-cache-jobs") {
+            const int value = parse_nonnegative_int(require_value("--shared-prefix-cache-jobs"),
+                                                    "shared-prefix-cache-jobs");
+            if (value == 0) {
+                throw std::invalid_argument("--shared-prefix-cache-jobs must be positive");
+            }
+            options.shared_prefix_cache_jobs = static_cast<std::uint32_t>(value);
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -323,9 +371,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             const int val = parse_nonnegative_int(require_value(arg.c_str()), "vision-max-tokens");
-            if (val <= 0) {
-                throw std::invalid_argument(std::string(arg) + " must be positive");
-            }
+            if (val <= 0) { throw std::invalid_argument(std::string(arg) + " must be positive"); }
             options.vision_max_tokens = static_cast<std::uint32_t>(val);
             options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
@@ -374,6 +420,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
     }
     if (!options.allow_prefix_reuse) {
+        if (!options.shared_prefix_cache_dir.empty()) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with --shared-prefix-cache-dir");
+        }
         if (context_capacity_explicit) {
             throw std::invalid_argument(
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");

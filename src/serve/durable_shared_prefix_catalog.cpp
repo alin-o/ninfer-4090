@@ -39,11 +39,13 @@ bool decimal_digits(std::string_view value) {
 
 bool catalog_record_name(std::string_view name);
 
-bool catalog_temporary_name(std::string_view name) {
+bool catalog_manifest_temporary_name(std::string_view name) {
     constexpr std::string_view manifest_prefix = "catalog.manifest.tmp.";
-    if (name.starts_with(manifest_prefix)) {
-        return decimal_digits(name.substr(manifest_prefix.size()));
-    }
+    return name.starts_with(manifest_prefix) && decimal_digits(name.substr(manifest_prefix.size()));
+}
+
+bool catalog_temporary_name(std::string_view name) {
+    if (catalog_manifest_temporary_name(name)) { return true; }
     constexpr std::string_view temporary_separator = ".tmp.";
     const std::size_t temporary                    = name.rfind(temporary_separator);
     return temporary != std::string_view::npos && catalog_record_name(name.substr(0, temporary)) &&
@@ -352,13 +354,22 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
 
     void cleanup_orphans() noexcept {
         std::uint32_t removed = 0;
-        std::vector<std::optional<std::uint64_t>> pending_deletion_charges;
-        const auto charge_orphan = [&](std::optional<std::uint64_t> bytes) {
+        std::vector<std::pair<std::optional<std::uint64_t>, bool>> pending_deletion_charges;
+        const auto charge_orphan = [&](std::optional<std::uint64_t> bytes,
+                                       bool manifest_temporary) {
             unpublished_records =
                 unpublished_records == UINT32_MAX ? UINT32_MAX : unpublished_records + 1U;
             unpublished_bytes = !bytes || unpublished_bytes > UINT64_MAX - *bytes
                                     ? UINT64_MAX
                                     : unpublished_bytes + *bytes;
+            if (manifest_temporary) {
+                manifest_temporary_records = manifest_temporary_records == UINT32_MAX
+                                                 ? UINT32_MAX
+                                                 : manifest_temporary_records + 1U;
+                manifest_temporary_bytes = !bytes || manifest_temporary_bytes > UINT64_MAX - *bytes
+                                               ? UINT64_MAX
+                                               : manifest_temporary_bytes + *bytes;
+            }
         };
         std::error_code error;
         for (std::filesystem::directory_iterator it(options.directory, error), end;
@@ -371,6 +382,7 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
             const bool indexed =
                 indexed_record != records.end() && indexed_record->second.filename == name;
             if (temporary || (record && !indexed)) {
+                const bool manifest_temporary = catalog_manifest_temporary_name(name);
                 error.clear();
                 const std::uint64_t size = it->file_size(error);
                 const std::optional<std::uint64_t> bytes =
@@ -381,10 +393,10 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
                     removed_now = std::filesystem::remove(it->path(), error);
                     if (!error && removed_now) {
                         ++removed;
-                        pending_deletion_charges.push_back(bytes);
+                        pending_deletion_charges.emplace_back(bytes, manifest_temporary);
                     }
                 }
-                if (!removed_now) { charge_orphan(bytes); }
+                if (!removed_now) { charge_orphan(bytes, manifest_temporary); }
                 error.clear();
             }
         }
@@ -392,7 +404,9 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
             try {
                 sync_directory(options.directory);
             } catch (...) {
-                for (const auto bytes : pending_deletion_charges) { charge_orphan(bytes); }
+                for (const auto& [bytes, manifest_temporary] : pending_deletion_charges) {
+                    charge_orphan(bytes, manifest_temporary);
+                }
             }
         }
     }
@@ -443,6 +457,50 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
     void release_unpublished(std::uint64_t bytes) noexcept {
         if (unpublished_records != UINT32_MAX) { --unpublished_records; }
         if (unpublished_bytes != UINT64_MAX) { unpublished_bytes -= bytes; }
+    }
+
+    [[nodiscard]] bool reserve_manifest_temporary(std::uint64_t bytes) noexcept {
+        std::lock_guard lock(mutex);
+        // Manifest publication is serialized. Allow one active or unsettled temporary so a
+        // failed cleanup cannot be followed by an unbounded series of catalog.manifest.tmp.*
+        // files. The manifest's own fixed metadata limit bounds the corresponding byte overhead.
+        if (manifest_temporary_records != 0 || bytes > kMaximumManifestBytes) {
+            ++values.quota_rejections;
+            return false;
+        }
+        manifest_temporary_records = 1;
+        manifest_temporary_bytes   = bytes;
+        charge_unpublished(bytes);
+        return true;
+    }
+
+    void settle_manifest_temporary(const AtomicWriteState& state, std::uint64_t bytes) noexcept {
+        // Rename consumes the temporary directory entry. Otherwise release only after unlink and
+        // parent sync are confirmed; a failed cleanup remains charged and blocks another manifest
+        // temporary until bounded startup orphan cleanup settles it.
+        if (state.temporary_created && !state.renamed && !state.cleanup_confirmed) { return; }
+        std::lock_guard lock(mutex);
+        if (manifest_temporary_records != UINT32_MAX) { --manifest_temporary_records; }
+        if (manifest_temporary_bytes != UINT64_MAX) { manifest_temporary_bytes -= bytes; }
+        release_unpublished(bytes);
+    }
+
+    void write_manifest(std::string_view manifest, std::uint64_t nonce, AtomicWriteState& state) {
+        if (!reserve_manifest_temporary(manifest.size())) {
+            throw std::runtime_error("durable catalog manifest temporary quota exceeded");
+        }
+        try {
+            atomic_write(
+                options.directory, options.directory / kManifestName,
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(manifest.data()), manifest.size()),
+                nonce, &state, options.before_manifest_rename,
+                options.before_manifest_temporary_remove);
+        } catch (...) {
+            settle_manifest_temporary(state, manifest.size());
+            throw;
+        }
+        settle_manifest_temporary(state, manifest.size());
     }
 
     void remove_unpublished(const std::filesystem::path& path, std::uint64_t bytes) noexcept {
@@ -559,11 +617,7 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
                         if (options.before_manifest_publish) { options.before_manifest_publish(); }
                         AtomicWriteState manifest_write;
                         try {
-                            atomic_write(options.directory, options.directory / kManifestName,
-                                         std::span<const std::uint8_t>(
-                                             reinterpret_cast<const std::uint8_t*>(manifest.data()),
-                                             manifest.size()),
-                                         record.order * 2U + 1U, &manifest_write);
+                            write_manifest(manifest, record.order * 2U + 1U, manifest_write);
                         } catch (...) {
                             // After manifest rename, the commit marker may survive a crash even if
                             // its parent fsync failed. Keep the referenced payload and its quota
@@ -631,11 +685,8 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
             }
             const std::string manifest = manifest_contents(std::nullopt, digest);
             const std::uint64_t nonce  = next_order++ * 2U + 1U;
-            atomic_write(
-                options.directory, options.directory / kManifestName,
-                std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t*>(manifest.data()), manifest.size()),
-                nonce);
+            AtomicWriteState manifest_write;
+            write_manifest(manifest, nonce, manifest_write);
             {
                 std::lock_guard lock(mutex);
                 const auto found = records.find(std::string(digest));
@@ -666,14 +717,16 @@ struct DurableSharedPrefixCatalog::State : std::enable_shared_from_this<State> {
     std::unordered_map<std::string, std::vector<std::function<void(bool)>>> pending_writes;
     std::unordered_set<std::string> exported_owners;
     DurableSharedPrefixCatalogStats values;
-    std::uint64_t catalog_bytes       = 0;
-    std::uint64_t next_order          = 1;
-    std::size_t reserved_bytes        = 0;
-    std::uint32_t reserved_jobs       = 0;
-    std::uint32_t active_jobs         = 0;
-    std::uint32_t unpublished_records = 0;
-    std::uint64_t unpublished_bytes   = 0;
-    bool stopping                     = false;
+    std::uint64_t catalog_bytes              = 0;
+    std::uint64_t next_order                 = 1;
+    std::size_t reserved_bytes               = 0;
+    std::uint32_t reserved_jobs              = 0;
+    std::uint32_t active_jobs                = 0;
+    std::uint32_t unpublished_records        = 0;
+    std::uint64_t unpublished_bytes          = 0;
+    std::uint32_t manifest_temporary_records = 0;
+    std::uint64_t manifest_temporary_bytes   = 0;
+    bool stopping                            = false;
 };
 
 DurableSharedPrefixCatalog::DurableSharedPrefixCatalog(DurableSharedPrefixCatalogOptions options)

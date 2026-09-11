@@ -855,7 +855,10 @@ Gateway receives only this bounded decision and never duplicates materialization
 Durable replacement uses a versioned payload filename and publishes the manifest last. Until the
 manifest commits, both the old record and new payload are charged to the directory quota. A failed
 publish unlinks and syncs the new payload before releasing its charge; if cleanup cannot be made
-crash-durable, the charge remains. Validation-rejected records are invalidated with the same
+crash-durable, the charge remains. A failed-cleanup manifest temporary is likewise charged until
+unlink and parent sync are confirmed. Because manifest writes are serialized, one such unsettled
+temporary blocks another manifest write and bounds repeated publication/invalidation failures until
+startup orphan cleanup settles it. Validation-rejected records are invalidated with the same
 manifest-first authority transition, and successful export claims are always released after Engine
 settlement.
 

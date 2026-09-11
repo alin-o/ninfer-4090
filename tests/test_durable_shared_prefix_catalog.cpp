@@ -103,6 +103,16 @@ std::uint32_t temporary_file_count(const std::filesystem::path& directory) {
     return count;
 }
 
+std::uint64_t manifest_temporary_bytes(const std::filesystem::path& directory) {
+    std::uint64_t bytes = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().filename().string().starts_with("catalog.manifest.tmp.")) {
+            bytes += entry.file_size();
+        }
+    }
+    return bytes;
+}
+
 void test_restart_lazy_load_and_duplicate_write() {
     TemporaryDirectory temporary;
     const std::vector<std::uint8_t> payload{1, 2, 3, 4, 5};
@@ -426,6 +436,109 @@ void test_pre_rename_failure_retains_charge_until_cleanup_is_durable() {
     }
 }
 
+void test_repeated_manifest_temporary_failures_stay_charged_and_bounded() {
+    {
+        TemporaryDirectory temporary;
+        auto configured = options(temporary.path);
+        {
+            DurableSharedPrefixCatalog catalog(configured);
+            catalog.enqueue(snapshot('a', 29, {1, 2, 3, 4}));
+            catalog.drain();
+        }
+
+        auto failing                   = configured;
+        failing.before_manifest_rename = [] {
+            throw std::runtime_error("injected manifest rename failure");
+        };
+        failing.before_manifest_temporary_remove = [] {
+            throw std::runtime_error("injected manifest cleanup failure");
+        };
+        {
+            DurableSharedPrefixCatalog catalog(std::move(failing));
+            for (const char digest : std::string_view("bcdef0")) {
+                catalog.enqueue(snapshot(digest, 29, {4, 3, 2, 1}));
+                catalog.drain();
+            }
+            const std::uint64_t temporary_bytes = manifest_temporary_bytes(temporary.path);
+            const auto stats                    = catalog.stats();
+            expect(temporary_file_count(temporary.path) == 1 && temporary_bytes != 0,
+                   "repeated publication failures accumulated manifest temporaries");
+            expect(stats.manifest_records == 1 && stats.manifest_bytes == 4 &&
+                       stats.unpublished_records == 1 &&
+                       stats.unpublished_bytes == temporary_bytes && stats.quota_rejections >= 5,
+                   "failed publication manifest temporary escaped quota accounting");
+        }
+        {
+            DurableSharedPrefixCatalog catalog(configured);
+            expect(temporary_file_count(temporary.path) == 0 &&
+                       catalog.stats().unpublished_records == 0,
+                   "startup did not durably settle the failed publication manifest temporary");
+            auto prior =
+                catalog.load({.content_digest = std::string(64, 'a'), .frontier = 29},
+                             DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+            expect(prior && *prior == std::vector<std::uint8_t>({1, 2, 3, 4}),
+                   "failed manifest publications changed the prior committed record");
+            prior.reset();
+            catalog.drain();
+        }
+    }
+
+    {
+        TemporaryDirectory temporary;
+        auto configured = options(temporary.path);
+        {
+            DurableSharedPrefixCatalog catalog(configured);
+            catalog.enqueue(snapshot('c', 30, {5, 6, 7, 8}));
+            catalog.drain();
+        }
+
+        auto failing                   = configured;
+        failing.before_manifest_rename = [] {
+            throw std::runtime_error("injected manifest rename failure");
+        };
+        failing.before_manifest_temporary_remove = [] {
+            throw std::runtime_error("injected manifest cleanup failure");
+        };
+        {
+            DurableSharedPrefixCatalog catalog(std::move(failing));
+            const auto candidate = DurableSharedPrefixCatalog::Candidate{
+                .content_digest = std::string(64, 'c'), .frontier = 30};
+            auto loaded = DurableSharedPrefixCatalogTestAccess::load_record(
+                catalog, candidate,
+                DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+            for (int attempt = 0; attempt < 6; ++attempt) {
+                DurableSharedPrefixCatalogTestAccess::invalidate_loaded(catalog, loaded);
+            }
+            const std::uint64_t temporary_bytes = manifest_temporary_bytes(temporary.path);
+            const auto stats                    = catalog.stats();
+            expect(temporary_file_count(temporary.path) == 1 && temporary_bytes != 0,
+                   "repeated invalidation failures accumulated manifest temporaries");
+            expect(stats.manifest_records == 1 && stats.manifest_bytes == 4 &&
+                       stats.unpublished_records == 1 &&
+                       stats.unpublished_bytes == temporary_bytes && stats.quota_rejections >= 5,
+                   "failed invalidation manifest temporary escaped quota accounting");
+            loaded.bytes.reset();
+            catalog.drain();
+        }
+        {
+            DurableSharedPrefixCatalog catalog(configured);
+            expect(temporary_file_count(temporary.path) == 0 &&
+                       catalog.stats().unpublished_records == 0,
+                   "startup did not durably settle the failed invalidation manifest temporary");
+            const auto candidate = DurableSharedPrefixCatalog::Candidate{
+                .content_digest = std::string(64, 'c'), .frontier = 30};
+            auto loaded = DurableSharedPrefixCatalogTestAccess::load_record(
+                catalog, candidate,
+                DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(1));
+            DurableSharedPrefixCatalogTestAccess::invalidate_loaded(catalog, loaded);
+            loaded.bytes.reset();
+            catalog.drain();
+            expect(catalog.stats().manifest_records == 0,
+                   "settled manifest temporary continued to block invalidation");
+        }
+    }
+}
+
 void test_orphan_cleanup_preserves_unrelated_files() {
     TemporaryDirectory temporary;
     const std::filesystem::path unrelated_temporary = temporary.path / "keep.tmp.user";
@@ -449,6 +562,7 @@ int main() {
     test_replacement_and_repeated_manifest_failures_stay_bounded();
     test_stale_loaded_version_cannot_invalidate_replacement();
     test_pre_rename_failure_retains_charge_until_cleanup_is_durable();
+    test_repeated_manifest_temporary_failures_stay_charged_and_bounded();
     test_orphan_cleanup_preserves_unrelated_files();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

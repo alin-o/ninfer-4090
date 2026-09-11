@@ -36,6 +36,8 @@ struct DurableSharedPrefixCatalogOptions {
     // Deterministic pre-rename and failed-cleanup seams. Production leaves them empty.
     std::function<void()> before_record_rename;
     std::function<void()> before_temporary_remove;
+    std::function<void()> before_manifest_rename;
+    std::function<void()> before_manifest_temporary_remove;
 };
 
 struct DurableSharedPrefixCatalogStats {

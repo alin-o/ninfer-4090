@@ -86,8 +86,11 @@ usable. Existing records coalesce only after byte-exact comparison with a curren
 validation failures are removed from the committed index before regeneration. Failed or pending
 writes never count as durable recovery. Content-addressed duplicate reads and writes coalesce,
 startup removes a bounded number of temporary/unindexed orphans, and directory quotas charge
-unpublished payloads until deletion is synced. Full quotas reject new work without altering a
-committed record. Metrics use `ninfer:shared_ssd_*`, including pending export claims and
+unpublished payloads and failed-cleanup manifest temporaries until deletion is synced. Manifest
+publication is serialized, and one unsettled manifest temporary blocks another manifest write, so
+repeated publication or invalidation failures cannot accumulate unbounded metadata files. Full
+quotas reject new work without altering a committed record. Metrics use `ninfer:shared_ssd_*`,
+including pending export claims and
 unpublished directory bytes/records; request JSONL adds
 `result.durable_restore` with frontier, loaded/warm classification and fallback reason.
 Once publication commits, Engine marks that exact shared owner as safely SSD-backed. Guided Host

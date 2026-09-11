@@ -300,7 +300,9 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   same-or-deeper ready Device/Host source is preferable. Program validates checksum,
   model/configuration, identity, State and Main/MTP KV before Engine adoption; invalid records are
   removed from the committed index, regenerated, and crash-safely replaced. Directory quotas also
-  charge unpublished payloads. Media, volatile, unclassified and DFlash prefixes are not durable.
+  charge unpublished payloads and failed-cleanup manifest temporaries; one unsettled manifest
+  temporary blocks further manifest writes until bounded startup cleanup settles it. Media,
+  volatile, unclassified and DFlash prefixes are not durable.
   Private `/slots` files and auto-save behavior are unchanged.
 - **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
   slots report their request's prompt and reused-prefix sizes, idle retained slots report the

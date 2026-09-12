@@ -1168,6 +1168,7 @@ public:
         const SharedPrefixHandle<Variant>* host_shared              = nullptr,
         const SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
         std::shared_ptr<const void> physical_plan                   = {});
+    void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle<Variant>& shared);
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

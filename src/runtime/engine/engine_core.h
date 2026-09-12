@@ -647,6 +647,39 @@ public:
         return view.summary;
     }
 
+    void erase_shared_prefixes_except_for_test(std::span<const std::uint32_t> retained_slots) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        for (std::uint32_t slot = 0; slot < resources_.shared_catalog_capacity(); ++slot) {
+            if (std::find(retained_slots.begin(), retained_slots.end(), slot) !=
+                retained_slots.end()) {
+                continue;
+            }
+            const auto view = resources_.shared_catalog_slot(slot);
+            if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued) {
+                continue;
+            }
+            auto released     = resources_.take_catalogued_shared(slot);
+            const auto result = instance_.program->release_shared_prefix(std::move(released));
+            if (result.status != ConsumeStatus::Consumed) {
+                throw std::logic_error("test shared-prefix cleanup did not consume its owner");
+            }
+        }
+        publish_runtime_stats();
+    }
+
+    void duplicate_shared_prefix_to_device_for_test(std::uint32_t slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.shared_catalog_slot(slot);
+        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            view.handle == nullptr) {
+            throw std::logic_error("test shared-prefix slot is not catalogued");
+        }
+        instance_.program->duplicate_shared_prefix_to_device_for_test(*view.handle);
+        publish_runtime_stats();
+    }
+
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);

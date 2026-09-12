@@ -43,13 +43,14 @@ struct SharedSnapshotTestAccess {
     import(Engine& engine, std::span<const std::uint8_t> bytes);
     [[nodiscard]] static std::uint32_t import_cancelled(Engine& engine,
                                                         std::span<const std::uint8_t> bytes);
-    [[nodiscard]] static SealedSharedSnapshotTestImport
-    parse(Engine& engine, std::span<const std::uint8_t> bytes);
-    static void import_validated(Engine& engine,
-                                 const SealedSharedSnapshotTestImport& imported);
-    [[nodiscard]] static std::uint32_t
-    import_with_cancellation(Engine& engine, std::span<const std::uint8_t> bytes,
-                             std::atomic<bool>& cancellation);
+    [[nodiscard]] static SealedSharedSnapshotTestImport parse(Engine& engine,
+                                                              std::span<const std::uint8_t> bytes);
+    static void import_validated(Engine& engine, const SealedSharedSnapshotTestImport& imported);
+    static void erase_shared_except(Engine& engine, std::span<const std::uint32_t> retained_slots);
+    static void duplicate_shared_to_device(Engine& engine, std::uint32_t slot);
+    [[nodiscard]] static std::uint32_t import_with_cancellation(Engine& engine,
+                                                                std::span<const std::uint8_t> bytes,
+                                                                std::atomic<bool>& cancellation);
 };
 
 } // namespace ninfer::runtime::testing

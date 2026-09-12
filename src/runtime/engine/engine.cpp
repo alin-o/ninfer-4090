@@ -1165,6 +1165,36 @@ void runtime::testing::SharedSnapshotTestAccess::import_validated(
         engine.impl_->core);
 }
 
+void runtime::testing::SharedSnapshotTestAccess::erase_shared_except(
+    Engine& engine, std::span<const std::uint32_t> retained_slots) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->erase_shared_prefixes_except_for_test(retained_slots);
+                          }) {
+                core->erase_shared_prefixes_except_for_test(retained_slots);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::duplicate_shared_to_device(Engine& engine,
+                                                                            std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->duplicate_shared_prefix_to_device_for_test(slot); }) {
+                core->duplicate_shared_prefix_to_device_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
 std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellation(
     Engine& engine, std::span<const std::uint8_t> bytes, std::atomic<bool>& cancellation) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
@@ -1172,9 +1202,14 @@ std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellati
     return std::visit(
         [&](auto& core) -> std::uint32_t {
             if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
-                const auto result = core->import_shared_prefix(
-                    bytes, binding, runtime::CancellationFlagView{.flag = &cancellation});
-                return static_cast<std::uint32_t>(result.disposition);
+                try {
+                    const auto result = core->import_shared_prefix(
+                        bytes, binding, runtime::CancellationFlagView{.flag = &cancellation});
+                    return static_cast<std::uint32_t>(result.disposition);
+                } catch (const RequestError& error) {
+                    if (error.kind() == RequestErrorKind::Cancelled) { return 2U; }
+                    throw;
+                }
             } else {
                 throw std::logic_error("shared snapshots require a generation Engine");
             }

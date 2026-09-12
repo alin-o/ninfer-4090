@@ -216,6 +216,14 @@ public:
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
 
+    // Transaction rollback path: reclaim the exact range occupied before a fallible replacement.
+    // The placement is captured while the source allocation is valid and can only be reused after
+    // that complete byte range has returned to the free list.
+    [[nodiscard]] std::size_t allocation_offset(HostKVAllocationHandle allocation) const;
+    [[nodiscard]] std::optional<HostKVAllocation> allocate_at(const HostKVPageLayout& layout,
+                                                              std::uint32_t pages,
+                                                              std::size_t byte_offset) noexcept;
+
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,
                         std::span<const HostKVAllocationRequest> target_allocations) const;

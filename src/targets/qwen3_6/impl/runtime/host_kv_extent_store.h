@@ -141,6 +141,12 @@ public:
     // so pages need not own Device replicas merely to establish a Host extent.
     [[nodiscard]] std::optional<HostKVExtentReservation>
     prepare_unpinned(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+        return prepare_unpinned_at(pages, membership, std::nullopt);
+    }
+
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_unpinned_at(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership,
+                        std::optional<std::size_t> byte_offset) {
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
             return std::nullopt;
         }
@@ -154,7 +160,9 @@ public:
 
         const HostKVPageLayout& layout = page_layout(pages);
         std::optional<HostKVAllocation> allocation =
-            arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+            byte_offset ? arena_->allocate_at(layout, static_cast<std::uint32_t>(membership.size()),
+                                              *byte_offset)
+                        : arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
         if (!allocation) { return std::nullopt; }
 
         const std::uint32_t descriptor = free_[--free_count_];
@@ -189,6 +197,21 @@ public:
         reservation.generation_ = extent.generation;
         reservation.page_store_ = &pages;
         return reservation;
+    }
+
+    [[nodiscard]] std::size_t page_byte_offset(LogicalKVPageStore& pages,
+                                               LogicalKVPageHandle page) const {
+        const HostKVPageReplica& replica = pages.host_replica(page);
+        const Extent& extent             = require(replica.extent);
+        const std::size_t stride         = page_layout(pages).page_stride;
+        if (!extent.allocation) { throw std::logic_error("Host KV extent has no allocation"); }
+        const std::size_t allocation_offset =
+            arena_->allocation_offset(extent.allocation->handle());
+        if (replica.page_offset >
+            (std::numeric_limits<std::size_t>::max() - allocation_offset) / stride) {
+            throw std::overflow_error("Host KV page placement overflow");
+        }
+        return allocation_offset + static_cast<std::size_t>(replica.page_offset) * stride;
     }
 
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {

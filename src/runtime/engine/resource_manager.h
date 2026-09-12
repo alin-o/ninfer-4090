@@ -1655,6 +1655,23 @@ public:
                 .id       = entry.id};
     }
 
+    [[nodiscard]] SharedPrefixHandle take_catalogued_shared(std::uint32_t slot) {
+        if (slot >= shared_catalog_count_) {
+            throw std::invalid_argument("shared catalog slot is out of range");
+        }
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        if (!std::holds_alternative<std::monostate>(transaction_) || durable_recovery_ ||
+            entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+            entry.transaction_pins != 0 || entry.summary.active_references != 0 ||
+            shared_active_edge_count(slot) != 0) {
+            throw std::logic_error("shared catalog slot is not releasable");
+        }
+        SharedPrefixHandle handle = std::move(*entry.handle);
+        clear_shared_entry(entry);
+        rebuild_prefix_index();
+        return handle;
+    }
+
     enum class SharedImportDisposition : std::uint8_t {
         Published = 0,
         Coalesced = 1,

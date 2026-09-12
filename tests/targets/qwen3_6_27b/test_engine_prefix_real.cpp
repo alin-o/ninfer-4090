@@ -4340,7 +4340,18 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                 }
                 return 1;
             }
-            const auto imported = Access::import(target, bytes);
+            ninfer::runtime::testing::SharedSnapshotImportObservation imported;
+            try {
+                imported = Access::import(target, bytes);
+            } catch (const std::invalid_argument& error) {
+                std::uint64_t owners = 0;
+                for (const std::uint32_t count : target.runtime_stats().context_cache_owners) {
+                    owners += count;
+                }
+                std::cerr << "shared snapshot import after cancellation failed: " << error.what()
+                          << " owners=" << owners << '\n';
+                return 1;
+            }
             if (imported.disposition != 0U || imported.frontier == 0 ||
                 imported.main_frontier != imported.frontier ||
                 imported.backend_frontier + 1U != imported.frontier ||
@@ -4483,10 +4494,11 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         {
             ninfer::EngineOptions failed_options = shared_snapshot_engine_options(artifact);
             // Canonical rewrite frontiers keep the unrelated resident and fatal-path prompt owners
-            // distinct. Reserve one additional catalog cell so the tested import reaches the
-            // injected State-allocation failure instead of being rejected earlier by logical
+            // distinct. Reserve bounded structural-capture headroom so the tested import reaches
+            // the injected State-allocation failure instead of being rejected earlier by logical
             // capacity.
-            failed_options.context_cache.max_shared_prefixes = 3;
+            failed_options.context_cache.max_shared_prefixes = 6;
+            failed_options.context_cache.host_state_slots    = 6;
             ninfer::Engine failed(std::move(failed_options));
             ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
             constexpr std::string_view resident_prefix = "fatal owner fixture\n";
@@ -4620,6 +4632,189 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                              "manifest and source pins\n";
                 return 1;
             }
+        }
+        {
+            // Exercise Program's sealed physical release set directly, beyond the
+            // ResourceManager fake. The first imported shared checkpoint is materialized to Both
+            // beside a Device-only continuation; the second is left Host-only. Only the precise
+            // limiting tier of the first checkpoint may be reclaimed, and the protected Host-only
+            // checkpoint must produce no lifecycle fact.
+            struct ResidentImport {
+                std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+                std::uint32_t frontier    = 0;
+                std::size_t host_kv_bytes = 0;
+            };
+
+            const auto make_resident = [&](std::size_t trim) {
+                ResidentImport fixture;
+                ninfer::PromptInput prompt = shared_snapshot_prompt();
+                prompt.messages.front().parts.front().text.erase(0, trim);
+                prompt.context_cache.markers.front().leading_instruction_bytes -=
+                    static_cast<std::uint32_t>(trim);
+                ninfer::Engine source(shared_snapshot_engine_options(artifact));
+                const ninfer::GenerationResult generated =
+                    source.generate(source.prepare(prompt), fixed_output(3));
+                if (generated.generated_token_ids.size() != 3) {
+                    throw std::runtime_error("physical release fixture generation failed");
+                }
+                auto [slot, snapshot] = Access::export_first_durable(source);
+                (void)slot;
+                snapshot.await_transfer(snapshot.bytes);
+                fixture.frontier = snapshot.tokens;
+                fixture.bytes =
+                    std::make_shared<const std::vector<std::uint8_t>>(std::move(snapshot.bytes));
+                const ninfer::MemorySummary memory = source.memory_summary();
+                const auto pages_for               = [](std::uint32_t frontier) {
+                    return frontier == 0
+                                             ? 0U
+                                             : 1U + (frontier - 1U) /
+                                          static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+                };
+                fixture.host_kv_bytes = static_cast<std::size_t>(pages_for(fixture.frontier)) *
+                                            memory.host_main_kv_page_bytes +
+                                        static_cast<std::size_t>(pages_for(fixture.frontier - 1U)) *
+                                            memory.host_backend_kv_page_bytes;
+                snapshot.release_storage();
+                return fixture;
+            };
+            const ResidentImport both_source      = make_resident(3500);
+            const ResidentImport host_only_source = make_resident(4200);
+            const auto exercise_filtered_release  = [&](bool state_pressure) {
+                ninfer::EngineOptions options = shared_snapshot_engine_options(artifact);
+                options.max_concurrency       = 4;
+                options.max_pending_requests  = 4;
+                options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+                options.context_cache.device_state_slots        = 6;
+                options.context_cache.max_private_continuations = 4;
+                options.context_cache.max_shared_prefixes       = 3;
+                options.context_cache.host_state_slots          = state_pressure ? 2 : 3;
+                options.context_cache.host_kv_capacity_bytes =
+                    state_pressure ? 1ULL << 30U
+                                    : durable_host_kv_bytes + host_only_source.host_kv_bytes;
+                ninfer::Engine engine(std::move(options));
+                const auto host_only_import = Access::import(engine, *host_only_source.bytes);
+                const auto both_import      = Access::import(engine, *both_source.bytes);
+                ninfer::GenerationResult device_only;
+                try {
+                    device_only = engine.generate(
+                        engine.prepare(pressure_turn("Keep a Device-only checkpoint beside mixed "
+                                                       "shared replicas.",
+                                                      "physical-release-device-only",
+                                                      ninfer::CacheRetentionHint::LiveSession)),
+                        fixed_output(1));
+                } catch (const std::bad_alloc&) {
+                    std::cerr << "Program physical release fixture could not create Device-only "
+                                  "checkpoint\n";
+                    return false;
+                }
+                const ninfer::RuntimeStats after_device_only = engine.runtime_stats();
+                const std::array retained_shared_slots{both_import.slot, host_only_import.slot};
+                Access::erase_shared_except(engine, retained_shared_slots);
+                const ninfer::RuntimeStats after_shared_cleanup = engine.runtime_stats();
+                try {
+                    Access::duplicate_shared_to_device(engine, both_import.slot);
+                } catch (const std::exception& error) {
+                    std::cerr << "Program physical release fixture could not duplicate shared "
+                                  "replicas to Device: "
+                              << error.what() << '\n';
+                    return false;
+                }
+                const ninfer::RuntimeStats before = engine.runtime_stats();
+                if (device_only.generated_token_ids.size() != 1 ||
+                    before.device_state_occupied_slots < 2 ||
+                    before.host_state_occupied_slots != 2 ||
+                    before.host_kv_occupied_bytes !=
+                        both_source.host_kv_bytes + host_only_source.host_kv_bytes) {
+                    std::cerr << "Program physical release fixture did not establish mixed "
+                                  "Both/Device-only/Host-only ownership: tokens="
+                              << device_only.generated_token_ids.size()
+                              << " device_state=" << before.device_state_occupied_slots
+                              << " host_state=" << before.host_state_occupied_slots
+                              << " host_kv=" << before.host_kv_occupied_bytes
+                              << " expected_host_kv="
+                              << both_source.host_kv_bytes + host_only_source.host_kv_bytes
+                              << " slot=" << device_only.slot
+                              << " stages=" << after_device_only.device_state_occupied_slots << '/'
+                              << after_shared_cleanup.device_state_occupied_slots << '/'
+                              << before.device_state_occupied_slots << '\n';
+                    return false;
+                }
+
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::PreparedPrompt prepared = engine.prepare(shared_snapshot_prompt());
+                const auto restored             = catalog.restore_matching(
+                    engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                const ninfer::RuntimeStats after = engine.runtime_stats();
+                if (!restored.loaded_from_ssd ||
+                    restored.fallback_reason != "ssd-successful-replacement" ||
+                    restored.lifecycle.size() != 2 ||
+                    restored.lifecycle.back().operation !=
+                        ninfer::CheckpointLifecycleOperation::Restored) {
+                    std::cerr << "Program filtered physical release did not commit exact SSD "
+                                  "adoption: pressure="
+                              << state_pressure << " loaded=" << restored.loaded_from_ssd
+                              << " reason=" << restored.fallback_reason
+                              << " lifecycle=" << restored.lifecycle.size();
+                    for (const auto& fact : restored.lifecycle) {
+                        std::cerr << ' ' << static_cast<int>(fact.operation) << ':'
+                                  << static_cast<int>(fact.source_tier) << "->"
+                                  << static_cast<int>(fact.destination_tier) << ':'
+                                  << fact.state_images << '/' << fact.main_kv_pages << '/'
+                                  << fact.backend_kv_pages;
+                    }
+                    std::cerr << '\n';
+                    return false;
+                }
+                const auto& reclaimed              = restored.lifecycle.front();
+                const ninfer::MemorySummary memory = engine.memory_summary();
+                const std::size_t reclaimed_kv_bytes =
+                    static_cast<std::size_t>(reclaimed.main_kv_pages) *
+                        memory.host_main_kv_page_bytes +
+                    static_cast<std::size_t>(reclaimed.backend_kv_pages) *
+                        memory.host_backend_kv_page_bytes;
+                const bool exact_state_only =
+                    state_pressure && reclaimed.state_images == 1 && reclaimed.main_kv_pages == 0 &&
+                    reclaimed.backend_kv_pages == 0 &&
+                    after.host_state_occupied_slots == before.host_state_occupied_slots &&
+                    after.host_kv_occupied_bytes ==
+                        before.host_kv_occupied_bytes + durable_host_kv_bytes;
+                const bool exact_kv_only =
+                    !state_pressure && reclaimed.state_images == 0 && reclaimed_kv_bytes != 0 &&
+                    after.host_state_occupied_slots == before.host_state_occupied_slots + 1U &&
+                    after.host_kv_occupied_bytes ==
+                        before.host_kv_occupied_bytes + durable_host_kv_bytes - reclaimed_kv_bytes;
+                if (reclaimed.operation != ninfer::CheckpointLifecycleOperation::Evicted ||
+                    reclaimed.status != ninfer::CheckpointLifecycleStatus::Committed ||
+                    reclaimed.frontier != both_source.frontier ||
+                    (!exact_state_only && !exact_kv_only) ||
+                    std::any_of(restored.lifecycle.begin(), restored.lifecycle.end(),
+                                 [&](const auto& fact) {
+                                    return fact.frontier == host_only_source.frontier &&
+                                           fact.operation !=
+                                               ninfer::CheckpointLifecycleOperation::Restored;
+                                })) {
+                    std::cerr << "Program physical release over-reclaimed a protected replica or "
+                                  "misattributed its exact tier delta: pressure="
+                              << state_pressure << " frontier=" << reclaimed.frontier << '/'
+                              << both_source.frontier << " state=" << reclaimed.state_images
+                              << " main=" << reclaimed.main_kv_pages
+                              << " backend=" << reclaimed.backend_kv_pages
+                              << " host_state=" << before.host_state_occupied_slots << "->"
+                              << after.host_state_occupied_slots
+                              << " host_kv=" << before.host_kv_occupied_bytes << "+"
+                              << durable_host_kv_bytes << "-" << reclaimed_kv_bytes << "->"
+                              << after.host_kv_occupied_bytes
+                              << " capacity=" << memory.host_kv_capacity_bytes
+                              << " tiers=" << static_cast<int>(reclaimed.source_tier) << "->"
+                              << static_cast<int>(reclaimed.destination_tier) << '\n';
+                    return false;
+                }
+                return true;
+            };
+            if (!exercise_filtered_release(true) || !exercise_filtered_release(false)) { return 1; }
         }
         {
             ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);

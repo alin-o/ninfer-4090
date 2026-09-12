@@ -726,6 +726,12 @@ SharedPrefixPublication<Variant> Program<Variant>::adopt_shared_prefix(
 }
 
 template <>
+void Program<Variant>::duplicate_shared_prefix_to_device_for_test(
+    const SharedPrefixHandle<Variant>& shared) {
+    impl_->duplicate_shared_prefix_to_device_for_test(shared);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

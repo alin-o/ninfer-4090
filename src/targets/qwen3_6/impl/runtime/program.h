@@ -765,6 +765,7 @@ public:
         const SharedPrefixHandle* host_shared                                = nullptr,
         const qwen3_6::SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
         std::shared_ptr<const void> physical_plan                            = {});
+    void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle& shared);
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;

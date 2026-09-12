@@ -504,6 +504,87 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "alternating Host extent partitions close without leaked descriptors");
 
+    // Model the durable-import rollback geometry directly: two victim pages occupy disjoint
+    // one-page holes separated by retained aliases.  A one-page incoming allocation fits and can
+    // fail after allocation, while the old aggregate two-page rollback allocation cannot fit.
+    // Recreating the two original runs must restore every byte and leave no source pins.
+    ninfer::HostKVArena fragmented_arena(host_layout.page_stride * 4U, host_layouts);
+    store::HostKVExtentStore fragmented_extents(fragmented_arena, 8);
+    const auto fragmented = addresses.create_active(4, 0);
+    expect(fragmented.has_value(), "fragmented rollback address allocation");
+    addresses.materialize_to_tokens(*fragmented, 193, device.stream);
+    addresses.commit_frontier(*fragmented, 193);
+    addresses.deactivate(*fragmented);
+    const std::array fragmented_pages{
+        addresses.logical_page(*fragmented, 0), addresses.logical_page(*fragmented, 1),
+        addresses.logical_page(*fragmented, 2), addresses.logical_page(*fragmented, 3)};
+    auto fragmented_backup = fragmented_extents.prepare(pages, fragmented_pages);
+    expect(fragmented_backup.has_value(), "fragmented rollback Host reservation");
+    const auto fragmented_sources = fragmented_extents.device_sources(*fragmented_backup);
+    physical_pages.copy_to_host(fragmented_sources,
+                                fragmented_extents.writable_view(*fragmented_backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const auto fragmented_extent = fragmented_extents.publish(std::move(*fragmented_backup));
+    const auto complete_view     = fragmented_extents.view(fragmented_extent);
+    std::vector<std::byte> original_fragmented_bytes(4U * host_layout.page_stride);
+    std::memcpy(original_fragmented_bytes.data(), complete_view.data(),
+                original_fragmented_bytes.size());
+    const std::array fragmented_offsets{
+        fragmented_extents.page_byte_offset(pages, fragmented_pages[0]),
+        fragmented_extents.page_byte_offset(pages, fragmented_pages[1]),
+        fragmented_extents.page_byte_offset(pages, fragmented_pages[2]),
+        fragmented_extents.page_byte_offset(pages, fragmented_pages[3])};
+    const std::array fragmented_release{fragmented_pages[0], fragmented_pages[2]};
+    expect(fragmented_extents.release_page_replicas(pages, fragmented_release) &&
+               fragmented_arena.occupied_bytes() == 2U * host_layout.page_stride &&
+               !fragmented_arena.can_allocate(host_layout, 2),
+           "fragmented rollback fixture did not preserve its separated one-page holes");
+    bool incoming_failure_injected = false;
+    auto failed_incoming           = fragmented_arena.allocate(host_layout, 1);
+    expect(failed_incoming.has_value(), "fragmented rollback incoming allocation");
+    try {
+        auto allocated = std::move(*failed_incoming);
+        (void)allocated;
+        throw std::runtime_error("injected failure after incoming Host KV allocation");
+    } catch (const std::runtime_error&) { incoming_failure_injected = true; }
+    expect(incoming_failure_injected && !fragmented_arena.can_allocate(host_layout, 2),
+           "failed incoming allocation unexpectedly made aggregate rollback contiguous");
+    for (const std::uint32_t page_index : {0U, 2U}) {
+        const std::array member{fragmented_pages[page_index]};
+        auto restored_run =
+            fragmented_extents.prepare_unpinned_at(pages, member, fragmented_offsets[page_index]);
+        expect(restored_run.has_value(), "fragmented rollback run reservation");
+        const auto source = fragmented_extents.device_sources(*restored_run);
+        physical_pages.copy_to_host(source, fragmented_extents.writable_view(*restored_run),
+                                    device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        (void)fragmented_extents.publish(std::move(*restored_run));
+    }
+    bool exact_fragmented_bytes = true;
+    for (std::uint32_t page = 0; page < fragmented_pages.size(); ++page) {
+        const auto replica = pages.host_replica(fragmented_pages[page]);
+        const auto view = fragmented_extents.view(replica.extent).subview(replica.page_offset, 1);
+        exact_fragmented_bytes =
+            exact_fragmented_bytes &&
+            std::memcmp(view.data(),
+                        original_fragmented_bytes.data() +
+                            static_cast<std::size_t>(page) * host_layout.page_stride,
+                        host_layout.page_stride) == 0 &&
+            pages.device_resident(fragmented_pages[page]) &&
+            pages.host_resident(fragmented_pages[page]) &&
+            fragmented_extents.page_byte_offset(pages, fragmented_pages[page]) ==
+                fragmented_offsets[page] &&
+            pages.source_pins(fragmented_pages[page]) == 0;
+    }
+    expect(exact_fragmented_bytes &&
+               fragmented_arena.occupied_bytes() == 4U * host_layout.page_stride,
+           "fragmented rollback changed bytes, residency, accounting, or source pins");
+    expect(addresses.release(*fragmented) &&
+               fragmented_extents.release_unreferenced() == 4U * host_layout.page_stride &&
+               fragmented_arena.occupied_bytes() == 0 && pages.occupied() == 0,
+           "fragmented rollback fixture leaked restored Host ownership");
+
     const auto shared = addresses.create_active(3, 0);
     expect(shared.has_value(), "shared-prefix source address allocation");
     addresses.materialize_to_tokens(*shared, 65, device.stream);

@@ -417,7 +417,8 @@ public:
         }
         const auto view = resources_.shared_catalog_slot(slot);
         if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
-            view.handle == nullptr || (expected_owner && view.id != *expected_owner)) {
+            view.handle == nullptr || view.metadata.transaction_pinned ||
+            (expected_owner && view.id != *expected_owner)) {
             throw std::invalid_argument("shared catalog slot holds no matching prefix");
         }
         auto snapshot          = run_shared_snapshot_operation([&] {
@@ -474,7 +475,7 @@ public:
         const auto view = resources_.shared_catalog_slot(slot);
         if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
             view.handle == nullptr || view.id == 0 || !view.metadata.ssd_eligible ||
-            view.metadata.ssd_backed) {
+            view.metadata.ssd_backed || view.metadata.transaction_pinned) {
             return std::nullopt;
         }
         return view.id;
@@ -502,6 +503,11 @@ public:
         return false;
     }
 
+    void cancel_durable_shared_prefix_recovery(std::uint64_t reservation_id) noexcept {
+        std::scoped_lock lock(execution_mutex_);
+        resources_.cancel_durable_recovery(reservation_id);
+    }
+
     [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult import_shared_prefix(
         std::span<const std::uint8_t> snapshot, std::string_view model_binding,
         runtime::CancellationFlagView cancellation                        = {},
@@ -512,7 +518,7 @@ public:
         bool ssd_backed                                                   = false,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
             std::nullopt,
-        bool* validation_completed = nullptr) {
+        bool* validation_completed = nullptr, std::uint64_t reservation_id = 0) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
@@ -551,13 +557,16 @@ public:
                         testing::shared_snapshot_import_checkpoint(
                             testing::SharedSnapshotImportStage::BeforeCatalogPublication);
                     },
-                    ssd_backed);
+                    ssd_backed, reservation_id);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
                 }
                 if (result.disposition == ResourceManagement::SharedImportDisposition::Cancelled) {
                     throw RequestError(RequestErrorKind::Cancelled,
                                        "shared snapshot import was cancelled");
+                }
+                if (result.disposition == ResourceManagement::SharedImportDisposition::Stale) {
+                    throw std::invalid_argument("durable shared recovery plan is stale");
                 }
                 {
                     const auto view = resources_.shared_catalog_slot(result.slot);

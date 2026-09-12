@@ -812,33 +812,44 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                 if (inspected.warm_frontier != 0 &&
                     (feasible_ssd == nullptr ||
                      inspected.warm_frontier >= feasible_ssd->frontier)) {
-                    const char* reason = "deeper-memory-ready";
-                    if (feasible_ssd != nullptr &&
-                        inspected.warm_frontier == feasible_ssd->frontier) {
-                        reason = "same-boundary-memory-ready";
-                    } else if (feasible_ssd == nullptr && !available_ssd_candidates.empty()) {
-                        reason = "ssd-adoption-infeasible-memory-ready";
-                    }
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
-                            .reason                   = reason};
+                            .reason                   = "warm-source-selected"};
                 }
                 if (feasible_ssd != nullptr) {
-                    return {.source    = RecoverySource::Ssd,
-                            .candidate = *feasible_ssd,
-                            .frontier  = feasible_ssd->frontier,
-                            .reason    = feasible_index == 0 ? "ssd-deeper-feasible"
-                                                             : "ssd-shallower-feasible"};
+                    return {.source         = RecoverySource::Ssd,
+                            .candidate      = *feasible_ssd,
+                            .frontier       = feasible_ssd->frontier,
+                            .reservation_id = inspected.reservation_id,
+                            .replacement    = inspected.replacement_slot.has_value(),
+                            .reason         = inspected.replacement_slot ? "ssd-replacement-planned"
+                                                                         : "ssd-admission-planned"};
                 }
                 if (inspected.warm_frontier != 0) {
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
-                            .reason                   = "ssd-adoption-infeasible-memory-ready"};
+                            .reason                   = "warm-source-selected"};
                 }
-                return {.reason = available_ssd_candidates.empty() ? "ssd-unavailable"
-                                                                   : "ssd-adoption-infeasible"};
+                const auto infeasible_reason = [&] {
+                    switch (inspected.infeasibility) {
+                    case DurableImportFeasibility::LogicalCapacity:
+                        return "ssd-logical-capacity-no-replaceable-victim";
+                    case DurableImportFeasibility::HostStateCapacity:
+                        return "ssd-host-state-capacity";
+                    case DurableImportFeasibility::HostKvCapacity:
+                        return "ssd-host-kv-capacity";
+                    case DurableImportFeasibility::DeviceCapacity:
+                        return "ssd-device-feasibility";
+                    case DurableImportFeasibility::TransactionConflict:
+                        return "ssd-transaction-conflict";
+                    default:
+                        return "ssd-logical-capacity-no-replaceable-victim";
+                    }
+                };
+                return {.reason = available_ssd_candidates.empty() ? "ssd-no-matching-record"
+                                                                   : infeasible_reason()};
             }
             return {.reason = "ssd-engine-unsupported"};
         },
@@ -848,10 +859,12 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
 runtime::DurableSharedSnapshotAccess::ImportResult
 runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
-                                             const CancellationView& cancellation) {
+                                             const CancellationView& cancellation,
+                                             std::uint64_t reservation_id) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
     if (!bytes) { throw std::invalid_argument("durable shared snapshot payload is empty"); }
     if (cancellation.requested()) {
+        cancel_recovery(engine, reservation_id);
         throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
     }
     const std::string binding = slot_model_binding(engine.impl_->load);
@@ -871,7 +884,7 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                                                        "shared snapshot import was cancelled");
                             }
                         },
-                        bytes, true, candidate, &validation_completed);
+                        bytes, true, candidate, &validation_completed, reservation_id);
                     if (!result.summary || !result.checkpoint) {
                         throw std::logic_error(
                             "durable shared import has no locked publication identity");
@@ -883,6 +896,7 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                             .validation_nanoseconds = validation_nanoseconds,
                             .adoption_nanoseconds   = adoption_nanoseconds,
                             .checkpoint             = std::move(*result.checkpoint),
+                            .displaced_checkpoint   = std::move(result.displaced_checkpoint),
                     };
                 } catch (const RequestError&) {
                     throw;
@@ -899,6 +913,20 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
     // next preparation checkpoint. Returning the committed identity lets that failure retain the
     // SSD lifecycle fact instead of making a completed adoption disappear from observability.
     return imported;
+}
+
+void runtime::DurableSharedSnapshotAccess::cancel_recovery(Engine& engine,
+                                                           std::uint64_t reservation_id) noexcept {
+    if (!engine.impl_ || reservation_id == 0) { return; }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->cancel_durable_shared_prefix_recovery(reservation_id);
+                          }) {
+                core->cancel_durable_shared_prefix_recovery(reservation_id);
+            }
+        },
+        engine.impl_->core);
 }
 
 bool runtime::DurableSharedSnapshotAccess::resident(Engine& engine, const Candidate& candidate) {

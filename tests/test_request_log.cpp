@@ -401,7 +401,7 @@ int main() {
     outcome.metrics.prefix_reuse_path        = ninfer::PrefixReusePath::PrivateTurnClosure;
     outcome.metrics.durable_restore_frontier = 101;
     outcome.metrics.durable_loaded_from_ssd  = true;
-    outcome.metrics.durable_fallback_reason  = "";
+    outcome.metrics.durable_fallback_reason  = "ssd-successful-replacement";
     outcome.metrics.engine_timing            = {
                    .queue_wait_seconds                   = 0.001,
                    .engine_boundary_exposed_seconds      = 0.001,
@@ -502,8 +502,23 @@ int main() {
     failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("durable_restore").at("frontier_tokens") == 101 &&
-                          done.at("result").at("durable_restore").at("ssd_loaded") == true,
+                          done.at("result").at("durable_restore").at("ssd_loaded") == true &&
+                          done.at("result").at("durable_restore").at("fallback_reason") ==
+                              "ssd-successful-replacement",
                       "durable restore classification missing");
+    const auto durable_reason = [&](std::string reason) {
+        GenerationOutcome classified               = outcome;
+        classified.metrics.durable_loaded_from_ssd = false;
+        classified.metrics.durable_fallback_reason = std::move(reason);
+        return Json::parse(format_request_done_json("serve-test", 3002, context, classified))
+            .at("result")
+            .at("durable_restore")
+            .at("fallback_reason");
+    };
+    failures += check(durable_reason("ssd-host-state-capacity") == "ssd-host-state-capacity" &&
+                          durable_reason("ssd-io-failure") == "ssd-io-failure" &&
+                          durable_reason("ssd-validation-failure") == "ssd-validation-failure",
+                      "pre-I/O capacity, I/O, and validation classifications collapsed in JSONL");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
@@ -577,6 +592,34 @@ int main() {
             lifecycle.at("elapsed_ns") == 12345 &&
             lifecycle.at("kv_capacity").at("device").at("main").at("used_pages") == 25,
         "checkpoint lifecycle identity, tier, quantity, correlation, or KV snapshot mismatch");
+    ninfer::CheckpointLifecycleFact displaced = lifecycle_fact;
+    displaced.key_digests                     = {0x1111, 0x2222};
+    displaced.content_digest                  = std::string(64, 'd');
+    displaced.role                            = ninfer::CheckpointLifecycleRole::SharedStablePrefix;
+    displaced.scope                           = ninfer::CheckpointLifecycleScope::Shared;
+    displaced.operation                       = ninfer::CheckpointLifecycleOperation::Evicted;
+    displaced.source_tier                     = ninfer::CheckpointLifecycleTier::Host;
+    displaced.destination_tier                = ninfer::CheckpointLifecycleTier::Ssd;
+    ninfer::CheckpointLifecycleFact restored  = displaced;
+    restored.key_digests                      = {0x3333, 0x4444};
+    restored.content_digest                   = std::string(64, 'r');
+    restored.operation                        = ninfer::CheckpointLifecycleOperation::Restored;
+    restored.source_tier                      = ninfer::CheckpointLifecycleTier::Ssd;
+    restored.destination_tier                 = ninfer::CheckpointLifecycleTier::Device;
+    const Json displaced_json =
+        Json::parse(format_checkpoint_lifecycle_json("serve-test", 3501, context, displaced));
+    const Json restored_json =
+        Json::parse(format_checkpoint_lifecycle_json("serve-test", 3502, context, restored));
+    failures += check(
+        displaced_json.at("operation") == "evicted" && displaced_json.at("status") == "committed" &&
+            displaced_json.at("source_tier") == "host" &&
+            displaced_json.at("destination_tier") == "ssd" &&
+            displaced_json.at("checkpoint").at("content_digest") == std::string(64, 'd') &&
+            restored_json.at("operation") == "restored" &&
+            restored_json.at("status") == "committed" && restored_json.at("source_tier") == "ssd" &&
+            restored_json.at("destination_tier") == "device" &&
+            restored_json.at("checkpoint").at("content_digest") == std::string(64, 'r'),
+        "replacement JSONL did not distinguish displaced and restored owners");
     RequestLogContext background_context;
     background_context.kv_snapshot = context.kv_snapshot;
     const Json background          = Json::parse(

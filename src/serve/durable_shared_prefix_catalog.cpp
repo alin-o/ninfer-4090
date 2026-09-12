@@ -1040,9 +1040,11 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
         }
         observation.fallback_reason             = decision.reason;
         const Candidate candidate               = decision.candidate;
+        const std::uint64_t reservation_id      = decision.reservation_id;
         const Clock::time_point restore_started = Clock::now();
         auto loaded                             = load_record(candidate, deadline, cancellation);
         if (!loaded.bytes) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             append_lifecycle(
                 candidate,
                 cancellation.requested() ? CheckpointLifecycleStatus::Aborted
@@ -1052,15 +1054,28 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                                                Clock::now() - restore_started)
                                                .count()));
             observation.fallback_reason =
-                Clock::now() >= deadline ? "ssd-deadline" : "ssd-unavailable";
+                cancellation.requested()
+                    ? "ssd-cancelled"
+                    : (Clock::now() >= deadline ? "ssd-deadline" : "ssd-io-failure");
             available.erase(std::remove(available.begin(), available.end(), candidate),
                             available.end());
             if (cancellation.requested() || Clock::now() >= deadline) { return observation; }
             continue;
         }
+        if (cancellation.requested() || Clock::now() >= deadline) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            append_lifecycle(
+                candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               Clock::now() - restore_started)
+                                               .count()));
+            observation.fallback_reason =
+                cancellation.requested() ? "ssd-cancelled" : "ssd-deadline";
+            return observation;
+        }
         try {
             const auto imported = runtime::DurableSharedSnapshotAccess::import(
-                engine, candidate, loaded.bytes, cancellation);
+                engine, candidate, loaded.bytes, cancellation, reservation_id);
             {
                 std::lock_guard lock(state_->mutex);
                 state_->values.validation_nanoseconds += imported.validation_nanoseconds;
@@ -1073,11 +1088,18 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - restore_started)
                     .count());
             observation.loaded_from_ssd = true;
+            observation.fallback_reason = imported.displaced_checkpoint
+                                              ? "ssd-successful-replacement"
+                                              : "ssd-successful-restore";
+            if (imported.displaced_checkpoint) {
+                observation.lifecycle.push_back(std::move(*imported.displaced_checkpoint));
+            }
             append_lifecycle(candidate, CheckpointLifecycleStatus::Committed,
                              observation.serialized_bytes, observation.elapsed_ns,
                              &imported.checkpoint);
             return observation;
         } catch (const RequestError& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             if (error.kind() == RequestErrorKind::Cancelled) {
                 append_lifecycle(
                     candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
@@ -1086,16 +1108,27 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                                                    .count()));
                 throw RequestError(error.kind(), error.what(), std::move(observation.lifecycle));
             }
-            observation.fallback_reason = "ssd-adoption-unavailable";
-        } catch (const runtime::DurableSharedSnapshotAccess::ValidationError&) {
+            observation.fallback_reason = "ssd-adoption-failure";
+        } catch (const runtime::DurableSharedSnapshotAccess::ValidationError& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             {
                 std::lock_guard lock(state_->mutex);
                 ++state_->values.corrupt_records;
             }
             invalidate_loaded(loaded);
-            observation.fallback_reason = "ssd-validation";
-        } catch (const std::invalid_argument&) {
-            observation.fallback_reason = "ssd-adoption-unavailable";
+            observation.fallback_reason =
+                std::string_view(error.what()).find("checksum") != std::string_view::npos
+                    ? "ssd-checksum-failure"
+                    : "ssd-validation-failure";
+        } catch (const std::invalid_argument& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            observation.fallback_reason =
+                std::string_view(error.what()).find("stale") != std::string_view::npos
+                    ? "ssd-stale-replanned"
+                    : "ssd-adoption-failure";
+        } catch (...) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            throw;
         }
         append_lifecycle(
             candidate, CheckpointLifecycleStatus::Failed, loaded.bytes->size(),

@@ -661,6 +661,12 @@ bool Program<Variant>::durable_shared_prefix_import_feasible(std::uint32_t front
 }
 
 template <>
+runtime::DurableImportAssessment Program<Variant>::inspect_durable_shared_prefix_import(
+    std::uint32_t frontier, const SharedPrefixHandle<Variant>* replacement) const {
+    return impl_->inspect_durable_shared_prefix_import(frontier, replacement);
+}
+
+template <>
 RetainedSessionSnapshot
 Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared,
                                        std::string_view model_binding,
@@ -698,6 +704,17 @@ Program<Variant>::adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>
         throw std::invalid_argument("validated shared import belongs to a different Program");
     }
     return impl_->adopt_shared_prefix(imported);
+}
+
+template <>
+SharedPrefixPublication<Variant>
+Program<Variant>::adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported,
+                                      SharedPrefixHandle<Variant>* replacement,
+                                      runtime::CancellationFlagView cancellation) {
+    if (imported.validating_program_ != shared_import_identity_) {
+        throw std::invalid_argument("validated shared import belongs to a different Program");
+    }
+    return impl_->adopt_shared_prefix(imported, replacement, cancellation);
 }
 
 template <>

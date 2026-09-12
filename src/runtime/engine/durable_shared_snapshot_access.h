@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@ struct DurableSharedSnapshotAccess {
         std::uint64_t validation_nanoseconds = 0;
         std::uint64_t adoption_nanoseconds   = 0;
         CheckpointLifecycleFact checkpoint;
+        std::optional<CheckpointLifecycleFact> displaced_checkpoint;
     };
 
     enum class RecoverySource : std::uint8_t {
@@ -46,6 +48,8 @@ struct DurableSharedSnapshotAccess {
         Candidate candidate;
         std::uint32_t frontier                 = 0;
         std::uint64_t estimated_memory_cost_ns = 0;
+        std::uint64_t reservation_id           = 0;
+        bool replacement                       = false;
         std::string reason;
     };
 
@@ -62,7 +66,9 @@ struct DurableSharedSnapshotAccess {
                     std::span<const Candidate> available_ssd_candidates);
     [[nodiscard]] static ImportResult import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
-                                             const CancellationView& cancellation = {});
+                                             const CancellationView& cancellation = {},
+                                             std::uint64_t reservation_id         = 0);
+    static void cancel_recovery(Engine& engine, std::uint64_t reservation_id) noexcept;
     [[nodiscard]] static bool resident(Engine& engine, const Candidate& candidate);
     [[nodiscard]] static bool settle_export(Engine& engine, std::uint32_t slot, std::uint64_t owner,
                                             bool committed);

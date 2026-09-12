@@ -737,6 +737,9 @@ public:
     durable_shared_prefix_matches(const qwen3_6::DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle& resident) const;
     [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
+    [[nodiscard]] runtime::DurableImportAssessment
+    inspect_durable_shared_prefix_import(std::uint32_t frontier,
+                                         const SharedPrefixHandle* replacement) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
                          const qwen3_6::SharedPrefixPersistenceMetadata& metadata);
@@ -752,6 +755,10 @@ public:
                           const SharedPrefixHandle& resident) const;
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported);
+    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+                        SharedPrefixHandle* replacement,
+                        runtime::CancellationFlagView cancellation = {});
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;
@@ -760,6 +767,10 @@ public:
     qwen3_6::SessionSnapshotTraffic snapshot_traffic_;
 
 private:
+    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
+    adopt_shared_prefix_impl(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+                             bool enable_failure_checkpoints);
+
     void advance_resource_revision() noexcept {
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }
     }

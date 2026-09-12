@@ -353,6 +353,47 @@ public:
                                                                  allocations);
     }
 
+    // Complete import preflight: in addition to arena bytes, prove that releasing these exact
+    // last references leaves enough bounded extent and membership descriptors for every new Host
+    // allocation. The release marks already deduplicate aliased pages and extents.
+    [[nodiscard]] bool can_prepare_after_last_reference_releases(
+        std::span<const HostKVPageReplicaRelease> releases,
+        std::span<const HostKVAllocationRequest> allocations) const {
+        if (!can_allocate_after_page_releases({}, releases, allocations)) { return false; }
+        std::uint64_t membership_need = 0;
+        for (const HostKVAllocationRequest& allocation : allocations) {
+            membership_need += allocation.pages;
+        }
+        if (membership_need > static_cast<std::uint64_t>(free_membership_count_) +
+                                  static_cast<std::uint64_t>(releases.size())) {
+            return false;
+        }
+
+        std::int64_t projected_free = free_count_;
+        for (const std::uint32_t index : affected_extents_) {
+            const Extent& extent        = extents_[index];
+            std::uint32_t node          = extent.head;
+            bool previous_released      = false;
+            std::uint32_t retained_runs = 0;
+            std::uint32_t released      = 0;
+            for (std::uint32_t page = 0; page < extent.page_count; ++page) {
+                if (node == kInvalidIndex) { return false; }
+                const bool is_released = release_marks_[node] == release_stamp_;
+                released += is_released ? 1U : 0U;
+                if (!is_released && (page == 0 || previous_released)) { ++retained_runs; }
+                previous_released = is_released;
+                node              = memberships_[node].next;
+            }
+            if (node != kInvalidIndex) { return false; }
+            if (released == extent.page_count) {
+                ++projected_free;
+            } else if (retained_runs > 1U) {
+                projected_free -= static_cast<std::int64_t>(retained_runs - 1U);
+            }
+        }
+        return projected_free >= static_cast<std::int64_t>(allocations.size());
+    }
+
     [[nodiscard]] bool release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) {
         if (!can_release_page_replicas(releases)) { return false; }
         release_marked_extents();

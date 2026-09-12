@@ -1137,6 +1137,9 @@ public:
     durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
+    [[nodiscard]] runtime::DurableImportAssessment
+    inspect_durable_shared_prefix_import(std::uint32_t frontier,
+                                         const SharedPrefixHandle<Variant>* replacement) const;
     [[nodiscard]] RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
                          const SharedPrefixPersistenceMetadata& metadata);
@@ -1151,6 +1154,10 @@ public:
                                              const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] SharedPrefixPublication<Variant>
     adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported);
+    [[nodiscard]] SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported,
+                        SharedPrefixHandle<Variant>* replacement,
+                        runtime::CancellationFlagView cancellation = {});
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

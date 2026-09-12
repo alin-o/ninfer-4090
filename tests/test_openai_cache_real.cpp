@@ -327,6 +327,120 @@ std::string read_file(const std::filesystem::path& path) {
     return std::string((std::istreambuf_iterator<char>(input)), {});
 }
 
+void exercise_durable_two_lineage_replacement(const char* artifact) {
+    TemporaryDirectory temporary;
+    ServeOptions configured                            = options(artifact);
+    configured.max_concurrency                         = 3;
+    configured.max_pending_requests                    = 3;
+    configured.context_cache.device_state_slots        = 6;
+    configured.context_cache.host_state_slots          = 8;
+    configured.context_cache.host_kv_capacity_bytes    = 2ULL << 30;
+    configured.context_cache.max_private_continuations = 6;
+    configured.context_cache.max_shared_prefixes       = 3;
+    configured.shared_prefix_cache_dir                 = temporary.path / "shared-prefixes";
+    configured.shared_prefix_cache_max_records         = 8;
+    configured.shared_prefix_cache_max_bytes           = 8ULL << 30;
+    configured.shared_prefix_cache_staging_bytes       = 2ULL << 30;
+    configured.shared_prefix_cache_workers             = 1;
+    configured.shared_prefix_cache_jobs                = 2;
+
+    const auto instructions = [](std::string_view lineage) {
+        std::string text = "durable-lineage-" + std::string(lineage) + ' ';
+        for (std::uint32_t index = 0; index < 900; ++index) { text += "stable "; }
+        text += "\n=== CACHE_BREAKPOINT ===\nvolatile workspace ";
+        text += lineage;
+        return text;
+    };
+    const auto wait_for_writes = [](const GenerationService& service, std::uint64_t minimum) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const RuntimeStats stats = service.runtime_stats();
+            if (stats.shared_ssd_writes_completed >= minimum && stats.shared_ssd_queued_jobs == 0 &&
+                stats.shared_ssd_active_jobs == 0 && stats.shared_ssd_pending_export_claims == 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    const auto shared_owner_count = [](const RuntimeStats& stats) {
+        std::uint32_t count = 0;
+        for (const ContextCacheMetricRole role :
+             {ContextCacheMetricRole::Harness, ContextCacheMetricRole::Project}) {
+            for (std::uint8_t placement = 0;
+                 placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
+                 ++placement) {
+                for (std::uint8_t pin = 0;
+                     pin < static_cast<std::uint8_t>(ContextCacheMetricPin::Count); ++pin) {
+                    for (std::uint8_t identity = 0;
+                         identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
+                         ++identity) {
+                        count += stats.context_cache_owners[context_cache_owner_metric_index(
+                            role, static_cast<ContextCacheMetricPlacement>(placement),
+                            static_cast<ContextCacheMetricPin>(pin),
+                            static_cast<ContextCacheMetricIdentity>(identity))];
+                    }
+                }
+            }
+        }
+        return count;
+    };
+
+    GenerationOutcome codex_oracle;
+    {
+        GenerationService seed(configured);
+        (void)generate(seed, instructions("direct-a"), "Direct seed A.", false);
+        codex_oracle = generate(seed, instructions("codex-b"), "Codex seed B.", true);
+        require(wait_for_writes(seed, 2),
+                "two-lineage fixture did not durably persist both SSD candidates");
+    }
+
+    GenerationService service(configured);
+    const GenerationOutcome direct_restored =
+        generate(service, instructions("direct-a"), "Direct seed A.", false);
+    require(direct_restored.metrics.durable_loaded_from_ssd &&
+                direct_restored.metrics.durable_fallback_reason == "ssd-successful-restore" &&
+                direct_restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+                direct_restored.metrics.prefix_cache_hit_tokens != 0,
+            "first Direct lineage did not restore its exact durable shared prefix");
+    (void)generate(service, instructions("direct-c"), "Direct activity C.", false);
+    (void)generate(service, instructions("direct-d"), "Direct activity D.", false);
+    const RuntimeStats filled = settled_stats(service);
+    require(shared_owner_count(filled) == 3,
+            "Direct activity did not fill the three-cell resident shared catalog");
+
+    const GenerationOutcome codex =
+        generate(service, instructions("codex-b"), "Codex seed B.", true);
+    const auto displaced = std::find_if(
+        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
+            return fact.operation == CheckpointLifecycleOperation::Evicted &&
+                   fact.status == CheckpointLifecycleStatus::Committed &&
+                   fact.scope == CheckpointLifecycleScope::Shared &&
+                   fact.destination_tier == CheckpointLifecycleTier::Ssd;
+        });
+    const auto restored = std::find_if(
+        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
+            return fact.operation == CheckpointLifecycleOperation::Restored &&
+                   fact.status == CheckpointLifecycleStatus::Committed &&
+                   fact.scope == CheckpointLifecycleScope::Shared &&
+                   fact.source_tier == CheckpointLifecycleTier::Ssd;
+        });
+    require(codex.metrics.durable_loaded_from_ssd &&
+                codex.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
+                codex.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+                codex.metrics.prefix_cache_hit_tokens == codex.metrics.durable_restore_frontier &&
+                codex.metrics.prefix_cache_hit_tokens != 0 &&
+                codex.prompt_tokens > static_cast<int>(codex.metrics.prefix_cache_hit_tokens) &&
+                codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens) ==
+                    codex.prompt_tokens -
+                        static_cast<int>(codex.metrics.durable_restore_frontier) &&
+                codex.generated_token_ids == codex_oracle.generated_token_ids &&
+                displaced != codex.checkpoint_lifecycle.end() &&
+                restored != codex.checkpoint_lifecycle.end() && displaced < restored &&
+                displaced->content_digest != restored->content_digest,
+            "Codex lineage root-prefilled or lost exact replacement/frontier/suffix evidence");
+}
+
 std::string base64(std::span<const std::uint8_t> bytes) {
     constexpr std::string_view alphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -633,6 +747,7 @@ int main() {
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);
+        exercise_durable_two_lineage_replacement(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);
         return 0;

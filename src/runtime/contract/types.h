@@ -538,11 +538,20 @@ struct CommittedKvOffloadRange {
                                                    CommittedKvOffloadRange) noexcept = default;
 };
 
+enum class DeviceStateVictimClass : std::uint8_t {
+    None,
+    Intermediate,
+    ConversationHead,
+};
+
 struct PressureOwnerOutcome {
     PlanningOwnerId owner;
     VictimDisposition disposition     = VictimDisposition::Retained;
     std::uint32_t degradation_units   = 0;
     std::uint32_t dropped_checkpoints = 0;
+    // Program-owned attribution for the hard Device-State victim class. This includes demotion,
+    // duplicate release, checkpoint drop, and whole-owner eviction.
+    DeviceStateVictimClass device_state_victim_class = DeviceStateVictimClass::None;
 
     [[nodiscard]] friend constexpr bool operator==(const PressureOwnerOutcome&,
                                                    const PressureOwnerOutcome&) noexcept = default;
@@ -571,6 +580,24 @@ struct UniquePhysicalReclamation {
     [[nodiscard]] friend constexpr bool
     operator==(const UniquePhysicalReclamation&,
                const UniquePhysicalReclamation&) noexcept = default;
+};
+
+// Program-owned diagnosis for one complete durable Host import projection.  ResourceManager may
+// compare these facts with logical retention value, but it must not reproduce allocator arithmetic.
+enum class DurableImportFeasibility : std::uint8_t {
+    Feasible,
+    LogicalCapacity,
+    HostStateCapacity,
+    HostKvCapacity,
+    DeviceCapacity,
+    TransactionConflict,
+    Unsupported,
+};
+
+struct DurableImportAssessment {
+    DurableImportFeasibility feasibility = DurableImportFeasibility::Unsupported;
+    ProgramResourceRevision resource_revision;
+    UniquePhysicalReclamation reclamation;
 };
 
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only

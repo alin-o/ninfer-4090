@@ -1572,6 +1572,88 @@ ninfer::PromptInput shared_snapshot_prompt() {
     return input;
 }
 
+struct SharedRecordFixture {
+    ninfer::PromptInput prompt;
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t frontier = 0;
+    std::string digest;
+    ninfer::CheckpointLifecycleFact checkpoint;
+};
+
+SharedRecordFixture make_shared_record(const char* artifact, ninfer::EngineOptions options,
+                                       std::uint32_t prompt_tokens, std::string_view word) {
+    using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
+    ninfer::Engine source(std::move(options));
+    constexpr std::string_view marker = "=== CACHE_BREAKPOINT ===";
+    const auto build_prompt           = [&](std::uint32_t repetitions) {
+        std::string stable(word);
+        stable.push_back(' ');
+        for (std::uint32_t index = 0; index < repetitions; ++index) { stable += "stable "; }
+        stable += "\n=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>";
+        const std::size_t marker_end = stable.find(marker) + marker.size();
+        ninfer::PromptInput input;
+        input.messages.push_back(
+            ninfer::ChatMessage{.role  = ninfer::ChatRole::System,
+                                          .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                     .text = stable + "\nCurrent working directory: x"}}});
+        input.messages.push_back(ninfer::ChatMessage{
+                      .role  = ninfer::ChatRole::User,
+                      .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Reply yes."}}});
+        input.options.enable_thinking = false;
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                      .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                      .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                      .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                      .leading_instruction_bytes = static_cast<std::uint32_t>(marker_end + 1U),
+        });
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
+    std::uint32_t low          = 0;
+    std::uint32_t high         = prompt_tokens;
+    ninfer::PromptInput prompt = build_prompt(0);
+    while (low <= high) {
+        const std::uint32_t middle    = low + (high - low) / 2U;
+        ninfer::PromptInput candidate = build_prompt(middle);
+        const std::uint32_t tokens    = source.count_tokens(candidate);
+        if (tokens <= prompt_tokens) { prompt = std::move(candidate); }
+        if (tokens < prompt_tokens) {
+            low = middle + 1U;
+        } else {
+            if (middle == 0) { break; }
+            high = middle - 1U;
+        }
+    }
+    const ninfer::GenerationResult generated =
+        source.generate(source.prepare(prompt), fixed_output(1));
+    if (generated.generated_token_ids.size() != 1) {
+        throw std::runtime_error("shared-record source generation failed");
+    }
+    auto [slot, snapshot] = Access::export_first_durable(source);
+    (void)slot;
+    snapshot.await_transfer(snapshot.bytes);
+    SharedRecordFixture fixture{
+        .prompt     = prompt,
+        .bytes      = snapshot.bytes,
+        .frontier   = snapshot.tokens,
+        .digest     = snapshot.content_digest,
+        .checkpoint = snapshot.checkpoint,
+    };
+    snapshot.release_storage();
+    return fixture;
+}
+
+ninfer::targets::qwen3_6::RetainedSessionSnapshot
+catalog_snapshot(const SharedRecordFixture& fixture) {
+    ninfer::targets::qwen3_6::RetainedSessionSnapshot snapshot;
+    snapshot.bytes          = fixture.bytes;
+    snapshot.transfer_bytes = fixture.bytes.size();
+    snapshot.tokens         = fixture.frontier;
+    snapshot.content_digest = fixture.digest;
+    snapshot.checkpoint     = fixture.checkpoint;
+    return snapshot;
+}
+
 std::uint64_t token_fixture_hash(std::span<const ninfer::TokenId> tokens) {
     std::uint64_t digest = 1469598103934665603ULL;
     for (const ninfer::TokenId token : tokens) {
@@ -4007,7 +4089,9 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
     std::vector<ninfer::TokenId> expected_tokens;
     std::uint32_t durable_frontier = 0;
     std::string durable_digest;
-    std::size_t durable_host_kv_bytes = 0;
+    std::size_t durable_host_kv_bytes   = 0;
+    std::size_t host_main_page_bytes    = 0;
+    std::size_t host_backend_page_bytes = 0;
     ninfer::runtime::testing::SealedSharedSnapshotTestImport source_validated;
     {
         ninfer::Engine source(shared_snapshot_engine_options(artifact));
@@ -4099,6 +4183,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         durable_frontier                          = snapshot.tokens;
         durable_digest                            = snapshot.content_digest;
         const ninfer::MemorySummary source_memory = source.memory_summary();
+        host_main_page_bytes                      = source_memory.host_main_kv_page_bytes;
+        host_backend_page_bytes                   = source_memory.host_backend_kv_page_bytes;
         const auto pages_for                      = [](std::uint32_t frontier) {
             return frontier == 0 ? 0U
                                                       : 1U + (frontier - 1U) /
@@ -4632,6 +4718,348 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                              "manifest and source pins\n";
                 return 1;
             }
+        }
+        {
+            // Arrange a bounded four-page Program arena as V0/S0/V1/S1, where V is the
+            // SSD-backed logical victim and S is a retained separator. The one-page incoming
+            // record consumes one released hole before the injected failure. Program adoption,
+            // not this fixture, must capture and restore both original disjoint runs.
+            auto source_options                = shared_snapshot_engine_options(artifact);
+            source_options.max_context         = 512;
+            source_options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(512);
+            source_options.speculative.backend = ninfer::SpeculativeBackend::None;
+            source_options.speculative.draft_tokens          = 0;
+            source_options.speculative.proposal_head         = ninfer::ProposalHead::Full;
+            source_options.context_cache.device_state_slots  = 4;
+            source_options.context_cache.host_state_slots    = 4;
+            source_options.context_cache.max_shared_prefixes = 2;
+            const SharedRecordFixture fragmented_victim =
+                make_shared_record(artifact, source_options, 140, "fragment-victim");
+            const SharedRecordFixture fragmented_separator =
+                make_shared_record(artifact, source_options, 140, "fragment-separator");
+            const SharedRecordFixture fragmented_incoming =
+                make_shared_record(artifact, source_options, 80, "fragment-incoming");
+            const auto pages_for = [](std::uint32_t frontier) {
+                return frontier == 0
+                           ? 0U
+                           : 1U + (frontier - 1U) /
+                                      static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+            };
+            if (pages_for(fragmented_victim.frontier) != 2 ||
+                pages_for(fragmented_separator.frontier) != 2 ||
+                pages_for(fragmented_incoming.frontier) != 1) {
+                std::cerr << "fragmented Program rollback fixture has unexpected page geometry: "
+                          << fragmented_victim.frontier << '/' << fragmented_separator.frontier
+                          << '/' << fragmented_incoming.frontier << '\n';
+                return 1;
+            }
+
+            const std::filesystem::path fragmented_directory =
+                directory / "fragmented-program-rollback";
+            ninfer::serve::DurableSharedPrefixCatalogOptions fragmented_catalog_options{
+                .directory     = fragmented_directory,
+                .max_records   = 3,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            };
+            ninfer::serve::DurableSharedPrefixCatalog fragmented_catalog(
+                fragmented_catalog_options);
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_victim));
+            fragmented_catalog.drain();
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_separator));
+            fragmented_catalog.drain();
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_incoming));
+            fragmented_catalog.drain();
+
+            ninfer::EngineOptions target_options                = source_options;
+            target_options.context_cache.host_kv_capacity_bytes = 4U * host_main_page_bytes;
+            ninfer::Engine fragmented_engine(std::move(target_options));
+            const auto victim_storage =
+                std::make_shared<const std::vector<std::uint8_t>>(fragmented_victim.bytes);
+            const auto separator_storage =
+                std::make_shared<const std::vector<std::uint8_t>>(fragmented_separator.bytes);
+            const auto victim_import = ninfer::runtime::DurableSharedSnapshotAccess::import(
+                fragmented_engine,
+                {.content_digest = fragmented_victim.digest,
+                 .frontier       = fragmented_victim.frontier},
+                victim_storage);
+            const auto separator_import = ninfer::runtime::DurableSharedSnapshotAccess::import(
+                fragmented_engine,
+                {.content_digest = fragmented_separator.digest,
+                 .frontier       = fragmented_separator.frontier},
+                separator_storage);
+            Access::duplicate_shared_to_device(fragmented_engine, victim_import.slot);
+            Access::duplicate_shared_to_device(fragmented_engine, separator_import.slot);
+            Access::fragment_shared_host_kv(fragmented_engine, victim_import.slot,
+                                            separator_import.slot);
+            auto before_snapshot = Access::export_slot(fragmented_engine, victim_import.slot);
+            before_snapshot.await_transfer(before_snapshot.bytes);
+            const std::vector<std::uint8_t> original_victim_bytes = before_snapshot.bytes;
+            before_snapshot.release_storage();
+            const ninfer::RuntimeStats fragmented_before = fragmented_engine.runtime_stats();
+            const std::uint64_t source_pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            ninfer::serve::DurableSharedPrefixRestore rejected;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                ninfer::PreparedPrompt prepared =
+                    fragmented_engine.prepare(fragmented_incoming.prompt);
+                rejected = fragmented_catalog.restore_matching(
+                    fragmented_engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+            }
+            const ninfer::RuntimeStats fragmented_after = fragmented_engine.runtime_stats();
+            auto after_snapshot = Access::export_slot(fragmented_engine, victim_import.slot);
+            after_snapshot.await_transfer(after_snapshot.bytes);
+            const bool exact_victim_bytes = after_snapshot.bytes == original_victim_bytes;
+            after_snapshot.release_storage();
+            const bool exact_fragmented_accounting =
+                fragmented_after.context_cache_owners == fragmented_before.context_cache_owners &&
+                fragmented_after.device_state_occupied_slots ==
+                    fragmented_before.device_state_occupied_slots &&
+                fragmented_after.host_state_occupied_slots ==
+                    fragmented_before.host_state_occupied_slots &&
+                fragmented_after.device_main_kv_occupied_pages ==
+                    fragmented_before.device_main_kv_occupied_pages &&
+                fragmented_after.host_kv_occupied_bytes == fragmented_before.host_kv_occupied_bytes;
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-adoption-failure" ||
+                !exact_victim_bytes || !exact_fragmented_accounting ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() !=
+                    source_pins_before ||
+                std::any_of(rejected.lifecycle.begin(), rejected.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            })) {
+                std::cerr << "fragmented Program adoption did not roll back exact bytes/topology: "
+                          << rejected.fallback_reason << " bytes=" << exact_victim_bytes
+                          << " accounting=" << exact_fragmented_accounting << '\n';
+                return 1;
+            }
+        }
+        {
+            // Build two private branches which share their long-anchor prefix pages. A delayed
+            // real session export pins the older branch's sources while the newer branch owns a
+            // Both endpoint, a Device-only non-head checkpoint, and selected Both KV replicas.
+            // Durable adoption must consume only the inspected unpinned private release set.
+            auto incoming_options = shared_snapshot_engine_options(artifact);
+            incoming_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture private_incoming =
+                make_shared_record(artifact, incoming_options, 80, "private-import");
+            const auto pages_for = [](std::uint32_t frontier) {
+                return frontier == 0
+                           ? 0U
+                           : 1U + (frontier - 1U) /
+                                      static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+            };
+            if (pages_for(private_incoming.frontier) != 1 ||
+                pages_for(private_incoming.frontier - 1U) != 1) {
+                std::cerr << "private release incoming record is not one Main/MTP page\n";
+                return 1;
+            }
+            const auto private_branch = [](std::string third) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                input.messages = {
+                    message(std::string(80, 'a') + " common private prefix one"),
+                    message(std::string(160, 'b') + " common private prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const auto exercise_private_release = [&](bool state_pressure) {
+                const std::filesystem::path private_directory =
+                    directory / (state_pressure ? "private-state-release" : "private-kv-release");
+                ninfer::serve::DurableSharedPrefixCatalogOptions private_catalog_options{
+                    .directory     = private_directory,
+                    .max_records   = 1,
+                    .max_bytes     = 1ULL << 30U,
+                    .workers       = 1,
+                    .max_jobs      = 1,
+                    .staging_bytes = 1ULL << 30U,
+                };
+                ninfer::serve::DurableSharedPrefixCatalog private_catalog(private_catalog_options);
+                private_catalog.enqueue(catalog_snapshot(private_incoming));
+                private_catalog.drain();
+
+                ninfer::EngineOptions options            = incoming_options;
+                options.max_concurrency                  = 2;
+                options.max_pending_requests             = 2;
+                options.context_cache.device_state_slots = 8;
+                options.context_cache.host_state_slots   = state_pressure ? 1 : 2;
+                options.context_cache.host_kv_capacity_bytes =
+                    state_pressure ? 512ULL << 20U
+                                   : 2U * (host_main_page_bytes + host_backend_page_bytes);
+                options.context_cache.max_private_continuations         = 3;
+                options.context_cache.max_shared_prefixes               = 1;
+                options.context_cache.max_long_anchors_per_continuation = 2;
+                ninfer::Engine engine(std::move(options));
+                const ninfer::GenerationResult older = engine.generate(
+                    engine.prepare(private_branch("older private branch")), fixed_output(1));
+                const ninfer::GenerationResult mixed =
+                    engine.generate(engine.prepare(private_branch(
+                                        std::string(640, 'c') + " newer divergent private branch")),
+                                    fixed_output(1));
+                if (older.slot < 0 || mixed.slot < 0 || older.slot == mixed.slot ||
+                    mixed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor) {
+                    std::cerr << "private release fixture did not retain an aliased long-anchor "
+                                 "branch: path="
+                              << static_cast<int>(mixed.prefix_reuse_path)
+                              << " slots=" << older.slot << '/' << mixed.slot << '\n';
+                    return false;
+                }
+                Access::prepare_private_host_reclamation(engine,
+                                                         static_cast<std::uint32_t>(mixed.slot));
+                const auto before = Access::observe_private_host_reclamation(
+                    engine, static_cast<std::uint32_t>(mixed.slot));
+                const ninfer::RuntimeStats stats_before = engine.runtime_stats();
+                if (before.both_state_checkpoints == 0 ||
+                    before.device_only_state_checkpoints == 0 ||
+                    before.unchanged_checkpoint_frontier == 0 || before.main_host_pages != 2 ||
+                    before.main_aliased_host_pages != 1 || before.backend_host_pages != 2 ||
+                    before.backend_aliased_host_pages != 1 ||
+                    (!state_pressure &&
+                     stats_before.host_kv_occupied_bytes !=
+                         2U * (host_main_page_bytes + host_backend_page_bytes))) {
+                    std::cerr << "private release fixture did not establish mixed State/KV "
+                                 "residency and aliases\n";
+                    return false;
+                }
+
+                ControlledSnapshotTransferGate transfer_gate;
+                auto pending_export =
+                    Access::begin_private_export(engine, static_cast<std::uint32_t>(older.slot));
+                const bool export_pinned = wait_until([&] {
+                    if (ninfer::runtime::testing::snapshot_transfer_gate_waits() == 0 ||
+                        ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0) {
+                        return false;
+                    }
+                    const auto pinned = Access::observe_private_host_reclamation(
+                        engine, static_cast<std::uint32_t>(mixed.slot));
+                    return pinned.main_pinned_host_pages == 1 &&
+                           pinned.backend_pinned_host_pages == 1;
+                });
+
+                ninfer::serve::DurableSharedPrefixRestore restored;
+                std::exception_ptr restore_failure;
+                if (export_pinned) {
+                    try {
+                        ninfer::PreparedPrompt prepared = engine.prepare(private_incoming.prompt);
+                        restored                        = private_catalog.restore_matching(
+                            engine, prepared,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(1));
+                    } catch (...) { restore_failure = std::current_exception(); }
+                }
+                const auto after = Access::observe_private_host_reclamation(
+                    engine, static_cast<std::uint32_t>(mixed.slot));
+                const ninfer::RuntimeStats stats_after    = engine.runtime_stats();
+                const bool transfer_pending_during_commit = transfer_gate.pending();
+                transfer_gate.release();
+                bool export_completed = false;
+                try {
+                    pending_export.await_transfer(pending_export.bytes);
+                    export_completed = !pending_export.bytes.empty();
+                } catch (...) {}
+                pending_export.release_storage();
+                if (restore_failure) {
+                    try {
+                        std::rethrow_exception(restore_failure);
+                    } catch (const std::exception& error) {
+                        std::cerr << "private release adoption threw: " << error.what() << '\n';
+                    }
+                    return false;
+                }
+
+                const auto reclaimed = std::find_if(
+                    restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                               fact.scope == ninfer::CheckpointLifecycleScope::Private;
+                    });
+                const bool unchanged_has_no_event = std::none_of(
+                    restored.lifecycle.begin(), restored.lifecycle.end(), [&](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                               fact.frontier == before.unchanged_checkpoint_frontier;
+                    });
+                const bool exact_state_only =
+                    state_pressure && reclaimed != restored.lifecycle.end() &&
+                    reclaimed->frontier == before.endpoint_frontier &&
+                    reclaimed->state_images == 1 && reclaimed->main_kv_pages == 0 &&
+                    reclaimed->backend_kv_pages == 0 &&
+                    after.both_state_checkpoints + 1U == before.both_state_checkpoints &&
+                    after.main_host_pages == before.main_host_pages &&
+                    after.backend_host_pages == before.backend_host_pages &&
+                    stats_after.host_state_occupied_slots ==
+                        stats_before.host_state_occupied_slots &&
+                    stats_after.host_kv_occupied_bytes == stats_before.host_kv_occupied_bytes +
+                                                              host_main_page_bytes +
+                                                              host_backend_page_bytes;
+                const bool exact_kv_only =
+                    !state_pressure && reclaimed != restored.lifecycle.end() &&
+                    reclaimed->frontier == before.endpoint_frontier &&
+                    reclaimed->state_images == 0 && reclaimed->main_kv_pages == 1 &&
+                    reclaimed->backend_kv_pages == 1 &&
+                    after.both_state_checkpoints == before.both_state_checkpoints &&
+                    after.main_host_pages == 1 && after.main_aliased_host_pages == 1 &&
+                    after.main_pinned_host_pages == 1 && after.backend_host_pages == 1 &&
+                    after.backend_aliased_host_pages == 1 && after.backend_pinned_host_pages == 1 &&
+                    stats_after.host_state_occupied_slots ==
+                        stats_before.host_state_occupied_slots + 1U &&
+                    stats_after.host_kv_occupied_bytes == stats_before.host_kv_occupied_bytes;
+                if (!export_pinned || !export_completed || !restored.loaded_from_ssd ||
+                    restored.fallback_reason != "ssd-successful-replacement" ||
+                    (!exact_state_only && !exact_kv_only) || !unchanged_has_no_event ||
+                    !transfer_pending_during_commit) {
+                    std::cerr << "private mixed-residency release did not preserve its pinned "
+                                 "alias or exact lifecycle: pressure="
+                              << state_pressure << " loaded=" << restored.loaded_from_ssd
+                              << " reason=" << restored.fallback_reason
+                              << " export_pinned=" << export_pinned
+                              << " export_completed=" << export_completed
+                              << " pending=" << transfer_pending_during_commit
+                              << " unchanged_event_free=" << unchanged_has_no_event
+                              << " lifecycle=" << restored.lifecycle.size();
+                    if (reclaimed != restored.lifecycle.end()) {
+                        std::cerr << " reclaimed=" << reclaimed->frontier << ':'
+                                  << reclaimed->state_images << '/' << reclaimed->main_kv_pages
+                                  << '/' << reclaimed->backend_kv_pages;
+                    }
+                    std::cerr << " checkpoints=" << before.endpoint_frontier << '/'
+                              << before.unchanged_checkpoint_frontier
+                              << " state=" << before.device_only_state_checkpoints << '/'
+                              << before.both_state_checkpoints << "->"
+                              << after.device_only_state_checkpoints << '/'
+                              << after.both_state_checkpoints << " main=" << before.main_host_pages
+                              << '/' << before.main_pinned_host_pages << "->"
+                              << after.main_host_pages << '/' << after.main_pinned_host_pages
+                              << " backend=" << before.backend_host_pages << '/'
+                              << before.backend_pinned_host_pages << "->"
+                              << after.backend_host_pages << '/' << after.backend_pinned_host_pages
+                              << " accounting=" << stats_before.host_state_occupied_slots << '/'
+                              << stats_before.host_kv_occupied_bytes << "->"
+                              << stats_after.host_state_occupied_slots << '/'
+                              << stats_after.host_kv_occupied_bytes << '\n';
+                    return false;
+                }
+                return true;
+            };
+            if (!exercise_private_release(true) || !exercise_private_release(false)) { return 1; }
         }
         {
             // Exercise Program's sealed physical release set directly, beyond the

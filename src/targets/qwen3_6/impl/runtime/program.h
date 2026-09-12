@@ -766,6 +766,11 @@ public:
         const qwen3_6::SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
         std::shared_ptr<const void> physical_plan                            = {});
     void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle& shared);
+    void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle& victim,
+                                                 const SharedPrefixHandle& separator);
+    void prepare_private_host_reclamation_for_test(const ContinuationHandle& continuation);
+    [[nodiscard]] qwen3_6::PrivateHostReclamationTestObservation
+    private_host_reclamation_observation_for_test(const ContinuationHandle& continuation) const;
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;

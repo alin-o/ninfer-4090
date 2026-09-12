@@ -2462,6 +2462,219 @@ void ProgramImplCore::duplicate_shared_prefix_to_device_for_test(const SharedPre
     advance_resource_revision();
 }
 
+void ProgramImplCore::fragment_shared_prefix_host_kv_for_test(
+    const SharedPrefixHandle& victim_handle, const SharedPrefixHandle& separator_handle) {
+    if (!valid_shared_prefix(victim_handle) || !valid_shared_prefix(separator_handle) ||
+        (ContractAccess::index(victim_handle) == ContractAccess::index(separator_handle) &&
+         ContractAccess::epoch(victim_handle) == ContractAccess::epoch(separator_handle)) ||
+        pending_transaction_ || has_context_transaction() || !host_kv_arena || !host_kv_extents) {
+        throw std::logic_error("test shared-prefix fragmentation is not available");
+    }
+    SharedPrefixState& victim    = shared_prefix_states[ContractAccess::index(victim_handle)];
+    SharedPrefixState& separator = shared_prefix_states[ContractAccess::index(separator_handle)];
+    if (!victim.kv || !separator.kv || victim.kv->backend || separator.kv->backend) {
+        throw std::logic_error("test shared-prefix fragmentation requires Main-only checkpoints");
+    }
+
+    const auto membership = [&](const SharedPrefixState& shared) {
+        std::vector<LogicalKVPageHandle> pages;
+        const std::uint32_t count = text_kv_addresses->mapped_pages(shared.kv->text);
+        pages.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            pages.push_back(text_kv_addresses->logical_page(shared.kv->text, index));
+        }
+        return pages;
+    };
+    const std::vector<LogicalKVPageHandle> victim_pages    = membership(victim);
+    const std::vector<LogicalKVPageHandle> separator_pages = membership(separator);
+    if (victim_pages.size() != 2 || separator_pages.size() != 2) {
+        throw std::logic_error("test shared-prefix fragmentation requires two pages per owner");
+    }
+    const HostKVPageLayout& layout = host_kv_extents->page_layout(*text_kv_pages);
+    if (host_kv_arena->occupied_bytes() != host_kv_arena->capacity_bytes() ||
+        host_kv_arena->capacity_bytes() != 4U * layout.page_stride) {
+        throw std::logic_error(
+            "test shared-prefix fragmentation requires an exact four-page arena");
+    }
+
+    struct SavedPage {
+        LogicalKVPageHandle page;
+        std::vector<std::byte> bytes;
+    };
+
+    const auto save = [&](LogicalKVPageHandle page) {
+        if (!text_kv_pages->device_resident(page) || !text_kv_pages->host_resident(page) ||
+            text_kv_pages->source_pins(page) != 0) {
+            throw std::logic_error("test shared-prefix fragmentation page is not settled Both");
+        }
+        const HostKVPageReplica replica = text_kv_pages->host_replica(page);
+        const HostKVAllocationConstView source =
+            host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
+        SavedPage saved{.page = page, .bytes = std::vector<std::byte>(layout.page_stride)};
+        std::memcpy(saved.bytes.data(), source.data(), layout.page_stride);
+        return saved;
+    };
+    std::array<SavedPage, 4> ordered{save(victim_pages[0]), save(separator_pages[0]),
+                                     save(victim_pages[1]), save(separator_pages[1])};
+    std::array<HostKVPageReplicaRelease, 4> releases{};
+    for (std::size_t index = 0; index < ordered.size(); ++index) {
+        releases[index] = {.pages = text_kv_pages.get(), .page = ordered[index].page};
+    }
+    if (!host_kv_extents->release_page_replicas(releases) || host_kv_arena->occupied_bytes() != 0) {
+        throw std::logic_error("test shared-prefix fragmentation could not release its arena");
+    }
+    for (const SavedPage& saved : ordered) {
+        const std::array page{saved.page};
+        auto reservation = host_kv_extents->prepare_unpinned(*text_kv_pages, page);
+        if (!reservation) {
+            throw std::logic_error("test shared-prefix fragmentation could not rebuild one page");
+        }
+        std::memcpy(host_kv_extents->writable_view(*reservation).data(), saved.bytes.data(),
+                    layout.page_stride);
+        (void)host_kv_extents->publish(std::move(*reservation));
+    }
+    if (host_kv_arena->occupied_bytes() != host_kv_arena->capacity_bytes()) {
+        throw std::logic_error("test shared-prefix fragmentation did not refill its arena");
+    }
+    for (std::size_t index = 0; index < ordered.size(); ++index) {
+        if (host_kv_extents->page_byte_offset(*text_kv_pages, ordered[index].page) !=
+            index * layout.page_stride) {
+            throw std::logic_error("test shared-prefix fragmentation placement changed");
+        }
+    }
+    advance_resource_revision();
+}
+
+void ProgramImplCore::prepare_private_host_reclamation_for_test(
+    const ContinuationHandle& continuation) {
+    if (!valid_continuation(continuation) || pending_transaction_ || has_context_transaction() ||
+        !host_kv_extents || !host_state_images) {
+        throw std::logic_error("test private Host reclamation is not available");
+    }
+    SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
+    if (!sequence.endpoint_valid || !sequence.kv || sequence.state.read != sequence.state.write ||
+        !state_store->valid(sequence.state.read)) {
+        throw std::logic_error("test private Host reclamation requires a settled endpoint");
+    }
+    bool distinct_non_head =
+        sequence.rewrite_state && *sequence.rewrite_state != sequence.state.read;
+    distinct_non_head =
+        distinct_non_head || std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                                         [&](const LongAnchorCheckpoint& anchor) {
+                                             return anchor.state != sequence.state.read;
+                                         });
+    if (!distinct_non_head) {
+        throw std::logic_error("test private Host reclamation requires a distinct non-head state");
+    }
+    if (state_store->residency(sequence.state.read) == StateReplicaResidency::DeviceOnly) {
+        auto transfer =
+            state_store->begin_device_to_host(sequence.state.read, device.transfer_stream);
+        if (!transfer) {
+            throw std::logic_error("test private Host reclamation has no Host State capacity");
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        state_store->publish_transfer(std::move(*transfer), true);
+    }
+    if (state_store->residency(sequence.state.read) != StateReplicaResidency::Both) {
+        throw std::logic_error("test private endpoint did not become mixed-resident");
+    }
+
+    const auto duplicate_pages = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                     KVAddressSpaceHandle address) {
+        std::optional<LogicalKVPageHandle> aliased;
+        std::optional<LogicalKVPageHandle> unaliased;
+        for (std::uint32_t index = 0; index < addresses.mapped_pages(address); ++index) {
+            const LogicalKVPageHandle page = addresses.logical_page(address, index);
+            if (!pages.device_resident(page) || pages.host_resident(page) ||
+                pages.source_pins(page) != 0) {
+                continue;
+            }
+            if (pages.address_references(page) > 1 && !aliased) {
+                aliased = page;
+            } else if (pages.address_references(page) == 1) {
+                unaliased = page;
+            }
+        }
+        if (!aliased || !unaliased) {
+            throw std::logic_error(
+                "test private Host reclamation requires aliased and private KV pages");
+        }
+        const std::array selected{*aliased, *unaliased};
+        auto reservation = host_kv_extents->prepare(pages, selected);
+        if (!reservation) {
+            throw std::logic_error("test private Host reclamation has no Host KV capacity");
+        }
+        const auto sources = host_kv_extents->device_sources(*reservation);
+        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reservation),
+                                           device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        (void)host_kv_extents->publish(std::move(*reservation));
+    };
+    duplicate_pages(*text_kv_addresses, *text_kv_pages, sequence.kv->text);
+    if (sequence.kv->backend) {
+        duplicate_pages(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend);
+    }
+    advance_resource_revision();
+}
+
+qwen3_6::PrivateHostReclamationTestObservation
+ProgramImplCore::private_host_reclamation_observation_for_test(
+    const ContinuationHandle& continuation) const {
+    if (!valid_continuation(continuation)) {
+        throw std::logic_error("test private Host reclamation owner is invalid");
+    }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
+    qwen3_6::PrivateHostReclamationTestObservation out;
+    const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
+    out.endpoint_frontier    = summary.endpoint ? summary.endpoint->ref.frontier : 0;
+    const auto observe_state = [&](StateImageHandle state, std::uint32_t frontier) {
+        if (state != sequence.state.read && out.unchanged_checkpoint_frontier == 0) {
+            out.unchanged_checkpoint_frontier = frontier;
+        }
+        switch (state_store->residency(state)) {
+        case StateReplicaResidency::DeviceOnly:
+            ++out.device_only_state_checkpoints;
+            break;
+        case StateReplicaResidency::HostOnly:
+            ++out.host_only_state_checkpoints;
+            break;
+        case StateReplicaResidency::Both:
+            ++out.both_state_checkpoints;
+            break;
+        case StateReplicaResidency::None:
+            break;
+        }
+    };
+    observe_state(sequence.state.read, out.endpoint_frontier);
+    if (sequence.rewrite_state && summary.rewrite) {
+        observe_state(*sequence.rewrite_state, summary.rewrite->ref.frontier);
+    }
+    for (std::size_t index = 0;
+         index < sequence.long_anchors.size() && index < summary.long_anchors.size(); ++index) {
+        observe_state(sequence.long_anchors[index].state, summary.long_anchors[index].ref.frontier);
+    }
+    const auto observe_pages = [&](const KVAddressSpaceStore& addresses,
+                                   const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
+                                   std::uint32_t& host, std::uint32_t& aliased,
+                                   std::uint32_t& pinned) {
+        for (std::uint32_t index = 0; index < addresses.mapped_pages(address); ++index) {
+            const LogicalKVPageHandle page = addresses.logical_page(address, index);
+            if (!pages.host_resident(page)) { continue; }
+            ++host;
+            if (pages.address_references(page) > 1) { ++aliased; }
+            if (pages.source_pins(page) != 0) { ++pinned; }
+        }
+    };
+    observe_pages(*text_kv_addresses, *text_kv_pages, sequence.kv->text, out.main_host_pages,
+                  out.main_aliased_host_pages, out.main_pinned_host_pages);
+    if (sequence.kv->backend) {
+        observe_pages(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                      out.backend_host_pages, out.backend_aliased_host_pages,
+                      out.backend_pinned_host_pages);
+    }
+    return out;
+}
+
 qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported, SharedPrefixHandle* replacement,
     runtime::CancellationFlagView cancellation, const std::function<void()>& commit_checkpoint,

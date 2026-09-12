@@ -1195,6 +1195,68 @@ void runtime::testing::SharedSnapshotTestAccess::duplicate_shared_to_device(Engi
         engine.impl_->core);
 }
 
+void runtime::testing::SharedSnapshotTestAccess::fragment_shared_host_kv(
+    Engine& engine, std::uint32_t victim_slot, std::uint32_t separator_slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->fragment_shared_prefix_host_kv_for_test(victim_slot,
+                                                                            separator_slot);
+                          }) {
+                core->fragment_shared_prefix_host_kv_for_test(victim_slot, separator_slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::prepare_private_host_reclamation(
+    Engine& engine, std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->prepare_private_host_reclamation_for_test(slot); }) {
+                core->prepare_private_host_reclamation_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+targets::qwen3_6::PrivateHostReclamationTestObservation
+runtime::testing::SharedSnapshotTestAccess::observe_private_host_reclamation(Engine& engine,
+                                                                             std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> targets::qwen3_6::PrivateHostReclamationTestObservation {
+            if constexpr (requires { core->private_host_reclamation_observation_for_test(slot); }) {
+                return core->private_host_reclamation_observation_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+targets::qwen3_6::RetainedSessionSnapshot
+runtime::testing::SharedSnapshotTestAccess::begin_private_export(Engine& engine,
+                                                                 std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
+            if constexpr (requires { core->begin_private_export_for_test(slot, binding); }) {
+                return core->begin_private_export_for_test(slot, binding);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
 std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellation(
     Engine& engine, std::span<const std::uint8_t> bytes, std::atomic<bool>& cancellation) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }

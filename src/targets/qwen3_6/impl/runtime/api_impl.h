@@ -732,6 +732,25 @@ void Program<Variant>::duplicate_shared_prefix_to_device_for_test(
 }
 
 template <>
+void Program<Variant>::fragment_shared_prefix_host_kv_for_test(
+    const SharedPrefixHandle<Variant>& victim, const SharedPrefixHandle<Variant>& separator) {
+    impl_->fragment_shared_prefix_host_kv_for_test(victim, separator);
+}
+
+template <>
+void Program<Variant>::prepare_private_host_reclamation_for_test(
+    const ContinuationHandle<Variant>& continuation) {
+    impl_->prepare_private_host_reclamation_for_test(continuation);
+}
+
+template <>
+PrivateHostReclamationTestObservation
+Program<Variant>::private_host_reclamation_observation_for_test(
+    const ContinuationHandle<Variant>& continuation) const {
+    return impl_->private_host_reclamation_observation_for_test(continuation);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

@@ -680,6 +680,55 @@ public:
         publish_runtime_stats();
     }
 
+    void fragment_shared_prefix_host_kv_for_test(std::uint32_t victim_slot,
+                                                 std::uint32_t separator_slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto victim    = resources_.shared_catalog_slot(victim_slot);
+        const auto separator = resources_.shared_catalog_slot(separator_slot);
+        if (victim.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            victim.handle == nullptr ||
+            separator.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            separator.handle == nullptr) {
+            throw std::logic_error("test fragmented shared-prefix slots are not catalogued");
+        }
+        instance_.program->fragment_shared_prefix_host_kv_for_test(*victim.handle,
+                                                                   *separator.handle);
+        publish_runtime_stats();
+    }
+
+    void prepare_private_host_reclamation_for_test(std::uint32_t slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private Host reclamation slot is not catalogued");
+        }
+        instance_.program->prepare_private_host_reclamation_for_test(*view.handle);
+        publish_runtime_stats();
+    }
+
+    [[nodiscard]] targets::qwen3_6::PrivateHostReclamationTestObservation
+    private_host_reclamation_observation_for_test(std::uint32_t slot) const {
+        std::scoped_lock lock(execution_mutex_);
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private Host reclamation slot is not catalogued");
+        }
+        return instance_.program->private_host_reclamation_observation_for_test(*view.handle);
+    }
+
+    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
+    begin_private_export_for_test(std::uint32_t slot, std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private export slot is not catalogued");
+        }
+        return instance_.program->begin_save_continuation(*view.handle, model_binding);
+    }
+
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);

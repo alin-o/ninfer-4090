@@ -841,6 +841,22 @@ struct SharedPrefixPublication {
     std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
 };
 
+// Internal real-Program regression observation. Test access uses this to prove that durable
+// import pressure releases only the pinned-aware physical set sealed during inspection.
+struct PrivateHostReclamationTestObservation {
+    std::uint32_t endpoint_frontier             = 0;
+    std::uint32_t unchanged_checkpoint_frontier = 0;
+    std::uint32_t device_only_state_checkpoints = 0;
+    std::uint32_t host_only_state_checkpoints   = 0;
+    std::uint32_t both_state_checkpoints        = 0;
+    std::uint32_t main_host_pages               = 0;
+    std::uint32_t main_aliased_host_pages       = 0;
+    std::uint32_t main_pinned_host_pages        = 0;
+    std::uint32_t backend_host_pages            = 0;
+    std::uint32_t backend_aliased_host_pages    = 0;
+    std::uint32_t backend_pinned_host_pages     = 0;
+};
+
 // A checksum-verified, compatibility-checked shared snapshot held entirely in immutable Host
 // storage. Parsing and all bounded-length checks precede any Program physical reservation.
 template <class Variant>
@@ -1169,6 +1185,12 @@ public:
         const SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
         std::shared_ptr<const void> physical_plan                   = {});
     void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle<Variant>& shared);
+    void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle<Variant>& victim,
+                                                 const SharedPrefixHandle<Variant>& separator);
+    void prepare_private_host_reclamation_for_test(const ContinuationHandle<Variant>& continuation);
+    [[nodiscard]] PrivateHostReclamationTestObservation
+    private_host_reclamation_observation_for_test(
+        const ContinuationHandle<Variant>& continuation) const;
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

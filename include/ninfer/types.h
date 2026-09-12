@@ -954,6 +954,10 @@ struct MemorySummary {
     std::size_t device_backend_kv_page_bytes       = 0;
     std::uint32_t host_state_capacity_slots        = 0;
     std::uint32_t host_state_occupied_slots        = 0;
+    std::uint32_t logical_state_capacity_slots     = 0;
+    std::uint32_t logical_state_used_slots         = 0;
+    std::uint32_t logical_state_reserved_slots     = 0;
+    std::uint32_t logical_state_inflight_slots     = 0;
     std::size_t host_main_kv_page_bytes            = 0;
     std::size_t host_backend_kv_page_bytes         = 0;
     std::size_t host_kv_capacity_bytes             = 0;
@@ -1105,6 +1109,10 @@ struct RuntimeStats {
     std::uint64_t partial_tail_cow_pages               = 0;
     std::uint32_t device_state_occupied_slots          = 0;
     std::uint32_t host_state_occupied_slots            = 0;
+    std::uint32_t logical_state_capacity_slots         = 0;
+    std::uint32_t logical_state_used_slots             = 0;
+    std::uint32_t logical_state_reserved_slots         = 0;
+    std::uint32_t logical_state_inflight_slots         = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;

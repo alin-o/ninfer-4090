@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "ninfer/build_identity.h"
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
@@ -34,6 +35,12 @@ using Json = nlohmann::json;
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
     return current >= previous ? current - previous : T{};
+}
+
+template <class T>
+T capacity_free(T capacity, T used, T reserved) noexcept {
+    if (used >= capacity) { return T{}; }
+    return reserved >= capacity - used ? T{} : capacity - used - reserved;
 }
 
 std::uint64_t unix_time_ms() {
@@ -539,6 +546,8 @@ std::string format_server_start_json(
     const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
     const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
+    record["build"] =
+        Json{{"revision", ninfer::build::revision}, {"source_dirty", ninfer::build::source_dirty}};
 
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
@@ -654,6 +663,13 @@ std::string format_server_start_json(
              {"device_backend_kv_page_bytes", memory.device_backend_kv_page_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"logical_state_capacity_slots", memory.logical_state_capacity_slots},
+             {"logical_state_used_slots", memory.logical_state_used_slots},
+             {"logical_state_free_slots",
+              capacity_free(memory.logical_state_capacity_slots, memory.logical_state_used_slots,
+                            memory.logical_state_reserved_slots)},
+             {"logical_state_reserved_slots", memory.logical_state_reserved_slots},
+             {"logical_state_inflight_slots", memory.logical_state_inflight_slots},
              {"host_main_kv_page_bytes", memory.host_main_kv_page_bytes},
              {"host_backend_kv_page_bytes", memory.host_backend_kv_page_bytes},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
@@ -1212,12 +1228,21 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                               current.pressure_maximal_fallback_selections)},
              {"historical_fork_hits",
               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
-        {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
-                           {"host_state_slots", current.host_state_occupied_slots},
-                           {"device_main_kv_pages", current.device_main_kv_occupied_pages},
-                           {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
-                           {"host_kv_bytes", current.host_kv_occupied_bytes},
-                           {"shared_active_references", current.shared_active_references}}},
+        {"occupancy",
+         Json{{"logical_state_images",
+               Json{{"capacity_slots", current.logical_state_capacity_slots},
+                    {"used_slots", current.logical_state_used_slots},
+                    {"free_slots", capacity_free(current.logical_state_capacity_slots,
+                                                 current.logical_state_used_slots,
+                                                 current.logical_state_reserved_slots)},
+                    {"reserved_slots", current.logical_state_reserved_slots},
+                    {"inflight_slots", current.logical_state_inflight_slots}}},
+              {"device_state_slots", current.device_state_occupied_slots},
+              {"host_state_slots", current.host_state_occupied_slots},
+              {"device_main_kv_pages", current.device_main_kv_occupied_pages},
+              {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
+              {"host_kv_bytes", current.host_kv_occupied_bytes},
+              {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();

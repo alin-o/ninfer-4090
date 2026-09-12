@@ -836,6 +836,8 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                     switch (inspected.infeasibility) {
                     case DurableImportFeasibility::LogicalCapacity:
                         return "ssd-logical-capacity-no-replaceable-victim";
+                    case DurableImportFeasibility::LogicalStateCapacity:
+                        return "ssd-logical-state-capacity";
                     case DurableImportFeasibility::HostStateCapacity:
                         return "ssd-host-state-capacity";
                     case DurableImportFeasibility::HostKvCapacity:

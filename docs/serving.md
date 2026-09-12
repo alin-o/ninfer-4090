@@ -942,7 +942,7 @@ payload-size fields; they do not infer request behavior from process-global coun
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | build commit and dirty-source flag, target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, logical StateImage and physical Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, boundary-consistent KV capacity/used/free, and optional prompt-file publication metadata |
 | `request_rejected` | parsed request shape and response identity, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, the exact HTTP status/type/code/parameter/message, and any lifecycle-derived checkpoint summary for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, exact generated token IDs, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, complete speculative-decoding counters, terminal KV capacity/used/free, and optional response-file metadata |
@@ -980,6 +980,20 @@ physical pool/store values. Device Main and backend pools each report capacity/u
 and bytes; Host KV reports capacity/used/free bytes. Free values saturate at zero if an observed
 used value exceeds capacity. Shared aliases do not add occupancy, and CUDA's general free-memory
 value is not treated as KV capacity.
+
+State telemetry deliberately separates logical identity from physical placement. The
+`server_start.memory` fields `logical_state_{capacity,used,free,reserved,inflight}_slots` describe
+the `StateImageStore` descriptor catalog; `host_state_{capacity,occupied}_slots` describes only
+the pinned physical Host pool. Throughput publishes the same logical gauges under
+`context_cache.occupancy.logical_state_images`, beside the independent Device and Host slot
+counts. Reserved descriptors are excluded from `used` and included when deriving `free`; `inflight`
+is an overlapping activity gauge, not another quantity to subtract. A pre-I/O
+`ssd-logical-state-capacity` rejection therefore cannot be reported as
+`ssd-host-state-capacity`.
+
+`server_start.build.revision` is the Git commit embedded when the serving library was built, and
+`server_start.build.source_dirty` records whether tracked or untracked source changes were present
+for that build. Target verification should require the intended revision and a false dirty flag.
 
 `requested_reasoning_effort` is the client value or `null` when omitted.
 `resolved_reasoning_effort` is `none`, a native effort tier, or `null` when thinking is enabled but

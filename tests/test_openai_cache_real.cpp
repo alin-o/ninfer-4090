@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iostream>
 #include <netinet/in.h>
+#include <optional>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -78,7 +79,8 @@ ServeOptions options(const char* artifact) {
 }
 
 GenerationOutcome generate_history(GenerationService& service, const Json& history, bool responses,
-                                   bool explicit_only = false) {
+                                   bool explicit_only                     = false,
+                                   std::optional<std::string> session_key = std::nullopt) {
     Json body{{"model", "qwen3.8"}};
     if (explicit_only) { body["prompt_cache_options"] = Json{{"mode", "explicit"}}; }
     GenerationRequest generation;
@@ -98,6 +100,7 @@ GenerationOutcome generate_history(GenerationService& service, const Json& histo
         body["max_tokens"] = 8;
         generation         = parse_chat_completion_request(body, RequestLimits{}).generation;
     }
+    if (session_key) { hints.session_key = std::move(*session_key); }
     // Exercise the production merge of protocol markers/policy with Responses retention hints.
     auto prepared = service.prepare(generation, GenerationConsumerMode::Aggregate, {}, hints);
     auto result   = service.run(prepared, nullptr);
@@ -107,11 +110,12 @@ GenerationOutcome generate_history(GenerationService& service, const Json& histo
 }
 
 GenerationOutcome generate(GenerationService& service, const std::string& instructions,
-                           const std::string& user, bool responses, bool explicit_only = false) {
+                           const std::string& user, bool responses, bool explicit_only = false,
+                           std::optional<std::string> session_key = std::nullopt) {
     return generate_history(service,
                             Json::array({Json{{"role", "system"}, {"content", instructions}},
                                          Json{{"role", "user"}, {"content", user}}}),
-                            responses, explicit_only);
+                            responses, explicit_only, std::move(session_key));
 }
 
 void exercise_disconnect_after_checkpoint_reuse(const char* artifact) {
@@ -330,26 +334,28 @@ std::string read_file(const std::filesystem::path& path) {
 
 void exercise_durable_two_lineage_replacement(const char* artifact) {
     TemporaryDirectory temporary;
-    ServeOptions configured                            = options(artifact);
-    configured.max_concurrency                         = 3;
-    configured.max_pending_requests                    = 3;
-    configured.context_cache.device_state_slots        = 6;
-    configured.context_cache.host_state_slots          = 8;
-    configured.context_cache.host_kv_capacity_bytes    = 2ULL << 30;
-    configured.context_cache.max_private_continuations = 6;
-    configured.context_cache.max_shared_prefixes       = 3;
-    configured.shared_prefix_cache_dir                 = temporary.path / "shared-prefixes";
-    configured.shared_prefix_cache_max_records         = 8;
-    configured.shared_prefix_cache_max_bytes           = 8ULL << 30;
-    configured.shared_prefix_cache_staging_bytes       = 2ULL << 30;
-    configured.shared_prefix_cache_workers             = 1;
-    configured.shared_prefix_cache_jobs                = 2;
+    ServeOptions configured                                    = options(artifact);
+    configured.max_concurrency                                 = 3;
+    configured.max_pending_requests                            = 3;
+    configured.context_cache.device_state_slots                = 3;
+    configured.context_cache.host_state_slots                  = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 2ULL << 30;
+    configured.context_cache.max_private_continuations         = 6;
+    configured.context_cache.max_shared_prefixes               = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    configured.shared_prefix_cache_dir                         = temporary.path / "shared-prefixes";
+    configured.shared_prefix_cache_max_records                 = 8;
+    configured.shared_prefix_cache_max_bytes                   = 8ULL << 30;
+    configured.shared_prefix_cache_staging_bytes               = 2ULL << 30;
+    configured.shared_prefix_cache_workers                     = 1;
+    configured.shared_prefix_cache_jobs                        = 2;
 
     const auto instructions = [](std::string_view lineage) {
         std::string text = "durable-lineage-" + std::string(lineage) + ' ';
         for (std::uint32_t index = 0; index < 900; ++index) { text += "stable "; }
         text += "\n=== CACHE_BREAKPOINT ===\nvolatile workspace ";
         text += lineage;
+        for (std::uint32_t index = 0; index < 100; ++index) { text += " suffix"; }
         return text;
     };
     const auto wait_for_writes = [](const GenerationService& service, std::uint64_t minimum) {
@@ -403,51 +409,102 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
     }
 
     GenerationService service(configured);
+    const auto trace_state = [&](int request) {
+        const RuntimeStats stats = settled_stats(service, true);
+        std::cerr << "TRACE r" << request << " logical=" << stats.logical_state_used_slots << '+'
+                  << stats.logical_state_reserved_slots << '/' << stats.logical_state_capacity_slots
+                  << " device=" << stats.device_state_occupied_slots
+                  << " host=" << stats.host_state_occupied_slots << '\n';
+    };
     const GenerationOutcome direct_restored =
         generate(service, instructions("direct-a"), "Direct seed A.", false);
+    trace_state(1);
     require(direct_restored.metrics.durable_loaded_from_ssd &&
                 direct_restored.metrics.durable_fallback_reason == "ssd-successful-restore" &&
                 direct_restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
                 direct_restored.metrics.prefix_cache_hit_tokens != 0,
             "first Direct lineage did not restore its exact durable shared prefix");
-    (void)generate(service, instructions("direct-c"), "Direct activity C.", false);
-    (void)generate(service, instructions("direct-d"), "Direct activity D.", false);
-    require(wait_for_writes(service, 2),
+    const GenerationOutcome codex_seed =
+        generate(service, instructions("codex-b"), "Codex seed B.", true, false, "codex-lineage");
+    trace_state(2);
+    const Json codex_continuation = Json::array({
+        Json{{"role", "system"}, {"content", instructions("codex-b")}},
+        Json{{"role", "user"}, {"content", "Codex seed B."}},
+        Json{{"role", "assistant"}, {"content", codex_seed.text}},
+        Json{{"role", "user"}, {"content", "Continue Codex B."}},
+    });
+    (void)generate_history(service, codex_continuation, true, true, "codex-continuation");
+    trace_state(3);
+    (void)generate(service, instructions("direct-a"), "Direct follow-up A.", false, true);
+    trace_state(4);
+    const std::uint64_t writes_before_direct_c =
+        service.runtime_stats().shared_ssd_writes_completed;
+    const GenerationOutcome direct_c =
+        generate(service, instructions("direct-c"), "Direct activity C.", false);
+    trace_state(5);
+    require(wait_for_writes(service, writes_before_direct_c + 1U),
+            "Direct C shared prefix was not durably backed before further churn");
+    const Json direct_c_continuation = Json::array({
+        Json{{"role", "system"}, {"content", instructions("direct-c")}},
+        Json{{"role", "user"}, {"content", "Direct activity C."}},
+        Json{{"role", "assistant"}, {"content", direct_c.text}},
+        Json{{"role", "user"}, {"content", "Continue Direct C."}},
+    });
+    (void)generate_history(service, direct_c_continuation, false, true);
+    trace_state(6);
+    (void)generate(service, instructions("direct-c"), "Direct activity C.", false, true);
+    trace_state(7);
+    require(wait_for_writes(service, 1),
             "Direct activity did not finish its durable exports before replacement");
     const RuntimeStats filled = settled_stats(service, true);
     require(shared_owner_count(service, filled) == 3,
             "Direct activity did not fill the three-cell resident shared catalog");
 
+    const GenerationOutcome direct_repeated =
+        generate(service, instructions("direct-a"), "Direct seed A.", false, true);
+    trace_state(8);
+    require(!direct_repeated.metrics.durable_loaded_from_ssd &&
+                direct_repeated.metrics.durable_warm_available &&
+                direct_repeated.metrics.durable_fallback_reason == "warm-source-selected" &&
+                direct_repeated.metrics.prefix_cache_hit_tokens >
+                    direct_restored.metrics.durable_restore_frontier &&
+                direct_repeated.prompt_tokens >
+                    static_cast<int>(direct_repeated.metrics.prefix_cache_hit_tokens) &&
+                direct_repeated.prompt_tokens -
+                        static_cast<int>(direct_repeated.metrics.prefix_cache_hit_tokens) ==
+                    direct_repeated.prompt_tokens -
+                        static_cast<int>(direct_repeated.metrics.durable_restore_frontier),
+            "repeated Direct lineage did not choose its deepest warm checkpoint");
+    const RuntimeStats before_codex = settled_stats(service, true);
     const GenerationOutcome codex =
-        generate(service, instructions("codex-b"), "Codex seed B.", true);
-    const auto displaced = std::find_if(
-        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
-            return fact.operation == CheckpointLifecycleOperation::Evicted &&
-                   fact.status == CheckpointLifecycleStatus::Committed &&
-                   fact.scope == CheckpointLifecycleScope::Shared &&
-                   fact.destination_tier == CheckpointLifecycleTier::Ssd;
-        });
-    const auto restored = std::find_if(
-        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
-            return fact.operation == CheckpointLifecycleOperation::Restored &&
-                   fact.status == CheckpointLifecycleStatus::Committed &&
-                   fact.scope == CheckpointLifecycleScope::Shared &&
-                   fact.source_tier == CheckpointLifecycleTier::Ssd;
-        });
-    require(codex.metrics.durable_loaded_from_ssd &&
-                codex.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
-                codex.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
-                codex.metrics.prefix_cache_hit_tokens == codex.metrics.durable_restore_frontier &&
-                codex.metrics.prefix_cache_hit_tokens != 0 &&
-                codex.prompt_tokens > static_cast<int>(codex.metrics.prefix_cache_hit_tokens) &&
-                codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens) ==
-                    codex.prompt_tokens -
-                        static_cast<int>(codex.metrics.durable_restore_frontier) &&
-                codex.generated_token_ids == codex_oracle.generated_token_ids &&
-                displaced != codex.checkpoint_lifecycle.end() &&
-                restored != codex.checkpoint_lifecycle.end() && displaced < restored &&
-                displaced->content_digest != restored->content_digest,
-            "Codex lineage root-prefilled or lost exact replacement/frontier/suffix evidence");
+        generate(service, instructions("codex-b"), "Codex seed B.", true, false, "codex-lineage");
+    trace_state(9);
+    require(
+        !codex.metrics.durable_loaded_from_ssd && codex.metrics.durable_warm_available &&
+            codex.metrics.durable_fallback_reason == "warm-source-selected" &&
+            codex.metrics.prefix_reuse_path == PrefixReusePath::PrivateResponseReplay &&
+            codex.metrics.prefix_cache_hit_tokens == codex.metrics.durable_restore_frontier &&
+            codex.metrics.prefix_cache_hit_tokens > codex_seed.metrics.durable_restore_frontier &&
+            codex.prompt_tokens > static_cast<int>(codex.metrics.prefix_cache_hit_tokens) &&
+            codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens) ==
+                codex.prompt_tokens - static_cast<int>(codex.metrics.durable_restore_frontier) &&
+            codex.generated_token_ids == codex_oracle.generated_token_ids &&
+            before_codex.logical_state_capacity_slots == 14 &&
+            before_codex.logical_state_used_slots == 14 &&
+            before_codex.logical_state_reserved_slots == 0 &&
+            before_codex.logical_state_inflight_slots == 0 &&
+            before_codex.device_state_occupied_slots == 6 &&
+            before_codex.host_state_occupied_slots == 8,
+        "Codex repeat did not choose the deepest warm checkpoint under accumulated logical "
+        "State pressure");
+    std::cout << "two_lineage_replay logical=" << before_codex.logical_state_used_slots << '/'
+              << before_codex.logical_state_capacity_slots
+              << " device=" << before_codex.device_state_occupied_slots
+              << " host=" << before_codex.host_state_occupied_slots
+              << " direct_reuse=" << direct_repeated.metrics.prefix_cache_hit_tokens
+              << " codex_reuse=" << codex.metrics.prefix_cache_hit_tokens << " codex_suffix="
+              << codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens)
+              << '\n';
 }
 
 std::string base64(std::span<const std::uint8_t> bytes) {
@@ -746,6 +803,7 @@ void exercise_http_secret_exclusion(const char* artifact) {
 
 int main() {
     const char* artifact = std::getenv("NINFER_QWEN3_8_27B_WEIGHTS");
+    const char* scenario = std::getenv("NINFER_OPENAI_CACHE_SCENARIO");
     int devices          = 0;
     if (artifact == nullptr || *artifact == '\0' || cudaGetDeviceCount(&devices) != cudaSuccess ||
         devices == 0) {
@@ -753,6 +811,10 @@ int main() {
         return 77;
     }
     try {
+        if (scenario != nullptr && std::string_view(scenario) == "durable-two-lineage") {
+            exercise_durable_two_lineage_replacement(artifact);
+            return 0;
+        }
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);

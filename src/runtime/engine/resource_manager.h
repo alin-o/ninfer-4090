@@ -486,8 +486,11 @@ public:
             // may be a private owner or a different shared owner whose complete Device replica
             // remains. Program is the authority for aliasing and exact allocator feasibility;
             // ResourceManager only ranks the feasible logical owners by retained value/last use.
-            if (!selected && (result.infeasibility == DurableImportFeasibility::HostStateCapacity ||
-                              result.infeasibility == DurableImportFeasibility::HostKvCapacity)) {
+            if (!selected &&
+                (result.infeasibility == DurableImportFeasibility::LogicalCapacity ||
+                 result.infeasibility == DurableImportFeasibility::LogicalStateCapacity ||
+                 result.infeasibility == DurableImportFeasibility::HostStateCapacity ||
+                 result.infeasibility == DurableImportFeasibility::HostKvCapacity)) {
                 const auto consider_host_reclamation =
                     [&](std::uint32_t logical_slot, const SharedPrefixHandle* logical_replacement,
                         std::uint32_t private_slot, std::uint32_t shared_slot,
@@ -503,6 +506,11 @@ public:
                             program.inspect_durable_shared_prefix_import(
                                 candidate.frontier, logical_replacement, private_handle,
                                 shared_handle);
+                        if (logical_slot != kInvalidCatalogSlot &&
+                            !shared_catalog_[logical_slot].ssd_backed &&
+                            !assessed.replacement_alternate_coverage) {
+                            return;
+                        }
                         if (assessed.feasibility != DurableImportFeasibility::Feasible) {
                             result.infeasibility = assessed.feasibility;
                             return;
@@ -550,8 +558,7 @@ public:
                     for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                         const SharedCatalogEntry& entry = shared_catalog_[slot];
                         if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
-                            !entry.ssd_backed || entry.transaction_pins != 0 ||
-                            entry.summary.active_references != 0 ||
+                            entry.transaction_pins != 0 || entry.summary.active_references != 0 ||
                             shared_active_edge_count(slot) != 0) {
                             continue;
                         }
@@ -569,6 +576,8 @@ public:
                 .program_revision = selected->assessment.resource_revision,
                 .reclamation      = selected->assessment.reclamation,
                 .physical_plan    = selected->assessment.physical_plan,
+                .replacement_alternate_coverage =
+                    selected->assessment.replacement_alternate_coverage,
             };
             if (record.id == 0) { record.id = next_durable_recovery_id_++; }
             if (selected->slot != kInvalidCatalogSlot) {
@@ -1523,6 +1532,10 @@ public:
         out.context_cache_owners.fill(0);
 
         const auto usage                     = program.physical_usage();
+        out.logical_state_capacity_slots     = usage.logical_state_capacity_slots;
+        out.logical_state_used_slots         = usage.logical_state_used_slots;
+        out.logical_state_reserved_slots     = usage.logical_state_reserved_slots;
+        out.logical_state_inflight_slots     = usage.logical_state_inflight_slots;
         out.device_state_occupied_slots      = usage.device_state_slots;
         out.host_state_occupied_slots        = usage.host_state_slots;
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
@@ -1849,29 +1862,78 @@ public:
             if (!valid_continuation_summary(after) || after.active_references != 0) {
                 return false;
             }
-            ContinuationSummary expected  = before;
-            const auto preserve_residency = [&](auto& checkpoint) {
-                const auto* refreshed = find_checkpoint(after, checkpoint.ref);
-                if (refreshed == nullptr) { return false; }
-                checkpoint.state_residency = refreshed->state_residency;
-                return true;
+            const auto same_checkpoint = [](const auto& expected, const auto& observed) {
+                auto normalized            = expected;
+                normalized.state_residency = observed.state_residency;
+                return normalized == observed;
             };
-            if ((expected.endpoint && !preserve_residency(*expected.endpoint)) ||
-                (expected.rewrite && !preserve_residency(*expected.rewrite))) {
+            if (before.endpoint.has_value() != after.endpoint.has_value() ||
+                (before.endpoint && !same_checkpoint(*before.endpoint, *after.endpoint))) {
                 return false;
             }
-            for (auto& anchor : expected.long_anchors) {
-                if (!preserve_residency(anchor)) { return false; }
+            if (after.rewrite &&
+                (!before.rewrite || !same_checkpoint(*before.rewrite, *after.rewrite))) {
+                return false;
             }
-            return expected.endpoint == after.endpoint && expected.rewrite == after.rewrite &&
-                   expected.long_anchors == after.long_anchors &&
-                   expected.active_references == after.active_references;
+            for (const auto& anchor : after.long_anchors) {
+                const auto prior = std::find_if(
+                    before.long_anchors.begin(), before.long_anchors.end(),
+                    [&](const auto& expected) { return same_checkpoint(expected, anchor); });
+                if (prior == before.long_anchors.end()) { return false; }
+            }
+            return after.long_anchors.size() <= before.long_anchors.size();
+        };
+        const auto removed_private_checkpoints = [](const ContinuationSummary& before,
+                                                    const ContinuationSummary& after) {
+            std::vector<CheckpointRef> removed;
+            const auto retained = [&](const auto& checkpoint) {
+                if (after.rewrite && after.rewrite->ref == checkpoint.ref) { return true; }
+                return std::any_of(
+                    after.long_anchors.begin(), after.long_anchors.end(),
+                    [&](const auto& candidate) { return candidate.ref == checkpoint.ref; });
+            };
+            if (before.rewrite && !retained(*before.rewrite)) {
+                removed.push_back(before.rewrite->ref);
+            }
+            for (const auto& anchor : before.long_anchors) {
+                if (!retained(anchor)) { removed.push_back(anchor.ref); }
+            }
+            std::sort(removed.begin(), removed.end(), [](CheckpointRef left, CheckpointRef right) {
+                return std::tuple{left.kind, left.frontier, left.ordinal} <
+                       std::tuple{right.kind, right.frontier, right.ordinal};
+            });
+            return removed;
+        };
+        const auto committed_logical_drops = [&] {
+            std::vector<CheckpointRef> dropped;
+            for (const CheckpointLifecycleFact& fact : publication.reclaimed_checkpoints) {
+                if (fact.scope != CheckpointLifecycleScope::Private ||
+                    fact.operation != CheckpointLifecycleOperation::Evicted ||
+                    fact.destination_tier != CheckpointLifecycleTier::None ||
+                    fact.status != CheckpointLifecycleStatus::Committed) {
+                    continue;
+                }
+                dropped.push_back(CheckpointRef{
+                    .kind     = static_cast<CheckpointKind>(fact.role),
+                    .frontier = fact.frontier,
+                    .ordinal  = fact.ordinal,
+                });
+            }
+            std::sort(dropped.begin(), dropped.end(), [](CheckpointRef left, CheckpointRef right) {
+                return std::tuple{left.kind, left.frontier, left.ordinal} <
+                       std::tuple{right.kind, right.frontier, right.ordinal};
+            });
+            return dropped;
         };
         if (reclaimed_private_before.has_value() !=
                 publication.reclaimed_private_summary.has_value() ||
             (reclaimed_private_before &&
              !same_private_identity(*reclaimed_private_before,
-                                    *publication.reclaimed_private_summary))) {
+                                    *publication.reclaimed_private_summary)) ||
+            (reclaimed_private_before &&
+             removed_private_checkpoints(*reclaimed_private_before,
+                                         *publication.reclaimed_private_summary) !=
+                 committed_logical_drops())) {
             release_publication();
             throw std::logic_error("Program returned an invalid reclaimed private summary");
         }
@@ -1900,6 +1962,7 @@ public:
             cancel_durable_recovery(reservation_id);
             return {.disposition = SharedImportDisposition::Stale};
         }
+        const bool displaced_ssd_backed = recovery && recovery->replacement && entry.ssd_backed;
         if (recovery && recovery->replacement) {
             entry.handle.reset();
             clear_shared_entry(entry);
@@ -1960,7 +2023,9 @@ public:
                 displaced_summary->checkpoint.state_residency == ReplicaResidency::HostOnly
                     ? CheckpointLifecycleTier::Host
                     : CheckpointLifecycleTier::Device,
-                CheckpointLifecycleTier::Ssd, CheckpointLifecycleStatus::Committed);
+                displaced_ssd_backed ? CheckpointLifecycleTier::Ssd
+                                     : CheckpointLifecycleTier::None,
+                CheckpointLifecycleStatus::Committed);
         }
         return result;
     }
@@ -2144,6 +2209,7 @@ private:
         ProgramResourceRevision program_revision;
         UniquePhysicalReclamation reclamation;
         std::shared_ptr<const void> physical_plan;
+        bool replacement_alternate_coverage = false;
     };
 
     [[nodiscard]] bool
@@ -2160,7 +2226,9 @@ private:
                    capability.owner.kind == LogicalOwnerKind::SharedPrefix &&
                    publication.state == SharedCatalogState::Catalogued && publication.handle &&
                    publication.id == capability.owner.id &&
-                   publication.revision == capability.generation && publication.ssd_backed &&
+                   publication.revision == capability.generation &&
+                   (publication.ssd_backed || record.replacement_alternate_coverage) &&
+                   (!record.replacement_alternate_coverage || record.host_private.has_value()) &&
                    publication.summary.active_references == 0 &&
                    shared_active_edge_count(capability.slot) == 0;
         }();

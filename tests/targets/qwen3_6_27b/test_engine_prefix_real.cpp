@@ -5062,6 +5062,179 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
             if (!exercise_private_release(true) || !exercise_private_release(false)) { return 1; }
         }
         {
+            // Reproduce the post-merge failure's literal logical/physical pressure boundary. The
+            // logical store has three genuinely free descriptors while Device State is 6/6 and
+            // physical Host State is only 5/8. SSD admission must not collapse those independent
+            // gauges into a false HostStateCapacity rejection.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            record_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture incoming_record =
+                make_shared_record(artifact, record_options, 80, "logical-incoming");
+            const std::filesystem::path logical_directory = directory / "logical-state-pressure";
+            ninfer::serve::DurableSharedPrefixCatalog logical_catalog({
+                .directory     = logical_directory,
+                .max_records   = 1,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            });
+            logical_catalog.enqueue(catalog_snapshot(incoming_record));
+            logical_catalog.drain();
+
+            ninfer::EngineOptions options                           = record_options;
+            options.max_concurrency                                 = 2;
+            options.max_pending_requests                            = 2;
+            options.context_cache.device_state_slots                = 4;
+            options.context_cache.host_state_slots                  = 8;
+            options.context_cache.host_kv_capacity_bytes            = 1ULL << 30U;
+            options.context_cache.max_private_continuations         = 6;
+            options.context_cache.max_shared_prefixes               = 3;
+            options.context_cache.max_long_anchors_per_continuation = 2;
+            ninfer::Engine engine(std::move(options));
+
+            const auto branch = [](std::string third) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                input.messages = {
+                    message(std::string(80, 'a') + " logical pressure prefix one"),
+                    message(std::string(160, 'b') + " logical pressure prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const ninfer::GenerationResult first =
+                engine.generate(engine.prepare(branch("logical first branch")), fixed_output(1));
+            const ninfer::GenerationResult second = engine.generate(
+                engine.prepare(branch(std::string(640, 'c') + " logical second branch")),
+                fixed_output(1));
+            const ninfer::GenerationResult third = engine.generate(
+                engine.prepare(pressure_turn("logical pressure third head", "logical-third",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fourth = engine.generate(
+                engine.prepare(pressure_turn("logical pressure fourth head", "logical-fourth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fifth = engine.generate(
+                engine.prepare(pressure_turn("logical pressure fifth head", "logical-fifth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::RuntimeStats full = engine.runtime_stats();
+            if (first.slot < 0 || second.slot < 0 || third.slot < 0 || fourth.slot < 0 ||
+                fifth.slot < 0 || full.logical_state_capacity_slots != 14 ||
+                full.logical_state_used_slots != 11 || full.logical_state_reserved_slots != 0 ||
+                full.logical_state_inflight_slots != 0 || full.device_state_occupied_slots != 6 ||
+                full.host_state_occupied_slots != 5) {
+                std::cerr << "logical State pressure fixture did not establish 11/14 descriptors "
+                             "over exact Device 6/6 and Host 5/8 physical occupancy: logical="
+                          << full.logical_state_used_slots << '+'
+                          << full.logical_state_reserved_slots << '/'
+                          << full.logical_state_capacity_slots
+                          << " inflight=" << full.logical_state_inflight_slots
+                          << " physical=" << full.device_state_occupied_slots << '/'
+                          << full.host_state_occupied_slots << " slots=" << first.slot << '/'
+                          << second.slot << '/' << third.slot << '/' << fourth.slot << '/'
+                          << fifth.slot << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.logical_state_capacity_slots == full.logical_state_capacity_slots &&
+                       observed.logical_state_used_slots == full.logical_state_used_slots &&
+                       observed.logical_state_reserved_slots == full.logical_state_reserved_slots &&
+                       observed.logical_state_inflight_slots == full.logical_state_inflight_slots &&
+                       observed.device_state_occupied_slots == full.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == full.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           full.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           full.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == full.host_kv_occupied_bytes &&
+                       observed.context_cache_owners == full.context_cache_owners;
+            };
+
+            ninfer::PreparedPrompt failed_prompt = engine.prepare(incoming_record.prompt);
+            ninfer::serve::DurableSharedPrefixRestore failed;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                failed = logical_catalog.restore_matching(
+                    engine, failed_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+            }
+            if (failed.loaded_from_ssd || failed.fallback_reason != "ssd-adoption-failure" ||
+                !same_topology(engine.runtime_stats()) ||
+                std::any_of(failed.lifecycle.begin(), failed.lifecycle.end(), [](const auto& fact) {
+                    return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                })) {
+                std::cerr << "logical State reclamation rollback changed the accumulated topology: "
+                          << failed.fallback_reason << '\n';
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = engine.prepare(incoming_record.prompt);
+            const auto restored             = logical_catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(1));
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            const auto logical_drop          = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Private &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::None &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto shared_restore = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Shared &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            if (!restored.loaded_from_ssd || restored.frontier != incoming_record.frontier ||
+                restored.fallback_reason != "ssd-successful-restore" ||
+                logical_drop != restored.lifecycle.end() ||
+                shared_restore == restored.lifecycle.end() || shared_restore->state_images != 1 ||
+                after.logical_state_capacity_slots != 14 || after.logical_state_used_slots != 12 ||
+                after.logical_state_reserved_slots != 0 ||
+                after.logical_state_inflight_slots != 0 || after.device_state_occupied_slots != 6 ||
+                after.host_state_occupied_slots != 6) {
+                std::cerr << "SSD recovery misclassified or mutated the exact 6/6 Device, 5/8 Host "
+                             "admission boundary: loaded="
+                          << restored.loaded_from_ssd << " reason=" << restored.fallback_reason
+                          << " logical=" << after.logical_state_used_slots << '+'
+                          << after.logical_state_reserved_slots << '/'
+                          << after.logical_state_capacity_slots
+                          << " physical=" << after.device_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots;
+                for (const auto& fact : restored.lifecycle) {
+                    std::cerr << " fact=" << static_cast<int>(fact.operation) << ':'
+                              << static_cast<int>(fact.scope) << ':'
+                              << static_cast<int>(fact.source_tier) << "->"
+                              << static_cast<int>(fact.destination_tier) << ':' << fact.state_images
+                              << '/' << fact.main_kv_pages << '/' << fact.backend_kv_pages;
+                }
+                std::cerr << '\n';
+                return 1;
+            }
+        }
+        {
             // Exercise Program's sealed physical release set directly, beyond the
             // ResourceManager fake. The first imported shared checkpoint is materialized to Both
             // beside a Device-only continuation; the second is left Host-only. Only the precise

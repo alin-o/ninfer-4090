@@ -379,8 +379,10 @@ if(NINFER_BUILD_SERVE)
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
+    ${PROJECT_BINARY_DIR}/generated
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+  add_dependencies(ninfer_serve ninfer_build_identity)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET})

@@ -597,11 +597,15 @@ struct FakeDiscardResult {
 };
 
 struct FakePhysicalUsage {
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t logical_state_capacity_slots = 0;
+    std::uint32_t logical_state_used_slots     = 0;
+    std::uint32_t logical_state_reserved_slots = 0;
+    std::uint32_t logical_state_inflight_slots = 0;
+    std::uint32_t device_state_slots           = 0;
+    std::uint32_t host_state_slots             = 0;
+    std::uint32_t device_main_kv_pages         = 0;
+    std::uint32_t device_backend_kv_pages      = 0;
+    std::size_t host_kv_bytes                  = 0;
 };
 
 class FakeProgram;
@@ -1132,6 +1136,9 @@ public:
                         ? UniquePhysicalReclamation{.host_state_slots = 1,
                                                     .host_kv_bytes = durable_host_reclamation_bytes}
                         : UniquePhysicalReclamation{},
+                .replacement_alternate_coverage =
+                    durable_import_replacement_alternate_coverage && replacement != nullptr &&
+                    host_private != nullptr,
                 .physical_plan = std::make_shared<const std::uint32_t>(frontier)};
     }
 
@@ -1425,6 +1432,7 @@ public:
     std::uint64_t shared_import_adoptions         = 0;
     std::uint32_t max_durable_import_frontier     = UINT32_MAX;
     bool durable_import_requires_host_reclamation = false;
+    bool durable_import_replacement_alternate_coverage = false;
     DurableImportFeasibility durable_import_pressure_dimension =
         DurableImportFeasibility::HostStateCapacity;
     std::size_t durable_host_reclamation_bytes = 1;
@@ -2632,6 +2640,52 @@ void test_durable_recovery_replaces_full_catalog_transactionally() {
     require(replanned.reservation_id != 0,
             "stale durable recovery did not release every logical reservation");
     manager.cancel_durable_recovery(replanned.reservation_id);
+}
+
+void test_durable_recovery_non_ssd_victim_reports_logical_eviction() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    const auto imported = [](std::uint32_t content, std::uint32_t frontier) {
+        return FakeValidatedSharedPrefixImport{
+            .imported_summary =
+                FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(content, frontier)},
+            .imported_metadata =
+                FakeSharedPrefixPersistenceMetadata{
+                    .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                    .ssd_eligible = true,
+                },
+            .content_key = content,
+        };
+    };
+
+    FakeManager manager = make_manager(1, 1, 1);
+    FakeProgram program;
+    const ActiveRequest private_seed = start_active(manager, program, 740, make_base(740), 1);
+    (void)finish_active(manager, program, private_seed);
+    const auto original =
+        manager.adopt_imported_shared(program, imported(740, 16), {}, {}, false);
+    require(original.disposition == FakeManager::SharedImportDisposition::Published &&
+                !manager.shared_catalog_metadata(0).ssd_backed,
+            "alternate-coverage fixture did not retain a non-SSD shared owner");
+
+    program.durable_import_replacement_alternate_coverage = true;
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{741}, make_base(741),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.reservation_id != 0 && inspection.replacement_slot == 0,
+            "private alternate coverage did not admit non-SSD logical replacement");
+    const auto replaced = manager.adopt_imported_shared(
+        program, imported(741, 96), {}, {}, true, inspection.reservation_id);
+    require(replaced.disposition == FakeManager::SharedImportDisposition::Replaced &&
+                replaced.displaced_checkpoint.has_value() &&
+                replaced.displaced_checkpoint->operation ==
+                    CheckpointLifecycleOperation::Evicted &&
+                replaced.displaced_checkpoint->destination_tier == CheckpointLifecycleTier::None &&
+                manager.shared_catalog_metadata(0).ssd_backed,
+            "non-SSD logical replacement falsely reported durable displaced coverage");
 }
 
 void test_durable_recovery_never_replaces_active_capture_owner() {
@@ -4909,6 +4963,8 @@ int main() {
              test_durable_recovery_uses_first_feasible_ssd_candidate);
     run_test("transactional full-catalog durable recovery",
              test_durable_recovery_replaces_full_catalog_transactionally);
+    run_test("non-SSD alternate-covered durable replacement lifecycle",
+             test_durable_recovery_non_ssd_victim_reports_logical_eviction);
     run_test("active capture durable replacement protection",
              test_durable_recovery_never_replaces_active_capture_owner);
     run_test("independent private Host duplicate durable recovery",

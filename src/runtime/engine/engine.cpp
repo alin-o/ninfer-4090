@@ -875,9 +875,16 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                 std::uint64_t adoption_nanoseconds   = 0;
                 bool validation_completed            = false;
                 try {
+                    const runtime::CancellationFlagView cancellation_flag{
+                            .context = &cancellation,
+                            .query =
+                            [](const void* context) {
+                                return static_cast<const CancellationView*>(context)->requested();
+                            },
+                    };
                     auto result = core->import_shared_prefix(
-                        std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
-                        &adoption_nanoseconds,
+                        std::span<const std::uint8_t>(*bytes), binding, cancellation_flag,
+                        &validation_nanoseconds, &adoption_nanoseconds,
                         [&] {
                             if (cancellation.requested()) {
                                 throw RequestError(RequestErrorKind::Cancelled,

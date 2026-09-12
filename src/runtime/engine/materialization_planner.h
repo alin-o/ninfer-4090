@@ -291,6 +291,31 @@ public:
         MaterializationStopReason stop_reason   = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                   = false;
 
+        struct VictimClassFloor {
+            std::uint8_t victim_class       = 0;
+            std::uint64_t oldest_head_epoch = 0;
+            bool certified                  = false;
+        };
+
+        std::vector<VictimClassFloor> victim_class_floors(candidates.size());
+        const auto apply_victim_class_floor = [&](std::uint32_t candidate_index,
+                                                  std::uint8_t& victim_class,
+                                                  std::uint64_t& oldest_head_epoch) {
+            const VictimClassFloor& floor = victim_class_floors[candidate_index];
+            if (!floor.certified || victim_class > floor.victim_class) { return; }
+            if (victim_class < floor.victim_class) {
+                victim_class      = floor.victim_class;
+                oldest_head_epoch = floor.oldest_head_epoch;
+                return;
+            }
+            if (victim_class ==
+                    static_cast<std::uint8_t>(DeviceStateVictimClass::ConversationHead) &&
+                (oldest_head_epoch == 0 ||
+                 (floor.oldest_head_epoch != 0 && floor.oldest_head_epoch < oldest_head_epoch))) {
+                oldest_head_epoch = floor.oldest_head_epoch;
+            }
+        };
+
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
             QueueEntry entry;
@@ -321,10 +346,11 @@ public:
             });
         }
 
-        const auto make_queue_entry = [](PressureTargetHandle target, std::uint32_t candidate_index,
-                                         const PressureTargetAssessment& assessment,
-                                         const FoldedCost& cost) {
-            return QueueEntry{
+        const auto make_queue_entry = [&](PressureTargetHandle target,
+                                          std::uint32_t candidate_index,
+                                          const PressureTargetAssessment& assessment,
+                                          const FoldedCost& cost) {
+            QueueEntry entry{
                 .target                    = target,
                 .candidate_index           = candidate_index,
                 .lower_bound_ns            = cost.lower_bound_ns,
@@ -343,6 +369,8 @@ public:
                 .stable_target_ordinal     = assessment.stable_target_ordinal,
                 .victim_class              = cost.victim_class,
             };
+            apply_victim_class_floor(candidate_index, entry.victim_class, entry.oldest_head_epoch);
+            return entry;
         };
 
         const auto assess_target =
@@ -400,8 +428,10 @@ public:
                 mark_target(guidance.stable_target_ordinal, kTargetDiscovered);
                 const std::uint64_t lower_bound_ns = std::max(
                     identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
-                const GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
-                                                        pressure.owner_policy, machine_cost);
+                GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
+                                                  pressure.owner_policy, machine_cost);
+                apply_victim_class_floor(candidate_index, cost.victim_class,
+                                         cost.oldest_head_epoch);
                 PendingEntry pending{
                     .target          = child,
                     .candidate_index = candidate_index,
@@ -490,6 +520,17 @@ public:
             if (closure_guidance.candidate != candidates[root.candidate_index].id) {
                 throw std::logic_error("guided closure changed admission candidate");
             }
+            if (closure_guidance.physical.unsatisfied_constraints != 0) {
+                throw std::logic_error("guided closure retained a physical deficit");
+            }
+            const GuidanceCost closure_cost =
+                fold_guidance(candidates[root.candidate_index], closure_guidance,
+                              pressure.owner_policy, machine_cost);
+            victim_class_floors[root.candidate_index] = VictimClassFloor{
+                .victim_class      = closure_cost.victim_class,
+                .oldest_head_epoch = closure_cost.oldest_head_epoch,
+                .certified         = true,
+            };
             if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
                 continue;
             }
@@ -504,6 +545,24 @@ public:
             maximum_step_ns =
                 std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
         }
+
+        // The guided closure certifies the best reachable Device-State victim class for its
+        // candidate. Partial KV-only nodes have not selected that eventual state victim yet, so
+        // rank them at the certified floor instead of treating None as a better feasible class.
+        for (QueueEntry& entry : queue_) {
+            apply_victim_class_floor(entry.candidate_index, entry.victim_class,
+                                     entry.oldest_head_epoch);
+        }
+        std::make_heap(queue_.begin(), queue_.end(), [](const auto& left, const auto& right) {
+            return queue_key(right) < queue_key(left);
+        });
+        for (PendingEntry& entry : pending_) {
+            apply_victim_class_floor(entry.candidate_index, entry.guidance.victim_class,
+                                     entry.guidance.oldest_head_epoch);
+        }
+        std::make_heap(pending_.begin(), pending_.end(), [](const auto& left, const auto& right) {
+            return pending_key(right) < pending_key(left);
+        });
 
         // Build one ordinary feasible seed per expandable candidate. Estimated machine cost orders
         // independent beams but never excludes a candidate or certifies an incumbent.

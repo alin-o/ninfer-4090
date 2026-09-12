@@ -297,13 +297,17 @@ enum class Readiness : std::uint8_t {
     PermanentlyInfeasible,
 };
 
-// Non-owning cancellation observation used while the worker advances a context transaction. The
-// request record owns the flag for longer than Program can retain this view.
+// Non-owning cancellation observation used while the worker advances a context transaction or a
+// synchronous Engine-locked import. The request record owns an atomic flag for asynchronous work;
+// synchronous adapters may instead borrow a type-erased query for the duration of the call.
 struct CancellationFlagView {
     const std::atomic<bool>* flag = nullptr;
+    const void* context           = nullptr;
+    bool (*query)(const void*)    = nullptr;
 
-    [[nodiscard]] bool requested() const noexcept {
-        return flag != nullptr && flag->load(std::memory_order_acquire);
+    [[nodiscard]] bool requested() const {
+        return (flag != nullptr && flag->load(std::memory_order_acquire)) ||
+               (query != nullptr && query(context));
     }
 };
 

@@ -38,12 +38,13 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-RuntimeStats settled_stats(const GenerationService& service) {
+RuntimeStats settled_stats(const GenerationService& service, bool wait_for_capture = false) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         const auto stats = service.runtime_stats();
         if (stats.running_requests == 0 && stats.waiting_requests == 0 &&
-            stats.materializing_requests == 0) {
+            stats.materializing_requests == 0 &&
+            (!wait_for_capture || stats.capture_pending_requests == 0)) {
             return stats;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -363,10 +364,11 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
         }
         return false;
     };
-    const auto shared_owner_count = [](const RuntimeStats& stats) {
-        std::uint32_t count = 0;
-        for (const ContextCacheMetricRole role :
-             {ContextCacheMetricRole::Harness, ContextCacheMetricRole::Project}) {
+    const auto shared_owner_count = [](const GenerationService& service,
+                                       const RuntimeStats& stats) {
+        std::uint32_t all_owners = 0;
+        for (std::uint8_t role = 0; role < static_cast<std::uint8_t>(ContextCacheMetricRole::Count);
+             ++role) {
             for (std::uint8_t placement = 0;
                  placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
                  ++placement) {
@@ -375,15 +377,20 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
                     for (std::uint8_t identity = 0;
                          identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
                          ++identity) {
-                        count += stats.context_cache_owners[context_cache_owner_metric_index(
-                            role, static_cast<ContextCacheMetricPlacement>(placement),
+                        all_owners += stats.context_cache_owners[context_cache_owner_metric_index(
+                            static_cast<ContextCacheMetricRole>(role),
+                            static_cast<ContextCacheMetricPlacement>(placement),
                             static_cast<ContextCacheMetricPin>(pin),
                             static_cast<ContextCacheMetricIdentity>(identity))];
                     }
                 }
             }
         }
-        return count;
+        const auto slots          = service.slot_states();
+        const auto private_owners = static_cast<std::uint32_t>(std::count_if(
+            slots.begin(), slots.end(), [](const auto& slot) { return slot.retained; }));
+        require(all_owners >= private_owners, "cache owner metrics lost a private continuation");
+        return all_owners - private_owners;
     };
 
     GenerationOutcome codex_oracle;
@@ -405,8 +412,8 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
             "first Direct lineage did not restore its exact durable shared prefix");
     (void)generate(service, instructions("direct-c"), "Direct activity C.", false);
     (void)generate(service, instructions("direct-d"), "Direct activity D.", false);
-    const RuntimeStats filled = settled_stats(service);
-    require(shared_owner_count(filled) == 3,
+    const RuntimeStats filled = settled_stats(service, true);
+    require(shared_owner_count(service, filled) == 3,
             "Direct activity did not fill the three-cell resident shared catalog");
 
     const GenerationOutcome codex =

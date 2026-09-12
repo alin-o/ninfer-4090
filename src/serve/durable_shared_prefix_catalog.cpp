@@ -1044,9 +1044,10 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
         const auto decision = runtime::DurableSharedSnapshotAccess::decide_recovery(
             engine, prompt, request_options, available);
         if (decision.source == runtime::DurableSharedSnapshotAccess::RecoverySource::Memory) {
-            observation.fallback_reason = decision.reason;
-            observation.frontier        = decision.frontier;
-            observation.warm_available  = true;
+            observation.fallback_reason         = decision.reason;
+            observation.frontier                = decision.frontier;
+            observation.warm_available          = true;
+            observation.recovery_reservation_id = decision.reservation_id;
             return observation;
         }
         if (decision.source != runtime::DurableSharedSnapshotAccess::RecoverySource::Ssd) {

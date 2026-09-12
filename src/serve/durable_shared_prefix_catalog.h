@@ -71,10 +71,11 @@ struct DurableSharedPrefixCatalogStats {
 struct DurableSharedPrefixRestore {
     std::uint32_t frontier = 0;
     std::string content_digest;
-    std::uint64_t serialized_bytes = 0;
-    std::uint64_t elapsed_ns       = 0;
-    bool loaded_from_ssd           = false;
-    bool warm_available            = false;
+    std::uint64_t serialized_bytes        = 0;
+    std::uint64_t elapsed_ns              = 0;
+    bool loaded_from_ssd                  = false;
+    bool warm_available                   = false;
+    std::uint64_t recovery_reservation_id = 0;
     std::string fallback_reason;
     std::vector<ninfer::CheckpointLifecycleFact> lifecycle;
 };

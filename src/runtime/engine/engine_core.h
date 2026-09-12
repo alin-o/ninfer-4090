@@ -211,7 +211,8 @@ public:
 
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
-                      Clock::time_point pending_deadline = {}) {
+                      Clock::time_point pending_deadline    = {},
+                      std::uint64_t recovery_reservation_id = 0) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -253,9 +254,10 @@ public:
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
             }
-            request = std::make_shared<Request>(
-                request_id, publication_order, std::move(prompt), std::move(output), prompt_summary,
-                prepare_seconds, std::move(options), consumer_mode, pending_deadline, submitted);
+            request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
+                                                std::move(output), prompt_summary, prepare_seconds,
+                                                std::move(options), consumer_mode, pending_deadline,
+                                                submitted, recovery_reservation_id);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -1455,7 +1457,14 @@ private:
         request->base_plan.reset();
     }
 
+    void release_durable_recovery(const std::shared_ptr<Request>& request) noexcept {
+        if (request->durable_recovery_reservation_id == 0) { return; }
+        resources_.cancel_durable_recovery(request->durable_recovery_reservation_id);
+        request->durable_recovery_reservation_id = 0;
+    }
+
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        release_durable_recovery(request);
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
@@ -1475,6 +1484,7 @@ private:
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
+        release_durable_recovery(request);
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
@@ -2075,7 +2085,8 @@ private:
 
     [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order);
+                                  request->publication_order,
+                                  request->durable_recovery_reservation_id);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -2266,12 +2277,13 @@ private:
 
         const auto reserved = resources_.reserve_materialization(
             *instance_.program, std::move(choice), std::move(request->prompt),
-            CancellationFlagView{&request->cancelled});
+            CancellationFlagView{&request->cancelled}, request->durable_recovery_reservation_id);
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
             request_admission_check();
             return AdmissionProgress::ControlProgress;
         }
         if (reserved == ResourceManagement::MaterializationReserveResult::Aborted) {
+            request->durable_recovery_reservation_id = 0;
             if (!erase_pending(request)) {
                 throw std::logic_error("aborted materialization lost its waiting request");
             }
@@ -2281,6 +2293,7 @@ private:
             publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
+        request->durable_recovery_reservation_id = 0;
         if (!erase_pending(request)) {
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }

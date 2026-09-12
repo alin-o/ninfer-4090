@@ -2595,14 +2595,80 @@ void test_durable_recovery_prefers_pressure_feasible_warm_candidate() {
 
     require(inspection.warm_frontier == 16 &&
                 inspection.warm_tier == FakeManager::WarmRecoveryTier::Device &&
-                !inspection.ssd_candidate_index && inspection.reservation_id == 0 &&
+                !inspection.ssd_candidate_index && inspection.reservation_id != 0 &&
                 program.pressure_planning_sessions != 0 &&
                 program.inspected_durable_frontiers.empty(),
             "pressure-feasible warm winner did not suppress shallower SSD adoption");
 
-    auto admission = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 3);
+    program.invalidate_resources();
+    auto unreserved = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 3);
+    require(unreserved.choice && unreserved.choice->summary().reusable_prompt_tokens == 0,
+            "warm recovery lease remained visible to an unrelated admission");
+    auto admission = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 3,
+                                     inspection.reservation_id);
     require(admission.choice && admission.choice->summary().reusable_prompt_tokens == 16,
-            "warm recovery preview was not revalidated by ordinary admission");
+            "warm recovery lease was not re-planned after topology invalidation");
+    const auto reserved =
+        manager.reserve_materialization(program, std::move(*admission.choice),
+                                        FakePreparedPrompt{17}, {}, inspection.reservation_id);
+    require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+            "re-planned warm recovery lease was stale at admission");
+}
+
+void test_durable_shared_warm_recovery_pins_source_until_admission() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 1, 1);
+    FakeProgram program;
+    const FakeValidatedSharedPrefixImport imported{
+        .imported_summary = FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(27, 32)},
+        .imported_metadata =
+            FakeSharedPrefixPersistenceMetadata{
+                .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                .ssd_eligible = true,
+            },
+        .content_key = 27,
+    };
+    const auto adopted = manager.adopt_imported_shared(program, imported, {}, {}, true);
+    require(adopted.disposition == FakeManager::SharedImportDisposition::Published,
+            "shared warm-lease fixture was not published");
+
+    const std::array candidates{DurableCandidate{.frontier = 16}};
+    const auto cancelled =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{27}, make_base(27),
+                                         std::span<const DurableCandidate>(candidates));
+    require(cancelled.warm_frontier == 32 && cancelled.reservation_id != 0 &&
+                manager.shared_catalog_metadata(0).transaction_pinned,
+            "shared warm recovery did not reserve its exact source");
+
+    bool release_blocked = false;
+    try {
+        (void)manager.take_catalogued_shared(0);
+    } catch (const std::logic_error&) { release_blocked = true; }
+    require(release_blocked, "shared warm source was releasable before request admission");
+
+    manager.cancel_durable_recovery(cancelled.reservation_id);
+    require(!manager.shared_catalog_metadata(0).transaction_pinned,
+            "cancelled shared warm recovery retained its source pin");
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{27}, make_base(27),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.reservation_id != 0,
+            "shared warm recovery could not be reinspected after cancellation");
+
+    program.invalidate_resources();
+    auto admission = manager.inspect(program, FakePreparedPrompt{27}, make_base(27), 2,
+                                     inspection.reservation_id);
+    require(admission.choice && admission.choice->summary().reusable_prompt_tokens == 32,
+            "shared warm recovery was lost after topology invalidation");
+    const auto reserved =
+        manager.reserve_materialization(program, std::move(*admission.choice),
+                                        FakePreparedPrompt{27}, {}, inspection.reservation_id);
+    require(reserved == FakeManager::MaterializationReserveResult::Reserved &&
+                manager.shared_catalog_metadata(0).transaction_pinned,
+            "shared warm recovery lease did not transfer into materialization ownership");
 }
 
 void test_durable_recovery_replaces_full_catalog_transactionally() {
@@ -2652,6 +2718,7 @@ void test_durable_recovery_replaces_full_catalog_transactionally() {
                                          std::span<const DurableCandidate>(candidates));
     require(!stale_plan.ssd_candidate_index,
             "an exact warm resident owner incorrectly planned a duplicate SSD import");
+    manager.cancel_durable_recovery(stale_plan.reservation_id);
 
     const std::array deeper{DurableCandidate{.frontier = 128}};
     const auto reserved =
@@ -4993,6 +5060,8 @@ int main() {
              test_durable_recovery_uses_first_feasible_ssd_candidate);
     run_test("pressure-feasible warm durable recovery winner",
              test_durable_recovery_prefers_pressure_feasible_warm_candidate);
+    run_test("shared warm recovery source survives stale topology",
+             test_durable_shared_warm_recovery_pins_source_until_admission);
     run_test("transactional full-catalog durable recovery",
              test_durable_recovery_replaces_full_catalog_transactionally);
     run_test("non-SSD alternate-covered durable replacement lifecycle",

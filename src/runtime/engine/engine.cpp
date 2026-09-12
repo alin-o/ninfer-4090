@@ -497,6 +497,13 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
                                 std::chrono::steady_clock::time_point pending_deadline) {
+    return submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
+                                pending_deadline, 0);
+}
+
+GenerationHandle Engine::submit_with_recovery(
+    PreparedPrompt prompt, RequestOptions options, OutputConsumerMode consumer_mode,
+    std::chrono::steady_clock::time_point pending_deadline, std::uint64_t recovery_reservation_id) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
@@ -515,6 +522,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
+        runtime::DurableSharedSnapshotAccess::cancel_recovery(*this, recovery_reservation_id);
+
         struct ImmediateSubmission {
             GenerationResult result;
             OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
@@ -551,12 +560,20 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), consumer_mode, pending_deadline);
+                                 std::move(resolved_options), consumer_mode, pending_deadline,
+                                 recovery_reservation_id);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
         },
         impl_->core);
+}
+
+GenerationHandle runtime::DurableSharedSnapshotAccess::submit(
+    Engine& engine, PreparedPrompt prompt, RequestOptions options, OutputConsumerMode consumer_mode,
+    std::chrono::steady_clock::time_point pending_deadline, std::uint64_t recovery_reservation_id) {
+    return engine.submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
+                                       pending_deadline, recovery_reservation_id);
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -815,6 +832,7 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
+                            .reservation_id           = inspected.reservation_id,
                             .reason                   = "warm-source-selected"};
                 }
                 if (feasible_ssd != nullptr) {
@@ -830,6 +848,7 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
+                            .reservation_id           = inspected.reservation_id,
                             .reason                   = "warm-source-selected"};
                 }
                 const auto infeasible_reason = [&] {

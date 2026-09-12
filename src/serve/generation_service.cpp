@@ -353,7 +353,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime(deadline_policy);
+    prepared.lifetime                     = acquire_request_lifetime(deadline_policy);
+    std::uint64_t recovery_reservation_id = 0;
 
     try {
         const auto acquisition_started = Clock::now();
@@ -412,6 +413,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             prepared.durable_loaded_from_ssd    = restore.loaded_from_ssd;
             prepared.durable_warm_available     = restore.warm_available;
             prepared.durable_fallback_reason    = restore.fallback_reason;
+            recovery_reservation_id             = restore.recovery_reservation_id;
             check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
@@ -422,24 +424,32 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         }
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              consumer_mode == GenerationConsumerMode::Streaming
-                                                  ? ninfer::OutputConsumerMode::Streaming
-                                                  : ninfer::OutputConsumerMode::Aggregate,
-                                              prepared.lifetime->deadline);
-        prepared.sampling   = prepared.generation.resolved_sampling();
+        prepared.generation = runtime::DurableSharedSnapshotAccess::submit(
+            *engine_, std::move(prompt), std::move(request_options),
+            consumer_mode == GenerationConsumerMode::Streaming
+                ? ninfer::OutputConsumerMode::Streaming
+                : ninfer::OutputConsumerMode::Aggregate,
+            prepared.lifetime->deadline, recovery_reservation_id);
+        recovery_reservation_id = 0;
+        prepared.sampling       = prepared.generation.resolved_sampling();
     } catch (const ApiException& exception) {
+        runtime::DurableSharedSnapshotAccess::cancel_recovery(*engine_, recovery_reservation_id);
         throw_with_durable_lifecycle(exception.error(), prepared.durable_lifecycle);
     } catch (const ninfer::RequestError& exception) {
+        runtime::DurableSharedSnapshotAccess::cancel_recovery(*engine_, recovery_reservation_id);
         throw_with_durable_lifecycle(request_error_to_api_error(exception),
                                      prepared.durable_lifecycle);
     } catch (const std::invalid_argument& exception) {
+        runtime::DurableSharedSnapshotAccess::cancel_recovery(*engine_, recovery_reservation_id);
         ApiError error;
         error.status  = 400;
         error.param   = "messages";
         error.code    = "invalid_prompt";
         error.message = exception.what();
         throw_with_durable_lifecycle(std::move(error), prepared.durable_lifecycle);
+    } catch (...) {
+        runtime::DurableSharedSnapshotAccess::cancel_recovery(*engine_, recovery_reservation_id);
+        throw;
     }
     return prepared;
 }

@@ -281,7 +281,7 @@ public:
                              std::span<const DurableCandidate> ssd_candidates) {
         DurableRecoveryInspection result;
         if (!std::holds_alternative<std::monostate>(transaction_) ||
-            program.has_context_transaction() || durable_recovery_) {
+            program.has_context_transaction() || durable_recovery_ || warm_recovery_) {
             result.infeasibility = DurableImportFeasibility::TransactionConflict;
             return result;
         }
@@ -300,11 +300,15 @@ public:
         // Recovery inspection runs before the request enters FIFO admission. Preview the same
         // bounded materialization planner used after submission so Host->Device and other warm
         // sources that need safe pressure reclamation remain first-class competitors to SSD. The
-        // preview owns no reservation and is deliberately re-planned by normal admission if it
-        // wins; topology changes therefore cannot commit this provisional choice.
+        // preview is deliberately re-planned by normal FIFO admission if it wins. A logical lease
+        // below preserves only the exact source across that boundary; Program remains the authority
+        // for revalidating physical feasibility against the then-current resource revision.
         constexpr std::uint64_t kPreviewPublicationOrder =
             std::numeric_limits<std::uint64_t>::max();
         Inspection warm = inspect(program, prompt, base, kPreviewPublicationOrder);
+        std::optional<CatalogCapability> warm_private_source;
+        std::optional<CatalogCapability> warm_shared_source;
+        std::optional<CheckpointRef> warm_checkpoint;
         if (warm.choice && warm.choice->summary().reusable_prompt_tokens != 0) {
             const Choice& choice = *warm.choice;
             result.warm_frontier = choice.summary().reusable_prompt_tokens;
@@ -312,6 +316,8 @@ public:
 
             ReplicaResidency residency = ReplicaResidency::DeviceOnly;
             if (choice.private_source_ && choice.selected_observation_) {
+                warm_private_source          = choice.private_source_;
+                warm_checkpoint              = choice.selected_observation_->checkpoint;
                 const CatalogEntry& entry    = catalog_[choice.private_source_->slot];
                 const CheckpointRef selected = choice.selected_observation_->checkpoint;
                 const auto take_residency    = [&](const auto& checkpoint) {
@@ -330,8 +336,10 @@ public:
                                 });
                 if (!found) { throw std::logic_error("warm preview lost its private checkpoint"); }
             } else if (choice.shared_source_) {
-                residency =
-                    shared_catalog_[choice.shared_source_->slot].summary.checkpoint.state_residency;
+                warm_shared_source              = choice.shared_source_;
+                const SharedCatalogEntry& entry = shared_catalog_[choice.shared_source_->slot];
+                warm_checkpoint                 = entry.summary.checkpoint.ref;
+                residency                       = entry.summary.checkpoint.state_residency;
             } else {
                 throw std::logic_error("warm preview selected no resident source");
             }
@@ -601,6 +609,24 @@ public:
             result.infeasibility = DurableImportFeasibility::Feasible;
             break;
         }
+        if (!result.ssd_candidate_index && result.warm_frontier != 0 && warm_checkpoint &&
+            (warm_private_source || warm_shared_source)) {
+            WarmRecoveryRecord record{
+                .id             = next_durable_recovery_id_++,
+                .private_source = warm_private_source,
+                .shared_source  = warm_shared_source,
+                .checkpoint     = *warm_checkpoint,
+                .frontier       = result.warm_frontier,
+            };
+            if (record.id == 0) { record.id = next_durable_recovery_id_++; }
+            if (record.private_source) {
+                catalog_[record.private_source->slot].state = CatalogState::Claimed;
+            } else {
+                ++shared_catalog_[record.shared_source->slot].transaction_pins;
+            }
+            result.reservation_id = record.id;
+            warm_recovery_.emplace(std::move(record));
+        }
         return result;
     }
 
@@ -631,10 +657,19 @@ public:
     }
 
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
-                                     const RequestBasePlan& base, std::uint64_t publication_order) {
+                                     const RequestBasePlan& base, std::uint64_t publication_order,
+                                     std::uint64_t warm_recovery_id = 0) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
             return {.readiness = Readiness::TemporarilyBlocked};
+        }
+        const WarmRecoveryRecord* warm_recovery = nullptr;
+        if (warm_recovery_id != 0) {
+            if (!warm_recovery_ || warm_recovery_->id != warm_recovery_id ||
+                !valid_warm_recovery_record(*warm_recovery_)) {
+                return {.readiness = Readiness::TemporarilyBlocked};
+            }
+            warm_recovery = &*warm_recovery_;
         }
         if (publication_order == 0) {
             throw std::invalid_argument("request publication order is zero");
@@ -731,8 +766,13 @@ public:
                 }
 
                 const SharedCatalogEntry& entry = shared_catalog_[index.slot];
+                const bool reserved_warm_source =
+                    warm_recovery && warm_recovery->shared_source &&
+                    warm_recovery->shared_source->slot == index.slot &&
+                    warm_recovery->shared_source->owner.id == entry.id &&
+                    warm_recovery->shared_source->generation == entry.revision;
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
-                    entry.transaction_pins != 0) {
+                    (entry.transaction_pins != 0 && !reserved_warm_source)) {
                     continue;
                 }
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
@@ -757,12 +797,70 @@ public:
                     .source_key = index.key,
                 });
             }
+
+            // A private warm lease marks its owner Claimed so no intervening capture or pressure
+            // plan can consume it. Claimed owners are intentionally absent from prefix_index_, so
+            // add this request's exact leased source explicitly while leaving it unavailable to
+            // every other request and to the pressure-victim portfolio.
+            if (warm_recovery && warm_recovery->private_source) {
+                const CatalogCapability& capability = *warm_recovery->private_source;
+                const CatalogEntry& entry           = catalog_[capability.slot];
+                const auto append_reserved          = [&](const auto& checkpoint) {
+                    if (checkpoint.ref != warm_recovery->checkpoint) { return false; }
+                    const std::optional<PrefixShortlistKey> incoming =
+                        base.prefix_shortlist_key(checkpoint.ref.frontier);
+                    if (!incoming || *incoming != checkpoint.shortlist_key) { return true; }
+                    const bool retain = entry.session.has_value();
+                    std::optional<AdmissionCandidate> plan =
+                        program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                           nullptr, checkpoint.ref, retain);
+                    if (!plan || plan->summary().reusable_prompt_tokens == 0 ||
+                        (retain &&
+                         plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
+                        return true;
+                    }
+                    const bool current_session_binding =
+                        current_session_cell &&
+                        session_index_[*current_session_cell].slot == capability.slot &&
+                        session_index_[*current_session_cell].owner_id == entry.id &&
+                        session_index_[*current_session_cell].revision == entry.revision;
+                    append_unique(provisional_demand.exact_resident_keys, checkpoint.shortlist_key);
+                    PolicyObservationKey observation;
+                    observation.shared     = false;
+                    observation.slot       = capability.slot;
+                    observation.owner_id   = entry.id;
+                    observation.revision   = entry.revision;
+                    observation.checkpoint = checkpoint.ref;
+                    Candidate reserved;
+                    reserved.plan                    = std::move(*plan);
+                    reserved.current_session_binding = current_session_binding;
+                    reserved.private_source          = capability;
+                    reserved.selected_observation    = observation;
+                    reserved.source_key              = checkpoint.shortlist_key;
+                    candidates.push_back(std::move(reserved));
+                    return true;
+                };
+                bool found = entry.summary.endpoint && append_reserved(*entry.summary.endpoint);
+                if (!found && entry.summary.rewrite) {
+                    found = append_reserved(*entry.summary.rewrite);
+                }
+                if (!found) {
+                    found = std::any_of(entry.summary.long_anchors.begin(),
+                                        entry.summary.long_anchors.end(), append_reserved);
+                }
+                if (!found) {
+                    throw std::logic_error("warm recovery lease lost its private checkpoint");
+                }
+            }
         }
 
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (warm_recovery && selected->summary().reusable_prompt_tokens < warm_recovery->frontier) {
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -782,7 +880,7 @@ public:
 
     [[nodiscard]] MaterializationReserveResult
     reserve_materialization(Program& program, Choice&& choice, PreparedPrompt&& prompt,
-                            CancellationFlagView cancellation) {
+                            CancellationFlagView cancellation, std::uint64_t warm_recovery_id = 0) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
             throw std::logic_error("ResourceManager already owns a resource transaction");
@@ -791,10 +889,18 @@ public:
         if (!choice.plan_ || resource_revision.value == 0) {
             throw std::logic_error("resource choice is malformed");
         }
+        if (warm_recovery_id != 0 && (!warm_recovery_ || warm_recovery_->id != warm_recovery_id ||
+                                      !valid_warm_recovery_record(*warm_recovery_))) {
+            return MaterializationReserveResult::Stale;
+        }
         if (choice.plan_->resource_revision() != resource_revision) {
             return MaterializationReserveResult::Stale;
         }
-        validate_choice(choice, resource_revision);
+        validate_choice(choice, resource_revision, warm_recovery_id);
+        if (warm_recovery_id != 0) {
+            release_warm_recovery_reservation(*warm_recovery_);
+            warm_recovery_.reset();
+        }
         MaterializationRecord record = take_materialization_record(choice);
         transaction_.template emplace<MaterializationRecord>(std::move(record));
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
@@ -1689,9 +1795,15 @@ public:
     };
 
     void cancel_durable_recovery(std::uint64_t reservation_id) noexcept {
-        if (!durable_recovery_ || durable_recovery_->id != reservation_id) { return; }
-        release_durable_recovery_reservation(*durable_recovery_);
-        durable_recovery_.reset();
+        if (durable_recovery_ && durable_recovery_->id == reservation_id) {
+            release_durable_recovery_reservation(*durable_recovery_);
+            durable_recovery_.reset();
+            return;
+        }
+        if (warm_recovery_ && warm_recovery_->id == reservation_id) {
+            release_warm_recovery_reservation(*warm_recovery_);
+            warm_recovery_.reset();
+        }
     }
 
     // Transactional adoption of a Program-validated Host import. Exact semantic coalescing is
@@ -2194,6 +2306,61 @@ private:
         std::shared_ptr<const void> physical_plan;
         bool replacement_alternate_coverage = false;
     };
+
+    struct WarmRecoveryRecord {
+        std::uint64_t id = 0;
+        std::optional<CatalogCapability> private_source;
+        std::optional<CatalogCapability> shared_source;
+        CheckpointRef checkpoint;
+        std::uint32_t frontier = 0;
+    };
+
+    [[nodiscard]] bool valid_warm_recovery_record(const WarmRecoveryRecord& record) const noexcept {
+        if (record.id == 0 || record.frontier == 0 ||
+            record.private_source.has_value() == record.shared_source.has_value()) {
+            return false;
+        }
+        if (record.private_source) {
+            const CatalogCapability& capability = *record.private_source;
+            if (capability.slot >= catalog_count_ ||
+                capability.owner.kind != LogicalOwnerKind::PrivateContinuation) {
+                return false;
+            }
+            const CatalogEntry& entry = catalog_[capability.slot];
+            return entry.state == CatalogState::Claimed && entry.handle &&
+                   entry.id == capability.owner.id && entry.revision == capability.generation &&
+                   !private_has_active_edge(capability.slot) &&
+                   continuation_contains_checkpoint(entry.summary, record.checkpoint);
+        }
+        const CatalogCapability& capability = *record.shared_source;
+        if (capability.slot >= shared_catalog_count_ ||
+            capability.owner.kind != LogicalOwnerKind::SharedPrefix) {
+            return false;
+        }
+        const SharedCatalogEntry& entry = shared_catalog_[capability.slot];
+        return entry.state == SharedCatalogState::Catalogued && entry.handle &&
+               entry.transaction_pins == 1 && entry.id == capability.owner.id &&
+               entry.revision == capability.generation &&
+               entry.summary.checkpoint.ref == record.checkpoint;
+    }
+
+    void release_warm_recovery_reservation(const WarmRecoveryRecord& record) noexcept {
+        if (record.private_source && record.private_source->slot < catalog_count_) {
+            CatalogEntry& entry = catalog_[record.private_source->slot];
+            if (entry.state == CatalogState::Claimed &&
+                entry.id == record.private_source->owner.id &&
+                entry.revision == record.private_source->generation) {
+                entry.state = CatalogState::Catalogued;
+            }
+        }
+        if (record.shared_source && record.shared_source->slot < shared_catalog_count_) {
+            SharedCatalogEntry& entry = shared_catalog_[record.shared_source->slot];
+            if (entry.transaction_pins != 0 && entry.id == record.shared_source->owner.id &&
+                entry.revision == record.shared_source->generation) {
+                --entry.transaction_pins;
+            }
+        }
+    }
 
     [[nodiscard]] bool
     valid_durable_recovery_record(const DurableRecoveryRecord& record) const noexcept {
@@ -3340,7 +3507,8 @@ private:
         return choice;
     }
 
-    void validate_choice(const Choice& choice, ProgramResourceRevision revision) const {
+    void validate_choice(const Choice& choice, ProgramResourceRevision revision,
+                         std::uint64_t warm_recovery_id = 0) const {
         if (!choice.plan_ || choice.destination_.value >= lane_count_ ||
             lanes_[choice.destination_.value] != LogicalLaneState::Free || revision.value == 0 ||
             choice.publication_slot_ >= catalog_count_ || choice.publication_order_ == 0) {
@@ -3353,7 +3521,12 @@ private:
                 throw std::logic_error("private source slot is invalid");
             }
             const CatalogEntry& source = catalog_[capability.slot];
-            if (source.state != CatalogState::Catalogued || !source.handle ||
+            const bool reserved_warm_source =
+                warm_recovery_id != 0 && warm_recovery_ && warm_recovery_->id == warm_recovery_id &&
+                warm_recovery_->private_source &&
+                warm_recovery_->private_source->slot == capability.slot;
+            if ((!reserved_warm_source && source.state != CatalogState::Catalogued) ||
+                (reserved_warm_source && source.state != CatalogState::Claimed) || !source.handle ||
                 source.id != capability.owner.id || source.revision != capability.generation ||
                 private_has_active_edge(capability.slot)) {
                 throw std::logic_error("private source changed after planning");
@@ -4882,6 +5055,7 @@ private:
     ContextTransaction transaction_;
     ContextMachineCostModel cost_model_;
     std::optional<DurableRecoveryRecord> durable_recovery_;
+    std::optional<WarmRecoveryRecord> warm_recovery_;
     std::uint64_t next_durable_recovery_id_ = 1;
     Planner planner_;
     CapturePlanner capture_planner_;

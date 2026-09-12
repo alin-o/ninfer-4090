@@ -67,6 +67,10 @@ struct DurableSharedSnapshotAccess {
     decide_recovery(Engine& engine, const PreparedPrompt& prompt,
                     const RequestOptions& request_options,
                     std::span<const Candidate> available_ssd_candidates);
+    [[nodiscard]] static GenerationHandle
+    submit(Engine& engine, PreparedPrompt prompt, RequestOptions options,
+           OutputConsumerMode consumer_mode, std::chrono::steady_clock::time_point pending_deadline,
+           std::uint64_t recovery_reservation_id);
     [[nodiscard]] static ImportResult import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
                                              const CancellationView& cancellation = {},

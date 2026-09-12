@@ -412,6 +412,8 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
             "first Direct lineage did not restore its exact durable shared prefix");
     (void)generate(service, instructions("direct-c"), "Direct activity C.", false);
     (void)generate(service, instructions("direct-d"), "Direct activity D.", false);
+    require(wait_for_writes(service, 2),
+            "Direct activity did not finish its durable exports before replacement");
     const RuntimeStats filled = settled_stats(service, true);
     require(shared_owner_count(service, filled) == 3,
             "Direct activity did not fill the three-cell resident shared catalog");

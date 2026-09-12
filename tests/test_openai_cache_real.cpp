@@ -479,6 +479,17 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
     const GenerationOutcome codex =
         generate(service, instructions("codex-b"), "Codex seed B.", true, false, "codex-lineage");
     trace_state(9);
+    std::cerr << "TRACE r9 reuse=" << codex.metrics.prefix_cache_hit_tokens
+              << " path=" << static_cast<unsigned>(codex.metrics.prefix_reuse_path)
+              << " durable=" << codex.metrics.durable_fallback_reason
+              << " frontier=" << codex.metrics.durable_restore_frontier
+              << " warm=" << codex.metrics.durable_warm_available
+              << " best=" << codex.metrics.materialization.best_reuse_prompt_tokens
+              << " targets=" << codex.metrics.materialization.targets_evaluated << " stop="
+              << materialization_stop_reason_name(codex.metrics.materialization.stop_reason)
+              << " maximal=" << codex.metrics.materialization.selected_maximal_fallback
+              << " reclaimed_state=" << codex.metrics.materialization.reclaimed_device_state_slots
+              << '\n';
     require(
         !codex.metrics.durable_loaded_from_ssd && codex.metrics.durable_warm_available &&
             codex.metrics.durable_fallback_reason == "warm-source-selected" &&

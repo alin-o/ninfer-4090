@@ -297,66 +297,49 @@ public:
             return result;
         }
 
-        rebuild_prefix_index();
-        const auto consider = [&](std::optional<AdmissionCandidate> plan,
-                                  ReplicaResidency residency) {
-            if (!plan || plan->summary().reusable_prompt_tokens == 0 ||
-                plan->identity_assessment().physical_status !=
-                    MaterializationPhysicalStatus::Feasible) {
-                return;
-            }
-            const std::uint32_t frontier = plan->summary().reusable_prompt_tokens;
-            const std::uint64_t cost     = price_materialization_machine_work(
-                                           cost_model_, plan->identity_assessment().machine_work)
-                                           .immediate_ns;
-            const WarmRecoveryTier tier = residency == ReplicaResidency::HostOnly
-                                              ? WarmRecoveryTier::Host
-                                              : WarmRecoveryTier::Device;
-            if (frontier > result.warm_frontier ||
-                (frontier == result.warm_frontier &&
-                 std::tie(cost, tier) < std::tie(result.warm_cost_ns, result.warm_tier))) {
-                result.warm_frontier = frontier;
-                result.warm_cost_ns  = cost;
-                result.warm_tier     = tier;
-            }
-        };
-        for (const PrefixIndexEntry& index : prefix_index_) {
-            if (!valid_prefix_index_entry(index)) { continue; }
-            const std::optional<PrefixShortlistKey> incoming =
-                base.prefix_shortlist_key(index.key.frontier);
-            if (!incoming || *incoming != index.key) { continue; }
-            if (!index.shared) {
-                const CatalogEntry& entry = catalog_[index.slot];
-                if (private_has_active_edge(index.slot)) { continue; }
-                const bool retain          = entry.session.has_value();
-                ReplicaResidency residency = ReplicaResidency::DeviceOnly;
-                const auto take_residency  = [&](const auto& checkpoint) {
-                    if (checkpoint && checkpoint->ref == index.checkpoint) {
+        // Recovery inspection runs before the request enters FIFO admission. Preview the same
+        // bounded materialization planner used after submission so Host->Device and other warm
+        // sources that need safe pressure reclamation remain first-class competitors to SSD. The
+        // preview owns no reservation and is deliberately re-planned by normal admission if it
+        // wins; topology changes therefore cannot commit this provisional choice.
+        constexpr std::uint64_t kPreviewPublicationOrder =
+            std::numeric_limits<std::uint64_t>::max();
+        Inspection warm = inspect(program, prompt, base, kPreviewPublicationOrder);
+        if (warm.choice && warm.choice->summary().reusable_prompt_tokens != 0) {
+            const Choice& choice = *warm.choice;
+            result.warm_frontier = choice.summary().reusable_prompt_tokens;
+            result.warm_cost_ns  = choice.diagnostics_.predicted_total_ns;
+
+            ReplicaResidency residency = ReplicaResidency::DeviceOnly;
+            if (choice.private_source_ && choice.selected_observation_) {
+                const CatalogEntry& entry    = catalog_[choice.private_source_->slot];
+                const CheckpointRef selected = choice.selected_observation_->checkpoint;
+                const auto take_residency    = [&](const auto& checkpoint) {
+                    if (checkpoint && checkpoint->ref == selected) {
                         residency = checkpoint->state_residency;
                         return true;
                     }
                     return false;
                 };
-                bool found_residency =
-                    take_residency(entry.summary.endpoint) || take_residency(entry.summary.rewrite);
-                if (!found_residency) {
-                    const auto found = std::find_if(
-                        entry.summary.long_anchors.begin(), entry.summary.long_anchors.end(),
-                        [&](const auto& checkpoint) { return checkpoint.ref == index.checkpoint; });
-                    if (found != entry.summary.long_anchors.end()) {
-                        residency = found->state_residency;
-                    }
-                }
-                consider(program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                   nullptr, index.checkpoint, retain),
-                         residency);
-                continue;
+                const bool found =
+                    take_residency(entry.summary.endpoint) ||
+                    take_residency(entry.summary.rewrite) ||
+                    std::any_of(entry.summary.long_anchors.begin(),
+                                entry.summary.long_anchors.end(), [&](const auto& checkpoint) {
+                                    return take_residency(std::optional(checkpoint));
+                                });
+                if (!found) { throw std::logic_error("warm preview lost its private checkpoint"); }
+            } else if (choice.shared_source_) {
+                residency =
+                    shared_catalog_[choice.shared_source_->slot].summary.checkpoint.state_residency;
+            } else {
+                throw std::logic_error("warm preview selected no resident source");
             }
-            const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-            consider(program.inspect_admission(prompt, base, *destination, nullptr, &*entry.handle,
-                                               index.checkpoint, false),
-                     entry.summary.checkpoint.state_residency);
+            result.warm_tier = residency == ReplicaResidency::HostOnly ? WarmRecoveryTier::Host
+                                                                       : WarmRecoveryTier::Device;
         }
+
+        rebuild_prefix_index();
 
         std::optional<std::uint32_t> vacant_slot;
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {

@@ -2575,6 +2575,36 @@ void test_durable_recovery_uses_first_feasible_ssd_candidate() {
             "durable recovery stopped at an infeasible deepest SSD record");
 }
 
+void test_durable_recovery_prefers_pressure_feasible_warm_candidate() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    const ActiveRequest warm = start_active(manager, program, 17, make_base(17), 1);
+    (void)finish_active(manager, program, warm, 16);
+    const ActiveRequest victim = start_active(manager, program, 18, make_base(18), 2);
+    (void)finish_active(manager, program, victim, 16);
+
+    program.required_pressure_actions = 1;
+    const std::array candidates{DurableCandidate{.frontier = 8}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{17}, make_base(17),
+                                         std::span<const DurableCandidate>(candidates));
+
+    require(inspection.warm_frontier == 16 &&
+                inspection.warm_tier == FakeManager::WarmRecoveryTier::Device &&
+                !inspection.ssd_candidate_index && inspection.reservation_id == 0 &&
+                program.pressure_planning_sessions != 0 &&
+                program.inspected_durable_frontiers.empty(),
+            "pressure-feasible warm winner did not suppress shallower SSD adoption");
+
+    auto admission = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 3);
+    require(admission.choice && admission.choice->summary().reusable_prompt_tokens == 16,
+            "warm recovery preview was not revalidated by ordinary admission");
+}
+
 void test_durable_recovery_replaces_full_catalog_transactionally() {
     struct DurableCandidate {
         std::uint32_t frontier = 0;
@@ -4961,6 +4991,8 @@ int main() {
              test_equal_lower_bound_does_not_short_circuit_tie_break);
     run_test("shallower feasible durable recovery",
              test_durable_recovery_uses_first_feasible_ssd_candidate);
+    run_test("pressure-feasible warm durable recovery winner",
+             test_durable_recovery_prefers_pressure_feasible_warm_candidate);
     run_test("transactional full-catalog durable recovery",
              test_durable_recovery_replaces_full_catalog_transactionally);
     run_test("non-SSD alternate-covered durable replacement lifecycle",

@@ -21,6 +21,22 @@
 namespace ninfer::serve {
 namespace {
 
+template <class Callback>
+class ScopeExit {
+public:
+    explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
+
+    ~ScopeExit() noexcept { callback_(); }
+
+    ScopeExit(const ScopeExit&)            = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ScopeExit(ScopeExit&&)                 = delete;
+    ScopeExit& operator=(ScopeExit&&)      = delete;
+
+private:
+    Callback callback_;
+};
+
 constexpr std::string_view kManifestName      = "catalog.manifest";
 constexpr std::string_view kManifestHeader    = "NINFER_SHARED_CATALOG\t1\n";
 constexpr std::size_t kMaximumManifestBytes   = 1U << 20U;
@@ -914,6 +930,7 @@ DurableSharedPrefixCatalog::load_record(const Candidate& candidate, Clock::time_
         if (enqueue_load) {
             const auto queued_job = job;
             try {
+                if (state->options.before_load_enqueue) { state->options.before_load_enqueue(); }
                 state->push([state, queued_job, record] {
                     const auto started = Clock::now();
                     try {
@@ -1038,9 +1055,15 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
             }
             return observation;
         }
-        observation.fallback_reason             = decision.reason;
-        const Candidate candidate               = decision.candidate;
-        const std::uint64_t reservation_id      = decision.reservation_id;
+        observation.fallback_reason        = decision.reason;
+        const Candidate candidate          = decision.candidate;
+        const std::uint64_t reservation_id = decision.reservation_id;
+        // Reservation must cover load job allocation, registration, and enqueue as well as the
+        // later checksum/validation/adoption path. load_record may throw before returning a job,
+        // so install cleanup before invoking it.
+        ScopeExit reservation_cleanup([&engine, reservation_id] {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+        });
         const Clock::time_point restore_started = Clock::now();
         auto loaded                             = load_record(candidate, deadline, cancellation);
         if (!loaded.bytes) {

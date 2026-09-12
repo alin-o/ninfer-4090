@@ -4556,6 +4556,8 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         std::error_code ignored;
         std::filesystem::remove_all(directory, ignored);
         std::atomic<bool> inject_payload_read_failure{false};
+        std::atomic<bool> inject_load_registration_failure{false};
+        std::atomic<bool> inject_load_enqueue_failure{false};
         ninfer::serve::DurableSharedPrefixCatalogOptions catalog_options{
             .directory     = directory,
             .max_records   = 2,
@@ -4567,6 +4569,16 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         catalog_options.before_payload_read = [&] {
             if (inject_payload_read_failure.load(std::memory_order_acquire)) {
                 throw std::runtime_error("injected durable payload read failure");
+            }
+        };
+        catalog_options.before_load_registration = [&] {
+            if (inject_load_registration_failure.load(std::memory_order_acquire)) {
+                throw std::runtime_error("injected durable load registration failure");
+            }
+        };
+        catalog_options.before_load_enqueue = [&] {
+            if (inject_load_enqueue_failure.load(std::memory_order_acquire)) {
+                throw std::runtime_error("injected durable load enqueue failure");
             }
         };
         std::vector<ninfer::CheckpointLifecycleFact> persistence_facts;
@@ -4626,6 +4638,119 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                 catalog.stats().loads_completed != 0 ||
                 generated.generated_token_ids != expected_tokens) {
                 std::cerr << "infeasible SSD adoption performed I/O or blocked root fallback\n";
+                return 1;
+            }
+        }
+        {
+            // The resident victim is longer than the requested SSD checkpoint and owns only
+            // Device replicas. Host KV is sized for the smaller incoming record, so rebuilding
+            // the victim through ordinary Host adoption would exceed a capacity that preflight
+            // never promised. Inject failure after incoming KV allocation and require the exact
+            // Device-only topology to survive.
+            ninfer::serve::DurableSharedPrefixCatalogOptions rollback_options = catalog_options;
+            rollback_options.directory = directory / "device-only-rollback";
+            ninfer::serve::DurableSharedPrefixCatalog catalog(rollback_options);
+            ninfer::PromptInput incoming_prompt = shared_snapshot_prompt();
+            constexpr std::size_t incoming_trim = 4200;
+            incoming_prompt.messages.front().parts.front().text.erase(0, incoming_trim);
+            incoming_prompt.context_cache.markers.front().leading_instruction_bytes -=
+                static_cast<std::uint32_t>(incoming_trim);
+            std::uint32_t incoming_frontier    = 0;
+            std::size_t incoming_host_kv_bytes = 0;
+            {
+                ninfer::Engine incoming_source(shared_snapshot_engine_options(artifact));
+                const ninfer::GenerationResult incoming = incoming_source.generate(
+                    incoming_source.prepare(incoming_prompt), fixed_output(3));
+                if (incoming.generated_token_ids.size() != 3) {
+                    std::cerr << "Device-only rollback fixture could not generate SSD source\n";
+                    return 1;
+                }
+                auto [slot, snapshot] = Access::export_first_durable(incoming_source);
+                (void)slot;
+                snapshot.await_transfer(snapshot.bytes);
+                incoming_frontier                  = snapshot.tokens;
+                const ninfer::MemorySummary memory = incoming_source.memory_summary();
+                const auto pages_for               = [](std::uint32_t frontier) {
+                    return frontier == 0
+                                             ? 0U
+                                             : 1U + (frontier - 1U) /
+                                          static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+                };
+                incoming_host_kv_bytes =
+                    static_cast<std::size_t>(pages_for(incoming_frontier)) *
+                        memory.host_main_kv_page_bytes +
+                    static_cast<std::size_t>(pages_for(incoming_frontier - 1U)) *
+                        memory.host_backend_kv_page_bytes;
+                catalog.enqueue(std::move(snapshot));
+                catalog.drain();
+            }
+            ninfer::EngineOptions constrained = shared_snapshot_engine_options(artifact);
+            constrained.context_cache.max_shared_prefixes       = 2;
+            constrained.context_cache.device_state_slots        = 4;
+            constrained.context_cache.host_state_slots          = 1;
+            constrained.context_cache.host_kv_capacity_bytes    = incoming_host_kv_bytes;
+            constrained.context_cache.max_private_continuations = 1;
+            ninfer::Engine engine(std::move(constrained));
+            ninfer::PromptInput victim_prompt = shared_snapshot_prompt();
+            const ninfer::GenerationResult victim =
+                engine.generate(engine.prepare(victim_prompt), fixed_output(3));
+            catalog.schedule_exports(engine);
+            catalog.drain();
+            const ninfer::RuntimeStats baseline = engine.runtime_stats();
+            if (victim.generated_token_ids.size() != 3 || incoming_frontier >= durable_frontier ||
+                incoming_host_kv_bytes >= durable_host_kv_bytes ||
+                baseline.host_state_occupied_slots != 0 || baseline.host_kv_occupied_bytes != 0 ||
+                baseline.device_state_occupied_slots == 0 ||
+                catalog.stats().writes_completed != 2) {
+                std::cerr << "Device-only replacement rollback fixture did not persist its victim: "
+                          << "state=" << baseline.device_state_occupied_slots << '/'
+                          << baseline.host_state_occupied_slots
+                          << " host_kv=" << baseline.host_kv_occupied_bytes
+                          << " writes=" << catalog.stats().writes_completed << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.context_cache_owners == baseline.context_cache_owners &&
+                       observed.device_state_occupied_slots ==
+                           baseline.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == baseline.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           baseline.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           baseline.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == baseline.host_kv_occupied_bytes;
+            };
+            ninfer::serve::DurableSharedPrefixRestore rejected;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                ninfer::PreparedPrompt prepared = engine.prepare(incoming_prompt);
+                rejected                        = catalog.restore_matching(
+                    engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+            }
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-adoption-failure" ||
+                !engine.healthy() || !same_topology(engine.runtime_stats()) ||
+                std::any_of(rejected.lifecycle.begin(), rejected.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            })) {
+                std::cerr << "Device-only constrained replacement did not roll back exactly: "
+                          << rejected.fallback_reason << '\n';
+                return 1;
+            }
+            auto [restored_slot, restored_snapshot] = Access::export_first_durable(engine);
+            (void)restored_slot;
+            restored_snapshot.await_transfer(restored_snapshot.bytes);
+            const bool exact_rollback = restored_snapshot.content_digest == durable_digest &&
+                                        restored_snapshot.tokens == durable_frontier &&
+                                        restored_snapshot.bytes == bytes;
+            restored_snapshot.release_storage();
+            if (!exact_rollback) {
+                std::cerr << "Device-only replacement rollback lost its exact victim image\n";
                 return 1;
             }
         }
@@ -4698,6 +4823,40 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                            observed.context_cache_owners == full.context_cache_owners;
                 };
                 if (host_state_slots == 1) {
+                    inject_load_registration_failure.store(true, std::memory_order_release);
+                    bool registration_failed = false;
+                    try {
+                        ninfer::PreparedPrompt registration_prompt =
+                            engine.prepare(shared_snapshot_prompt());
+                        (void)catalog.restore_matching(
+                            engine, registration_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(3));
+                    } catch (const std::runtime_error&) { registration_failed = true; }
+                    inject_load_registration_failure.store(false, std::memory_order_release);
+                    if (!registration_failed || !same_resident_topology(engine.runtime_stats())) {
+                        std::cerr << "load-registration failure leaked replacement reservation\n";
+                        return false;
+                    }
+
+                    inject_load_enqueue_failure.store(true, std::memory_order_release);
+                    bool enqueue_failed = false;
+                    try {
+                        ninfer::PreparedPrompt enqueue_prompt =
+                            engine.prepare(shared_snapshot_prompt());
+                        (void)catalog.restore_matching(
+                            engine, enqueue_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(3));
+                    } catch (const std::runtime_error&) { enqueue_failed = true; }
+                    inject_load_enqueue_failure.store(false, std::memory_order_release);
+                    if (!enqueue_failed || !same_resident_topology(engine.runtime_stats())) {
+                        std::cerr << "load-enqueue failure leaked replacement reservation\n";
+                        return false;
+                    }
+
                     inject_payload_read_failure.store(true, std::memory_order_release);
                     ninfer::PreparedPrompt read_failed_prompt =
                         engine.prepare(shared_snapshot_prompt());

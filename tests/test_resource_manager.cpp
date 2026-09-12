@@ -22,6 +22,11 @@ namespace {
 
 using ninfer::PrefixReusePath;
 using ninfer::RuntimeStats;
+using ninfer::CheckpointLifecycleFact;
+using ninfer::CheckpointLifecycleOperation;
+using ninfer::CheckpointLifecycleScope;
+using ninfer::CheckpointLifecycleStatus;
+using ninfer::CheckpointLifecycleTier;
 using ninfer::ContextCacheMetricIdentity;
 using ninfer::ContextCacheMetricPin;
 using ninfer::ContextCacheMetricPlacement;
@@ -489,6 +494,7 @@ struct FakeSharedPrefixPublication {
     FakeSharedPrefixSummary summary;
     std::optional<FakeContinuationSummary> reclaimed_private_summary;
     std::optional<FakeSharedPrefixSummary> reclaimed_shared_summary;
+    std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
 };
 
 struct FakeSharedPrefixPersistenceMetadata {
@@ -1125,7 +1131,8 @@ public:
                     replacement != nullptr || host_reclamation
                         ? UniquePhysicalReclamation{.host_state_slots = 1,
                                                     .host_kv_bytes = durable_host_reclamation_bytes}
-                        : UniquePhysicalReclamation{}};
+                        : UniquePhysicalReclamation{},
+                .physical_plan = std::make_shared<const std::uint32_t>(frontier)};
     }
 
     void execute_scheduled_decode(std::span<const FakeSequenceHandle> members) {
@@ -1292,18 +1299,51 @@ public:
                         FakeSharedPrefixHandle* replacement, CancellationFlagView cancellation = {},
                         const std::function<void()>& commit_checkpoint = {}, std::string_view = {},
                         const FakeContinuationHandle* host_private = nullptr,
-                        const FakeSharedPrefixHandle* host_shared  = nullptr) {
+                        const FakeSharedPrefixHandle* host_shared  = nullptr,
+                        const FakeSharedPrefixPersistenceMetadata* = nullptr,
+                        std::shared_ptr<const void> physical_plan  = {}) {
+        if ((replacement != nullptr || host_private != nullptr || host_shared != nullptr) &&
+            !physical_plan) {
+            throw std::logic_error("durable physical plan was not carried to adoption");
+        }
         if (cancellation.requested()) { return adopt_shared_prefix(imported); }
         if (commit_checkpoint) { commit_checkpoint(); }
         if (replacement != nullptr) { released_shared_prefixes.push_back(replacement->id); }
         auto publication = adopt_shared_prefix(imported);
         if (host_private != nullptr) {
-            publication.reclaimed_private_summary = FakeContinuationSummary{
+            FakeContinuationSummary reclaimed{
                 .endpoint = endpoint(host_private->content_key, finish_frontier)};
+            if (finish_with_rewrite) {
+                reclaimed.rewrite =
+                    rewrite_checkpoint(host_private->content_key, finish_frontier - 1U);
+            }
+            publication.reclaimed_private_summary = std::move(reclaimed);
+            publication.reclaimed_checkpoints.push_back(CheckpointLifecycleFact{
+                .frontier         = finish_frontier,
+                .scope            = CheckpointLifecycleScope::Private,
+                .operation        = CheckpointLifecycleOperation::Evicted,
+                .source_tier      = CheckpointLifecycleTier::Host,
+                .destination_tier = CheckpointLifecycleTier::Device,
+                .status           = CheckpointLifecycleStatus::Committed,
+                .state_images =
+                    durable_import_pressure_dimension == DurableImportFeasibility::HostStateCapacity
+                        ? 1U
+                        : 0U,
+                .main_kv_pages =
+                    durable_import_pressure_dimension == DurableImportFeasibility::HostKvCapacity
+                        ? 1U
+                        : 0U});
         }
         if (host_shared != nullptr) {
             publication.reclaimed_shared_summary = FakeSharedPrefixSummary{
                 .checkpoint = shared_checkpoint(host_shared->content_key, finish_frontier)};
+            publication.reclaimed_checkpoints.push_back(
+                CheckpointLifecycleFact{.frontier         = finish_frontier,
+                                        .scope            = CheckpointLifecycleScope::Shared,
+                                        .operation        = CheckpointLifecycleOperation::Evicted,
+                                        .source_tier      = CheckpointLifecycleTier::Host,
+                                        .destination_tier = CheckpointLifecycleTier::Device,
+                                        .status           = CheckpointLifecycleStatus::Committed});
         }
         return publication;
     }
@@ -2649,7 +2689,8 @@ void test_durable_recovery_reclaims_private_host_duplicate_with_vacant_shared_ce
 
     FakeManager manager = make_manager(1, 2, 1);
     FakeProgram program;
-    const ActiveRequest seed = start_active(manager, program, 720, make_base(720), 1);
+    program.finish_with_rewrite = true;
+    const ActiveRequest seed    = start_active(manager, program, 720, make_base(720), 1);
     (void)finish_active(manager, program, seed);
     program.durable_import_requires_host_reclamation = true;
     program.durable_import_pressure_dimension        = DurableImportFeasibility::HostStateCapacity;
@@ -2697,6 +2738,8 @@ void test_durable_recovery_reclaims_private_host_duplicate_with_vacant_shared_ce
                     ninfer::CheckpointLifecycleTier::Host &&
                 adopted.reclaimed_checkpoints.front().destination_tier ==
                     ninfer::CheckpointLifecycleTier::Device &&
+                adopted.reclaimed_checkpoints.front().state_images == 1 &&
+                adopted.reclaimed_checkpoints.front().main_kv_pages == 0 &&
                 stats.reclaimed_host_state_slots_total == 1 &&
                 stats.reclaimed_host_kv_bytes_total == 4096,
             "independent private Host reclamation lost its summary, lifecycle, or reservation");
@@ -2735,6 +2778,8 @@ void test_durable_recovery_reclaims_private_host_kv_duplicate() {
     manager.populate_runtime_stats(program, stats);
     require(adopted.disposition == FakeManager::SharedImportDisposition::Published &&
                 adopted.reclaimed_checkpoints.size() == 1 &&
+                adopted.reclaimed_checkpoints.front().state_images == 0 &&
+                adopted.reclaimed_checkpoints.front().main_kv_pages == 1 &&
                 stats.reclaimed_host_kv_bytes_total == 8192,
             "independent Host KV reclamation was not committed with authoritative lifecycle");
 }

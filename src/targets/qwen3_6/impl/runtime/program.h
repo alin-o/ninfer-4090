@@ -761,8 +761,10 @@ public:
         const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
         SharedPrefixHandle* replacement, runtime::CancellationFlagView cancellation = {},
         const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
-        const ContinuationHandle* host_private = nullptr,
-        const SharedPrefixHandle* host_shared  = nullptr);
+        const ContinuationHandle* host_private                               = nullptr,
+        const SharedPrefixHandle* host_shared                                = nullptr,
+        const qwen3_6::SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
+        std::shared_ptr<const void> physical_plan                            = {});
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;

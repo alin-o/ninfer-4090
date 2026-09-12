@@ -714,12 +714,15 @@ SharedPrefixPublication<Variant> Program<Variant>::adopt_shared_prefix(
     const ValidatedSharedPrefixImport<Variant>& imported, SharedPrefixHandle<Variant>* replacement,
     runtime::CancellationFlagView cancellation, const std::function<void()>& commit_checkpoint,
     std::string_view model_binding, const ContinuationHandle<Variant>* host_private,
-    const SharedPrefixHandle<Variant>* host_shared) {
+    const SharedPrefixHandle<Variant>* host_shared,
+    const SharedPrefixPersistenceMetadata* replacement_metadata,
+    std::shared_ptr<const void> physical_plan) {
     if (imported.validating_program_ != shared_import_identity_) {
         throw std::invalid_argument("validated shared import belongs to a different Program");
     }
     return impl_->adopt_shared_prefix(imported, replacement, cancellation, commit_checkpoint,
-                                      model_binding, host_private, host_shared);
+                                      model_binding, host_private, host_shared,
+                                      replacement_metadata, std::move(physical_plan));
 }
 
 template <>

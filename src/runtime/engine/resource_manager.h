@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -567,6 +568,7 @@ public:
                 .publication_slot = publication_slot,
                 .program_revision = selected->assessment.resource_revision,
                 .reclamation      = selected->assessment.reclamation,
+                .physical_plan    = selected->assessment.physical_plan,
             };
             if (record.id == 0) { record.id = next_durable_recovery_id_++; }
             if (selected->slot != kInvalidCatalogSlot) {
@@ -1758,6 +1760,7 @@ public:
         }
 
         std::optional<SharedPrefixSummary> displaced_summary;
+        std::optional<SharedPrefixPersistenceMetadata> displaced_metadata;
         std::optional<ContinuationSummary> reclaimed_private_before;
         std::optional<SharedPrefixSummary> reclaimed_shared_before;
         SharedPrefixHandle* replacement  = nullptr;
@@ -1766,7 +1769,14 @@ public:
         if (recovery && recovery->replacement) {
             SharedCatalogEntry& victim = shared_catalog_[recovery->replacement->slot];
             displaced_summary          = victim.summary;
-            replacement                = &*victim.handle;
+            displaced_metadata         = SharedPrefixPersistenceMetadata{
+                        .evidence             = victim.evidence,
+                        .structural_origins   = victim.structural_origins,
+                        .structural_role      = victim.structural_role,
+                        .ssd_eligible         = victim.ssd_eligible,
+                        .first_volatile_token = victim.first_volatile_token,
+            };
+            replacement = &*victim.handle;
         }
         if (recovery && recovery->host_private) {
             CatalogEntry& victim     = catalog_[recovery->host_private->slot];
@@ -1780,14 +1790,18 @@ public:
         }
         auto publication = [&] {
             if constexpr (requires {
-                              program.adopt_shared_prefix(imported, replacement, cancellation,
-                                                          before_publication, model_binding,
-                                                          host_private, host_shared);
+                              program.adopt_shared_prefix(
+                                  imported, replacement, cancellation, before_publication,
+                                  model_binding, host_private, host_shared,
+                                  displaced_metadata ? &*displaced_metadata : nullptr,
+                                  recovery ? recovery->physical_plan : nullptr);
                           }) {
                 try {
-                    return program.adopt_shared_prefix(imported, replacement, cancellation,
-                                                       before_publication, model_binding,
-                                                       host_private, host_shared);
+                    return program.adopt_shared_prefix(
+                        imported, replacement, cancellation, before_publication, model_binding,
+                        host_private, host_shared,
+                        displaced_metadata ? &*displaced_metadata : nullptr,
+                        recovery ? recovery->physical_plan : nullptr);
                 } catch (...) {
                     cancel_durable_recovery(reservation_id);
                     throw;
@@ -1922,6 +1936,7 @@ public:
             .slot                           = slot,
             .capacity_reclamation_committed = reclaimed_capacity,
         };
+        result.reclaimed_checkpoints = std::move(publication.reclaimed_checkpoints);
         if (displaced_summary) {
             result.displaced_checkpoint = lifecycle_fact(
                 displaced_summary->checkpoint, CheckpointLifecycleOperation::Evicted,
@@ -1929,25 +1944,6 @@ public:
                     ? CheckpointLifecycleTier::Host
                     : CheckpointLifecycleTier::Device,
                 CheckpointLifecycleTier::Ssd, CheckpointLifecycleStatus::Committed);
-        }
-        const auto append_host_reclamation = [&](const auto& checkpoint) {
-            result.reclaimed_checkpoints.push_back(lifecycle_fact(
-                checkpoint, CheckpointLifecycleOperation::Evicted, CheckpointLifecycleTier::Host,
-                CheckpointLifecycleTier::Device, CheckpointLifecycleStatus::Committed));
-        };
-        if (reclaimed_private_before) {
-            if (reclaimed_private_before->endpoint) {
-                append_host_reclamation(*reclaimed_private_before->endpoint);
-            }
-            if (reclaimed_private_before->rewrite) {
-                append_host_reclamation(*reclaimed_private_before->rewrite);
-            }
-            for (const auto& anchor : reclaimed_private_before->long_anchors) {
-                append_host_reclamation(anchor);
-            }
-        }
-        if (reclaimed_shared_before) {
-            append_host_reclamation(reclaimed_shared_before->checkpoint);
         }
         return result;
     }
@@ -2130,6 +2126,7 @@ private:
         std::optional<CatalogCapability> host_shared;
         ProgramResourceRevision program_revision;
         UniquePhysicalReclamation reclamation;
+        std::shared_ptr<const void> physical_plan;
     };
 
     [[nodiscard]] bool

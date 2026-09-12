@@ -212,8 +212,8 @@ public:
     [[nodiscard]] bool can_pin_snapshot_source(StateImageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Object& object = objects_[handle.index_];
-        return object.role == StateImageRole::CheckpointImmutable && object.device_slot.has_value() &&
-               !object.destination_pinned &&
+        return object.role == StateImageRole::CheckpointImmutable &&
+               object.device_slot.has_value() && !object.destination_pinned &&
                object.source_pins != std::numeric_limits<std::uint32_t>::max();
     }
 
@@ -295,6 +295,30 @@ public:
         object.host_slot     = *slot;
         object.content_epoch = next_epoch();
         return handle;
+    }
+
+    // Failure-only durable-import rollback path. Restore a Device-only immutable image directly
+    // from the sealed Host bytes, without transiently consuming a Host State slot that the
+    // displaced checkpoint never owned.
+    [[nodiscard]] std::optional<StateImageHandle>
+    adopt_device_image(const qwen3_6::HostStateImageConstView& source,
+                       cudaStream_t stream = nullptr) {
+        if (source.data == nullptr || source.layout == nullptr ||
+            source.layout->image_bytes != device_->host_layout().image_bytes) {
+            return std::nullopt;
+        }
+        std::optional<StateImageHandle> handle =
+            allocate(StateImageRole::CheckpointImmutable, true);
+        if (!handle) { return std::nullopt; }
+        try {
+            Object& object = require(*handle);
+            device_->copy_from_host(source, *object.device_slot, stream);
+            object.content_epoch = next_epoch();
+            return handle;
+        } catch (...) {
+            (void)release(*handle);
+            throw;
+        }
     }
 
     void move_checkpoint_to_active(StateImageHandle handle) {

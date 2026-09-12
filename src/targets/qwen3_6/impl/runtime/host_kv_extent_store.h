@@ -105,9 +105,10 @@ public:
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
         if (extent.state != ExtentState::Free) { std::terminate(); }
-        extent.state      = ExtentState::Reserved;
-        extent.page_store = &pages;
-        extent.allocation = std::move(allocation);
+        extent.state          = ExtentState::Reserved;
+        extent.page_store     = &pages;
+        extent.allocation     = std::move(allocation);
+        extent.sources_pinned = true;
         for (const LogicalKVPageHandle page : membership) {
             const std::uint32_t node = take_membership();
             if (node == kInvalidIndex) { std::terminate(); }
@@ -127,6 +128,60 @@ public:
             ++extent.page_count;
         }
         for (const LogicalKVPageHandle page : membership) { pages.pin_source(page); }
+
+        HostKVExtentReservation reservation;
+        reservation.owner_      = this;
+        reservation.descriptor_ = descriptor;
+        reservation.generation_ = extent.generation;
+        reservation.page_store_ = &pages;
+        return reservation;
+    }
+
+    // Failure-only durable-import rollback path. The caller supplies immutable bytes directly,
+    // so pages need not own Device replicas merely to establish a Host extent.
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_unpinned(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+        if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            return std::nullopt;
+        }
+        for (const LogicalKVPageHandle page : membership) {
+            if (!pages.valid(page) || pages.host_resident(page) || pages.source_pins(page) != 0 ||
+                !pages.can_attach_host_replica(page, pages.content_epoch(page),
+                                               pages.committed_columns(page))) {
+                return std::nullopt;
+            }
+        }
+
+        const HostKVPageLayout& layout = page_layout(pages);
+        std::optional<HostKVAllocation> allocation =
+            arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        if (!allocation) { return std::nullopt; }
+
+        const std::uint32_t descriptor = free_[--free_count_];
+        Extent& extent                 = extents_[descriptor];
+        if (extent.state != ExtentState::Free) { std::terminate(); }
+        extent.state          = ExtentState::Reserved;
+        extent.page_store     = &pages;
+        extent.allocation     = std::move(allocation);
+        extent.sources_pinned = false;
+        for (const LogicalKVPageHandle page : membership) {
+            const std::uint32_t node = take_membership();
+            if (node == kInvalidIndex) { std::terminate(); }
+            Membership& entry = memberships_[node];
+            entry.page        = page;
+            entry.epoch       = pages.content_epoch(page);
+            entry.coverage    = pages.committed_columns(page);
+            entry.extent      = descriptor;
+            entry.offset      = extent.page_count;
+            entry.next        = kInvalidIndex;
+            if (extent.tail == kInvalidIndex) {
+                extent.head = node;
+            } else {
+                memberships_[extent.tail].next = node;
+            }
+            extent.tail = node;
+            ++extent.page_count;
+        }
 
         HostKVExtentReservation reservation;
         reservation.owner_      = this;
@@ -198,9 +253,10 @@ public:
                                                   .content_epoch     = entry.epoch,
                                                   .committed_columns = entry.coverage});
             } catch (...) { std::terminate(); }
-            extent.page_store->unpin_source(entry.page);
+            if (extent.sources_pinned) { extent.page_store->unpin_source(entry.page); }
             node = entry.next;
         }
+        extent.sources_pinned = false;
         consume(reservation);
         return capability;
     }
@@ -215,12 +271,15 @@ public:
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
             if (node == kInvalidIndex) { std::terminate(); }
             const LogicalKVPageHandle page = memberships_[node].page;
-            if (!extent.page_store->valid(page) || extent.page_store->source_pins(page) == 0) {
+            if (!extent.page_store->valid(page) ||
+                (extent.sources_pinned && extent.page_store->source_pins(page) == 0)) {
                 std::terminate();
             }
-            try {
-                extent.page_store->unpin_source(page);
-            } catch (...) { std::terminate(); }
+            if (extent.sources_pinned) {
+                try {
+                    extent.page_store->unpin_source(page);
+                } catch (...) { std::terminate(); }
+            }
             node = memberships_[node].next;
         }
         release_descriptor(reservation.descriptor_, extent);
@@ -475,6 +534,7 @@ private:
         std::uint32_t head       = kInvalidIndex;
         std::uint32_t tail       = kInvalidIndex;
         std::uint32_t page_count = 0;
+        bool sources_pinned      = false;
     };
 
     struct Membership {
@@ -739,9 +799,10 @@ private:
         extent.state      = ExtentState::Free;
         extent.page_store = nullptr;
         extent.allocation.reset();
-        extent.head       = kInvalidIndex;
-        extent.tail       = kInvalidIndex;
-        extent.page_count = 0;
+        extent.head           = kInvalidIndex;
+        extent.tail           = kInvalidIndex;
+        extent.page_count     = 0;
+        extent.sources_pinned = false;
         increment_generation(extent.generation);
         free_[free_count_++] = index;
     }

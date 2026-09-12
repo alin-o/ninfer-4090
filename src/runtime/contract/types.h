@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -602,6 +603,9 @@ struct DurableImportAssessment {
     DurableImportFeasibility feasibility = DurableImportFeasibility::Unsupported;
     ProgramResourceRevision resource_revision;
     UniquePhysicalReclamation reclamation;
+    // Target-private, immutable physical release plan. ResourceManager carries the exact plan
+    // selected during inspection back to the same Program at commit; Gateway never interprets it.
+    std::shared_ptr<const void> physical_plan;
 };
 
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only

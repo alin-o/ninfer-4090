@@ -836,6 +836,9 @@ struct SharedPrefixPublication {
     SharedPrefixSummary summary;
     std::optional<ContinuationSummary> reclaimed_private_summary;
     std::optional<SharedPrefixSummary> reclaimed_shared_summary;
+    // Exact committed Host replica changes produced by the sealed physical plan. Quantities are
+    // deltas, not the checkpoint's full theoretical requirement.
+    std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
 };
 
 // A checksum-verified, compatibility-checked shared snapshot held entirely in immutable Host
@@ -1161,8 +1164,10 @@ public:
         const ValidatedSharedPrefixImport<Variant>& imported,
         SharedPrefixHandle<Variant>* replacement, runtime::CancellationFlagView cancellation = {},
         const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
-        const ContinuationHandle<Variant>* host_private = nullptr,
-        const SharedPrefixHandle<Variant>* host_shared  = nullptr);
+        const ContinuationHandle<Variant>* host_private             = nullptr,
+        const SharedPrefixHandle<Variant>* host_shared              = nullptr,
+        const SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
+        std::shared_ptr<const void> physical_plan                   = {});
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

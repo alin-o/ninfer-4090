@@ -3265,14 +3265,19 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
                                             before_pressure.pressure_private_owners_degraded;
     const std::uint64_t pressure_evicted = after_pressure.pressure_private_owners_evicted -
                                            before_pressure.pressure_private_owners_evicted;
-    const std::uint64_t expected_spill_pages = groupwise_backing ? 6 : 4;
-    if (short_b.generated_token_ids.size() != 1 || pressure_main_pages != 4 ||
+    // Device State class order is stronger than transfer cost.  The short owner's non-head turn
+    // closure must be reclaimed before the older long owner's conversation head, even though
+    // dropping that head would reduce the remaining KV deficit by one page.  The long owner is
+    // therefore offloaded by the full five-page main deficit (plus three MTP pages), while the
+    // short owner loses only its intermediate checkpoint and retains its conversation head.
+    const std::uint64_t expected_spill_pages = groupwise_backing ? 8 : 5;
+    if (short_b.generated_token_ids.size() != 1 || pressure_main_pages != 5 ||
         pressure_spill_pages != expected_spill_pages || pressure_drops != 1 ||
-        pressure_degraded != 1 || pressure_evicted != 0 ||
+        pressure_degraded != 2 || pressure_evicted != 0 ||
         after_pressure.state_d2h_count != before_pressure.state_d2h_count ||
         short_b.materialization.selected_maximal_fallback) {
-        std::cerr << "pressure-resume did not select endpoint-drop plus "
-                  << (groupwise_backing ? "bounded MTP spill" : "four-page spill")
+        std::cerr << "pressure-resume did not select intermediate-first reclamation plus "
+                  << (groupwise_backing ? "bounded MTP spill" : "five-page spill")
                   << ": main=" << pressure_main_pages << " spill=" << pressure_spill_pages
                   << " drops=" << pressure_drops << " degraded=" << pressure_degraded
                   << " evicted=" << pressure_evicted
@@ -3289,6 +3294,7 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
                          return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded &&
                                 fact.source_tier == ninfer::CheckpointLifecycleTier::Device &&
                                 fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                                fact.role == ninfer::CheckpointLifecycleRole::TurnClosure &&
                                 fact.status == ninfer::CheckpointLifecycleStatus::Committed;
                      });
     const ninfer::RequestCheckpointSummary pressure_summary =
@@ -3300,6 +3306,26 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
         kv_offloaded->scope != ninfer::CheckpointLifecycleScope::Private ||
         !kv_offloaded->kv_snapshot || !pressure_summary.offload_committed) {
         std::cerr << "KV-only pressure lost its attributable offload lifecycle or summary\n";
+        return 1;
+    }
+    const auto non_head_evicted =
+        std::find_if(short_b.checkpoint_lifecycle.begin(), short_b.checkpoint_lifecycle.end(),
+                     [](const auto& fact) {
+                         return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                                fact.role == ninfer::CheckpointLifecycleRole::TurnClosure &&
+                                fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                     });
+    const bool conversation_head_evicted =
+        std::any_of(short_b.checkpoint_lifecycle.begin(), short_b.checkpoint_lifecycle.end(),
+                    [](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                               fact.role == ninfer::CheckpointLifecycleRole::SessionEndpoint &&
+                               fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                    });
+    if (non_head_evicted == short_b.checkpoint_lifecycle.end() || non_head_evicted->frontier == 0 ||
+        conversation_head_evicted) {
+        std::cerr << "Device State pressure did not preserve every conversation head while an "
+                     "eligible turn closure existed\n";
         return 1;
     }
     const ninfer::RuntimeStats before_resume = engine.runtime_stats();
@@ -3545,6 +3571,17 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         return 1;
     }
 
+    const ninfer::GenerationResult replay = engine.generate(
+        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        fixed_output(2));
+    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
+        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        std::cerr << "late older finish displaced the newer session binding: path="
+                  << static_cast<int>(replay.prefix_reuse_path)
+                  << " reused=" << replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
     for (std::uint32_t index = 0; index < 6; ++index) {
         const std::string suffix              = std::to_string(index);
         const ninfer::GenerationResult filler = engine.generate(
@@ -3566,17 +3603,6 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         after_pressure.pressure_private_owners_evicted <=
             before_pressure.pressure_private_owners_evicted) {
         std::cerr << "full session catalog did not execute its canonical eviction\n";
-        return 1;
-    }
-
-    const ninfer::GenerationResult replay = engine.generate(
-        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
-        fixed_output(2));
-    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
-        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
-        std::cerr << "late older finish exposed the newer session binding to pressure: path="
-                  << static_cast<int>(replay.prefix_reuse_path)
-                  << " reused=" << replay.reused_prompt_tokens << '\n';
         return 1;
     }
 

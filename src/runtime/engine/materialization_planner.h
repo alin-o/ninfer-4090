@@ -309,10 +309,8 @@ public:
                 return;
             }
             if (victim_class ==
-                    static_cast<std::uint8_t>(DeviceStateVictimClass::ConversationHead) &&
-                (oldest_head_epoch == 0 ||
-                 (floor.oldest_head_epoch != 0 && floor.oldest_head_epoch < oldest_head_epoch))) {
-                oldest_head_epoch = floor.oldest_head_epoch;
+                static_cast<std::uint8_t>(DeviceStateVictimClass::ConversationHead)) {
+                oldest_head_epoch = std::min(oldest_head_epoch, floor.oldest_head_epoch);
             }
         };
 
@@ -997,9 +995,9 @@ private:
                     throw std::logic_error(
                         "pressure guidance classified a non-head owner as a conversation head");
                 }
-                cost.victim_class = 1;
-                if (cost.oldest_head_epoch == 0 ||
-                    policy->authoritative_epoch < cost.oldest_head_epoch) {
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
                     cost.oldest_head_epoch = policy->authoritative_epoch;
                 }
             }
@@ -1048,9 +1046,9 @@ private:
                     throw std::logic_error(
                         "pressure target classified a non-head owner as a conversation head");
                 }
-                cost.victim_class = 1;
-                if (cost.oldest_head_epoch == 0 ||
-                    policy->authoritative_epoch < cost.oldest_head_epoch) {
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
                     cost.oldest_head_epoch = policy->authoritative_epoch;
                 }
             }

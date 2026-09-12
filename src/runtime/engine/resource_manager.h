@@ -1261,7 +1261,10 @@ public:
         publication.session   = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
-        publication.authoritative_epoch = ++retention_epoch_;
+        // Completion order is not publication order: a longer, older request may settle after a
+        // newer request.  Device-State head pressure must compare the authoritative request/use
+        // order so a late finish cannot masquerade as the newer conversation.
+        publication.authoritative_epoch = active.publication_order;
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
@@ -1802,7 +1805,9 @@ public:
         entry.retention = RetentionClass::RecentPrivate;
         assign_continuation_summary(entry.summary, summary);
         migrate_observations(entry, summary, entry.retention);
-        entry.authoritative_epoch = ++retention_epoch_;
+        // A restored anonymous continuation has no request publication epoch until it is selected.
+        // Treat it as older than request-published heads in the interim.
+        entry.authoritative_epoch = 0;
         advance_revision(entry.revision);
         entry.handle.emplace(std::move(handle));
     }
@@ -3196,8 +3201,9 @@ private:
                 saturating_increment(selected->selected_hit_count);
                 selected->last_hit_epoch = ++retention_epoch_;
                 if (!record.selected_observation->shared) {
-                    catalog_[record.selected_observation->slot].authoritative_epoch =
-                        selected->last_hit_epoch;
+                    CatalogEntry& entry = catalog_[record.selected_observation->slot];
+                    entry.authoritative_epoch =
+                        std::max(entry.authoritative_epoch, record.publication_order);
                 }
             }
         }

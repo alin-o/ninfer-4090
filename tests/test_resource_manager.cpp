@@ -2875,7 +2875,7 @@ void test_device_state_pressure_uses_hard_victim_classes() {
         ninfer::runtime::MaterializationOwnerPolicy{
             .owner = ordered_ids[0], .conversation_head = true, .authoritative_epoch = 20},
         ninfer::runtime::MaterializationOwnerPolicy{
-            .owner = ordered_ids[1], .conversation_head = true, .authoritative_epoch = 10},
+            .owner = ordered_ids[1], .conversation_head = true, .authoritative_epoch = 0},
     };
     const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 2> ordered_checkpoints{
         ninfer::runtime::MaterializationCheckpointPolicy{
@@ -3494,6 +3494,18 @@ void test_session_publication_order_controls_tied_source() {
                     ContextCacheMetricRole::ConversationHead, ContextCacheMetricPlacement::Device,
                     ContextCacheMetricPin::Unpinned, ContextCacheMetricIdentity::Explicit)] == 1,
             "session publication/supersession or current-head gauges are inconsistent");
+
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto pressure = manager.inspect(program, FakePreparedPrompt{100}, make_base(100), 50);
+    require(pressure.choice.has_value(),
+            "out-of-order publication test could not plan full-catalog pressure");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*pressure.choice),
+                                          FakePreparedPrompt{100}, {});
+    require(!program.started_action_ids.empty() &&
+                program.started_action_ids.back() == 2000U + older.sequence.id,
+            "completion order made the older conversation head appear newer to pressure");
 }
 
 void test_cancelled_replacement_preserves_successful_head_until_atomic_publish() {

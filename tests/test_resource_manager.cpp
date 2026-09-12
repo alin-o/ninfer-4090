@@ -487,6 +487,8 @@ struct FakeMaterializationResult {
 struct FakeSharedPrefixPublication {
     FakeSharedPrefixHandle handle;
     FakeSharedPrefixSummary summary;
+    std::optional<FakeContinuationSummary> reclaimed_private_summary;
+    std::optional<FakeSharedPrefixSummary> reclaimed_shared_summary;
 };
 
 struct FakeSharedPrefixPersistenceMetadata {
@@ -1108,15 +1110,21 @@ public:
 
     [[nodiscard]] DurableImportAssessment
     inspect_durable_shared_prefix_import(std::uint32_t frontier,
-                                         const FakeSharedPrefixHandle* replacement) {
+                                         const FakeSharedPrefixHandle* replacement,
+                                         const FakeContinuationHandle* host_private = nullptr,
+                                         const FakeSharedPrefixHandle* host_shared  = nullptr) {
         inspected_durable_frontiers.push_back(frontier);
-        return {.feasibility       = frontier <= max_durable_import_frontier
-                                         ? DurableImportFeasibility::Feasible
-                                         : DurableImportFeasibility::HostKvCapacity,
+        const bool host_reclamation = host_private != nullptr || host_shared != nullptr;
+        return {.feasibility       = frontier > max_durable_import_frontier
+                                         ? DurableImportFeasibility::HostKvCapacity
+                                     : durable_import_requires_host_reclamation && !host_reclamation
+                                         ? durable_import_pressure_dimension
+                                         : DurableImportFeasibility::Feasible,
                 .resource_revision = revision_,
                 .reclamation =
-                    replacement != nullptr
-                        ? UniquePhysicalReclamation{.host_state_slots = 1, .host_kv_bytes = 1}
+                    replacement != nullptr || host_reclamation
+                        ? UniquePhysicalReclamation{.host_state_slots = 1,
+                                                    .host_kv_bytes = durable_host_reclamation_bytes}
                         : UniquePhysicalReclamation{}};
     }
 
@@ -1281,11 +1289,23 @@ public:
 
     [[nodiscard]] FakeSharedPrefixPublication
     adopt_shared_prefix(const FakeValidatedSharedPrefixImport& imported,
-                        FakeSharedPrefixHandle* replacement,
-                        CancellationFlagView cancellation = {}) {
+                        FakeSharedPrefixHandle* replacement, CancellationFlagView cancellation = {},
+                        const std::function<void()>& commit_checkpoint = {}, std::string_view = {},
+                        const FakeContinuationHandle* host_private = nullptr,
+                        const FakeSharedPrefixHandle* host_shared  = nullptr) {
         if (cancellation.requested()) { return adopt_shared_prefix(imported); }
+        if (commit_checkpoint) { commit_checkpoint(); }
         if (replacement != nullptr) { released_shared_prefixes.push_back(replacement->id); }
-        return adopt_shared_prefix(imported);
+        auto publication = adopt_shared_prefix(imported);
+        if (host_private != nullptr) {
+            publication.reclaimed_private_summary = FakeContinuationSummary{
+                .endpoint = endpoint(host_private->content_key, finish_frontier)};
+        }
+        if (host_shared != nullptr) {
+            publication.reclaimed_shared_summary = FakeSharedPrefixSummary{
+                .checkpoint = shared_checkpoint(host_shared->content_key, finish_frontier)};
+        }
+        return publication;
     }
 
     [[nodiscard]] FakeReleaseResult
@@ -1362,8 +1382,12 @@ public:
     std::vector<std::uint32_t> inspected_durable_frontiers;
     std::vector<std::uint32_t> released_continuations;
     std::vector<std::uint32_t> released_shared_prefixes;
-    std::uint64_t shared_import_adoptions     = 0;
-    std::uint32_t max_durable_import_frontier = UINT32_MAX;
+    std::uint64_t shared_import_adoptions         = 0;
+    std::uint32_t max_durable_import_frontier     = UINT32_MAX;
+    bool durable_import_requires_host_reclamation = false;
+    DurableImportFeasibility durable_import_pressure_dimension =
+        DurableImportFeasibility::HostStateCapacity;
+    std::size_t durable_host_reclamation_bytes = 1;
     std::vector<std::string_view> timeline;
 
 private:
@@ -2616,6 +2640,103 @@ void test_durable_recovery_never_replaces_active_capture_owner() {
     require(!inspection.ssd_candidate_index && manager.shared_catalog_slot(0).id == slot.id,
             "active capture owner was selected for durable replacement");
     (void)finish_active(manager, program, active);
+}
+
+void test_durable_recovery_reclaims_private_host_duplicate_with_vacant_shared_cell() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 720, make_base(720), 1);
+    (void)finish_active(manager, program, seed);
+    program.durable_import_requires_host_reclamation = true;
+    program.durable_import_pressure_dimension        = DurableImportFeasibility::HostStateCapacity;
+    program.durable_host_reclamation_bytes           = 4096;
+
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{721}, make_base(721),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.ssd_candidate_index == 0 && inspection.reservation_id != 0 &&
+                !inspection.replacement_slot,
+            "vacant shared publication did not plan independent private Host reclamation");
+
+    program.invalidate_resources();
+
+    FakeValidatedSharedPrefixImport imported{
+        .imported_summary = FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(721, 96)},
+        .imported_metadata =
+            FakeSharedPrefixPersistenceMetadata{
+                .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                .ssd_eligible = true,
+            },
+        .content_key = 721,
+    };
+    const auto stale =
+        manager.adopt_imported_shared(program, imported, {}, {}, true, inspection.reservation_id);
+    require(stale.disposition == FakeManager::SharedImportDisposition::Stale &&
+                manager.catalog_slot(0).state == FakeManager::CatalogState::Catalogued,
+            "stale Host reclamation retained a private claim or mutated its owner");
+    const auto replanned =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{721}, make_base(721),
+                                         std::span<const DurableCandidate>(candidates));
+    require(replanned.reservation_id != 0,
+            "stale Host reclamation did not release its physical/logical reservation");
+    const auto adopted =
+        manager.adopt_imported_shared(program, imported, {}, {}, true, replanned.reservation_id);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(adopted.disposition == FakeManager::SharedImportDisposition::Published &&
+                manager.catalog_slot(0).state == FakeManager::CatalogState::Catalogued &&
+                adopted.reclaimed_checkpoints.size() == 1 &&
+                adopted.reclaimed_checkpoints.front().scope ==
+                    ninfer::CheckpointLifecycleScope::Private &&
+                adopted.reclaimed_checkpoints.front().source_tier ==
+                    ninfer::CheckpointLifecycleTier::Host &&
+                adopted.reclaimed_checkpoints.front().destination_tier ==
+                    ninfer::CheckpointLifecycleTier::Device &&
+                stats.reclaimed_host_state_slots_total == 1 &&
+                stats.reclaimed_host_kv_bytes_total == 4096,
+            "independent private Host reclamation lost its summary, lifecycle, or reservation");
+}
+
+void test_durable_recovery_reclaims_private_host_kv_duplicate() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 2, 1);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 730, make_base(730), 1);
+    (void)finish_active(manager, program, seed);
+    program.durable_import_requires_host_reclamation = true;
+    program.durable_import_pressure_dimension        = DurableImportFeasibility::HostKvCapacity;
+    program.durable_host_reclamation_bytes           = 8192;
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{731}, make_base(731),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.reservation_id != 0 && !inspection.replacement_slot,
+            "Host KV pressure did not plan independent private duplicate reclamation");
+    FakeValidatedSharedPrefixImport imported{
+        .imported_summary = FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(731, 96)},
+        .imported_metadata =
+            FakeSharedPrefixPersistenceMetadata{
+                .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                .ssd_eligible = true,
+            },
+        .content_key = 731,
+    };
+    const auto adopted =
+        manager.adopt_imported_shared(program, imported, {}, {}, true, inspection.reservation_id);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(adopted.disposition == FakeManager::SharedImportDisposition::Published &&
+                adopted.reclaimed_checkpoints.size() == 1 &&
+                stats.reclaimed_host_kv_bytes_total == 8192,
+            "independent Host KV reclamation was not committed with authoritative lifecycle");
 }
 
 void test_guided_pressure_prefers_complete_durable_recovery() {
@@ -4745,6 +4866,10 @@ int main() {
              test_durable_recovery_replaces_full_catalog_transactionally);
     run_test("active capture durable replacement protection",
              test_durable_recovery_never_replaces_active_capture_owner);
+    run_test("independent private Host duplicate durable recovery",
+             test_durable_recovery_reclaims_private_host_duplicate_with_vacant_shared_cell);
+    run_test("independent private Host KV durable recovery",
+             test_durable_recovery_reclaims_private_host_kv_duplicate);
     run_test("durable recovery pressure preference",
              test_guided_pressure_prefers_complete_durable_recovery);
     run_test("Device State hard victim classes",

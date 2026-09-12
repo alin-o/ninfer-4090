@@ -518,7 +518,8 @@ public:
         bool ssd_backed                                                   = false,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
             std::nullopt,
-        bool* validation_completed = nullptr, std::uint64_t reservation_id = 0) {
+        bool* validation_completed = nullptr, std::uint64_t reservation_id = 0,
+        Clock::time_point deadline = Clock::time_point::max()) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
@@ -534,9 +535,14 @@ public:
                 throw RequestError(RequestErrorKind::Cancelled,
                                    "shared snapshot import was cancelled");
             }
+            if (Clock::now() >= deadline) {
+                throw RequestError(RequestErrorKind::QueueTimeout,
+                                   "shared snapshot import exceeded its deadline");
+            }
         };
         return run_shared_snapshot_operation(
             [&] {
+                checkpoint();
                 const Clock::time_point validation_started = Clock::now();
                 auto imported                              = instance_.program->parse_shared_prefix(
                     snapshot, model_binding, checkpoint, std::move(retained_storage));
@@ -550,14 +556,16 @@ public:
                 if (validation_nanoseconds != nullptr) {
                     *validation_nanoseconds = elapsed_ns(validation_started, Clock::now());
                 }
+                checkpoint();
                 const Clock::time_point adoption_started = Clock::now();
                 auto result                              = resources_.adopt_imported_shared(
                     *instance_.program, imported, cancellation,
-                    [] {
+                    [&] {
                         testing::shared_snapshot_import_checkpoint(
                             testing::SharedSnapshotImportStage::BeforeCatalogPublication);
+                        checkpoint();
                     },
-                    ssd_backed, reservation_id);
+                    ssd_backed, reservation_id, model_binding);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
                 }

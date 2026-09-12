@@ -359,16 +359,38 @@ public:
     [[nodiscard]] bool can_prepare_after_last_reference_releases(
         std::span<const HostKVPageReplicaRelease> releases,
         std::span<const HostKVAllocationRequest> allocations) const {
-        if (!can_allocate_after_page_releases({}, releases, allocations)) { return false; }
+        return can_prepare_after_page_releases({}, releases, allocations);
+    }
+
+    [[nodiscard]] bool can_prepare_after_page_releases(
+        std::span<const HostKVPageReplicaRelease> duplicate_releases,
+        std::span<const HostKVPageReplicaRelease> last_reference_releases,
+        std::span<const HostKVAllocationRequest> allocations) const {
+        if (!can_allocate_after_page_releases(duplicate_releases, last_reference_releases,
+                                              allocations)) {
+            return false;
+        }
         std::uint64_t membership_need = 0;
         for (const HostKVAllocationRequest& allocation : allocations) {
             membership_need += allocation.pages;
         }
         if (membership_need > static_cast<std::uint64_t>(free_membership_count_) +
-                                  static_cast<std::uint64_t>(releases.size())) {
+                                  static_cast<std::uint64_t>(duplicate_releases.size()) +
+                                  static_cast<std::uint64_t>(last_reference_releases.size())) {
             return false;
         }
 
+        begin_release_marks();
+        for (const HostKVPageReplicaRelease& release : duplicate_releases) {
+            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false)) {
+                return false;
+            }
+        }
+        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
+            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true)) {
+                return false;
+            }
+        }
         std::int64_t projected_free = free_count_;
         for (const std::uint32_t index : affected_extents_) {
             const Extent& extent        = extents_[index];

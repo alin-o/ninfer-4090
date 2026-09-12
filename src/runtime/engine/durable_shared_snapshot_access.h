@@ -7,6 +7,7 @@
 #include "ninfer/engine.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -35,6 +36,8 @@ struct DurableSharedSnapshotAccess {
         std::uint64_t adoption_nanoseconds   = 0;
         CheckpointLifecycleFact checkpoint;
         std::optional<CheckpointLifecycleFact> displaced_checkpoint;
+        std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
+        bool capacity_reclamation_committed = false;
     };
 
     enum class RecoverySource : std::uint8_t {
@@ -67,7 +70,9 @@ struct DurableSharedSnapshotAccess {
     [[nodiscard]] static ImportResult import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
                                              const CancellationView& cancellation = {},
-                                             std::uint64_t reservation_id         = 0);
+                                             std::uint64_t reservation_id         = 0,
+                                             std::chrono::steady_clock::time_point deadline =
+                                                 std::chrono::steady_clock::time_point::max());
     static void cancel_recovery(Engine& engine, std::uint64_t reservation_id) noexcept;
     [[nodiscard]] static bool resident(Engine& engine, const Candidate& candidate);
     [[nodiscard]] static bool settle_export(Engine& engine, std::uint32_t slot, std::uint64_t owner,

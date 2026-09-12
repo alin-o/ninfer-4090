@@ -739,7 +739,9 @@ public:
     [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] runtime::DurableImportAssessment
     inspect_durable_shared_prefix_import(std::uint32_t frontier,
-                                         const SharedPrefixHandle* replacement) const;
+                                         const SharedPrefixHandle* replacement,
+                                         const ContinuationHandle* host_private = nullptr,
+                                         const SharedPrefixHandle* host_shared  = nullptr) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
                          const qwen3_6::SharedPrefixPersistenceMetadata& metadata);
@@ -755,10 +757,12 @@ public:
                           const SharedPrefixHandle& resident) const;
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported);
-    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
-    adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-                        SharedPrefixHandle* replacement,
-                        runtime::CancellationFlagView cancellation = {});
+    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant> adopt_shared_prefix(
+        const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+        SharedPrefixHandle* replacement, runtime::CancellationFlagView cancellation = {},
+        const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
+        const ContinuationHandle* host_private = nullptr,
+        const SharedPrefixHandle* host_shared  = nullptr);
 
     [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
         return snapshot_traffic_;
@@ -769,7 +773,8 @@ public:
 private:
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix_impl(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-                             bool enable_failure_checkpoints);
+                             bool enable_failure_checkpoints,
+                             const std::function<void()>& commit_checkpoint = {});
 
     void advance_resource_revision() noexcept {
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }

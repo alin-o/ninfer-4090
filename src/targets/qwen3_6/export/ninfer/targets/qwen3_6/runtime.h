@@ -834,6 +834,8 @@ template <class Variant>
 struct SharedPrefixPublication {
     SharedPrefixHandle<Variant> handle;
     SharedPrefixSummary summary;
+    std::optional<ContinuationSummary> reclaimed_private_summary;
+    std::optional<SharedPrefixSummary> reclaimed_shared_summary;
 };
 
 // A checksum-verified, compatibility-checked shared snapshot held entirely in immutable Host
@@ -1137,9 +1139,10 @@ public:
     durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
-    [[nodiscard]] runtime::DurableImportAssessment
-    inspect_durable_shared_prefix_import(std::uint32_t frontier,
-                                         const SharedPrefixHandle<Variant>* replacement) const;
+    [[nodiscard]] runtime::DurableImportAssessment inspect_durable_shared_prefix_import(
+        std::uint32_t frontier, const SharedPrefixHandle<Variant>* replacement,
+        const ContinuationHandle<Variant>* host_private = nullptr,
+        const SharedPrefixHandle<Variant>* host_shared  = nullptr) const;
     [[nodiscard]] RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
                          const SharedPrefixPersistenceMetadata& metadata);
@@ -1154,10 +1157,12 @@ public:
                                              const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] SharedPrefixPublication<Variant>
     adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported);
-    [[nodiscard]] SharedPrefixPublication<Variant>
-    adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported,
-                        SharedPrefixHandle<Variant>* replacement,
-                        runtime::CancellationFlagView cancellation = {});
+    [[nodiscard]] SharedPrefixPublication<Variant> adopt_shared_prefix(
+        const ValidatedSharedPrefixImport<Variant>& imported,
+        SharedPrefixHandle<Variant>* replacement, runtime::CancellationFlagView cancellation = {},
+        const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
+        const ContinuationHandle<Variant>* host_private = nullptr,
+        const SharedPrefixHandle<Variant>* host_shared  = nullptr);
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

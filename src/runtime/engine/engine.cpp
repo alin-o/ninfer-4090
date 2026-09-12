@@ -856,16 +856,20 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
         engine.impl_->core);
 }
 
-runtime::DurableSharedSnapshotAccess::ImportResult
-runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& candidate,
-                                             std::shared_ptr<const std::vector<std::uint8_t>> bytes,
-                                             const CancellationView& cancellation,
-                                             std::uint64_t reservation_id) {
+runtime::DurableSharedSnapshotAccess::ImportResult runtime::DurableSharedSnapshotAccess::import(
+    Engine& engine, const Candidate& candidate,
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes, const CancellationView& cancellation,
+    std::uint64_t reservation_id, std::chrono::steady_clock::time_point deadline) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
     if (!bytes) { throw std::invalid_argument("durable shared snapshot payload is empty"); }
     if (cancellation.requested()) {
         cancel_recovery(engine, reservation_id);
         throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        cancel_recovery(engine, reservation_id);
+        throw RequestError(RequestErrorKind::QueueTimeout,
+                           "shared snapshot import exceeded its deadline");
     }
     const std::string binding = slot_model_binding(engine.impl_->load);
     ImportResult imported     = std::visit(
@@ -890,8 +894,12 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                                 throw RequestError(RequestErrorKind::Cancelled,
                                                        "shared snapshot import was cancelled");
                             }
+                            if (std::chrono::steady_clock::now() >= deadline) {
+                                throw RequestError(RequestErrorKind::QueueTimeout,
+                                                       "shared snapshot import exceeded its deadline");
+                            }
                         },
-                        bytes, true, candidate, &validation_completed, reservation_id);
+                        bytes, true, candidate, &validation_completed, reservation_id, deadline);
                     if (!result.summary || !result.checkpoint) {
                         throw std::logic_error(
                             "durable shared import has no locked publication identity");
@@ -904,6 +912,8 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                             .adoption_nanoseconds   = adoption_nanoseconds,
                             .checkpoint             = std::move(*result.checkpoint),
                             .displaced_checkpoint   = std::move(result.displaced_checkpoint),
+                            .reclaimed_checkpoints  = std::move(result.reclaimed_checkpoints),
+                            .capacity_reclamation_committed = result.capacity_reclamation_committed,
                     };
                 } catch (const RequestError&) {
                     throw;

@@ -1505,9 +1505,9 @@ bool ProgramImplCore::durable_shared_prefix_import_feasible(std::uint32_t fronti
     } catch (...) { return false; }
 }
 
-runtime::DurableImportAssessment
-ProgramImplCore::inspect_durable_shared_prefix_import(std::uint32_t frontier,
-                                                      const SharedPrefixHandle* replacement) const {
+runtime::DurableImportAssessment ProgramImplCore::inspect_durable_shared_prefix_import(
+    std::uint32_t frontier, const SharedPrefixHandle* replacement,
+    const ContinuationHandle* host_private, const SharedPrefixHandle* host_shared) const {
     runtime::DurableImportAssessment out{.resource_revision = resource_revision_};
     if (frontier == 0 || frontier > capacity || speculative_backend == SpeculativeBackend::DFlash ||
         !state_store || !text_kv_addresses || !text_kv_pages) {
@@ -1523,6 +1523,13 @@ ProgramImplCore::inspect_durable_shared_prefix_import(std::uint32_t frontier,
         return out;
     }
     if (pending_transaction_ || has_context_transaction()) {
+        out.feasibility = runtime::DurableImportFeasibility::TransactionConflict;
+        return out;
+    }
+    if ((host_private != nullptr && host_shared != nullptr) ||
+        (host_private != nullptr && !valid_continuation(*host_private)) ||
+        (host_shared != nullptr && !valid_shared_prefix(*host_shared)) ||
+        (replacement != nullptr && host_shared == replacement)) {
         out.feasibility = runtime::DurableImportFeasibility::TransactionConflict;
         return out;
     }
@@ -1554,9 +1561,63 @@ ProgramImplCore::inspect_durable_shared_prefix_import(std::uint32_t frontier,
         return out;
     }
 
+    std::vector<StateImageHandle> duplicate_host_states;
+    std::vector<HostKVPageReplicaRelease> duplicate_host_releases;
+    const auto append_state = [&](StateImageHandle state) {
+        if (victim != nullptr && state == victim->state) { return; }
+        if (std::find(duplicate_host_states.begin(), duplicate_host_states.end(), state) !=
+            duplicate_host_states.end()) {
+            return;
+        }
+        if (state_store->residency(state) == StateReplicaResidency::Both &&
+            state_store->source_pins(state) == 0) {
+            duplicate_host_states.push_back(state);
+        }
+    };
+    const auto append_host_pages = [&](const SequenceKVBundle& kv) {
+        const auto append = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                KVAddressSpaceHandle address) {
+            for (std::uint32_t index = 0; index < addresses.mapped_pages(address); ++index) {
+                const LogicalKVPageHandle page = addresses.logical_page(address, index);
+                const bool duplicate = pages.device_resident(page) && pages.host_resident(page) &&
+                                       pages.source_pins(page) == 0 &&
+                                       host_kv_extents->can_release_page_replica(pages, page);
+                const bool already =
+                    std::any_of(duplicate_host_releases.begin(), duplicate_host_releases.end(),
+                                [&](const HostKVPageReplicaRelease& item) {
+                                    return item.pages == &pages && item.page == page;
+                                });
+                if (duplicate && !already) {
+                    duplicate_host_releases.push_back({.pages = &pages, .page = page});
+                }
+            }
+        };
+        append(*text_kv_addresses, *text_kv_pages, kv.text);
+        if (kv.backend) { append(*backend_kv_addresses, *backend_kv_pages, *kv.backend); }
+    };
+    if (host_private != nullptr) {
+        const SequenceState& sequence = continuation_states[ContractAccess::index(*host_private)];
+        if (sequence.endpoint_valid) { append_state(sequence.state.read); }
+        if (sequence.rewrite_state) { append_state(*sequence.rewrite_state); }
+        for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+            append_state(anchor.state);
+        }
+        if (sequence.kv) { append_host_pages(*sequence.kv); }
+    } else if (host_shared != nullptr) {
+        const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(*host_shared)];
+        if (shared.active_references != 0 || !shared.kv) {
+            out.feasibility = runtime::DurableImportFeasibility::TransactionConflict;
+            return out;
+        }
+        append_state(shared.state);
+        append_host_pages(*shared.kv);
+    }
+    out.reclamation.host_state_slots += static_cast<std::uint32_t>(duplicate_host_states.size());
+
     const std::uint32_t victim_state_descriptors =
         victim != nullptr && state_store->checkpoint_references(victim->state) == 1 ? 1U : 0U;
     if (state_store->occupied() - victim_state_descriptors >= state_store->capacity() ||
+        out.reclamation.host_state_slots > host_state_images->occupied() ||
         host_state_images->occupied() - out.reclamation.host_state_slots >=
             host_state_images->capacity()) {
         out.feasibility = runtime::DurableImportFeasibility::HostStateCapacity;
@@ -1582,6 +1643,23 @@ ProgramImplCore::inspect_durable_shared_prefix_import(std::uint32_t frontier,
         if (victim->kv->backend) {
             collect(*backend_kv_addresses, *backend_kv_pages, *victim->kv->backend);
         }
+    }
+    std::erase_if(duplicate_host_releases, [&](const HostKVPageReplicaRelease& duplicate) {
+        return std::any_of(host_releases.begin(), host_releases.end(),
+                           [&](const HostKVPageReplicaRelease& released) {
+                               return duplicate.pages == released.pages &&
+                                      duplicate.page == released.page;
+                           });
+    });
+    for (const HostKVPageReplicaRelease& release : duplicate_host_releases) {
+        const std::size_t stride = release.pages == text_kv_pages.get()
+                                       ? text_host_kv_page_stride
+                                       : backend_host_kv_page_stride;
+        if (stride > std::numeric_limits<std::size_t>::max() - out.reclamation.host_kv_bytes) {
+            out.feasibility = runtime::DurableImportFeasibility::HostKvCapacity;
+            return out;
+        }
+        out.reclamation.host_kv_bytes += stride;
     }
 
     const auto address_fits = [&](const KVAddressSpaceStore& addresses,
@@ -1630,8 +1708,8 @@ ProgramImplCore::inspect_durable_shared_prefix_import(std::uint32_t frontier,
         allocations[allocation_count++] = {.layout = &*backend_layout, .pages = backend_pages};
     }
     try {
-        if (!host_kv_extents->can_prepare_after_last_reference_releases(
-                host_releases,
+        if (!host_kv_extents->can_prepare_after_page_releases(
+                duplicate_host_releases, host_releases,
                 std::span<const HostKVAllocationRequest>(allocations.data(), allocation_count))) {
             out.feasibility = runtime::DurableImportFeasibility::HostKvCapacity;
             return out;
@@ -2239,36 +2317,267 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     return adopt_shared_prefix_impl(imported, true);
 }
 
-qwen3_6::SharedPrefixPublication<Variant>
-ProgramImplCore::adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-                                     SharedPrefixHandle* replacement,
-                                     runtime::CancellationFlagView cancellation) {
-    if (replacement == nullptr) { return adopt_shared_prefix_impl(imported, true); }
+qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
+    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported, SharedPrefixHandle* replacement,
+    runtime::CancellationFlagView cancellation, const std::function<void()>& commit_checkpoint,
+    std::string_view model_binding, const ContinuationHandle* host_private,
+    const SharedPrefixHandle* host_shared) {
+    if (replacement == nullptr && host_private == nullptr && host_shared == nullptr) {
+        return adopt_shared_prefix_impl(imported, true, commit_checkpoint);
+    }
     const runtime::DurableImportAssessment assessment = inspect_durable_shared_prefix_import(
-        imported.summary().checkpoint.ref.frontier, replacement);
+        imported.summary().checkpoint.ref.frontier, replacement, host_private, host_shared);
     if (assessment.feasibility != runtime::DurableImportFeasibility::Feasible) {
         throw std::invalid_argument("durable shared import replacement is no longer feasible");
     }
-    // Failure/cancellation seams run before the irreversible boundary. Once the exact projection
-    // has been revalidated, the victim teardown and imported publication are one Engine-locked
-    // Program commit and contain no externally injected failure point.
-    runtime::testing::shared_snapshot_import_checkpoint(
-        runtime::testing::SharedSnapshotImportStage::StateAllocated);
-    runtime::testing::shared_snapshot_import_checkpoint(
-        runtime::testing::SharedSnapshotImportStage::MainKvAllocated);
+
+    std::vector<StateImageHandle> duplicate_host_states;
+    std::vector<LogicalKVPageHandle> text_host_pages;
+    std::vector<LogicalKVPageHandle> backend_host_pages;
+    const SharedPrefixState* replacement_state =
+        replacement == nullptr ? nullptr
+                               : &shared_prefix_states[ContractAccess::index(*replacement)];
+    const auto append_state = [&](StateImageHandle state) {
+        if (replacement_state != nullptr && state == replacement_state->state) { return; }
+        if (state_store->residency(state) == StateReplicaResidency::Both &&
+            std::find(duplicate_host_states.begin(), duplicate_host_states.end(), state) ==
+                duplicate_host_states.end()) {
+            duplicate_host_states.push_back(state);
+        }
+    };
+    const auto append_pages = [&](const SequenceKVBundle& kv) {
+        const auto append = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                KVAddressSpaceHandle address,
+                                std::vector<LogicalKVPageHandle>& output) {
+            for (std::uint32_t index = 0; index < addresses.mapped_pages(address); ++index) {
+                const LogicalKVPageHandle page  = addresses.logical_page(address, index);
+                const auto replacement_contains = [&] {
+                    if (replacement_state == nullptr || !replacement_state->kv) { return false; }
+                    const std::optional<KVAddressSpaceHandle> victim_address =
+                        &pages == text_kv_pages.get()
+                            ? std::optional<KVAddressSpaceHandle>(replacement_state->kv->text)
+                            : replacement_state->kv->backend;
+                    if (!victim_address) { return false; }
+                    for (std::uint32_t victim_page = 0;
+                         victim_page < addresses.mapped_pages(*victim_address); ++victim_page) {
+                        if (addresses.logical_page(*victim_address, victim_page) == page) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                if (pages.device_resident(page) && pages.host_resident(page) &&
+                    !replacement_contains &&
+                    std::find(output.begin(), output.end(), page) == output.end()) {
+                    output.push_back(page);
+                }
+            }
+        };
+        append(*text_kv_addresses, *text_kv_pages, kv.text, text_host_pages);
+        if (kv.backend) {
+            append(*backend_kv_addresses, *backend_kv_pages, *kv.backend, backend_host_pages);
+        }
+    };
+    if (host_private != nullptr) {
+        const SequenceState& sequence = continuation_states[ContractAccess::index(*host_private)];
+        if (sequence.endpoint_valid) { append_state(sequence.state.read); }
+        if (sequence.rewrite_state) { append_state(*sequence.rewrite_state); }
+        for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+            append_state(anchor.state);
+        }
+        if (sequence.kv) { append_pages(*sequence.kv); }
+    } else if (host_shared != nullptr) {
+        const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(*host_shared)];
+        append_state(shared.state);
+        append_pages(*shared.kv);
+    }
+    const auto release_host_duplicates = [&] {
+        for (const StateImageHandle state : duplicate_host_states) {
+            if (!state_store->drop_host_replica(state)) { std::terminate(); }
+        }
+        if (!text_host_pages.empty() &&
+            !host_kv_extents->release_page_replicas(*text_kv_pages, text_host_pages)) {
+            std::terminate();
+        }
+        if (!backend_host_pages.empty() &&
+            !host_kv_extents->release_page_replicas(*backend_kv_pages, backend_host_pages)) {
+            std::terminate();
+        }
+    };
+    std::vector<StateImageTransfer> rollback_state_transfers;
+    rollback_state_transfers.reserve(duplicate_host_states.size());
+    std::vector<DeviceKVPageHandle> rollback_text_sources(text_host_pages.size());
+    std::vector<DeviceKVPageHandle> rollback_backend_sources(backend_host_pages.size());
+    const auto restore_host_duplicates = [&] {
+        for (const StateImageHandle state : duplicate_host_states) {
+            std::optional<StateImageTransfer> transfer =
+                state_store->begin_device_to_host(state, device.transfer_stream);
+            if (!transfer) { std::terminate(); }
+            rollback_state_transfers.push_back(std::move(*transfer));
+        }
+        std::optional<HostKVExtentReservation> text;
+        std::optional<HostKVExtentReservation> backend;
+        if (!text_host_pages.empty()) {
+            auto reserved = host_kv_extents->prepare(*text_kv_pages, text_host_pages);
+            if (!reserved) { std::terminate(); }
+            text.emplace(std::move(*reserved));
+            host_kv_extents->device_sources(*text, rollback_text_sources);
+            text_kv_pages->physical_pool().copy_to_host(rollback_text_sources,
+                                                        host_kv_extents->writable_view(*text),
+                                                        device.transfer_stream);
+        }
+        if (!backend_host_pages.empty()) {
+            auto reserved = host_kv_extents->prepare(*backend_kv_pages, backend_host_pages);
+            if (!reserved) { std::terminate(); }
+            backend.emplace(std::move(*reserved));
+            host_kv_extents->device_sources(*backend, rollback_backend_sources);
+            backend_kv_pages->physical_pool().copy_to_host(rollback_backend_sources,
+                                                           host_kv_extents->writable_view(*backend),
+                                                           device.transfer_stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        for (StateImageTransfer& transfer : rollback_state_transfers) {
+            state_store->publish_transfer(std::move(transfer), true);
+        }
+        if (text) { (void)host_kv_extents->publish(std::move(*text)); }
+        if (backend) { (void)host_kv_extents->publish(std::move(*backend)); }
+    };
     if (cancellation.requested()) {
         throw RequestError(RequestErrorKind::Cancelled,
                            "shared snapshot replacement was cancelled before commit");
     }
-    const std::uint32_t victim_index = ContractAccess::index(*replacement);
-    (void)release_shared_prefix_state_strict(victim_index, SharedPrefixSlotRole::Catalogued);
-    ContractAccess::consume(*replacement);
-    return adopt_shared_prefix_impl(imported, false);
+    if (commit_checkpoint) { commit_checkpoint(); }
+
+    // Seal an exact in-memory rollback image while every victim replica and source pin is still
+    // intact. The imported allocation/copy path remains genuinely fallible after teardown; any
+    // exception reconstructs the victim and rewrites the caller-owned capability before it can
+    // escape to ResourceManager. This is deliberately not an evict-first failure seam.
+    if (replacement != nullptr && model_binding.empty()) {
+        throw std::invalid_argument("durable replacement requires its model binding");
+    }
+    std::optional<qwen3_6::ValidatedSharedPrefixImport<Variant>> rollback_import;
+    StateReplicaResidency rollback_state_residency = StateReplicaResidency::None;
+    std::vector<std::pair<bool, bool>> rollback_text_residency;
+    std::vector<std::pair<bool, bool>> rollback_backend_residency;
+    if (replacement != nullptr) {
+        const SharedPrefixState& original =
+            shared_prefix_states[ContractAccess::index(*replacement)];
+        rollback_state_residency     = state_store->residency(original.state);
+        const auto capture_residency = [&](const KVAddressSpaceStore& addresses,
+                                           const LogicalKVPageStore& pages,
+                                           KVAddressSpaceHandle address,
+                                           std::vector<std::pair<bool, bool>>& output) {
+            output.reserve(addresses.mapped_pages(address));
+            for (std::uint32_t page = 0; page < addresses.mapped_pages(address); ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                output.emplace_back(pages.device_resident(logical), pages.host_resident(logical));
+            }
+        };
+        capture_residency(*text_kv_addresses, *text_kv_pages, original.kv->text,
+                          rollback_text_residency);
+        if (original.kv->backend) {
+            capture_residency(*backend_kv_addresses, *backend_kv_pages, *original.kv->backend,
+                              rollback_backend_residency);
+        }
+        qwen3_6::RetainedSessionSnapshot rollback_snapshot =
+            export_shared_prefix(*replacement, model_binding, imported.metadata());
+        auto rollback_bytes =
+            std::make_shared<const std::vector<std::uint8_t>>(std::move(rollback_snapshot.bytes));
+        rollback_import.emplace(
+            parse_shared_prefix(*rollback_bytes, model_binding, {}, rollback_bytes));
+    }
+    std::vector<LogicalKVPageHandle> rollback_text_host_drops;
+    std::vector<LogicalKVPageHandle> rollback_backend_host_drops;
+    rollback_text_host_drops.reserve(rollback_text_residency.size());
+    rollback_backend_host_drops.reserve(rollback_backend_residency.size());
+
+    if (cancellation.requested()) {
+        throw RequestError(RequestErrorKind::Cancelled,
+                           "shared snapshot replacement was cancelled before commit");
+    }
+    if (commit_checkpoint) { commit_checkpoint(); }
+    release_host_duplicates();
+    if (replacement != nullptr) {
+        const std::uint32_t victim_index = ContractAccess::index(*replacement);
+        (void)release_shared_prefix_state_strict(victim_index, SharedPrefixSlotRole::Catalogued);
+        ContractAccess::consume(*replacement);
+    }
+    try {
+        auto publication = adopt_shared_prefix_impl(imported, true, commit_checkpoint);
+        if (host_private != nullptr) {
+            publication.reclaimed_private_summary = continuation_summary(*host_private);
+        }
+        if (host_shared != nullptr) {
+            publication.reclaimed_shared_summary =
+                shared_prefix_summary(shared_prefix_states[ContractAccess::index(*host_shared)]);
+        }
+        return publication;
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        try {
+            if (rollback_import) {
+                auto restored = adopt_shared_prefix_impl(*rollback_import, false);
+                SharedPrefixState& restored_state =
+                    shared_prefix_states[ContractAccess::index(restored.handle)];
+                if (rollback_state_residency == StateReplicaResidency::DeviceOnly ||
+                    rollback_state_residency == StateReplicaResidency::Both) {
+                    auto transfer = state_store->begin_host_to_device(restored_state.state,
+                                                                      device.transfer_stream);
+                    if (!transfer) { std::terminate(); }
+                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                    state_store->publish_transfer(std::move(*transfer),
+                                                  rollback_state_residency ==
+                                                      StateReplicaResidency::Both);
+                }
+                const auto restore_kv_residency =
+                    [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                        KVAddressSpaceHandle address,
+                        const std::vector<std::pair<bool, bool>>& residency,
+                        std::vector<LogicalKVPageHandle>& host_drops) {
+                        if (addresses.mapped_pages(address) != residency.size()) {
+                            std::terminate();
+                        }
+                        for (std::uint32_t page = 0; page < residency.size(); ++page) {
+                            const LogicalKVPageHandle logical =
+                                addresses.logical_page(address, page);
+                            const auto [had_device, had_host] = residency[page];
+                            if (!had_device && had_host) {
+                                if (!pages.drop_device_replica(logical)) { std::terminate(); }
+                            } else if (had_device && !had_host) {
+                                host_drops.push_back(logical);
+                            } else if (!had_device || !had_host) {
+                                std::terminate();
+                            }
+                        }
+                        if (!host_drops.empty() &&
+                            !host_kv_extents->release_page_replicas(pages, host_drops)) {
+                            std::terminate();
+                        }
+                    };
+                restore_kv_residency(*text_kv_addresses, *text_kv_pages, restored_state.kv->text,
+                                     rollback_text_residency, rollback_text_host_drops);
+                if (!rollback_backend_residency.empty()) {
+                    restore_kv_residency(*backend_kv_addresses, *backend_kv_pages,
+                                         *restored_state.kv->backend, rollback_backend_residency,
+                                         rollback_backend_host_drops);
+                }
+                std::destroy_at(replacement);
+                std::construct_at(replacement, std::move(restored.handle));
+            }
+            restore_host_duplicates();
+        } catch (...) {
+            // The exact victim just released these resources and imported cleanup returned every
+            // partial allocation. Failure to restore that sealed image is an internal invariant
+            // breach, not a recoverable admission rejection.
+            std::terminate();
+        }
+        std::rethrow_exception(failure);
+    }
 }
 
 qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix_impl(
-    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-    bool enable_failure_checkpoints) {
+    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported, bool enable_failure_checkpoints,
+    const std::function<void()>& commit_checkpoint) {
     if (!imported) { throw std::invalid_argument("shared import plan is empty"); }
     if (pending_transaction_ || has_context_transaction()) {
         throw std::logic_error("cannot adopt a shared prefix during a resource transaction");
@@ -2403,6 +2712,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix_i
         if (summary != imported.summary()) {
             throw std::logic_error("shared snapshot summary changed during sealed adoption");
         }
+        if (commit_checkpoint) { commit_checkpoint(); }
         shared_prefix_slots[*shared_index].role = SharedPrefixSlotRole::Catalogued;
         state.reset();
         text_address.reset();

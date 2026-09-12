@@ -1672,7 +1672,7 @@ private:
 
 class SharedSnapshotImportGate {
 public:
-    enum class Action : std::uint8_t { Reject, Fail, Cancel };
+    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay };
 
     SharedSnapshotImportGate(ninfer::runtime::testing::SharedSnapshotImportStage stage,
                              Action action, std::atomic<bool>* cancellation = nullptr)
@@ -1704,6 +1704,9 @@ private:
                 throw std::logic_error("shared import cancellation gate has no flag");
             }
             gate.cancellation_->store(true, std::memory_order_release);
+            return;
+        case Action::Delay:
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
             return;
         }
     }
@@ -4730,6 +4733,31 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                                                ninfer::CheckpointLifecycleStatus::Committed;
                                     })) {
                         std::cerr << "expired replacement mutated or committed its resident\n";
+                        return false;
+                    }
+
+                    ninfer::PreparedPrompt expires_after_load_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    ninfer::serve::DurableSharedPrefixRestore expires_after_load;
+                    {
+                        SharedSnapshotImportGate gate(
+                            ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                            SharedSnapshotImportGate::Action::Delay);
+                        expires_after_load = catalog.restore_matching(
+                            engine, expires_after_load_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::milliseconds(5),
+                            {}, fixed_output(3));
+                    }
+                    if (expires_after_load.loaded_from_ssd ||
+                        expires_after_load.fallback_reason != "ssd-deadline" ||
+                        !same_resident_topology(engine.runtime_stats()) ||
+                        std::any_of(expires_after_load.lifecycle.begin(),
+                                    expires_after_load.lifecycle.end(), [](const auto& fact) {
+                                        return fact.status ==
+                                               ninfer::CheckpointLifecycleStatus::Committed;
+                                    })) {
+                        std::cerr << "post-load deadline committed or lost replacement victim\n";
                         return false;
                     }
 

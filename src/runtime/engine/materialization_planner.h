@@ -38,6 +38,8 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    bool conversation_head                 = false;
+    std::uint64_t authoritative_epoch      = 0;
 };
 
 template <class Package>
@@ -281,12 +283,36 @@ public:
         const Clock::time_point search_started = Clock::now();
         const std::uint64_t search_budget_ns =
             std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
-        std::uint64_t maximum_step_ns          = 0;
-        std::uint32_t optional_targets         = 0;
-        std::uint32_t guided_assessments       = 0;
-        MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
-        bool budget_exhausted                  = false;
+        const std::uint64_t guided_watchdog_ns  = search_budget_ns;
+        const bool require_device_class_closure = incumbent.cost.victim_class != 0;
+        std::uint64_t maximum_step_ns           = 0;
+        std::uint32_t optional_targets          = 0;
+        std::uint32_t guided_assessments        = 0;
+        MaterializationStopReason stop_reason   = MaterializationStopReason::QueueExhausted;
+        bool budget_exhausted                   = false;
+
+        struct VictimClassFloor {
+            std::uint8_t victim_class       = 0;
+            std::uint64_t oldest_head_epoch = 0;
+            bool certified                  = false;
+        };
+
+        std::vector<VictimClassFloor> victim_class_floors(candidates.size());
+        const auto apply_victim_class_floor = [&](std::uint32_t candidate_index,
+                                                  std::uint8_t& victim_class,
+                                                  std::uint64_t& oldest_head_epoch) {
+            const VictimClassFloor& floor = victim_class_floors[candidate_index];
+            if (!floor.certified || victim_class > floor.victim_class) { return; }
+            if (victim_class < floor.victim_class) {
+                victim_class      = floor.victim_class;
+                oldest_head_epoch = floor.oldest_head_epoch;
+                return;
+            }
+            if (victim_class ==
+                static_cast<std::uint8_t>(DeviceStateVictimClass::ConversationHead)) {
+                oldest_head_epoch = std::min(oldest_head_epoch, floor.oldest_head_epoch);
+            }
+        };
 
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
@@ -318,15 +344,17 @@ public:
             });
         }
 
-        const auto make_queue_entry = [](PressureTargetHandle target, std::uint32_t candidate_index,
-                                         const PressureTargetAssessment& assessment,
-                                         const FoldedCost& cost) {
-            return QueueEntry{
+        const auto make_queue_entry = [&](PressureTargetHandle target,
+                                          std::uint32_t candidate_index,
+                                          const PressureTargetAssessment& assessment,
+                                          const FoldedCost& cost) {
+            QueueEntry entry{
                 .target                    = target,
                 .candidate_index           = candidate_index,
                 .lower_bound_ns            = cost.lower_bound_ns,
                 .affected_selected_hits    = cost.affected_selected_hits,
                 .newest_affected_hit_epoch = cost.newest_affected_hit_epoch,
+                .oldest_head_epoch         = cost.oldest_head_epoch,
                 .owner_evictions           = cost.owner_evictions,
                 .checkpoint_drops          = cost.checkpoint_drops,
                 .copy_operations           = cost.copy_operations,
@@ -337,7 +365,10 @@ public:
                 .current_session_binding   = cost.current_session_binding,
                 .candidate_ordinal         = cost.candidate_ordinal,
                 .stable_target_ordinal     = assessment.stable_target_ordinal,
+                .victim_class              = cost.victim_class,
             };
+            apply_victim_class_floor(candidate_index, entry.victim_class, entry.oldest_head_epoch);
+            return entry;
         };
 
         const auto assess_target =
@@ -395,8 +426,10 @@ public:
                 mark_target(guidance.stable_target_ordinal, kTargetDiscovered);
                 const std::uint64_t lower_bound_ns = std::max(
                     identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
-                const GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
-                                                        pressure.owner_policy, machine_cost);
+                GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
+                                                  pressure.owner_policy, machine_cost);
+                apply_victim_class_floor(candidate_index, cost.victim_class,
+                                         cost.oldest_head_epoch);
                 PendingEntry pending{
                     .target          = child,
                     .candidate_index = candidate_index,
@@ -434,6 +467,8 @@ public:
         std::sort(preferred_owners.begin(), preferred_owners.end(),
                   [](const auto* left, const auto* right) {
                       return std::tuple{
+                                 left->conversation_head ? 1U : 0U,
+                                 left->conversation_head ? left->authoritative_epoch : 0U,
                                  left->recovery_preference,
                                  left->selected_hit_count,
                                  left->explicit_shared_credit ? 1U : 0U,
@@ -441,6 +476,8 @@ public:
                                  left->last_hit_epoch,
                                  left->owner.value,
                              } < std::tuple{
+                                     right->conversation_head ? 1U : 0U,
+                                     right->conversation_head ? right->authoritative_epoch : 0U,
                                      right->recovery_preference,
                                      right->selected_hit_count,
                                      right->explicit_shared_credit ? 1U : 0U,
@@ -467,7 +504,8 @@ public:
                   });
         for (const IdentityRoot& root : closure_order) {
             if (!candidate_needs_seed(root.candidate_index) ||
-                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
+                (!require_device_class_closure &&
+                 elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) ||
                 optional_targets >= kTargetBudget) {
                 continue;
             }
@@ -480,6 +518,17 @@ public:
             if (closure_guidance.candidate != candidates[root.candidate_index].id) {
                 throw std::logic_error("guided closure changed admission candidate");
             }
+            if (closure_guidance.physical.unsatisfied_constraints != 0) {
+                throw std::logic_error("guided closure retained a physical deficit");
+            }
+            const GuidanceCost closure_cost =
+                fold_guidance(candidates[root.candidate_index], closure_guidance,
+                              pressure.owner_policy, machine_cost);
+            victim_class_floors[root.candidate_index] = VictimClassFloor{
+                .victim_class      = closure_cost.victim_class,
+                .oldest_head_epoch = closure_cost.oldest_head_epoch,
+                .certified         = true,
+            };
             if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
                 continue;
             }
@@ -494,6 +543,24 @@ public:
             maximum_step_ns =
                 std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
         }
+
+        // The guided closure certifies the best reachable Device-State victim class for its
+        // candidate. Partial KV-only nodes have not selected that eventual state victim yet, so
+        // rank them at the certified floor instead of treating None as a better feasible class.
+        for (QueueEntry& entry : queue_) {
+            apply_victim_class_floor(entry.candidate_index, entry.victim_class,
+                                     entry.oldest_head_epoch);
+        }
+        std::make_heap(queue_.begin(), queue_.end(), [](const auto& left, const auto& right) {
+            return queue_key(right) < queue_key(left);
+        });
+        for (PendingEntry& entry : pending_) {
+            apply_victim_class_floor(entry.candidate_index, entry.guidance.victim_class,
+                                     entry.guidance.oldest_head_epoch);
+        }
+        std::make_heap(pending_.begin(), pending_.end(), [](const auto& left, const auto& right) {
+            return pending_key(right) < pending_key(left);
+        });
 
         // Build one ordinary feasible seed per expandable candidate. Estimated machine cost orders
         // independent beams but never excludes a candidate or certifies an incumbent.
@@ -536,6 +603,7 @@ public:
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
         }
 
+        bool hard_class_unresolved = false;
         for (;;) {
             while (!queue_.empty() &&
                    target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
@@ -557,22 +625,40 @@ public:
                                                     ? std::numeric_limits<std::uint64_t>::max()
                                                     : pending_.front().lower_bound_ns;
             const std::uint64_t next_bound    = std::min(queue_bound, pending_bound);
-            const std::uint64_t elapsed       = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
+            const auto incumbent_class =
+                std::tuple{incumbent.cost.victim_class, incumbent.cost.oldest_head_epoch};
+            const auto queue_class =
+                queue_.empty()
+                    ? std::tuple{std::numeric_limits<std::uint8_t>::max(),
+                                 std::numeric_limits<std::uint64_t>::max()}
+                    : std::tuple{queue_.front().victim_class, queue_.front().oldest_head_epoch};
+            const auto pending_class =
+                pending_.empty() ? std::tuple{std::numeric_limits<std::uint8_t>::max(),
+                                              std::numeric_limits<std::uint64_t>::max()}
+                                 : std::tuple{pending_.front().guidance.victim_class,
+                                              pending_.front().guidance.oldest_head_epoch};
+            const auto next_class       = std::min(queue_class, pending_class);
+            const std::uint64_t elapsed = elapsed_ns(search_started, Clock::now());
+            if (elapsed >= search_budget_ns && next_class >= incumbent_class) {
                 stop_reason      = MaterializationStopReason::TimeBudget;
                 budget_exhausted = true;
                 break;
             }
             const std::uint64_t possible_improvement =
                 incumbent.cost.total_ns > next_bound ? incumbent.cost.total_ns - next_bound : 0;
-            if (possible_improvement != 0 && maximum_step_ns != 0 &&
-                maximum_step_ns >= possible_improvement) {
+            if (next_class >= incumbent_class && possible_improvement != 0 &&
+                maximum_step_ns != 0 && maximum_step_ns >= possible_improvement) {
                 stop_reason = MaterializationStopReason::ValueOfNextExpansion;
                 break;
             }
 
             const bool assess_pending =
-                !pending_.empty() && (queue_.empty() || pending_bound <= queue_bound);
+                !pending_.empty() &&
+                (queue_.empty() ||
+                 std::tuple{pending_.front().guidance.victim_class,
+                            pending_.front().guidance.oldest_head_epoch, pending_bound} <=
+                     std::tuple{queue_.front().victim_class, queue_.front().oldest_head_epoch,
+                                queue_bound});
             const Clock::time_point step_started = Clock::now();
             if (assess_pending) {
                 const PendingEntry next = pending_pop();
@@ -582,14 +668,16 @@ public:
                 }
             } else {
                 if (optional_targets >= kTargetBudget) {
-                    stop_reason      = MaterializationStopReason::TargetBudget;
-                    budget_exhausted = true;
+                    stop_reason           = MaterializationStopReason::TargetBudget;
+                    budget_exhausted      = true;
+                    hard_class_unresolved = next_class < incumbent_class;
                     break;
                 }
                 const QueueEntry parent = queue_pop();
                 if (!expand_target(parent)) {
-                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
-                    budget_exhausted = true;
+                    stop_reason           = MaterializationStopReason::ExpansionCapacity;
+                    budget_exhausted      = true;
+                    hard_class_unresolved = next_class < incumbent_class;
                     break;
                 }
             }
@@ -597,6 +685,7 @@ public:
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
+        if (hard_class_unresolved) { return std::nullopt; }
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
             const PressureTargetAssessment& assessment = assessed.assessment();
@@ -670,6 +759,7 @@ private:
         std::uint64_t lower_bound_ns            = 0;
         std::uint64_t affected_selected_hits    = 0;
         std::uint64_t newest_affected_hit_epoch = 0;
+        std::uint64_t oldest_head_epoch         = 0;
         std::uint32_t owner_evictions           = 0;
         std::uint32_t checkpoint_drops          = 0;
         std::uint32_t copy_operations           = 0;
@@ -680,9 +770,12 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t target_ordinal            = 0;
+        std::uint8_t victim_class               = 0;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
+                victim_class,
+                oldest_head_epoch,
                 total_ns,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
@@ -730,6 +823,7 @@ private:
         std::uint64_t lower_bound_ns            = 0;
         std::uint64_t affected_selected_hits    = 0;
         std::uint64_t newest_affected_hit_epoch = 0;
+        std::uint64_t oldest_head_epoch         = 0;
         std::uint32_t owner_evictions           = 0;
         std::uint32_t checkpoint_drops          = 0;
         std::uint32_t copy_operations           = 0;
@@ -740,6 +834,7 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t stable_target_ordinal     = 0;
+        std::uint8_t victim_class               = 0;
     };
 
     struct GuidanceCost {
@@ -748,6 +843,7 @@ private:
         std::uint64_t normalized_residual_q20   = 0;
         std::uint64_t affected_selected_hits    = 0;
         std::uint64_t newest_affected_hit_epoch = 0;
+        std::uint64_t oldest_head_epoch         = 0;
         std::uint64_t retention_weight          = 0;
         std::uint32_t explicit_shared_losses    = 0;
         std::uint32_t owner_evictions           = 0;
@@ -762,9 +858,12 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t stable_target_ordinal     = 0;
+        std::uint8_t victim_class               = 0;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
+                victim_class,
+                oldest_head_epoch,
                 affected_selected_hits,
                 explicit_shared_losses,
                 owner_evictions,
@@ -891,6 +990,17 @@ private:
                 throw std::logic_error("pressure guidance references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::ConversationHead) {
+                if (!policy->conversation_head) {
+                    throw std::logic_error(
+                        "pressure guidance classified a non-head owner as a conversation head");
+                }
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
+                    cost.oldest_head_epoch = policy->authoritative_epoch;
+                }
+            }
             const bool may_reduce_recovery_value =
                 outcome.disposition == VictimDisposition::Evicted ||
                 outcome.dropped_checkpoints != 0 || outcome.degradation_units != 0;
@@ -931,6 +1041,17 @@ private:
                 throw std::logic_error("pressure target references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::ConversationHead) {
+                if (!policy->conversation_head) {
+                    throw std::logic_error(
+                        "pressure target classified a non-head owner as a conversation head");
+                }
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
+                    cost.oldest_head_epoch = policy->authoritative_epoch;
+                }
+            }
         }
 
         impact_scratch_.clear();
@@ -1043,6 +1164,8 @@ private:
 
     [[nodiscard]] static auto queue_key(const QueueEntry& entry) noexcept {
         return std::tuple{
+            entry.victim_class,
+            entry.oldest_head_epoch,
             entry.lower_bound_ns,
             entry.affected_selected_hits,
             entry.newest_affected_hit_epoch,
@@ -1076,7 +1199,8 @@ private:
     }
 
     [[nodiscard]] static auto pending_key(const PendingEntry& entry) noexcept {
-        return std::tuple{entry.lower_bound_ns, entry.guidance.key()};
+        return std::tuple{entry.guidance.victim_class, entry.guidance.oldest_head_epoch,
+                          entry.lower_bound_ns, entry.guidance.key()};
     }
 
     void pending_push(PendingEntry entry) {
@@ -1097,22 +1221,38 @@ private:
 
     [[nodiscard]] static bool guidance_dominates(const GuidanceCost& left,
                                                  const GuidanceCost& right) noexcept {
-        const std::array<std::uint64_t, 13> left_dimensions{
-            left.estimated_remaining_steps, left.unsatisfied_constraints,
-            left.normalized_residual_q20,   left.affected_selected_hits,
-            left.newest_affected_hit_epoch, left.explicit_shared_losses,
-            left.retention_weight,          left.owner_evictions,
-            left.checkpoint_drops,          left.estimated_immediate_ns,
-            left.degradation_units,         left.copy_operations,
+        const std::array<std::uint64_t, 15> left_dimensions{
+            left.victim_class,
+            left.oldest_head_epoch,
+            left.estimated_remaining_steps,
+            left.unsatisfied_constraints,
+            left.normalized_residual_q20,
+            left.affected_selected_hits,
+            left.newest_affected_hit_epoch,
+            left.explicit_shared_losses,
+            left.retention_weight,
+            left.owner_evictions,
+            left.checkpoint_drops,
+            left.estimated_immediate_ns,
+            left.degradation_units,
+            left.copy_operations,
             left.transferred_bytes,
         };
-        const std::array<std::uint64_t, 13> right_dimensions{
-            right.estimated_remaining_steps, right.unsatisfied_constraints,
-            right.normalized_residual_q20,   right.affected_selected_hits,
-            right.newest_affected_hit_epoch, right.explicit_shared_losses,
-            right.retention_weight,          right.owner_evictions,
-            right.checkpoint_drops,          right.estimated_immediate_ns,
-            right.degradation_units,         right.copy_operations,
+        const std::array<std::uint64_t, 15> right_dimensions{
+            right.victim_class,
+            right.oldest_head_epoch,
+            right.estimated_remaining_steps,
+            right.unsatisfied_constraints,
+            right.normalized_residual_q20,
+            right.affected_selected_hits,
+            right.newest_affected_hit_epoch,
+            right.explicit_shared_losses,
+            right.retention_weight,
+            right.owner_evictions,
+            right.checkpoint_drops,
+            right.estimated_immediate_ns,
+            right.degradation_units,
+            right.copy_operations,
             right.transferred_bytes,
         };
         bool strict = false;
@@ -1147,8 +1287,10 @@ private:
         for (auto item = guided_.begin(); item != guided_.end(); ++item) {
             if (item->candidate_index != candidate_index) { continue; }
             if (worst == guided_.end() ||
-                std::tuple{worst->lower_bound_ns, worst->guidance.key()} <
-                    std::tuple{item->lower_bound_ns, item->guidance.key()}) {
+                std::tuple{worst->guidance.victim_class, worst->guidance.oldest_head_epoch,
+                           worst->lower_bound_ns, worst->guidance.key()} <
+                    std::tuple{item->guidance.victim_class, item->guidance.oldest_head_epoch,
+                               item->lower_bound_ns, item->guidance.key()}) {
                 worst = item;
             }
         }
@@ -1165,6 +1307,8 @@ private:
             }
             return std::tuple{
                 candidate_guided_steps_[entry.candidate_index] == 0 ? 0U : 1U,
+                entry.guidance.victim_class,
+                entry.guidance.oldest_head_epoch,
                 entry.lower_bound_ns,
                 entry.guidance.key(),
             };

@@ -33,6 +33,8 @@ struct DurableSharedPrefixCatalogOptions {
     std::function<void()> before_payload_read;
     // Deterministic first-load registration race seam. Production leaves it empty.
     std::function<void()> before_load_registration;
+    // Deterministic load-queue insertion failure seam. Production leaves it empty.
+    std::function<void()> before_load_enqueue;
     // Deterministic pre-rename and failed-cleanup seams. Production leaves them empty.
     std::function<void()> before_record_rename;
     std::function<void()> before_temporary_remove;

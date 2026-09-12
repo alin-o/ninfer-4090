@@ -417,7 +417,8 @@ public:
         }
         const auto view = resources_.shared_catalog_slot(slot);
         if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
-            view.handle == nullptr || (expected_owner && view.id != *expected_owner)) {
+            view.handle == nullptr || view.metadata.transaction_pinned ||
+            (expected_owner && view.id != *expected_owner)) {
             throw std::invalid_argument("shared catalog slot holds no matching prefix");
         }
         auto snapshot          = run_shared_snapshot_operation([&] {
@@ -474,7 +475,7 @@ public:
         const auto view = resources_.shared_catalog_slot(slot);
         if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
             view.handle == nullptr || view.id == 0 || !view.metadata.ssd_eligible ||
-            view.metadata.ssd_backed) {
+            view.metadata.ssd_backed || view.metadata.transaction_pinned) {
             return std::nullopt;
         }
         return view.id;
@@ -502,6 +503,11 @@ public:
         return false;
     }
 
+    void cancel_durable_shared_prefix_recovery(std::uint64_t reservation_id) noexcept {
+        std::scoped_lock lock(execution_mutex_);
+        resources_.cancel_durable_recovery(reservation_id);
+    }
+
     [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult import_shared_prefix(
         std::span<const std::uint8_t> snapshot, std::string_view model_binding,
         runtime::CancellationFlagView cancellation                        = {},
@@ -512,7 +518,8 @@ public:
         bool ssd_backed                                                   = false,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
             std::nullopt,
-        bool* validation_completed = nullptr) {
+        bool* validation_completed = nullptr, std::uint64_t reservation_id = 0,
+        Clock::time_point deadline = Clock::time_point::max()) {
         std::scoped_lock lock(execution_mutex_);
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
@@ -528,9 +535,14 @@ public:
                 throw RequestError(RequestErrorKind::Cancelled,
                                    "shared snapshot import was cancelled");
             }
+            if (Clock::now() >= deadline) {
+                throw RequestError(RequestErrorKind::QueueTimeout,
+                                   "shared snapshot import exceeded its deadline");
+            }
         };
         return run_shared_snapshot_operation(
             [&] {
+                checkpoint();
                 const Clock::time_point validation_started = Clock::now();
                 auto imported                              = instance_.program->parse_shared_prefix(
                     snapshot, model_binding, checkpoint, std::move(retained_storage));
@@ -544,20 +556,25 @@ public:
                 if (validation_nanoseconds != nullptr) {
                     *validation_nanoseconds = elapsed_ns(validation_started, Clock::now());
                 }
+                checkpoint();
                 const Clock::time_point adoption_started = Clock::now();
                 auto result                              = resources_.adopt_imported_shared(
                     *instance_.program, imported, cancellation,
-                    [] {
+                    [&] {
                         testing::shared_snapshot_import_checkpoint(
                             testing::SharedSnapshotImportStage::BeforeCatalogPublication);
+                        checkpoint();
                     },
-                    ssd_backed);
+                    ssd_backed, reservation_id, model_binding);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
                 }
                 if (result.disposition == ResourceManagement::SharedImportDisposition::Cancelled) {
                     throw RequestError(RequestErrorKind::Cancelled,
                                        "shared snapshot import was cancelled");
+                }
+                if (result.disposition == ResourceManagement::SharedImportDisposition::Stale) {
+                    throw std::invalid_argument("durable shared recovery plan is stale");
                 }
                 {
                     const auto view = resources_.shared_catalog_slot(result.slot);
@@ -628,6 +645,88 @@ public:
             return std::nullopt;
         }
         return view.summary;
+    }
+
+    void erase_shared_prefixes_except_for_test(std::span<const std::uint32_t> retained_slots) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        for (std::uint32_t slot = 0; slot < resources_.shared_catalog_capacity(); ++slot) {
+            if (std::find(retained_slots.begin(), retained_slots.end(), slot) !=
+                retained_slots.end()) {
+                continue;
+            }
+            const auto view = resources_.shared_catalog_slot(slot);
+            if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued) {
+                continue;
+            }
+            auto released     = resources_.take_catalogued_shared(slot);
+            const auto result = instance_.program->release_shared_prefix(std::move(released));
+            if (result.status != ConsumeStatus::Consumed) {
+                throw std::logic_error("test shared-prefix cleanup did not consume its owner");
+            }
+        }
+        publish_runtime_stats();
+    }
+
+    void duplicate_shared_prefix_to_device_for_test(std::uint32_t slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.shared_catalog_slot(slot);
+        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            view.handle == nullptr) {
+            throw std::logic_error("test shared-prefix slot is not catalogued");
+        }
+        instance_.program->duplicate_shared_prefix_to_device_for_test(*view.handle);
+        publish_runtime_stats();
+    }
+
+    void fragment_shared_prefix_host_kv_for_test(std::uint32_t victim_slot,
+                                                 std::uint32_t separator_slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto victim    = resources_.shared_catalog_slot(victim_slot);
+        const auto separator = resources_.shared_catalog_slot(separator_slot);
+        if (victim.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            victim.handle == nullptr ||
+            separator.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
+            separator.handle == nullptr) {
+            throw std::logic_error("test fragmented shared-prefix slots are not catalogued");
+        }
+        instance_.program->fragment_shared_prefix_host_kv_for_test(*victim.handle,
+                                                                   *separator.handle);
+        publish_runtime_stats();
+    }
+
+    void prepare_private_host_reclamation_for_test(std::uint32_t slot) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private Host reclamation slot is not catalogued");
+        }
+        instance_.program->prepare_private_host_reclamation_for_test(*view.handle);
+        publish_runtime_stats();
+    }
+
+    [[nodiscard]] targets::qwen3_6::PrivateHostReclamationTestObservation
+    private_host_reclamation_observation_for_test(std::uint32_t slot) const {
+        std::scoped_lock lock(execution_mutex_);
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private Host reclamation slot is not catalogued");
+        }
+        return instance_.program->private_host_reclamation_observation_for_test(*view.handle);
+    }
+
+    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
+    begin_private_export_for_test(std::uint32_t slot, std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_shared_snapshot_engine_healthy();
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::logic_error("test private export slot is not catalogued");
+        }
+        return instance_.program->begin_save_continuation(*view.handle, model_binding);
     }
 
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {

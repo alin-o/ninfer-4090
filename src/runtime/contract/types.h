@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -297,13 +298,17 @@ enum class Readiness : std::uint8_t {
     PermanentlyInfeasible,
 };
 
-// Non-owning cancellation observation used while the worker advances a context transaction. The
-// request record owns the flag for longer than Program can retain this view.
+// Non-owning cancellation observation used while the worker advances a context transaction or a
+// synchronous Engine-locked import. The request record owns an atomic flag for asynchronous work;
+// synchronous adapters may instead borrow a type-erased query for the duration of the call.
 struct CancellationFlagView {
     const std::atomic<bool>* flag = nullptr;
+    const void* context           = nullptr;
+    bool (*query)(const void*)    = nullptr;
 
-    [[nodiscard]] bool requested() const noexcept {
-        return flag != nullptr && flag->load(std::memory_order_acquire);
+    [[nodiscard]] bool requested() const {
+        return (flag != nullptr && flag->load(std::memory_order_acquire)) ||
+               (query != nullptr && query(context));
     }
 };
 
@@ -538,11 +543,20 @@ struct CommittedKvOffloadRange {
                                                    CommittedKvOffloadRange) noexcept = default;
 };
 
+enum class DeviceStateVictimClass : std::uint8_t {
+    None,
+    Intermediate,
+    ConversationHead,
+};
+
 struct PressureOwnerOutcome {
     PlanningOwnerId owner;
     VictimDisposition disposition     = VictimDisposition::Retained;
     std::uint32_t degradation_units   = 0;
     std::uint32_t dropped_checkpoints = 0;
+    // Program-owned attribution for the hard Device-State victim class. This includes demotion,
+    // duplicate release, checkpoint drop, and whole-owner eviction.
+    DeviceStateVictimClass device_state_victim_class = DeviceStateVictimClass::None;
 
     [[nodiscard]] friend constexpr bool operator==(const PressureOwnerOutcome&,
                                                    const PressureOwnerOutcome&) noexcept = default;
@@ -571,6 +585,27 @@ struct UniquePhysicalReclamation {
     [[nodiscard]] friend constexpr bool
     operator==(const UniquePhysicalReclamation&,
                const UniquePhysicalReclamation&) noexcept = default;
+};
+
+// Program-owned diagnosis for one complete durable Host import projection.  ResourceManager may
+// compare these facts with logical retention value, but it must not reproduce allocator arithmetic.
+enum class DurableImportFeasibility : std::uint8_t {
+    Feasible,
+    LogicalCapacity,
+    HostStateCapacity,
+    HostKvCapacity,
+    DeviceCapacity,
+    TransactionConflict,
+    Unsupported,
+};
+
+struct DurableImportAssessment {
+    DurableImportFeasibility feasibility = DurableImportFeasibility::Unsupported;
+    ProgramResourceRevision resource_revision;
+    UniquePhysicalReclamation reclamation;
+    // Target-private, immutable physical release plan. ResourceManager carries the exact plan
+    // selected during inspection back to the same Program at commit; Gateway never interprets it.
+    std::shared_ptr<const void> physical_plan;
 };
 
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only

@@ -812,47 +812,64 @@ runtime::DurableSharedSnapshotAccess::decide_recovery(
                 if (inspected.warm_frontier != 0 &&
                     (feasible_ssd == nullptr ||
                      inspected.warm_frontier >= feasible_ssd->frontier)) {
-                    const char* reason = "deeper-memory-ready";
-                    if (feasible_ssd != nullptr &&
-                        inspected.warm_frontier == feasible_ssd->frontier) {
-                        reason = "same-boundary-memory-ready";
-                    } else if (feasible_ssd == nullptr && !available_ssd_candidates.empty()) {
-                        reason = "ssd-adoption-infeasible-memory-ready";
-                    }
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
-                            .reason                   = reason};
+                            .reason                   = "warm-source-selected"};
                 }
                 if (feasible_ssd != nullptr) {
-                    return {.source    = RecoverySource::Ssd,
-                            .candidate = *feasible_ssd,
-                            .frontier  = feasible_ssd->frontier,
-                            .reason    = feasible_index == 0 ? "ssd-deeper-feasible"
-                                                             : "ssd-shallower-feasible"};
+                    return {.source         = RecoverySource::Ssd,
+                            .candidate      = *feasible_ssd,
+                            .frontier       = feasible_ssd->frontier,
+                            .reservation_id = inspected.reservation_id,
+                            .replacement    = inspected.replacement_slot.has_value(),
+                            .reason         = inspected.replacement_slot ? "ssd-replacement-planned"
+                                                                         : "ssd-admission-planned"};
                 }
                 if (inspected.warm_frontier != 0) {
                     return {.source                   = RecoverySource::Memory,
                             .frontier                 = inspected.warm_frontier,
                             .estimated_memory_cost_ns = inspected.warm_cost_ns,
-                            .reason                   = "ssd-adoption-infeasible-memory-ready"};
+                            .reason                   = "warm-source-selected"};
                 }
-                return {.reason = available_ssd_candidates.empty() ? "ssd-unavailable"
-                                                                   : "ssd-adoption-infeasible"};
+                const auto infeasible_reason = [&] {
+                    switch (inspected.infeasibility) {
+                    case DurableImportFeasibility::LogicalCapacity:
+                        return "ssd-logical-capacity-no-replaceable-victim";
+                    case DurableImportFeasibility::HostStateCapacity:
+                        return "ssd-host-state-capacity";
+                    case DurableImportFeasibility::HostKvCapacity:
+                        return "ssd-host-kv-capacity";
+                    case DurableImportFeasibility::DeviceCapacity:
+                        return "ssd-device-feasibility";
+                    case DurableImportFeasibility::TransactionConflict:
+                        return "ssd-transaction-conflict";
+                    default:
+                        return "ssd-logical-capacity-no-replaceable-victim";
+                    }
+                };
+                return {.reason = available_ssd_candidates.empty() ? "ssd-no-matching-record"
+                                                                   : infeasible_reason()};
             }
             return {.reason = "ssd-engine-unsupported"};
         },
         engine.impl_->core);
 }
 
-runtime::DurableSharedSnapshotAccess::ImportResult
-runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& candidate,
-                                             std::shared_ptr<const std::vector<std::uint8_t>> bytes,
-                                             const CancellationView& cancellation) {
+runtime::DurableSharedSnapshotAccess::ImportResult runtime::DurableSharedSnapshotAccess::import(
+    Engine& engine, const Candidate& candidate,
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes, const CancellationView& cancellation,
+    std::uint64_t reservation_id, std::chrono::steady_clock::time_point deadline) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
     if (!bytes) { throw std::invalid_argument("durable shared snapshot payload is empty"); }
     if (cancellation.requested()) {
+        cancel_recovery(engine, reservation_id);
         throw RequestError(RequestErrorKind::Cancelled, "shared snapshot import was cancelled");
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        cancel_recovery(engine, reservation_id);
+        throw RequestError(RequestErrorKind::QueueTimeout,
+                           "shared snapshot import exceeded its deadline");
     }
     const std::string binding = slot_model_binding(engine.impl_->load);
     ImportResult imported     = std::visit(
@@ -862,16 +879,27 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                 std::uint64_t adoption_nanoseconds   = 0;
                 bool validation_completed            = false;
                 try {
+                    const runtime::CancellationFlagView cancellation_flag{
+                            .context = &cancellation,
+                            .query =
+                            [](const void* context) {
+                                return static_cast<const CancellationView*>(context)->requested();
+                            },
+                    };
                     auto result = core->import_shared_prefix(
-                        std::span<const std::uint8_t>(*bytes), binding, {}, &validation_nanoseconds,
-                        &adoption_nanoseconds,
+                        std::span<const std::uint8_t>(*bytes), binding, cancellation_flag,
+                        &validation_nanoseconds, &adoption_nanoseconds,
                         [&] {
                             if (cancellation.requested()) {
                                 throw RequestError(RequestErrorKind::Cancelled,
                                                        "shared snapshot import was cancelled");
                             }
+                            if (std::chrono::steady_clock::now() >= deadline) {
+                                throw RequestError(RequestErrorKind::QueueTimeout,
+                                                       "shared snapshot import exceeded its deadline");
+                            }
                         },
-                        bytes, true, candidate, &validation_completed);
+                        bytes, true, candidate, &validation_completed, reservation_id, deadline);
                     if (!result.summary || !result.checkpoint) {
                         throw std::logic_error(
                             "durable shared import has no locked publication identity");
@@ -883,6 +911,9 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
                             .validation_nanoseconds = validation_nanoseconds,
                             .adoption_nanoseconds   = adoption_nanoseconds,
                             .checkpoint             = std::move(*result.checkpoint),
+                            .displaced_checkpoint   = std::move(result.displaced_checkpoint),
+                            .reclaimed_checkpoints  = std::move(result.reclaimed_checkpoints),
+                            .capacity_reclamation_committed = result.capacity_reclamation_committed,
                     };
                 } catch (const RequestError&) {
                     throw;
@@ -899,6 +930,20 @@ runtime::DurableSharedSnapshotAccess::import(Engine& engine, const Candidate& ca
     // next preparation checkpoint. Returning the committed identity lets that failure retain the
     // SSD lifecycle fact instead of making a completed adoption disappear from observability.
     return imported;
+}
+
+void runtime::DurableSharedSnapshotAccess::cancel_recovery(Engine& engine,
+                                                           std::uint64_t reservation_id) noexcept {
+    if (!engine.impl_ || reservation_id == 0) { return; }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->cancel_durable_shared_prefix_recovery(reservation_id);
+                          }) {
+                core->cancel_durable_shared_prefix_recovery(reservation_id);
+            }
+        },
+        engine.impl_->core);
 }
 
 bool runtime::DurableSharedSnapshotAccess::resident(Engine& engine, const Candidate& candidate) {
@@ -1120,6 +1165,98 @@ void runtime::testing::SharedSnapshotTestAccess::import_validated(
         engine.impl_->core);
 }
 
+void runtime::testing::SharedSnapshotTestAccess::erase_shared_except(
+    Engine& engine, std::span<const std::uint32_t> retained_slots) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->erase_shared_prefixes_except_for_test(retained_slots);
+                          }) {
+                core->erase_shared_prefixes_except_for_test(retained_slots);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::duplicate_shared_to_device(Engine& engine,
+                                                                            std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->duplicate_shared_prefix_to_device_for_test(slot); }) {
+                core->duplicate_shared_prefix_to_device_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::fragment_shared_host_kv(
+    Engine& engine, std::uint32_t victim_slot, std::uint32_t separator_slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires {
+                              core->fragment_shared_prefix_host_kv_for_test(victim_slot,
+                                                                            separator_slot);
+                          }) {
+                core->fragment_shared_prefix_host_kv_for_test(victim_slot, separator_slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::testing::SharedSnapshotTestAccess::prepare_private_host_reclamation(
+    Engine& engine, std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->prepare_private_host_reclamation_for_test(slot); }) {
+                core->prepare_private_host_reclamation_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+targets::qwen3_6::PrivateHostReclamationTestObservation
+runtime::testing::SharedSnapshotTestAccess::observe_private_host_reclamation(Engine& engine,
+                                                                             std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> targets::qwen3_6::PrivateHostReclamationTestObservation {
+            if constexpr (requires { core->private_host_reclamation_observation_for_test(slot); }) {
+                return core->private_host_reclamation_observation_for_test(slot);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
+targets::qwen3_6::RetainedSessionSnapshot
+runtime::testing::SharedSnapshotTestAccess::begin_private_export(Engine& engine,
+                                                                 std::uint32_t slot) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    const std::string binding = slot_model_binding(engine.impl_->load);
+    return std::visit(
+        [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
+            if constexpr (requires { core->begin_private_export_for_test(slot, binding); }) {
+                return core->begin_private_export_for_test(slot, binding);
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
+}
+
 std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellation(
     Engine& engine, std::span<const std::uint8_t> bytes, std::atomic<bool>& cancellation) {
     if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
@@ -1127,9 +1264,14 @@ std::uint32_t runtime::testing::SharedSnapshotTestAccess::import_with_cancellati
     return std::visit(
         [&](auto& core) -> std::uint32_t {
             if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
-                const auto result = core->import_shared_prefix(
-                    bytes, binding, runtime::CancellationFlagView{.flag = &cancellation});
-                return static_cast<std::uint32_t>(result.disposition);
+                try {
+                    const auto result = core->import_shared_prefix(
+                        bytes, binding, runtime::CancellationFlagView{.flag = &cancellation});
+                    return static_cast<std::uint32_t>(result.disposition);
+                } catch (const RequestError& error) {
+                    if (error.kind() == RequestErrorKind::Cancelled) { return 2U; }
+                    throw;
+                }
             } else {
                 throw std::logic_error("shared snapshots require a generation Engine");
             }

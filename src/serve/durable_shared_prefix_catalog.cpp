@@ -21,6 +21,22 @@
 namespace ninfer::serve {
 namespace {
 
+template <class Callback>
+class ScopeExit {
+public:
+    explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
+
+    ~ScopeExit() noexcept { callback_(); }
+
+    ScopeExit(const ScopeExit&)            = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ScopeExit(ScopeExit&&)                 = delete;
+    ScopeExit& operator=(ScopeExit&&)      = delete;
+
+private:
+    Callback callback_;
+};
+
 constexpr std::string_view kManifestName      = "catalog.manifest";
 constexpr std::string_view kManifestHeader    = "NINFER_SHARED_CATALOG\t1\n";
 constexpr std::size_t kMaximumManifestBytes   = 1U << 20U;
@@ -914,6 +930,7 @@ DurableSharedPrefixCatalog::load_record(const Candidate& candidate, Clock::time_
         if (enqueue_load) {
             const auto queued_job = job;
             try {
+                if (state->options.before_load_enqueue) { state->options.before_load_enqueue(); }
                 state->push([state, queued_job, record] {
                     const auto started = Clock::now();
                     try {
@@ -1038,11 +1055,19 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
             }
             return observation;
         }
-        observation.fallback_reason             = decision.reason;
-        const Candidate candidate               = decision.candidate;
+        observation.fallback_reason        = decision.reason;
+        const Candidate candidate          = decision.candidate;
+        const std::uint64_t reservation_id = decision.reservation_id;
+        // Reservation must cover load job allocation, registration, and enqueue as well as the
+        // later checksum/validation/adoption path. load_record may throw before returning a job,
+        // so install cleanup before invoking it.
+        ScopeExit reservation_cleanup([&engine, reservation_id] {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+        });
         const Clock::time_point restore_started = Clock::now();
         auto loaded                             = load_record(candidate, deadline, cancellation);
         if (!loaded.bytes) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             append_lifecycle(
                 candidate,
                 cancellation.requested() ? CheckpointLifecycleStatus::Aborted
@@ -1052,15 +1077,28 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                                                Clock::now() - restore_started)
                                                .count()));
             observation.fallback_reason =
-                Clock::now() >= deadline ? "ssd-deadline" : "ssd-unavailable";
+                cancellation.requested()
+                    ? "ssd-cancelled"
+                    : (Clock::now() >= deadline ? "ssd-deadline" : "ssd-io-failure");
             available.erase(std::remove(available.begin(), available.end(), candidate),
                             available.end());
             if (cancellation.requested() || Clock::now() >= deadline) { return observation; }
             continue;
         }
+        if (cancellation.requested() || Clock::now() >= deadline) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            append_lifecycle(
+                candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               Clock::now() - restore_started)
+                                               .count()));
+            observation.fallback_reason =
+                cancellation.requested() ? "ssd-cancelled" : "ssd-deadline";
+            return observation;
+        }
         try {
             const auto imported = runtime::DurableSharedSnapshotAccess::import(
-                engine, candidate, loaded.bytes, cancellation);
+                engine, candidate, loaded.bytes, cancellation, reservation_id, deadline);
             {
                 std::lock_guard lock(state_->mutex);
                 state_->values.validation_nanoseconds += imported.validation_nanoseconds;
@@ -1073,11 +1111,22 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - restore_started)
                     .count());
             observation.loaded_from_ssd = true;
+            observation.fallback_reason =
+                imported.displaced_checkpoint || imported.capacity_reclamation_committed
+                    ? "ssd-successful-replacement"
+                    : "ssd-successful-restore";
+            if (imported.displaced_checkpoint) {
+                observation.lifecycle.push_back(std::move(*imported.displaced_checkpoint));
+            }
+            for (auto& checkpoint : imported.reclaimed_checkpoints) {
+                observation.lifecycle.push_back(std::move(checkpoint));
+            }
             append_lifecycle(candidate, CheckpointLifecycleStatus::Committed,
                              observation.serialized_bytes, observation.elapsed_ns,
                              &imported.checkpoint);
             return observation;
         } catch (const RequestError& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             if (error.kind() == RequestErrorKind::Cancelled) {
                 append_lifecycle(
                     candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
@@ -1086,16 +1135,36 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                                                    .count()));
                 throw RequestError(error.kind(), error.what(), std::move(observation.lifecycle));
             }
-            observation.fallback_reason = "ssd-adoption-unavailable";
-        } catch (const runtime::DurableSharedSnapshotAccess::ValidationError&) {
+            if (error.kind() == RequestErrorKind::QueueTimeout) {
+                append_lifecycle(
+                    candidate, CheckpointLifecycleStatus::Aborted, loaded.bytes->size(),
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   Clock::now() - restore_started)
+                                                   .count()));
+                observation.fallback_reason = "ssd-deadline";
+                return observation;
+            }
+            observation.fallback_reason = "ssd-adoption-failure";
+        } catch (const runtime::DurableSharedSnapshotAccess::ValidationError& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
             {
                 std::lock_guard lock(state_->mutex);
                 ++state_->values.corrupt_records;
             }
             invalidate_loaded(loaded);
-            observation.fallback_reason = "ssd-validation";
-        } catch (const std::invalid_argument&) {
-            observation.fallback_reason = "ssd-adoption-unavailable";
+            observation.fallback_reason =
+                std::string_view(error.what()).find("checksum") != std::string_view::npos
+                    ? "ssd-checksum-failure"
+                    : "ssd-validation-failure";
+        } catch (const std::invalid_argument& error) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            observation.fallback_reason =
+                std::string_view(error.what()).find("stale") != std::string_view::npos
+                    ? "ssd-stale-replanned"
+                    : "ssd-adoption-failure";
+        } catch (...) {
+            runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            throw;
         }
         append_lifecycle(
             candidate, CheckpointLifecycleStatus::Failed, loaded.bytes->size(),

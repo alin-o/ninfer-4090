@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -268,6 +269,9 @@ public:
         std::uint64_t warm_cost_ns  = 0;
         WarmRecoveryTier warm_tier  = WarmRecoveryTier::None;
         std::optional<std::size_t> ssd_candidate_index;
+        std::uint64_t reservation_id = 0;
+        std::optional<std::uint32_t> replacement_slot;
+        DurableImportFeasibility infeasibility = DurableImportFeasibility::Unsupported;
     };
 
     template <class DurableCandidate>
@@ -277,7 +281,8 @@ public:
                              std::span<const DurableCandidate> ssd_candidates) {
         DurableRecoveryInspection result;
         if (!std::holds_alternative<std::monostate>(transaction_) ||
-            program.has_context_transaction()) {
+            program.has_context_transaction() || durable_recovery_) {
+            result.infeasibility = DurableImportFeasibility::TransactionConflict;
             return result;
         }
         std::optional<LaneId> destination;
@@ -287,7 +292,10 @@ public:
                 break;
             }
         }
-        if (!destination) { return result; }
+        if (!destination) {
+            result.infeasibility = DurableImportFeasibility::DeviceCapacity;
+            return result;
+        }
 
         rebuild_prefix_index();
         const auto consider = [&](std::optional<AdmissionCandidate> plan,
@@ -350,17 +358,256 @@ public:
                      entry.summary.checkpoint.state_residency);
         }
 
-        const bool vacant_logical =
-            std::any_of(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
-                return entry.state == SharedCatalogState::Vacant && !entry.handle;
-            });
-        if (vacant_logical) {
-            for (std::size_t index = 0; index < ssd_candidates.size(); ++index) {
-                if (program.durable_shared_prefix_import_feasible(ssd_candidates[index].frontier)) {
-                    result.ssd_candidate_index = index;
-                    break;
+        std::optional<std::uint32_t> vacant_slot;
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state == SharedCatalogState::Vacant && !entry.handle &&
+                entry.transaction_pins == 0) {
+                vacant_slot = slot;
+                break;
+            }
+        }
+
+        struct ReplacementCandidate {
+            std::uint32_t slot = kInvalidCatalogSlot;
+            DurableImportAssessment assessment;
+            std::uint64_t portfolio_loss    = 0;
+            std::uint32_t host_private_slot = kInvalidCatalogSlot;
+            std::uint32_t host_shared_slot  = kInvalidCatalogSlot;
+            std::uint64_t host_last_use     = 0;
+        };
+
+        const auto replacement_loss = [&](std::uint32_t victim_slot) {
+            std::vector<ContextPortfolioOwnerPolicy> owners;
+            std::vector<ContextPortfolioCheckpointValue> checkpoints;
+            owners.reserve(shared_catalog_count_);
+            checkpoints.reserve(shared_catalog_count_);
+            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                const PlanningOwnerId owner{.value = slot};
+                const std::uint64_t rebuild =
+                    cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work);
+                const std::uint64_t baseline = price_checkpoint_recovery_work(
+                    cost_model_,
+                    program.checkpoint_recovery_work(*entry.handle, entry.summary.checkpoint.ref));
+                owners.push_back({.owner = owner, .explicit_shared_credit = entry.explicit_credit});
+                checkpoints.push_back({
+                    .owner = owner,
+                    .demand_mask =
+                        committed_demand_mask_for(entry.summary.checkpoint.shortlist_key),
+                    .rebuild_ns           = rebuild,
+                    .baseline_recovery_ns = baseline,
+                    .target_recovery_ns   = slot == victim_slot ? rebuild : baseline,
+                });
+            }
+            ContextPortfolioValue portfolio;
+            const ContextPortfolioValueResult value = portfolio.fold(owners, checkpoints);
+            return value.saturated || value.target_public_value > value.baseline_public_value
+                       ? std::numeric_limits<std::uint64_t>::max()
+                       : value.baseline_public_value - value.target_public_value;
+        };
+        const auto less_valuable = [&](const ReplacementCandidate& left,
+                                       const ReplacementCandidate& right) {
+            const auto rank = [&](const ReplacementCandidate& value) {
+                std::uint64_t hits    = 0;
+                std::uint32_t credit  = 0;
+                std::uint64_t epoch   = 0;
+                std::uint64_t rebuild = 0;
+                if (value.slot != kInvalidCatalogSlot) {
+                    const SharedCatalogEntry& entry = shared_catalog_[value.slot];
+                    hits                            = entry.observation.selected_hit_count;
+                    credit                          = entry.explicit_credit ? 1U : 0U;
+                    epoch                           = entry.observation.last_hit_epoch;
+                    rebuild = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work);
+                }
+                return std::tuple{value.portfolio_loss,
+                                  hits,
+                                  credit,
+                                  epoch,
+                                  rebuild,
+                                  value.slot,
+                                  value.host_last_use,
+                                  value.host_private_slot,
+                                  value.host_shared_slot};
+            };
+            return rank(left) < rank(right);
+        };
+        for (std::size_t index = 0; index < ssd_candidates.size(); ++index) {
+            const auto& candidate = ssd_candidates[index];
+            if (result.warm_frontier >= candidate.frontier) { break; }
+
+            DurableImportAssessment direct =
+                program.inspect_durable_shared_prefix_import(candidate.frontier, nullptr);
+            std::optional<ReplacementCandidate> selected;
+            if (vacant_slot && direct.feasibility == DurableImportFeasibility::Feasible) {
+                selected = ReplacementCandidate{.slot = kInvalidCatalogSlot, .assessment = direct};
+            } else {
+                result.infeasibility =
+                    vacant_slot ? direct.feasibility : DurableImportFeasibility::LogicalCapacity;
+                bool protected_transaction = false;
+                for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                    const SharedCatalogEntry& entry = shared_catalog_[slot];
+                    // Complete durable coverage is the safety authority for destructive import
+                    // replacement.  A pending export does not set ssd_backed and therefore cannot
+                    // make an owner eligible.
+                    if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                        !entry.ssd_backed) {
+                        continue;
+                    }
+                    if (entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0 ||
+                        entry.summary.active_references != 0) {
+                        protected_transaction = true;
+                        continue;
+                    }
+                    DurableImportAssessment assessed = program.inspect_durable_shared_prefix_import(
+                        candidate.frontier, &*entry.handle);
+                    if (assessed.feasibility != DurableImportFeasibility::Feasible) {
+                        result.infeasibility = assessed.feasibility;
+                        continue;
+                    }
+                    ReplacementCandidate feasible{
+                        .slot           = slot,
+                        .assessment     = assessed,
+                        .portfolio_loss = replacement_loss(slot),
+                    };
+                    if (!selected || less_valuable(feasible, *selected)) {
+                        selected = std::move(feasible);
+                    }
+                }
+                if (!selected && protected_transaction &&
+                    result.infeasibility == DurableImportFeasibility::LogicalCapacity) {
+                    result.infeasibility = DurableImportFeasibility::TransactionConflict;
                 }
             }
+
+            // Host duplicate reclamation is independent of the logical publication victim. A
+            // vacant shared cell can still need Host State/KV capacity, and the safest provider
+            // may be a private owner or a different shared owner whose complete Device replica
+            // remains. Program is the authority for aliasing and exact allocator feasibility;
+            // ResourceManager only ranks the feasible logical owners by retained value/last use.
+            if (!selected && (result.infeasibility == DurableImportFeasibility::HostStateCapacity ||
+                              result.infeasibility == DurableImportFeasibility::HostKvCapacity)) {
+                const auto consider_host_reclamation =
+                    [&](std::uint32_t logical_slot, const SharedPrefixHandle* logical_replacement,
+                        std::uint32_t private_slot, std::uint32_t shared_slot,
+                        std::uint64_t last_use) {
+                        const ContinuationHandle* private_handle =
+                            private_slot == kInvalidCatalogSlot ? nullptr
+                                                                : &*catalog_[private_slot].handle;
+                        const SharedPrefixHandle* shared_handle =
+                            shared_slot == kInvalidCatalogSlot
+                                ? nullptr
+                                : &*shared_catalog_[shared_slot].handle;
+                        DurableImportAssessment assessed =
+                            program.inspect_durable_shared_prefix_import(
+                                candidate.frontier, logical_replacement, private_handle,
+                                shared_handle);
+                        if (assessed.feasibility != DurableImportFeasibility::Feasible) {
+                            result.infeasibility = assessed.feasibility;
+                            return;
+                        }
+                        ReplacementCandidate feasible{
+                            .slot              = logical_slot,
+                            .assessment        = assessed,
+                            .portfolio_loss    = logical_slot == kInvalidCatalogSlot
+                                                     ? 0
+                                                     : replacement_loss(logical_slot),
+                            .host_private_slot = private_slot,
+                            .host_shared_slot  = shared_slot,
+                            .host_last_use     = last_use,
+                        };
+                        if (!selected || less_valuable(feasible, *selected)) {
+                            selected = std::move(feasible);
+                        }
+                    };
+                const auto inspect_host_candidates = [&](std::uint32_t logical_slot,
+                                                         const SharedPrefixHandle* replacement) {
+                    for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                        const CatalogEntry& entry = catalog_[slot];
+                        if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                            entry.summary.active_references != 0 || private_has_active_edge(slot)) {
+                            continue;
+                        }
+                        consider_host_reclamation(logical_slot, replacement, slot,
+                                                  kInvalidCatalogSlot, entry.authoritative_epoch);
+                    }
+                    for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                        const SharedCatalogEntry& entry = shared_catalog_[slot];
+                        if (slot == logical_slot || entry.state != SharedCatalogState::Catalogued ||
+                            !entry.handle || entry.transaction_pins != 0 ||
+                            entry.summary.active_references != 0 ||
+                            shared_active_edge_count(slot) != 0) {
+                            continue;
+                        }
+                        consider_host_reclamation(logical_slot, replacement, kInvalidCatalogSlot,
+                                                  slot, entry.observation.last_hit_epoch);
+                    }
+                };
+                if (vacant_slot) {
+                    inspect_host_candidates(kInvalidCatalogSlot, nullptr);
+                } else {
+                    for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                        const SharedCatalogEntry& entry = shared_catalog_[slot];
+                        if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                            !entry.ssd_backed || entry.transaction_pins != 0 ||
+                            entry.summary.active_references != 0 ||
+                            shared_active_edge_count(slot) != 0) {
+                            continue;
+                        }
+                        inspect_host_candidates(slot, &*entry.handle);
+                    }
+                }
+            }
+            if (!selected) { continue; }
+
+            const std::uint32_t publication_slot =
+                selected->slot != kInvalidCatalogSlot ? selected->slot : *vacant_slot;
+            DurableRecoveryRecord record{
+                .id               = next_durable_recovery_id_++,
+                .publication_slot = publication_slot,
+                .program_revision = selected->assessment.resource_revision,
+                .reclamation      = selected->assessment.reclamation,
+                .physical_plan    = selected->assessment.physical_plan,
+            };
+            if (record.id == 0) { record.id = next_durable_recovery_id_++; }
+            if (selected->slot != kInvalidCatalogSlot) {
+                const SharedCatalogEntry& victim = shared_catalog_[selected->slot];
+                record.replacement               = CatalogCapability{
+                                  .owner      = {.kind = LogicalOwnerKind::SharedPrefix, .id = victim.id},
+                                  .slot       = selected->slot,
+                                  .generation = victim.revision,
+                };
+            }
+            if (selected->host_private_slot != kInvalidCatalogSlot) {
+                const CatalogEntry& victim = catalog_[selected->host_private_slot];
+                record.host_private        = CatalogCapability{
+                           .owner      = {.kind = LogicalOwnerKind::PrivateContinuation, .id = victim.id},
+                           .slot       = selected->host_private_slot,
+                           .generation = victim.revision,
+                };
+            }
+            if (selected->host_shared_slot != kInvalidCatalogSlot) {
+                const SharedCatalogEntry& victim = shared_catalog_[selected->host_shared_slot];
+                record.host_shared               = CatalogCapability{
+                                  .owner      = {.kind = LogicalOwnerKind::SharedPrefix, .id = victim.id},
+                                  .slot       = selected->host_shared_slot,
+                                  .generation = victim.revision,
+                };
+            }
+            durable_recovery_.emplace(record);
+            ++shared_catalog_[publication_slot].transaction_pins;
+            if (record.host_private) {
+                catalog_[record.host_private->slot].state = CatalogState::Claimed;
+            }
+            if (record.host_shared) {
+                ++shared_catalog_[record.host_shared->slot].transaction_pins;
+            }
+            result.ssd_candidate_index = index;
+            result.reservation_id      = record.id;
+            if (record.replacement) { result.replacement_slot = record.replacement->slot; }
+            result.infeasibility = DurableImportFeasibility::Feasible;
+            break;
         }
         return result;
     }
@@ -492,7 +739,10 @@ public:
                 }
 
                 const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                    entry.transaction_pins != 0) {
+                    continue;
+                }
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
                 if (!plan) { continue; }
@@ -668,6 +918,7 @@ public:
                     continue;
                 }
                 SharedCatalogEntry& entry = shared_catalog_[index.slot];
+                if (entry.transaction_pins != 0) { continue; }
                 if (program.shared_capture_matches(offer, *entry.handle)) {
                     exact_shared      = &*entry.handle;
                     exact_shared_slot = index.slot;
@@ -719,7 +970,10 @@ public:
             std::vector<CaptureScenario> scenarios;
             scenarios.reserve(static_cast<std::size_t>(shared_catalog_count_) + 1U);
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                if (shared_catalog_[slot].state != SharedCatalogState::Vacant) { continue; }
+                if (shared_catalog_[slot].state != SharedCatalogState::Vacant ||
+                    shared_catalog_[slot].transaction_pins != 0) {
+                    continue;
+                }
                 scenarios.push_back(CaptureScenario{
                     .assessment       = candidate,
                     .publication_slot = slot,
@@ -1121,6 +1375,10 @@ public:
         publication.session   = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
+        // Completion order is not publication order: a longer, older request may settle after a
+        // newer request.  Device-State head pressure must compare the authoritative request/use
+        // order so a late finish cannot masquerade as the newer conversation.
+        publication.authoritative_epoch = active.publication_order;
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
@@ -1360,6 +1618,7 @@ public:
         std::uint8_t structural_role     = 0;
         bool ssd_eligible                = false;
         bool ssd_backed                  = false;
+        bool transaction_pinned          = false;
         std::optional<std::uint32_t> first_volatile_token;
     };
 
@@ -1372,6 +1631,7 @@ public:
                 .structural_role      = entry.structural_role,
                 .ssd_eligible         = entry.ssd_eligible,
                 .ssd_backed           = entry.ssd_backed,
+                .transaction_pinned   = entry.transaction_pins != 0,
                 .first_volatile_token = entry.first_volatile_token};
     }
 
@@ -1395,7 +1655,30 @@ public:
                 .id       = entry.id};
     }
 
-    enum class SharedImportDisposition : std::uint8_t { Published, Coalesced, Cancelled };
+    [[nodiscard]] SharedPrefixHandle take_catalogued_shared(std::uint32_t slot) {
+        if (slot >= shared_catalog_count_) {
+            throw std::invalid_argument("shared catalog slot is out of range");
+        }
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        if (!std::holds_alternative<std::monostate>(transaction_) || durable_recovery_ ||
+            entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+            entry.transaction_pins != 0 || entry.summary.active_references != 0 ||
+            shared_active_edge_count(slot) != 0) {
+            throw std::logic_error("shared catalog slot is not releasable");
+        }
+        SharedPrefixHandle handle = std::move(*entry.handle);
+        clear_shared_entry(entry);
+        rebuild_prefix_index();
+        return handle;
+    }
+
+    enum class SharedImportDisposition : std::uint8_t {
+        Published = 0,
+        Coalesced = 1,
+        Cancelled = 2,
+        Replaced  = 3,
+        Stale     = 4,
+    };
 
     struct SharedImportAdoptionResult {
         SharedImportDisposition disposition = SharedImportDisposition::Cancelled;
@@ -1404,7 +1687,16 @@ public:
         // adoption decision; Engine owns publication of this immutable identity/snapshot.
         std::optional<SharedPrefixSummary> summary;
         std::optional<CheckpointLifecycleFact> checkpoint;
+        std::optional<CheckpointLifecycleFact> displaced_checkpoint;
+        std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
+        bool capacity_reclamation_committed = false;
     };
+
+    void cancel_durable_recovery(std::uint64_t reservation_id) noexcept {
+        if (!durable_recovery_ || durable_recovery_->id != reservation_id) { return; }
+        release_durable_recovery_reservation(*durable_recovery_);
+        durable_recovery_.reset();
+    }
 
     // Transactional adoption of a Program-validated Host import. Exact semantic coalescing is
     // delegated back to Program; policy metadata is merged onto the one existing owner. A new
@@ -1414,7 +1706,8 @@ public:
     adopt_imported_shared(Program& program, const ValidatedSharedPrefixImport& imported,
                           CancellationFlagView cancellation               = {},
                           const std::function<void()>& before_publication = {},
-                          bool ssd_backed                                 = false) {
+                          bool ssd_backed = false, std::uint64_t reservation_id = 0,
+                          std::string_view model_binding = {}) {
         if (!std::holds_alternative<std::monostate>(transaction_)) {
             throw std::logic_error("shared snapshot adoption requires a settled resource catalog");
         }
@@ -1423,6 +1716,7 @@ public:
             throw std::invalid_argument("shared snapshot import plan is invalid");
         }
         if (cancellation.requested()) {
+            cancel_durable_recovery(reservation_id);
             return {.disposition = SharedImportDisposition::Cancelled};
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -1435,21 +1729,109 @@ public:
             }
             merge_shared_metadata(entry, imported.metadata());
             entry.ssd_backed = entry.ssd_backed || ssd_backed;
+            cancel_durable_recovery(reservation_id);
             return {.disposition = SharedImportDisposition::Coalesced, .slot = slot};
         }
-        std::uint32_t slot = kInvalidCatalogSlot;
-        for (std::uint32_t candidate = 0; candidate < shared_catalog_count_; ++candidate) {
-            const SharedCatalogEntry& entry = shared_catalog_[candidate];
-            if (entry.state == SharedCatalogState::Vacant && !entry.handle) {
-                slot = candidate;
-                break;
+
+        DurableRecoveryRecord* recovery = nullptr;
+        if (reservation_id != 0) {
+            if (!durable_recovery_ || durable_recovery_->id != reservation_id) {
+                return {.disposition = SharedImportDisposition::Stale};
+            }
+            recovery                 = &*durable_recovery_;
+            const bool logical_stale = !valid_durable_recovery_record(*recovery);
+            if (logical_stale) {
+                cancel_durable_recovery(reservation_id);
+                return {.disposition = SharedImportDisposition::Stale};
+            }
+            // A physical revision can add a better warm source or change which logical victim is
+            // the correct pressure choice even when the old victim would still fit.  Adoption has
+            // neither the prompt nor the SSD candidate set needed to repeat that comparison, so
+            // it must abort this reservation and let the Gateway fall back/reinspect rather than
+            // commit a victim selected from stale topology.
+            if (recovery->program_revision != program.resource_revision()) {
+                cancel_durable_recovery(reservation_id);
+                return {.disposition = SharedImportDisposition::Stale};
+            }
+        }
+
+        std::uint32_t slot = recovery ? recovery->publication_slot : kInvalidCatalogSlot;
+        if (!recovery) {
+            for (std::uint32_t candidate = 0; candidate < shared_catalog_count_; ++candidate) {
+                const SharedCatalogEntry& entry = shared_catalog_[candidate];
+                if (entry.state == SharedCatalogState::Vacant && !entry.handle &&
+                    entry.transaction_pins == 0) {
+                    slot = candidate;
+                    break;
+                }
             }
         }
         if (slot == kInvalidCatalogSlot) {
             throw std::invalid_argument("shared snapshot does not fit the shared catalog");
         }
 
-        auto publication               = program.adopt_shared_prefix(imported);
+        if (before_publication) { before_publication(); }
+        if (cancellation.requested()) {
+            cancel_durable_recovery(reservation_id);
+            return {.disposition = SharedImportDisposition::Cancelled};
+        }
+
+        std::optional<SharedPrefixSummary> displaced_summary;
+        std::optional<SharedPrefixPersistenceMetadata> displaced_metadata;
+        std::optional<ContinuationSummary> reclaimed_private_before;
+        std::optional<SharedPrefixSummary> reclaimed_shared_before;
+        SharedPrefixHandle* replacement  = nullptr;
+        ContinuationHandle* host_private = nullptr;
+        SharedPrefixHandle* host_shared  = nullptr;
+        if (recovery && recovery->replacement) {
+            SharedCatalogEntry& victim = shared_catalog_[recovery->replacement->slot];
+            displaced_summary          = victim.summary;
+            displaced_metadata         = SharedPrefixPersistenceMetadata{
+                        .evidence             = victim.evidence,
+                        .structural_origins   = victim.structural_origins,
+                        .structural_role      = victim.structural_role,
+                        .ssd_eligible         = victim.ssd_eligible,
+                        .first_volatile_token = victim.first_volatile_token,
+            };
+            replacement = &*victim.handle;
+        }
+        if (recovery && recovery->host_private) {
+            CatalogEntry& victim     = catalog_[recovery->host_private->slot];
+            reclaimed_private_before = victim.summary;
+            host_private             = &*victim.handle;
+        }
+        if (recovery && recovery->host_shared) {
+            SharedCatalogEntry& victim = shared_catalog_[recovery->host_shared->slot];
+            reclaimed_shared_before    = victim.summary;
+            host_shared                = &*victim.handle;
+        }
+        auto publication = [&] {
+            if constexpr (requires {
+                              program.adopt_shared_prefix(
+                                  imported, replacement, cancellation, before_publication,
+                                  model_binding, host_private, host_shared,
+                                  displaced_metadata ? &*displaced_metadata : nullptr,
+                                  recovery ? recovery->physical_plan : nullptr);
+                          }) {
+                try {
+                    return program.adopt_shared_prefix(
+                        imported, replacement, cancellation, before_publication, model_binding,
+                        host_private, host_shared,
+                        displaced_metadata ? &*displaced_metadata : nullptr,
+                        recovery ? recovery->physical_plan : nullptr);
+                } catch (...) {
+                    cancel_durable_recovery(reservation_id);
+                    throw;
+                }
+            } else {
+                if (replacement != nullptr) {
+                    cancel_durable_recovery(reservation_id);
+                    throw std::logic_error(
+                        "Program does not support transactional shared import replacement");
+                }
+                return program.adopt_shared_prefix(imported);
+            }
+        }();
         const auto release_publication = [&]() {
             auto released = program.release_shared_prefix(std::move(publication.handle));
             if (released.status != ConsumeStatus::Consumed) {
@@ -1462,14 +1844,69 @@ public:
             release_publication();
             throw std::logic_error("Program returned an invalid shared snapshot publication");
         }
-        if (before_publication) { before_publication(); }
-        if (cancellation.requested()) {
+        const auto same_private_identity = [&](const ContinuationSummary& before,
+                                               const ContinuationSummary& after) {
+            if (!valid_continuation_summary(after) || after.active_references != 0) {
+                return false;
+            }
+            ContinuationSummary expected  = before;
+            const auto preserve_residency = [&](auto& checkpoint) {
+                const auto* refreshed = find_checkpoint(after, checkpoint.ref);
+                if (refreshed == nullptr) { return false; }
+                checkpoint.state_residency = refreshed->state_residency;
+                return true;
+            };
+            if ((expected.endpoint && !preserve_residency(*expected.endpoint)) ||
+                (expected.rewrite && !preserve_residency(*expected.rewrite))) {
+                return false;
+            }
+            for (auto& anchor : expected.long_anchors) {
+                if (!preserve_residency(anchor)) { return false; }
+            }
+            return expected.endpoint == after.endpoint && expected.rewrite == after.rewrite &&
+                   expected.long_anchors == after.long_anchors &&
+                   expected.active_references == after.active_references;
+        };
+        if (reclaimed_private_before.has_value() !=
+                publication.reclaimed_private_summary.has_value() ||
+            (reclaimed_private_before &&
+             !same_private_identity(*reclaimed_private_before,
+                                    *publication.reclaimed_private_summary))) {
             release_publication();
-            return {.disposition = SharedImportDisposition::Cancelled};
+            throw std::logic_error("Program returned an invalid reclaimed private summary");
         }
-        SharedCatalogEntry& entry = shared_catalog_[slot];
-        if (entry.state != SharedCatalogState::Vacant || entry.handle) {
+        if (reclaimed_shared_before.has_value() !=
+            publication.reclaimed_shared_summary.has_value()) {
             release_publication();
+            throw std::logic_error("Program returned an invalid reclaimed shared summary");
+        }
+        if (reclaimed_shared_before) {
+            SharedPrefixSummary expected         = *reclaimed_shared_before;
+            const SharedPrefixSummary& refreshed = *publication.reclaimed_shared_summary;
+            expected.checkpoint.state_residency  = refreshed.checkpoint.state_residency;
+            if (!valid_shared_prefix_summary(refreshed) || refreshed.active_references != 0 ||
+                expected != refreshed) {
+                release_publication();
+                throw std::logic_error("Program changed reclaimed shared checkpoint identity");
+            }
+        }
+        // Program invokes before_publication at its actual sealed publication boundary and rolls
+        // back every staged/replacement mutation when that checkpoint rejects cancellation or a
+        // deadline. A control change observed after Program returns is post-commit; treating it as
+        // pre-commit here would split Program and ResourceManager topology.
+        SharedCatalogEntry& entry = shared_catalog_[slot];
+        if (recovery && !valid_durable_recovery_record(*recovery)) {
+            release_publication();
+            cancel_durable_recovery(reservation_id);
+            return {.disposition = SharedImportDisposition::Stale};
+        }
+        if (recovery && recovery->replacement) {
+            entry.handle.reset();
+            clear_shared_entry(entry);
+        } else if (entry.state != SharedCatalogState::Vacant || entry.handle ||
+                   entry.transaction_pins != (recovery ? 1U : 0U)) {
+            release_publication();
+            cancel_durable_recovery(reservation_id);
             throw std::logic_error("shared catalog changed during sealed import adoption");
         }
         entry.state = SharedCatalogState::Catalogued;
@@ -1488,8 +1925,44 @@ public:
                        : demand_epoch_ + kDemandWindowCapacity)
                 : 0;
         advance_revision(entry.revision);
+        const bool replaced    = displaced_summary.has_value();
+        entry.transaction_pins = 0;
+        if (recovery && recovery->host_private) {
+            CatalogEntry& host = catalog_[recovery->host_private->slot];
+            assign_continuation_summary(host.summary, *publication.reclaimed_private_summary);
+            migrate_observations(host, *publication.reclaimed_private_summary, host.retention);
+            advance_revision(host.revision);
+            refresh_session_owner_revision(host.id, recovery->host_private->slot, host.revision);
+            host.state = CatalogState::Catalogued;
+        }
+        if (recovery && recovery->host_shared) {
+            SharedCatalogEntry& host = shared_catalog_[recovery->host_shared->slot];
+            if (host.transaction_pins == 0) { std::terminate(); }
+            host.summary = *publication.reclaimed_shared_summary;
+            advance_revision(host.revision);
+            --host.transaction_pins;
+        }
+        const bool reclaimed_capacity =
+            recovery && recovery->reclamation != UniquePhysicalReclamation{};
+        if (recovery) { observe_committed_reclamation(recovery->reclamation); }
+        durable_recovery_.reset();
         rebuild_prefix_index();
-        return {.disposition = SharedImportDisposition::Published, .slot = slot};
+        SharedImportAdoptionResult result{
+            .disposition =
+                replaced ? SharedImportDisposition::Replaced : SharedImportDisposition::Published,
+            .slot                           = slot,
+            .capacity_reclamation_committed = reclaimed_capacity,
+        };
+        result.reclaimed_checkpoints = std::move(publication.reclaimed_checkpoints);
+        if (displaced_summary) {
+            result.displaced_checkpoint = lifecycle_fact(
+                displaced_summary->checkpoint, CheckpointLifecycleOperation::Evicted,
+                displaced_summary->checkpoint.state_residency == ReplicaResidency::HostOnly
+                    ? CheckpointLifecycleTier::Host
+                    : CheckpointLifecycleTier::Device,
+                CheckpointLifecycleTier::Ssd, CheckpointLifecycleStatus::Committed);
+        }
+        return result;
     }
 
     [[nodiscard]] bool mark_shared_ssd_backed(std::uint32_t slot,
@@ -1561,6 +2034,9 @@ public:
         entry.retention = RetentionClass::RecentPrivate;
         assign_continuation_summary(entry.summary, summary);
         migrate_observations(entry, summary, entry.retention);
+        // A restored anonymous continuation has no request publication epoch until it is selected.
+        // Treat it as older than request-published heads in the interim.
+        entry.authoritative_epoch = 0;
         advance_revision(entry.revision);
         entry.handle.emplace(std::move(handle));
     }
@@ -1636,7 +2112,8 @@ private:
         std::optional<ContinuationHandle> handle;
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
-        RetentionClass retention = RetentionClass::RecentPrivate;
+        RetentionClass retention          = RetentionClass::RecentPrivate;
+        std::uint64_t authoritative_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1657,6 +2134,83 @@ private:
         SharedCandidateEvidence evidence      = SharedCandidateEvidence::None;
         std::optional<std::uint32_t> first_volatile_token;
     };
+
+    struct DurableRecoveryRecord {
+        std::uint64_t id               = 0;
+        std::uint32_t publication_slot = kInvalidCatalogSlot;
+        std::optional<CatalogCapability> replacement;
+        std::optional<CatalogCapability> host_private;
+        std::optional<CatalogCapability> host_shared;
+        ProgramResourceRevision program_revision;
+        UniquePhysicalReclamation reclamation;
+        std::shared_ptr<const void> physical_plan;
+    };
+
+    [[nodiscard]] bool
+    valid_durable_recovery_record(const DurableRecoveryRecord& record) const noexcept {
+        if (record.id == 0 || record.publication_slot >= shared_catalog_count_) { return false; }
+        const SharedCatalogEntry& publication = shared_catalog_[record.publication_slot];
+        if (publication.transaction_pins != 1) { return false; }
+        const bool publication_valid = [&] {
+            if (!record.replacement) {
+                return publication.state == SharedCatalogState::Vacant && !publication.handle;
+            }
+            const CatalogCapability& capability = *record.replacement;
+            return capability.slot == record.publication_slot &&
+                   capability.owner.kind == LogicalOwnerKind::SharedPrefix &&
+                   publication.state == SharedCatalogState::Catalogued && publication.handle &&
+                   publication.id == capability.owner.id &&
+                   publication.revision == capability.generation && publication.ssd_backed &&
+                   publication.summary.active_references == 0 &&
+                   shared_active_edge_count(capability.slot) == 0;
+        }();
+        if (!publication_valid) { return false; }
+        if (record.host_private) {
+            const CatalogCapability& capability = *record.host_private;
+            if (capability.slot >= catalog_count_ ||
+                capability.owner.kind != LogicalOwnerKind::PrivateContinuation) {
+                return false;
+            }
+            const CatalogEntry& entry = catalog_[capability.slot];
+            if (entry.state != CatalogState::Claimed || !entry.handle ||
+                entry.id != capability.owner.id || entry.revision != capability.generation ||
+                entry.summary.active_references != 0 || private_has_active_edge(capability.slot)) {
+                return false;
+            }
+        }
+        if (record.host_shared) {
+            const CatalogCapability& capability = *record.host_shared;
+            if (capability.slot >= shared_catalog_count_ ||
+                capability.owner.kind != LogicalOwnerKind::SharedPrefix) {
+                return false;
+            }
+            const SharedCatalogEntry& entry = shared_catalog_[capability.slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                entry.transaction_pins != 1 || entry.id != capability.owner.id ||
+                entry.revision != capability.generation || entry.summary.active_references != 0 ||
+                shared_active_edge_count(capability.slot) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void release_durable_recovery_reservation(const DurableRecoveryRecord& record) noexcept {
+        if (record.publication_slot >= shared_catalog_count_) { return; }
+        SharedCatalogEntry& entry = shared_catalog_[record.publication_slot];
+        if (entry.transaction_pins != 0) { --entry.transaction_pins; }
+        if (record.host_private && record.host_private->slot < catalog_count_) {
+            CatalogEntry& host = catalog_[record.host_private->slot];
+            if (host.state == CatalogState::Claimed && host.id == record.host_private->owner.id &&
+                host.revision == record.host_private->generation) {
+                host.state = CatalogState::Catalogued;
+            }
+        }
+        if (record.host_shared && record.host_shared->slot < shared_catalog_count_) {
+            SharedCatalogEntry& host = shared_catalog_[record.host_shared->slot];
+            if (host.transaction_pins != 0) { --host.transaction_pins; }
+        }
+    }
 
     static void merge_shared_metadata(SharedCatalogEntry& entry,
                                       const SharedPrefixPersistenceMetadata& candidate) noexcept {
@@ -2108,7 +2662,8 @@ private:
         entry.handle.reset();
         entry.session.reset();
         entry.observations.clear();
-        entry.retention = RetentionClass::RecentPrivate;
+        entry.retention           = RetentionClass::RecentPrivate;
+        entry.authoritative_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -2221,7 +2776,7 @@ private:
         shared_candidates.reserve(base.context_cache().opportunities.size());
         const std::uint32_t vacant_shared_slots = static_cast<std::uint32_t>(
             std::count_if(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
-                return entry.state == SharedCatalogState::Vacant;
+                return entry.state == SharedCatalogState::Vacant && entry.transaction_pins == 0;
             }));
         for (const auto& opportunity : base.context_cache().opportunities) {
             if (opportunity.kind != PromptCacheMarkerKind::SharedStablePrefix ||
@@ -2500,6 +3055,8 @@ private:
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    .conversation_head        = true,
+                    .authoritative_epoch      = entry.authoritative_epoch,
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -2918,6 +3475,11 @@ private:
             if (selected) {
                 saturating_increment(selected->selected_hit_count);
                 selected->last_hit_epoch = ++retention_epoch_;
+                if (!record.selected_observation->shared) {
+                    CatalogEntry& entry = catalog_[record.selected_observation->slot];
+                    entry.authoritative_epoch =
+                        std::max(entry.authoritative_epoch, record.publication_order);
+                }
             }
         }
     }
@@ -4268,6 +4830,8 @@ private:
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;
     ContextTransaction transaction_;
     ContextMachineCostModel cost_model_;
+    std::optional<DurableRecoveryRecord> durable_recovery_;
+    std::uint64_t next_durable_recovery_id_ = 1;
     Planner planner_;
     CapturePlanner capture_planner_;
     EvictionObserver eviction_observer_;

@@ -308,6 +308,61 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
 
+std::size_t HostKVArena::allocation_offset(HostKVAllocationHandle allocation) const {
+    if (!valid_handle(allocation)) {
+        throw std::invalid_argument("Cannot inspect a stale Host KV allocation");
+    }
+    return descriptors_[allocation.descriptor_].offset;
+}
+
+std::optional<HostKVAllocation> HostKVArena::allocate_at(const HostKVPageLayout& layout,
+                                                         std::uint32_t pages,
+                                                         std::size_t byte_offset) noexcept {
+    const std::optional<std::uint32_t> layout_index = find_layout(layout);
+    if (!layout_index || pages == 0 || free_descriptors_.empty() ||
+        byte_offset % kHostKVAlignment != 0 ||
+        layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
+        return std::nullopt;
+    }
+    const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
+    if (byte_offset > capacity_bytes_ || bytes > capacity_bytes_ - byte_offset) {
+        return std::nullopt;
+    }
+    const auto free =
+        std::find_if(free_extents_.begin(), free_extents_.end(), [&](const FreeExtent& extent) {
+            return extent.offset <= byte_offset && byte_offset - extent.offset <= extent.bytes &&
+                   bytes <= extent.bytes - (byte_offset - extent.offset);
+        });
+    if (free == free_extents_.end()) { return std::nullopt; }
+
+    const std::uint32_t descriptor_index = take_descriptor();
+    if (descriptor_index == std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
+    const std::size_t original_end  = free->offset + free->bytes;
+    const std::size_t allocated_end = byte_offset + bytes;
+    if (free->offset == byte_offset && original_end == allocated_end) {
+        free_extents_.erase(free);
+    } else if (free->offset == byte_offset) {
+        free->offset = allocated_end;
+        free->bytes  = original_end - allocated_end;
+    } else if (original_end == allocated_end) {
+        free->bytes = byte_offset - free->offset;
+    } else {
+        const FreeExtent suffix{.offset = allocated_end, .bytes = original_end - allocated_end};
+        free->bytes = byte_offset - free->offset;
+        free_extents_.insert(free + 1, suffix);
+    }
+
+    Descriptor& descriptor = descriptors_[descriptor_index];
+    descriptor.offset      = byte_offset;
+    descriptor.bytes       = bytes;
+    descriptor.layout      = *layout_index;
+    descriptor.pages       = pages;
+    descriptor.active      = true;
+    occupied_bytes_ += bytes;
+    bump_revision();
+    return HostKVAllocation(*this, descriptor_index, descriptor.generation);
+}
+
 std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
     std::span<const HostKVAllocationHandle> proposed_releases,
     std::span<const HostKVAllocationRequest> target_allocations) const {

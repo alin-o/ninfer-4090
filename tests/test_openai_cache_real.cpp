@@ -38,12 +38,13 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-RuntimeStats settled_stats(const GenerationService& service) {
+RuntimeStats settled_stats(const GenerationService& service, bool wait_for_capture = false) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         const auto stats = service.runtime_stats();
         if (stats.running_requests == 0 && stats.waiting_requests == 0 &&
-            stats.materializing_requests == 0) {
+            stats.materializing_requests == 0 &&
+            (!wait_for_capture || stats.capture_pending_requests == 0)) {
             return stats;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -325,6 +326,128 @@ struct TemporaryDirectory {
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(input)), {});
+}
+
+void exercise_durable_two_lineage_replacement(const char* artifact) {
+    TemporaryDirectory temporary;
+    ServeOptions configured                            = options(artifact);
+    configured.max_concurrency                         = 3;
+    configured.max_pending_requests                    = 3;
+    configured.context_cache.device_state_slots        = 6;
+    configured.context_cache.host_state_slots          = 8;
+    configured.context_cache.host_kv_capacity_bytes    = 2ULL << 30;
+    configured.context_cache.max_private_continuations = 6;
+    configured.context_cache.max_shared_prefixes       = 3;
+    configured.shared_prefix_cache_dir                 = temporary.path / "shared-prefixes";
+    configured.shared_prefix_cache_max_records         = 8;
+    configured.shared_prefix_cache_max_bytes           = 8ULL << 30;
+    configured.shared_prefix_cache_staging_bytes       = 2ULL << 30;
+    configured.shared_prefix_cache_workers             = 1;
+    configured.shared_prefix_cache_jobs                = 2;
+
+    const auto instructions = [](std::string_view lineage) {
+        std::string text = "durable-lineage-" + std::string(lineage) + ' ';
+        for (std::uint32_t index = 0; index < 900; ++index) { text += "stable "; }
+        text += "\n=== CACHE_BREAKPOINT ===\nvolatile workspace ";
+        text += lineage;
+        return text;
+    };
+    const auto wait_for_writes = [](const GenerationService& service, std::uint64_t minimum) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const RuntimeStats stats = service.runtime_stats();
+            if (stats.shared_ssd_writes_completed >= minimum && stats.shared_ssd_queued_jobs == 0 &&
+                stats.shared_ssd_active_jobs == 0 && stats.shared_ssd_pending_export_claims == 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    const auto shared_owner_count = [](const GenerationService& service,
+                                       const RuntimeStats& stats) {
+        std::uint32_t all_owners = 0;
+        for (std::uint8_t role = 0; role < static_cast<std::uint8_t>(ContextCacheMetricRole::Count);
+             ++role) {
+            for (std::uint8_t placement = 0;
+                 placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
+                 ++placement) {
+                for (std::uint8_t pin = 0;
+                     pin < static_cast<std::uint8_t>(ContextCacheMetricPin::Count); ++pin) {
+                    for (std::uint8_t identity = 0;
+                         identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
+                         ++identity) {
+                        all_owners += stats.context_cache_owners[context_cache_owner_metric_index(
+                            static_cast<ContextCacheMetricRole>(role),
+                            static_cast<ContextCacheMetricPlacement>(placement),
+                            static_cast<ContextCacheMetricPin>(pin),
+                            static_cast<ContextCacheMetricIdentity>(identity))];
+                    }
+                }
+            }
+        }
+        const auto slots          = service.slot_states();
+        const auto private_owners = static_cast<std::uint32_t>(std::count_if(
+            slots.begin(), slots.end(), [](const auto& slot) { return slot.retained; }));
+        require(all_owners >= private_owners, "cache owner metrics lost a private continuation");
+        return all_owners - private_owners;
+    };
+
+    GenerationOutcome codex_oracle;
+    {
+        GenerationService seed(configured);
+        (void)generate(seed, instructions("direct-a"), "Direct seed A.", false);
+        codex_oracle = generate(seed, instructions("codex-b"), "Codex seed B.", true);
+        require(wait_for_writes(seed, 2),
+                "two-lineage fixture did not durably persist both SSD candidates");
+    }
+
+    GenerationService service(configured);
+    const GenerationOutcome direct_restored =
+        generate(service, instructions("direct-a"), "Direct seed A.", false);
+    require(direct_restored.metrics.durable_loaded_from_ssd &&
+                direct_restored.metrics.durable_fallback_reason == "ssd-successful-restore" &&
+                direct_restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+                direct_restored.metrics.prefix_cache_hit_tokens != 0,
+            "first Direct lineage did not restore its exact durable shared prefix");
+    (void)generate(service, instructions("direct-c"), "Direct activity C.", false);
+    (void)generate(service, instructions("direct-d"), "Direct activity D.", false);
+    require(wait_for_writes(service, 2),
+            "Direct activity did not finish its durable exports before replacement");
+    const RuntimeStats filled = settled_stats(service, true);
+    require(shared_owner_count(service, filled) == 3,
+            "Direct activity did not fill the three-cell resident shared catalog");
+
+    const GenerationOutcome codex =
+        generate(service, instructions("codex-b"), "Codex seed B.", true);
+    const auto displaced = std::find_if(
+        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
+            return fact.operation == CheckpointLifecycleOperation::Evicted &&
+                   fact.status == CheckpointLifecycleStatus::Committed &&
+                   fact.scope == CheckpointLifecycleScope::Shared &&
+                   fact.destination_tier == CheckpointLifecycleTier::Ssd;
+        });
+    const auto restored = std::find_if(
+        codex.checkpoint_lifecycle.begin(), codex.checkpoint_lifecycle.end(), [](const auto& fact) {
+            return fact.operation == CheckpointLifecycleOperation::Restored &&
+                   fact.status == CheckpointLifecycleStatus::Committed &&
+                   fact.scope == CheckpointLifecycleScope::Shared &&
+                   fact.source_tier == CheckpointLifecycleTier::Ssd;
+        });
+    require(codex.metrics.durable_loaded_from_ssd &&
+                codex.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
+                codex.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+                codex.metrics.prefix_cache_hit_tokens == codex.metrics.durable_restore_frontier &&
+                codex.metrics.prefix_cache_hit_tokens != 0 &&
+                codex.prompt_tokens > static_cast<int>(codex.metrics.prefix_cache_hit_tokens) &&
+                codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens) ==
+                    codex.prompt_tokens -
+                        static_cast<int>(codex.metrics.durable_restore_frontier) &&
+                codex.generated_token_ids == codex_oracle.generated_token_ids &&
+                displaced != codex.checkpoint_lifecycle.end() &&
+                restored != codex.checkpoint_lifecycle.end() && displaced < restored &&
+                displaced->content_digest != restored->content_digest,
+            "Codex lineage root-prefilled or lost exact replacement/frontier/suffix evidence");
 }
 
 std::string base64(std::span<const std::uint8_t> bytes) {
@@ -633,6 +756,7 @@ int main() {
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);
+        exercise_durable_two_lineage_replacement(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);
         return 0;

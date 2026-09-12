@@ -73,10 +73,13 @@ Startup reads only the bounded manifest. For a prepared prompt, serving asks Pro
 content digests, checks deepest candidates first, and loads a matching payload on demand. Before
 I/O, Engine evaluates exact private/shared memory sources with its physical readiness assessment
 and measured context cost model. A same-or-deeper ready Device/Host source wins over SSD; an SSD
-load is attempted only when adoption is currently feasible. A selected load completes (or falls
-back) before that request is submitted for prefill and uses the existing pending deadline. Corrupt,
-truncated, wrong-model/configuration and over-budget records receive no hit credit or Device
-reservation.
+load is attempted only after Engine reserves a feasible vacant slot or a value-selected inactive,
+unpinned owner with complete SSD coverage. Program projects the exact Host State, Host KV, Device
+KV and descriptor reclamation before the reservation. Serving then reads immutable bytes without
+the Engine execution lock; Program revalidates the record and resource revision before Engine
+atomically publishes it. A selected load completes (or falls back) before that request is submitted
+for prefill and uses the existing pending deadline. Corrupt, truncated, wrong-model/configuration
+and over-budget records receive no hit credit or Device reservation.
 
 Publication holds Program's immutable source pins through bounded assembly and write settlement.
 Each replacement uses a new record filename: it is written to a temporary file, synced, renamed and
@@ -92,11 +95,15 @@ repeated publication or invalidation failures cannot accumulate unbounded metada
 quotas reject new work without altering a committed record. Metrics use `ninfer:shared_ssd_*`,
 including pending export claims and
 unpublished directory bytes/records; request JSONL adds
-`result.durable_restore` with frontier, loaded/warm classification and fallback reason.
+`result.durable_restore` with frontier, loaded/warm classification and a stable reason separating
+no record, warm selection, logical/Host State/Host KV/Device capacity, transaction conflict, stale
+reinspection, I/O, checksum, validation, cancellation/deadline, and committed replacement.
 Once publication commits, Engine marks that exact shared owner as safely SSD-backed. Guided Host
 pressure considers those complete owners before complete Device-backed and RAM-only shared owners;
 active edges and transfer pins remain ineligible, and the measured materialization cost makes the
-final choice.
+final choice. Device State pressure uses a harder order: eligible intermediate and shared Device
+replicas are demoted or released before any conversation head; only then may the oldest eligible
+head by authoritative use/publication epoch be reclaimed. Cost ranks actions within that class.
 
 ### Session persistence
 

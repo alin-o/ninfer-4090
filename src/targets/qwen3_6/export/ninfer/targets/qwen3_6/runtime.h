@@ -834,6 +834,27 @@ template <class Variant>
 struct SharedPrefixPublication {
     SharedPrefixHandle<Variant> handle;
     SharedPrefixSummary summary;
+    std::optional<ContinuationSummary> reclaimed_private_summary;
+    std::optional<SharedPrefixSummary> reclaimed_shared_summary;
+    // Exact committed Host replica changes produced by the sealed physical plan. Quantities are
+    // deltas, not the checkpoint's full theoretical requirement.
+    std::vector<CheckpointLifecycleFact> reclaimed_checkpoints;
+};
+
+// Internal real-Program regression observation. Test access uses this to prove that durable
+// import pressure releases only the pinned-aware physical set sealed during inspection.
+struct PrivateHostReclamationTestObservation {
+    std::uint32_t endpoint_frontier             = 0;
+    std::uint32_t unchanged_checkpoint_frontier = 0;
+    std::uint32_t device_only_state_checkpoints = 0;
+    std::uint32_t host_only_state_checkpoints   = 0;
+    std::uint32_t both_state_checkpoints        = 0;
+    std::uint32_t main_host_pages               = 0;
+    std::uint32_t main_aliased_host_pages       = 0;
+    std::uint32_t main_pinned_host_pages        = 0;
+    std::uint32_t backend_host_pages            = 0;
+    std::uint32_t backend_aliased_host_pages    = 0;
+    std::uint32_t backend_pinned_host_pages     = 0;
 };
 
 // A checksum-verified, compatibility-checked shared snapshot held entirely in immutable Host
@@ -1137,6 +1158,10 @@ public:
     durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
+    [[nodiscard]] runtime::DurableImportAssessment inspect_durable_shared_prefix_import(
+        std::uint32_t frontier, const SharedPrefixHandle<Variant>* replacement,
+        const ContinuationHandle<Variant>* host_private = nullptr,
+        const SharedPrefixHandle<Variant>* host_shared  = nullptr) const;
     [[nodiscard]] RetainedSessionSnapshot
     export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
                          const SharedPrefixPersistenceMetadata& metadata);
@@ -1151,6 +1176,21 @@ public:
                                              const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] SharedPrefixPublication<Variant>
     adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported);
+    [[nodiscard]] SharedPrefixPublication<Variant> adopt_shared_prefix(
+        const ValidatedSharedPrefixImport<Variant>& imported,
+        SharedPrefixHandle<Variant>* replacement, runtime::CancellationFlagView cancellation = {},
+        const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
+        const ContinuationHandle<Variant>* host_private             = nullptr,
+        const SharedPrefixHandle<Variant>* host_shared              = nullptr,
+        const SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
+        std::shared_ptr<const void> physical_plan                   = {});
+    void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle<Variant>& shared);
+    void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle<Variant>& victim,
+                                                 const SharedPrefixHandle<Variant>& separator);
+    void prepare_private_host_reclamation_for_test(const ContinuationHandle<Variant>& continuation);
+    [[nodiscard]] PrivateHostReclamationTestObservation
+    private_host_reclamation_observation_for_test(
+        const ContinuationHandle<Variant>& continuation) const;
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;

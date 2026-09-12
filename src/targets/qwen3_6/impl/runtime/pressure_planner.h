@@ -140,6 +140,29 @@ dropped_checkpoint_count(const qwen3_6::detail::PressureDecision& decision) noex
     return decision.checkpoint_drops;
 }
 
+inline runtime::DeviceStateVictimClass
+device_state_victim_class(const qwen3_6::detail::PressureDecision& decision) noexcept {
+    if (decision.effect.removed.device.state_slots == 0) {
+        return runtime::DeviceStateVictimClass::None;
+    }
+    if (decision.shared_owner) { return runtime::DeviceStateVictimClass::Intermediate; }
+    if (decision.evicts_continuation ||
+        std::any_of(
+            decision.state_changes.begin(), decision.state_changes.end(),
+            [](qwen3_6::detail::PressureStateDecision change) {
+                return change ==
+                           qwen3_6::detail::PressureStateDecision::DropEndpointDeviceDuplicate ||
+                       change == qwen3_6::detail::PressureStateDecision::DemoteEndpointToHost;
+            }) ||
+        std::any_of(decision.dropped_checkpoints.begin(), decision.dropped_checkpoints.end(),
+                    [](runtime::CheckpointRef ref) {
+                        return ref.kind == runtime::CheckpointKind::SessionEndpoint;
+                    })) {
+        return runtime::DeviceStateVictimClass::ConversationHead;
+    }
+    return runtime::DeviceStateVictimClass::Intermediate;
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -713,8 +736,10 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
 
     struct Selection {
         std::size_t victim_index = 0;
+        std::size_t victim_rank  = 0;
         PressureDecision decision;
         detail::PhysicalResources residual;
+        bool adds_destruction = false;
     };
 
     const std::size_t maximum_steps = 16U * std::max<std::size_t>(1, options.victims.size()) + 16U;
@@ -737,46 +762,46 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         }
 
         std::optional<Selection> selected;
-        for (int destructive = 0; destructive < 2 && !selected; ++destructive) {
-            for (const std::size_t victim_index : victim_order) {
-                const std::uint16_t current_choice = choice_scratch[victim_index];
-                const PressureDecision* current =
-                    current_choice == 0
-                        ? nullptr
-                        : &options.victims[victim_index].decisions[current_choice - 1U];
-                if (current != nullptr && current->evicts_continuation) { continue; }
-                std::vector<PressureDecision> successors = pressure_successors(
-                    options.victims[victim_index], residual, *protection, current);
-                std::optional<Selection> owner_best;
-                for (PressureDecision& successor : successors) {
-                    const std::uint32_t prior_drops =
-                        current == nullptr ? 0 : current->checkpoint_drops;
-                    const bool adds_destruction =
-                        successor.evicts_continuation || successor.checkpoint_drops > prior_drops;
-                    if (adds_destruction != (destructive != 0)) { continue; }
-                    const detail::PhysicalResources child_residual =
-                        projected_residual(choice_scratch, victim_index, &successor);
-                    if (child_residual == residual) { continue; }
-                    Selection candidate{
-                        .victim_index = victim_index,
-                        .decision     = std::move(successor),
-                        .residual     = child_residual,
-                    };
-                    const auto key = [&](const Selection& value) {
-                        return std::tuple{
-                            residual_key(value.residual),
-                            NINFER_QWEN36_RUNTIME_NS::degradation_units(value.decision),
-                            transfer_bytes(value.decision),
-                            value.decision.id,
-                        };
-                    };
-                    if (!owner_best || key(candidate) < key(*owner_best)) {
-                        owner_best = std::move(candidate);
-                    }
-                }
-                if (owner_best) {
-                    selected = std::move(owner_best);
-                    break;
+        const auto selection_key = [&](const Selection& value) {
+            const runtime::DeviceStateVictimClass victim_class =
+                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(value.decision);
+            const bool head = victim_class == runtime::DeviceStateVictimClass::ConversationHead;
+            return std::tuple{
+                static_cast<std::uint8_t>(victim_class),
+                head ? value.victim_rank : static_cast<std::size_t>(value.adds_destruction),
+                head ? static_cast<std::size_t>(value.adds_destruction) : value.victim_rank,
+                residual_key(value.residual),
+                NINFER_QWEN36_RUNTIME_NS::degradation_units(value.decision),
+                transfer_bytes(value.decision),
+                value.decision.id,
+            };
+        };
+        for (std::size_t victim_rank = 0; victim_rank < victim_order.size(); ++victim_rank) {
+            const std::size_t victim_index     = victim_order[victim_rank];
+            const std::uint16_t current_choice = choice_scratch[victim_index];
+            const PressureDecision* current =
+                current_choice == 0 ? nullptr
+                                    : &options.victims[victim_index].decisions[current_choice - 1U];
+            if (current != nullptr && current->evicts_continuation) { continue; }
+            std::vector<PressureDecision> successors =
+                pressure_successors(options.victims[victim_index], residual, *protection, current);
+            for (PressureDecision& successor : successors) {
+                const std::uint32_t prior_drops =
+                    current == nullptr ? 0 : current->checkpoint_drops;
+                const bool adds_destruction =
+                    successor.evicts_continuation || successor.checkpoint_drops > prior_drops;
+                const detail::PhysicalResources child_residual =
+                    projected_residual(choice_scratch, victim_index, &successor);
+                if (child_residual == residual) { continue; }
+                Selection candidate{
+                    .victim_index     = victim_index,
+                    .victim_rank      = victim_rank,
+                    .decision         = std::move(successor),
+                    .residual         = child_residual,
+                    .adds_destruction = adds_destruction,
+                };
+                if (!selected || selection_key(candidate) < selection_key(*selected)) {
+                    selected = std::move(candidate);
                 }
             }
         }
@@ -845,6 +870,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
                                                               : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = decision.checkpoint_drops,
+            .device_state_victim_class =
+                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(decision),
         });
     }
     detail::PhysicalResources residual =
@@ -1021,6 +1048,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                                                                : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = dropped,
+            .device_state_victim_class =
+                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(*decision),
         });
         ++projection_work;
     }

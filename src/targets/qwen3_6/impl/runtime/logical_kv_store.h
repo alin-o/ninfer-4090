@@ -286,6 +286,29 @@ public:
         return LogicalKVPageHandle(this, index, page.generation);
     }
 
+    // Failure-only durable-import rollback path. Reserve an immutable logical page whose first
+    // physical replica will be attached by HostKVExtentStore. This avoids consuming a transient
+    // Device page when the displaced checkpoint was Host-only.
+    [[nodiscard]] std::optional<LogicalKVPageHandle>
+    reserve_host_only_page(std::uint32_t committed_columns) noexcept {
+        if (committed_columns == 0 ||
+            committed_columns > static_cast<std::uint32_t>(kPagedKVPageSize) || free_count_ == 0) {
+            return std::nullopt;
+        }
+        const std::uint32_t index = free_[--free_count_];
+        Page& page                = pages_[index];
+        if (page.occupied) {
+            free_[free_count_++] = index;
+            return std::nullopt;
+        }
+        page.content_epoch     = next_epoch(page.content_epoch);
+        page.committed_columns = committed_columns;
+        page.references        = 1;
+        page.writer_references = 0;
+        page.occupied          = true;
+        return LogicalKVPageHandle(this, index, page.generation);
+    }
+
     void materialize(DeviceKVPageReservation& reservation,
                      std::span<LogicalKVPageHandle> destinations,
                      std::optional<LogicalKVPageHandle> preferred_predecessor = std::nullopt) {
@@ -883,6 +906,70 @@ public:
         }
         address.occupied = true;
         return KVAddressSpaceHandle(this, index, address.generation);
+    }
+
+    // Rebuild an immutable checkpoint address after a failed transactional replacement. Valid
+    // entries are still-owned aliased pages; empty entries consume exactly one newly returned
+    // replica in the caller-specified original tier. No all-pages scratch allocation is required,
+    // so aliasing cannot inflate rollback capacity beyond what the displaced address released.
+    [[nodiscard]] KVAddressSpaceHandle
+    restore_inactive_checkpoint(std::span<const LogicalKVPageHandle> retained_pages,
+                                std::uint32_t frontier,
+                                std::span<const std::uint8_t> device_residency = {}) {
+        if (retained_pages.empty() || retained_pages.size() != pages_for_tokens(frontier) ||
+            (!device_residency.empty() && device_residency.size() != retained_pages.size())) {
+            throw std::invalid_argument("KV rollback checkpoint shape is invalid");
+        }
+        std::optional<KVAddressSpaceHandle> handle = create_inactive();
+        if (!handle) { throw std::invalid_argument("KV rollback address capacity is exhausted"); }
+        Address& address                    = require(*handle);
+        DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
+        std::uint32_t fresh_count           = 0;
+        for (std::size_t index = 0; index < retained_pages.size(); ++index) {
+            const LogicalKVPageHandle page = retained_pages[index];
+            if (page.valid()) {
+                if (!pages_->can_retain_reference(page, false)) {
+                    (void)release(*handle);
+                    throw std::logic_error("KV rollback alias is no longer retainable");
+                }
+            } else if (device_residency.empty() || device_residency[index] != 0) {
+                ++fresh_count;
+            }
+        }
+        try {
+            pages_->physical_pool().resize_reservation(reservation, fresh_count);
+            const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+            for (std::size_t index = 0; index < retained_pages.size(); ++index) {
+                const LogicalKVPageHandle retained = retained_pages[index];
+                LogicalKVPageHandle page;
+                if (retained.valid()) {
+                    pages_->retain_reference(retained, false);
+                    page = retained;
+                } else if (!device_residency.empty() && device_residency[index] == 0) {
+                    const std::uint32_t begin = static_cast<std::uint32_t>(index) * page_size;
+                    const auto reserved =
+                        pages_->reserve_host_only_page(std::min(page_size, frontier - begin));
+                    if (!reserved) {
+                        throw std::logic_error("KV rollback Host-only descriptor is unavailable");
+                    }
+                    page = *reserved;
+                } else {
+                    page                      = pages_->materialize(reservation);
+                    const std::uint32_t begin = static_cast<std::uint32_t>(index) * page_size;
+                    pages_->commit_coverage(page, std::min(page_size, frontier - begin));
+                    pages_->set_writer(page, false);
+                }
+                membership(address, static_cast<std::uint32_t>(index)) = page;
+                ++address.page_count;
+            }
+            address.committed_frontier  = frontier;
+            address.checkpoint_frontier = frontier;
+            rebuild_checkpoint_protection();
+            return *handle;
+        } catch (...) {
+            if (can_release(*handle)) { (void)release(*handle); }
+            throw;
+        }
     }
 
     [[nodiscard]] bool valid(KVAddressSpaceHandle handle) const noexcept {

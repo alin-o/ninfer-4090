@@ -76,6 +76,7 @@ struct DurableSharedPrefixRestore {
     bool loaded_from_ssd                  = false;
     bool warm_available                   = false;
     std::uint64_t recovery_reservation_id = 0;
+    std::shared_ptr<runtime::DeferredDurableRecovery> deferred_recovery;
     std::string fallback_reason;
     std::vector<ninfer::CheckpointLifecycleFact> lifecycle;
 };
@@ -98,6 +99,14 @@ public:
     restore_matching(Engine& engine, const PreparedPrompt& prompt, Clock::time_point deadline,
                      const CancellationView& cancellation  = {},
                      const RequestOptions& request_options = {});
+    [[nodiscard]] DurableSharedPrefixRestore
+    stage_matching(Engine& engine, const PreparedPrompt& prompt, Clock::time_point deadline,
+                   const CancellationView& cancellation = {});
+    void load_staged(Engine& engine,
+                     const std::shared_ptr<runtime::DeferredDurableRecovery>& recovery,
+                     Clock::time_point deadline, const CancellationView& cancellation = {});
+    [[nodiscard]] DurableSharedPrefixRestore
+    settle_staged(const std::shared_ptr<runtime::DeferredDurableRecovery>& recovery) noexcept;
     void schedule_exports(Engine& engine);
     void observe_hit(const DurableSharedPrefixRestore& restore, std::uint32_t reused_tokens,
                      PrefixReusePath path) noexcept;
@@ -111,6 +120,8 @@ public:
     [[nodiscard]] std::shared_ptr<const std::vector<std::uint8_t>>
     load(const Candidate& candidate, Clock::time_point deadline,
          const CancellationView& cancellation = {});
+    // Deterministic service-boundary deadline seam. Production never calls this.
+    void set_before_payload_read_for_test(std::function<void()> callback);
 
 private:
     struct State;

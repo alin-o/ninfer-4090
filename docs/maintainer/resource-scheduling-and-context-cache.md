@@ -853,12 +853,22 @@ publication.  Their result is adopted by the Engine at a unit boundary.  Full qu
 request's existing deadline/backpressure path; they are never an unbounded alternate cache or an
 admission path.
 
-Before a durable load, Engine builds the request base plan and asks ResourceManager to inspect exact
-private/shared memory sources with Program's ordinary identity and physical-readiness assessment.
-The deepest ready source is priced with the configured context cost model. A same-or-deeper memory
-source prevents SSD I/O; SSD is eligible only when the logical catalog, Host State/KV stores,
-temporary Device page capacity, address spaces, and an execution lane can accept the import. The
-Gateway receives only this bounded decision and never duplicates materialization policy.
+Gateway attaches only immutable matching manifest identities to the submitted request; this step
+does not claim a source, victim, logical cell, or physical capacity. After Scheduler selects that
+request as the FIFO admission owner, Engine builds its base plan and asks ResourceManager to inspect
+exact private/shared memory sources with Program's ordinary identity and physical-readiness
+assessment. The deepest ready source is priced with the configured context cost model. A
+same-or-deeper memory source prevents SSD I/O; SSD is eligible only when the logical catalog, Host
+State/KV stores, temporary Device page capacity, address spaces, and an execution lane can accept
+the import.
+
+When SSD wins, Engine reserves the sealed source/victim plan and signals Gateway to load the chosen
+immutable record. Gateway performs the bounded read without the Engine execution lock; already
+admitted work continues using its existing reservations. Completion, failure, cancellation, and
+deadline paths re-arm admission and wake the worker. Engine validates and adopts the bytes at the
+next worker boundary. A stale sealed revision releases the old reservation and repeats the complete
+warm/SSD inspection; no stale source or victim can publish. Gateway never duplicates
+materialization policy or mutates Program/ResourceManager state.
 
 Durable replacement uses a versioned payload filename and publishes the manifest last. Until the
 manifest commits, both the old record and new payload are charged to the directory quota. A failed

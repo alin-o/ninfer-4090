@@ -992,6 +992,7 @@ DurableSharedPrefixCatalog::load_record(const Candidate& candidate, Clock::time_
         if (cancellation.requested() || Clock::now() >= deadline) { return {}; }
         job->cv.wait_for(lock, std::chrono::milliseconds(10));
     }
+    if (cancellation.requested() || Clock::now() >= deadline) { return {}; }
     if (!job->error.empty()) { return {}; }
     return {
         .bytes =
@@ -1005,6 +1006,108 @@ DurableSharedPrefixCatalog::load_record(const Candidate& candidate, Clock::time_
 void DurableSharedPrefixCatalog::invalidate_loaded(const LoadedRecord& loaded) noexcept {
     if (!loaded.bytes) { return; }
     state_->invalidate(loaded.digest, loaded.filename, loaded.order);
+}
+
+DurableSharedPrefixRestore
+DurableSharedPrefixCatalog::stage_matching(Engine& engine, const PreparedPrompt& prompt,
+                                           Clock::time_point deadline,
+                                           const CancellationView& cancellation) {
+    DurableSharedPrefixRestore observation;
+    const auto candidates = runtime::DurableSharedSnapshotAccess::candidates(engine, prompt);
+    std::vector<runtime::DeferredDurableRecovery::Candidate> available;
+    {
+        std::lock_guard lock(state_->mutex);
+        available.reserve(candidates.size());
+        for (const Candidate& candidate : candidates) {
+            const auto found = state_->records.find(candidate.content_digest);
+            if (found != state_->records.end() && found->second.frontier == candidate.frontier) {
+                available.push_back(
+                    {.content_digest = candidate.content_digest, .frontier = candidate.frontier});
+            }
+        }
+    }
+    auto recovery = std::make_shared<runtime::DeferredDurableRecovery>();
+    recovery->lifecycle.reserve(8);
+    recovery->fallback_reason.reserve(40);
+    recovery->available_candidates = std::move(available);
+    recovery->gateway_cancellation = cancellation;
+    observation.deferred_recovery  = std::move(recovery);
+    observation.fallback_reason    = observation.deferred_recovery->available_candidates.empty()
+                                         ? "ssd-no-matching-record"
+                                         : "ssd-admission-pending";
+    return observation;
+}
+
+void DurableSharedPrefixCatalog::load_staged(
+    Engine& engine, const std::shared_ptr<runtime::DeferredDurableRecovery>& recovery,
+    Clock::time_point deadline, const CancellationView& cancellation) {
+    if (!recovery) { return; }
+    for (;;) {
+        Candidate candidate;
+        {
+            std::unique_lock lock(recovery->mutex);
+            while (!recovery->completed && !recovery->load_requested) {
+                if (cancellation.requested() || Clock::now() >= deadline) { return; }
+                recovery->cv.wait_for(lock, std::chrono::milliseconds(10));
+            }
+            if (recovery->completed) { return; }
+            candidate = Candidate{.content_digest = recovery->candidate.content_digest,
+                                  .frontier       = recovery->candidate.frontier};
+            recovery->load_requested = false;
+        }
+
+        const Clock::time_point started = Clock::now();
+        LoadedRecord loaded             = load_record(candidate, deadline, cancellation);
+        const std::uint64_t elapsed     = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
+        {
+            std::lock_guard lock(recovery->mutex);
+            if (recovery->completed) { return; }
+            recovery->bytes          = loaded.bytes;
+            recovery->filename       = std::move(loaded.filename);
+            recovery->manifest_order = loaded.order;
+            recovery->io_elapsed_ns += elapsed;
+            recovery->serialized_bytes = loaded.bytes ? loaded.bytes->size() : 0;
+            recovery->load_completed   = true;
+            if (!loaded.bytes) {
+                recovery->fallback_reason =
+                    cancellation.requested()
+                        ? "ssd-cancelled"
+                        : (Clock::now() >= deadline ? "ssd-deadline" : "ssd-io-failure");
+            }
+        }
+        recovery->cv.notify_all();
+        runtime::DurableSharedSnapshotAccess::wake_recovery(engine);
+    }
+}
+
+DurableSharedPrefixRestore DurableSharedPrefixCatalog::settle_staged(
+    const std::shared_ptr<runtime::DeferredDurableRecovery>& recovery) noexcept {
+    DurableSharedPrefixRestore observation;
+    if (!recovery) { return observation; }
+    std::lock_guard recovery_lock(recovery->mutex);
+    observation.frontier         = recovery->frontier;
+    observation.content_digest   = recovery->candidate.content_digest;
+    observation.serialized_bytes = recovery->serialized_bytes;
+    observation.elapsed_ns =
+        recovery->io_elapsed_ns + recovery->validation_nanoseconds + recovery->adoption_nanoseconds;
+    observation.loaded_from_ssd = recovery->loaded_from_ssd;
+    observation.warm_available  = recovery->warm_available;
+    observation.fallback_reason = recovery->fallback_reason;
+    observation.lifecycle       = recovery->lifecycle;
+    if (!recovery->completed || recovery->gateway_settled) { return observation; }
+    recovery->gateway_settled = true;
+    {
+        std::lock_guard lock(state_->mutex);
+        state_->values.validation_nanoseconds += recovery->validation_nanoseconds;
+        state_->values.adoption_nanoseconds += recovery->adoption_nanoseconds;
+        if (recovery->invalidate_record) { ++state_->values.corrupt_records; }
+    }
+    if (recovery->invalidate_record) {
+        state_->invalidate(recovery->candidate.content_digest, recovery->filename,
+                           recovery->manifest_order);
+    }
+    return observation;
 }
 
 DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
@@ -1227,6 +1330,11 @@ void DurableSharedPrefixCatalog::set_lifecycle_observer(
     std::function<void(const ninfer::CheckpointLifecycleFact&)> observer) {
     std::lock_guard lock(state_->mutex);
     state_->options.lifecycle_observer = std::move(observer);
+}
+
+void DurableSharedPrefixCatalog::set_before_payload_read_for_test(std::function<void()> callback) {
+    std::lock_guard lock(state_->mutex);
+    state_->options.before_payload_read = std::move(callback);
 }
 
 DurableSharedPrefixCatalogStats DurableSharedPrefixCatalog::stats() const noexcept {

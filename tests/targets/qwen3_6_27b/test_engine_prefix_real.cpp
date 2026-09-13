@@ -1754,7 +1754,7 @@ private:
 
 class SharedSnapshotImportGate {
 public:
-    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay };
+    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay, AllocationFailure };
 
     SharedSnapshotImportGate(ninfer::runtime::testing::SharedSnapshotImportStage stage,
                              Action action, std::atomic<bool>* cancellation = nullptr)
@@ -1790,6 +1790,8 @@ private:
         case Action::Delay:
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             return;
+        case Action::AllocationFailure:
+            throw std::bad_alloc();
         }
     }
 
@@ -4656,6 +4658,9 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         std::atomic<bool> inject_payload_read_failure{false};
         std::atomic<bool> inject_load_registration_failure{false};
         std::atomic<bool> inject_load_enqueue_failure{false};
+        std::atomic<bool> pause_payload_read{false};
+        std::atomic<bool> payload_read_paused{false};
+        std::atomic<bool> release_payload_read{false};
         ninfer::serve::DurableSharedPrefixCatalogOptions catalog_options{
             .directory     = directory,
             .max_records   = 2,
@@ -4667,6 +4672,13 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
         catalog_options.before_payload_read = [&] {
             if (inject_payload_read_failure.load(std::memory_order_acquire)) {
                 throw std::runtime_error("injected durable payload read failure");
+            }
+            if (pause_payload_read.load(std::memory_order_acquire)) {
+                payload_read_paused.store(true, std::memory_order_release);
+                payload_read_paused.notify_all();
+                while (!release_payload_read.load(std::memory_order_acquire)) {
+                    release_payload_read.wait(false, std::memory_order_acquire);
+                }
             }
         };
         catalog_options.before_load_registration = [&] {
@@ -5864,6 +5876,383 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                           << " restored=" << restored.frontier
                           << " reused=" << continued.reused_prompt_tokens
                           << " warm=" << warm.warm_available << '\n';
+                return 1;
+            }
+        }
+        {
+            // Candidate discovery is intentionally non-mutating. Remove the warm owner after the
+            // Gateway has captured SSD identity but before submission; FIFO admission must inspect
+            // the changed topology, reserve SSD, request the read, and reuse the restored owner.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt initial = restarted.prepare(shared_snapshot_prompt());
+            const auto initial_restore     = catalog.restore_matching(
+                restarted, initial,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            if (!initial_restore.loaded_from_ssd) {
+                std::cerr << "stale warm-to-SSD fixture could not establish its warm owner\n";
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged = catalog.stage_matching(restarted, prepared, deadline);
+            if (!staged.deferred_recovery) {
+                std::cerr << "stale warm-to-SSD fixture did not carry immutable SSD identity\n";
+                return 1;
+            }
+            Access::erase_shared_except(restarted, std::span<const std::uint32_t>{});
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+            catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (!settled.loaded_from_ssd || settled.fallback_reason != "ssd-successful-restore" ||
+                settled.frontier != durable_frontier ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr << "stale warm topology did not fall back to SSD at FIFO admission: "
+                          << settled.fallback_reason << " reused=" << continued.reused_prompt_tokens
+                          << '\n';
+                return 1;
+            }
+        }
+        {
+            // A later request may discover a warm owner while an earlier request is queued, but
+            // that discovery must not pin admission-visible topology. The earlier FIFO request
+            // needs the warm owner as its safe SSD-backed replacement victim and must retain the
+            // first right to reserve it once the active lane becomes available.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            const SharedRecordFixture queued_ssd =
+                make_shared_record(artifact, record_options, 800, "fifo-earlier-ssd");
+            auto fifo_options      = catalog_options;
+            fifo_options.directory = directory / "fifo-admission";
+            ninfer::serve::DurableSharedPrefixCatalog catalog(fifo_options);
+            const auto enqueue_record = [&](const SharedRecordFixture& record) {
+                ninfer::serve::DurableSharedPrefixCatalog::Snapshot snapshot;
+                snapshot.bytes          = record.bytes;
+                snapshot.transfer_bytes = snapshot.bytes.size();
+                snapshot.tokens         = record.frontier;
+                snapshot.session_digest = "fifo-admission";
+                snapshot.content_digest = record.digest;
+                snapshot.checkpoint     = record.checkpoint;
+                catalog.enqueue(std::move(snapshot));
+                catalog.drain();
+            };
+            SharedRecordFixture resident_record{
+                .prompt     = shared_snapshot_prompt(),
+                .bytes      = bytes,
+                .frontier   = durable_frontier,
+                .digest     = durable_digest,
+                .checkpoint = {},
+            };
+            resident_record.checkpoint.content_digest = durable_digest;
+            resident_record.checkpoint.frontier       = durable_frontier;
+            resident_record.checkpoint.role  = ninfer::CheckpointLifecycleRole::SharedStablePrefix;
+            resident_record.checkpoint.scope = ninfer::CheckpointLifecycleScope::Shared;
+            enqueue_record(resident_record);
+            enqueue_record(queued_ssd);
+
+            auto engine_options                 = shared_snapshot_engine_options(artifact);
+            engine_options.max_pending_requests = 3;
+            engine_options.context_cache.max_shared_prefixes = 1;
+            engine_options.context_cache.device_state_slots  = 2;
+            engine_options.context_cache.host_state_slots    = 2;
+            ninfer::Engine restarted(std::move(engine_options));
+            ninfer::PreparedPrompt resident = restarted.prepare(shared_snapshot_prompt());
+            const auto setup_deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            const auto setup_restore =
+                catalog.restore_matching(restarted, resident, setup_deadline, {}, fixed_output(3));
+            const auto setup_generation = restarted.generate(std::move(resident), fixed_output(3));
+            if (!setup_restore.loaded_from_ssd ||
+                setup_generation.reused_prompt_tokens != durable_frontier) {
+                std::cerr << "FIFO reservation fixture could not establish its resident victim\n";
+                return 1;
+            }
+
+            auto blocker = restarted.submit(
+                restarted.prepare_tokens({248045, 846, 198, 9011, 248046, 198}, false),
+                fixed_output(64, false));
+            if (!wait_until([&] { return restarted.runtime_stats().running_requests == 1; })) {
+                std::cerr << "FIFO reservation fixture did not occupy its active lane\n";
+                return 1;
+            }
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::minutes(2);
+            ninfer::PreparedPrompt earlier_prompt = restarted.prepare(queued_ssd.prompt);
+            auto earlier_staged = catalog.stage_matching(restarted, earlier_prompt, deadline);
+            auto earlier        = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(earlier_prompt), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, earlier_staged.deferred_recovery);
+            auto earlier_loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, earlier_staged.deferred_recovery, deadline);
+            });
+
+            ninfer::PreparedPrompt later_prompt = restarted.prepare(shared_snapshot_prompt());
+            auto later_staged = catalog.stage_matching(restarted, later_prompt, deadline);
+            auto later        = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(later_prompt), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, later_staged.deferred_recovery);
+            auto later_loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, later_staged.deferred_recovery, deadline);
+            });
+
+            (void)blocker.wait(nullptr, {});
+            const auto earlier_result = earlier.wait(nullptr, {});
+            earlier_loader.get();
+            const auto earlier_restore = catalog.settle_staged(earlier_staged.deferred_recovery);
+            const auto later_result    = later.wait(nullptr, {});
+            later_loader.get();
+            const auto later_restore = catalog.settle_staged(later_staged.deferred_recovery);
+            if (!earlier_restore.loaded_from_ssd ||
+                earlier_restore.fallback_reason != "ssd-successful-replacement" ||
+                earlier_restore.frontier != queued_ssd.frontier ||
+                earlier_result.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                earlier_result.reused_prompt_tokens != queued_ssd.frontier ||
+                later_result.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                later_result.reused_prompt_tokens != durable_frontier ||
+                later_restore.fallback_reason != "ssd-successful-replacement") {
+                std::cerr << "later pre-admission discovery stole the earlier FIFO victim/source: "
+                          << earlier_restore.fallback_reason << '/' << later_restore.fallback_reason
+                          << " earlier_reused=" << earlier_result.reused_prompt_tokens << '\n';
+                return 1;
+            }
+        }
+        {
+            // Make the topology genuinely stale after FIFO admission reserved SSD capacity and
+            // before adoption. A concurrent exact warm publication changes Program feasibility;
+            // the sealed SSD victim/source plan must not coalesce around revision validation.
+            // Full reinspection must select the now-warm owner without committing an SSD restore.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+
+            pause_payload_read.store(true, std::memory_order_release);
+            auto loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            });
+            payload_read_paused.wait(false, std::memory_order_acquire);
+            std::optional<ninfer::runtime::testing::SharedSnapshotImportObservation> warm_import;
+            try {
+                warm_import = Access::import(restarted, bytes);
+            } catch (...) {
+                release_payload_read.store(true, std::memory_order_release);
+                release_payload_read.notify_all();
+                loader.wait();
+                throw;
+            }
+            release_payload_read.store(true, std::memory_order_release);
+            release_payload_read.notify_all();
+            loader.get();
+            pause_payload_read.store(false, std::memory_order_release);
+
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled       = catalog.settle_staged(staged.deferred_recovery);
+            const bool committed_ssd = std::any_of(
+                settled.lifecycle.begin(), settled.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            if (!warm_import || warm_import->frontier != durable_frontier ||
+                settled.loaded_from_ssd || !settled.warm_available ||
+                settled.fallback_reason != "ssd-stale-replanned-warm-selected" || committed_ssd ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr << "post-reservation stale SSD plan committed or missed warm replan: "
+                          << settled.fallback_reason << " loaded=" << settled.loaded_from_ssd
+                          << " reused=" << continued.reused_prompt_tokens << '\n';
+                return 1;
+            }
+        }
+        {
+            // Cancel after FIFO admission has reserved SSD replacement but before Gateway starts
+            // the read. Handle abandonment must release the reservation, wake the worker, and let
+            // the next request enter without a topology mutation from the cancelled import.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt initial = restarted.prepare(shared_snapshot_prompt());
+            const auto initial_restore     = catalog.restore_matching(
+                restarted, initial,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            if (!initial_restore.loaded_from_ssd) {
+                std::cerr << "deferred cancellation fixture could not establish its warm owner\n";
+                return 1;
+            }
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged = catalog.stage_matching(restarted, prepared, deadline);
+            Access::erase_shared_except(restarted, std::span<const std::uint32_t>{});
+            {
+                auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                    restarted, std::move(prepared), fixed_output(3),
+                    ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+                std::unique_lock lock(staged.deferred_recovery->mutex);
+                if (!staged.deferred_recovery->cv.wait_for(
+                        lock, std::chrono::seconds(5),
+                        [&] {
+                            return staged.deferred_recovery->load_requested ||
+                                   staged.deferred_recovery->completed;
+                        }) ||
+                    !staged.deferred_recovery->load_requested) {
+                    std::cerr << "deferred cancellation fixture never reserved its SSD plan\n";
+                    return 1;
+                }
+            }
+            {
+                std::unique_lock lock(staged.deferred_recovery->mutex);
+                if (!staged.deferred_recovery->cv.wait_for(lock, std::chrono::seconds(5), [&] {
+                        return staged.deferred_recovery->completed;
+                    })) {
+                    std::cerr << "cancelled deferred recovery did not wake and settle\n";
+                    return 1;
+                }
+            }
+            const auto cancelled = catalog.settle_staged(staged.deferred_recovery);
+            const auto next =
+                restarted.generate(restarted.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (cancelled.fallback_reason != "ssd-cancelled" ||
+                std::any_of(cancelled.lifecycle.begin(), cancelled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                next.generated_token_ids != expected_tokens) {
+                std::cerr << "cancelled deferred recovery retained state or blocked admission\n";
+                return 1;
+            }
+        }
+        {
+            // Allocation/size failures are recoverable import outcomes. They must roll back the
+            // deferred reservation and let this request root-prefill without poisoning Engine
+            // health or unrelated work.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                    SharedSnapshotImportGate::Action::AllocationFailure);
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            }
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (!restarted.healthy() || settled.loaded_from_ssd ||
+                settled.fallback_reason != "ssd-adoption-failure" ||
+                std::any_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                continued.reused_prompt_tokens != 0 ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr
+                    << "recoverable deferred allocation failure poisoned Engine or committed: "
+                    << settled.fallback_reason << " healthy=" << restarted.healthy() << '\n';
+                return 1;
+            }
+        }
+        {
+            // Cancellation arriving after a successful SSD read but at Program's final
+            // publication checkpoint must be visible to Engine immediately. Gateway has not yet
+            // returned from load_staged, so waiting for GenerationHandle::wait to copy the flag
+            // would permit a committed replacement after client cancellation.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            std::atomic<bool> cancelled{false};
+            const ninfer::CancellationView cancellation(
+                [&] { return cancelled.load(std::memory_order_acquire); });
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline, cancellation);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+            ninfer::GenerationResult result;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::BeforeCatalogPublication,
+                    SharedSnapshotImportGate::Action::Cancel, &cancelled);
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline, cancellation);
+                result = generation.wait(nullptr, {});
+            }
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (result.finish_reason != ninfer::FinishReason::Cancelled ||
+                settled.loaded_from_ssd || settled.fallback_reason != "ssd-cancelled" ||
+                std::none_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                             [](const auto& fact) {
+                                 return fact.operation ==
+                                            ninfer::CheckpointLifecycleOperation::Restored &&
+                                        fact.status == ninfer::CheckpointLifecycleStatus::Aborted;
+                             }) ||
+                std::any_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                !restarted.healthy() ||
+                restarted.runtime_stats().logical_state_reserved_slots != 0) {
+                std::cerr << "post-read cancellation committed deferred SSD adoption: "
+                          << settled.fallback_reason << '\n';
+                return 1;
+            }
+        }
+        {
+            // A FIFO-head deadline after submission is distinct from cancellation and from an
+            // I/O failure. The pending request must settle its deferred recovery as Aborted,
+            // release every reservation, and discard a read which completes after settlement.
+            auto deadline_options                = catalog_options;
+            deadline_options.before_payload_read = [] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            };
+            ninfer::serve::DurableSharedPrefixCatalog catalog(deadline_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto staging_deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged         = catalog.stage_matching(restarted, prepared, staging_deadline);
+            const auto deadline = ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                  std::chrono::milliseconds(5);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, deadline, staged.deferred_recovery);
+            catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            bool queue_timeout = false;
+            try {
+                (void)generation.wait(nullptr, {});
+            } catch (const ninfer::RequestError& error) {
+                queue_timeout = error.kind() == ninfer::RequestErrorKind::QueueTimeout;
+            }
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            const bool aborted = std::any_of(
+                settled.lifecycle.begin(), settled.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Aborted;
+                });
+            if (!queue_timeout || settled.fallback_reason != "ssd-deadline" || !aborted ||
+                !restarted.healthy() ||
+                restarted.runtime_stats().logical_state_reserved_slots != 0) {
+                std::cerr << "deferred FIFO deadline was misclassified or retained recovery state: "
+                          << settled.fallback_reason << " aborted=" << aborted << '\n';
                 return 1;
             }
         }

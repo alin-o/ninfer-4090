@@ -211,8 +211,8 @@ public:
 
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
-                      Clock::time_point pending_deadline    = {},
-                      std::uint64_t recovery_reservation_id = 0) {
+                      Clock::time_point pending_deadline                = {},
+                      std::shared_ptr<DeferredDurableRecovery> recovery = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -257,7 +257,7 @@ public:
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, pending_deadline,
-                                                submitted, recovery_reservation_id);
+                                                submitted, std::move(recovery));
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -506,8 +506,17 @@ public:
     }
 
     void cancel_durable_shared_prefix_recovery(std::uint64_t reservation_id) noexcept {
-        std::scoped_lock lock(execution_mutex_);
-        resources_.cancel_durable_recovery(reservation_id);
+        {
+            std::scoped_lock lock(execution_mutex_);
+            resources_.cancel_durable_recovery(reservation_id);
+            request_admission_check();
+        }
+        queue_cv_.notify_one();
+    }
+
+    void wake_durable_shared_prefix_recovery() noexcept {
+        request_admission_check();
+        queue_cv_.notify_one();
     }
 
     [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult import_shared_prefix(
@@ -523,6 +532,21 @@ public:
         bool* validation_completed = nullptr, std::uint64_t reservation_id = 0,
         Clock::time_point deadline = Clock::time_point::max()) {
         std::scoped_lock lock(execution_mutex_);
+        return import_shared_prefix_locked(
+            snapshot, model_binding, cancellation, validation_nanoseconds, adoption_nanoseconds,
+            external_checkpoint, std::move(retained_storage), ssd_backed,
+            std::move(expected_candidate), validation_completed, reservation_id, deadline);
+    }
+
+private:
+    [[nodiscard]] typename ResourceManagement::SharedImportAdoptionResult
+    import_shared_prefix_locked(
+        std::span<const std::uint8_t> snapshot, std::string_view model_binding,
+        runtime::CancellationFlagView cancellation, std::uint64_t* validation_nanoseconds,
+        std::uint64_t* adoption_nanoseconds, const std::function<void()>& external_checkpoint,
+        std::shared_ptr<const std::vector<std::uint8_t>> retained_storage, bool ssd_backed,
+        std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate,
+        bool* validation_completed, std::uint64_t reservation_id, Clock::time_point deadline) {
         require_shared_snapshot_engine_healthy();
         if (!context_cache_enabled_) {
             throw std::invalid_argument("shared snapshot import requires the context cache");
@@ -619,6 +643,7 @@ public:
             true);
     }
 
+public:
     // Internal regression seam for retaining a genuinely Program-sealed Host plan across the
     // lifetime of its parsing Engine and presenting it to another Program.
     [[nodiscard]] ValidatedSharedPrefixImport
@@ -1457,14 +1482,48 @@ private:
         request->base_plan.reset();
     }
 
-    void release_durable_recovery(const std::shared_ptr<Request>& request) noexcept {
-        if (request->durable_recovery_reservation_id == 0) { return; }
-        resources_.cancel_durable_recovery(request->durable_recovery_reservation_id);
-        request->durable_recovery_reservation_id = 0;
+    static void append_deferred_recovery_fact(DeferredDurableRecovery& recovery,
+                                              CheckpointLifecycleStatus status,
+                                              std::uint64_t serialized_bytes = 0) {
+        if (recovery.candidate.content_digest.empty() || recovery.candidate.frontier == 0) {
+            return;
+        }
+        recovery.lifecycle.push_back(CheckpointLifecycleFact{
+            .content_digest   = recovery.candidate.content_digest,
+            .frontier         = recovery.candidate.frontier,
+            .role             = CheckpointLifecycleRole::SharedStablePrefix,
+            .scope            = CheckpointLifecycleScope::Shared,
+            .operation        = CheckpointLifecycleOperation::Restored,
+            .source_tier      = CheckpointLifecycleTier::Ssd,
+            .destination_tier = CheckpointLifecycleTier::Host,
+            .status           = status,
+            .state_images     = 1,
+            .serialized_bytes = serialized_bytes,
+            .elapsed_ns       = recovery.io_elapsed_ns + recovery.validation_nanoseconds +
+                          recovery.adoption_nanoseconds,
+        });
+    }
+
+    void settle_unresolved_recovery(const std::shared_ptr<Request>& request, std::string reason,
+                                    CheckpointLifecycleStatus status) {
+        if (!request->durable_recovery) { return; }
+        DeferredDurableRecovery& recovery = *request->durable_recovery;
+        std::unique_lock lock(recovery.mutex);
+        if (recovery.completed) { return; }
+        const std::uint64_t reservation_id = std::exchange(recovery.reservation_id, 0);
+        recovery.fallback_reason           = std::move(reason);
+        append_deferred_recovery_fact(recovery, status,
+                                      recovery.bytes ? recovery.bytes->size() : 0);
+        recovery.completed = true;
+        recovery.bytes.reset();
+        lock.unlock();
+        if (reservation_id != 0) { resources_.cancel_durable_recovery(reservation_id); }
+        recovery.cv.notify_all();
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
-        release_durable_recovery(request);
+        settle_unresolved_recovery(request, "ssd-admission-failure",
+                                   CheckpointLifecycleStatus::Failed);
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
@@ -1484,7 +1543,13 @@ private:
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
-        release_durable_recovery(request);
+        if (reason == FinishReason::Cancelled) {
+            settle_unresolved_recovery(request, "ssd-cancelled",
+                                       CheckpointLifecycleStatus::Aborted);
+        } else {
+            settle_unresolved_recovery(request, "ssd-warm-or-root-selected",
+                                       CheckpointLifecycleStatus::Aborted);
+        }
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
@@ -1689,6 +1754,8 @@ private:
         try {
             for (const auto& request : cancelled) { complete_detached_cancelled(request); }
             for (const auto& request : expired) {
+                settle_unresolved_recovery(request, "ssd-deadline",
+                                           CheckpointLifecycleStatus::Aborted);
                 complete_error(request,
                                std::make_exception_ptr(RequestError(
                                    RequestErrorKind::QueueTimeout,
@@ -2085,8 +2152,278 @@ private:
 
     [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order,
-                                  request->durable_recovery_reservation_id);
+                                  request->publication_order);
+    }
+
+    [[nodiscard]] static const char*
+    durable_infeasibility_reason(DurableImportFeasibility infeasibility) noexcept {
+        switch (infeasibility) {
+        case DurableImportFeasibility::LogicalCapacity:
+            return "ssd-logical-capacity-no-replaceable-victim";
+        case DurableImportFeasibility::LogicalStateCapacity:
+            return "ssd-logical-state-capacity";
+        case DurableImportFeasibility::HostStateCapacity:
+            return "ssd-host-state-capacity";
+        case DurableImportFeasibility::HostKvCapacity:
+            return "ssd-host-kv-capacity";
+        case DurableImportFeasibility::DeviceCapacity:
+            return "ssd-device-feasibility";
+        case DurableImportFeasibility::TransactionConflict:
+            return "ssd-transaction-conflict";
+        default:
+            return "ssd-logical-capacity-no-replaceable-victim";
+        }
+    }
+
+    [[nodiscard]] static bool deferred_gateway_cancel_requested(const void* context) noexcept {
+        if (context == nullptr) { return false; }
+        try {
+            return static_cast<const DeferredDurableRecovery*>(context)
+                ->gateway_cancellation.requested();
+        } catch (...) { return true; }
+    }
+
+    // Resolve only for the Scheduler-selected FIFO head. Selection and reservation happen here;
+    // Gateway then loads immutable bytes without the execution lock and wakes admission.
+    [[nodiscard]] bool resolve_deferred_recovery(const std::shared_ptr<Request>& request) {
+        if (!request->durable_recovery) { return true; }
+        DeferredDurableRecovery& recovery = *request->durable_recovery;
+        {
+            std::lock_guard lock(recovery.mutex);
+            if (recovery.completed) { return true; }
+        }
+        if (request->cancelled.load(std::memory_order_acquire) ||
+            deferred_gateway_cancel_requested(&recovery)) {
+            request->cancelled.store(true, std::memory_order_release);
+            settle_unresolved_recovery(request, "ssd-cancelled",
+                                       CheckpointLifecycleStatus::Aborted);
+            return true;
+        }
+        if (Clock::now() >= request->deadline) {
+            settle_unresolved_recovery(request, "ssd-deadline", CheckpointLifecycleStatus::Aborted);
+            return true;
+        }
+        if (materializing_ || instance_.program->has_context_transaction()) { return false; }
+        if (std::none_of(slots_.begin(), slots_.end(),
+                         [](const auto& slot) { return slot == nullptr; })) {
+            return false;
+        }
+
+        // A stale sealed plan is re-inspected against the complete warm/SSD choice set. The retry
+        // bound prevents a faulty Program test seam from turning admission into an unbounded loop.
+        for (std::uint32_t attempt = 0; attempt != 2; ++attempt) {
+            std::uint64_t reservation_id = 0;
+            DeferredDurableRecovery::Candidate selected_candidate;
+            std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+            {
+                std::lock_guard lock(recovery.mutex);
+                reservation_id     = recovery.reservation_id;
+                selected_candidate = recovery.candidate;
+                if (reservation_id != 0) {
+                    if (!recovery.load_completed) { return false; }
+                    bytes = recovery.bytes;
+                }
+            }
+
+            if (reservation_id == 0) {
+                auto inspected = resources_.inspect_durable_recovery(
+                    *instance_.program, request->prompt, *request->base_plan,
+                    std::span<const DeferredDurableRecovery::Candidate>(
+                        recovery.available_candidates),
+                    request->publication_order);
+                const auto feasible_candidate = [&]() -> const DeferredDurableRecovery::Candidate* {
+                    if (!inspected.ssd_candidate_index ||
+                        *inspected.ssd_candidate_index >= recovery.available_candidates.size()) {
+                        return nullptr;
+                    }
+                    return &recovery.available_candidates[*inspected.ssd_candidate_index];
+                }();
+                if (inspected.warm_frontier != 0 &&
+                    (feasible_candidate == nullptr ||
+                     inspected.warm_frontier >= feasible_candidate->frontier)) {
+                    std::unique_lock lock(recovery.mutex);
+                    recovery.frontier       = inspected.warm_frontier;
+                    recovery.warm_available = true;
+                    recovery.fallback_reason =
+                        attempt == 0 ? "warm-source-selected" : "ssd-stale-replanned-warm-selected";
+                    recovery.completed = true;
+                    recovery.bytes.reset();
+                    lock.unlock();
+                    recovery.cv.notify_all();
+                    return true;
+                }
+                if (feasible_candidate == nullptr) {
+                    if (inspected.infeasibility == DurableImportFeasibility::TransactionConflict) {
+                        return false;
+                    }
+                    std::unique_lock lock(recovery.mutex);
+                    if (inspected.warm_frontier != 0) {
+                        recovery.frontier        = inspected.warm_frontier;
+                        recovery.warm_available  = true;
+                        recovery.fallback_reason = "warm-source-selected";
+                    } else {
+                        recovery.fallback_reason =
+                            recovery.available_candidates.empty()
+                                ? "ssd-no-matching-record"
+                                : durable_infeasibility_reason(inspected.infeasibility);
+                    }
+                    recovery.completed = true;
+                    recovery.bytes.reset();
+                    lock.unlock();
+                    recovery.cv.notify_all();
+                    return true;
+                }
+                reservation_id     = inspected.reservation_id;
+                selected_candidate = *feasible_candidate;
+                std::unique_lock lock(recovery.mutex);
+                const bool loaded_selected = recovery.load_completed && recovery.bytes &&
+                                             recovery.candidate == selected_candidate;
+                recovery.candidate      = selected_candidate;
+                recovery.reservation_id = reservation_id;
+                if (!loaded_selected) {
+                    recovery.bytes.reset();
+                    recovery.load_completed = false;
+                    recovery.load_requested = true;
+                    lock.unlock();
+                    recovery.cv.notify_all();
+                    return false;
+                }
+                bytes = recovery.bytes;
+            }
+
+            if (!bytes) {
+                resources_.cancel_durable_recovery(reservation_id);
+                std::unique_lock lock(recovery.mutex);
+                recovery.reservation_id = 0;
+                recovery.fallback_reason =
+                    recovery.fallback_reason.empty() ? "ssd-io-failure" : recovery.fallback_reason;
+                if (recovery.fallback_reason == "ssd-cancelled") {
+                    request->cancelled.store(true, std::memory_order_release);
+                }
+                const bool aborted = recovery.fallback_reason == "ssd-cancelled" ||
+                                     recovery.fallback_reason == "ssd-deadline";
+                append_deferred_recovery_fact(recovery, aborted
+                                                            ? CheckpointLifecycleStatus::Aborted
+                                                            : CheckpointLifecycleStatus::Failed);
+                recovery.completed = true;
+                lock.unlock();
+                recovery.cv.notify_all();
+                request_admission_check();
+                return true;
+            }
+            bool validation_completed            = false;
+            const auto fail_recoverable_adoption = [&] {
+                resources_.cancel_durable_recovery(reservation_id);
+                std::unique_lock lock(recovery.mutex);
+                recovery.reservation_id  = 0;
+                recovery.fallback_reason = "ssd-adoption-failure";
+                append_deferred_recovery_fact(recovery, CheckpointLifecycleStatus::Failed,
+                                              bytes->size());
+                recovery.completed = true;
+                recovery.bytes.reset();
+                lock.unlock();
+                recovery.cv.notify_all();
+                request_admission_check();
+                return true;
+            };
+            try {
+                const CancellationFlagView cancellation{
+                    .flag    = &request->cancelled,
+                    .context = &recovery,
+                    .query   = &deferred_gateway_cancel_requested,
+                };
+                auto adopted = import_shared_prefix_locked(
+                    std::span<const std::uint8_t>(*bytes), recovery.model_binding, cancellation,
+                    &recovery.validation_nanoseconds, &recovery.adoption_nanoseconds, {}, bytes,
+                    true,
+                    targets::qwen3_6::DurableSharedPrefixCandidate{
+                        .content_digest = selected_candidate.content_digest,
+                        .frontier       = selected_candidate.frontier},
+                    &validation_completed, reservation_id, request->deadline);
+                if (!adopted.checkpoint) {
+                    throw std::logic_error("deferred durable import has no checkpoint identity");
+                }
+                std::unique_lock lock(recovery.mutex);
+                recovery.reservation_id  = 0;
+                recovery.frontier        = adopted.summary->checkpoint.ref.frontier;
+                recovery.loaded_from_ssd = true;
+                recovery.fallback_reason =
+                    adopted.displaced_checkpoint || adopted.capacity_reclamation_committed
+                        ? "ssd-successful-replacement"
+                        : "ssd-successful-restore";
+                if (adopted.displaced_checkpoint) {
+                    recovery.lifecycle.push_back(std::move(*adopted.displaced_checkpoint));
+                }
+                recovery.lifecycle.insert(
+                    recovery.lifecycle.end(),
+                    std::make_move_iterator(adopted.reclaimed_checkpoints.begin()),
+                    std::make_move_iterator(adopted.reclaimed_checkpoints.end()));
+                CheckpointLifecycleFact checkpoint = std::move(*adopted.checkpoint);
+                checkpoint.content_digest          = selected_candidate.content_digest;
+                checkpoint.operation               = CheckpointLifecycleOperation::Restored;
+                checkpoint.source_tier             = CheckpointLifecycleTier::Ssd;
+                checkpoint.destination_tier        = CheckpointLifecycleTier::Host;
+                checkpoint.status                  = CheckpointLifecycleStatus::Committed;
+                checkpoint.serialized_bytes        = bytes->size();
+                checkpoint.elapsed_ns = recovery.io_elapsed_ns + recovery.validation_nanoseconds +
+                                        recovery.adoption_nanoseconds;
+                recovery.lifecycle.push_back(std::move(checkpoint));
+                recovery.completed = true;
+                recovery.bytes.reset();
+                lock.unlock();
+                recovery.cv.notify_all();
+                request_admission_check();
+                return true;
+            } catch (const RequestError& error) {
+                resources_.cancel_durable_recovery(reservation_id);
+                std::unique_lock lock(recovery.mutex);
+                recovery.reservation_id = 0;
+                const bool cancelled    = error.kind() == RequestErrorKind::Cancelled;
+                if (cancelled) { request->cancelled.store(true, std::memory_order_release); }
+                recovery.fallback_reason = cancelled ? "ssd-cancelled" : "ssd-deadline";
+                append_deferred_recovery_fact(recovery, CheckpointLifecycleStatus::Aborted,
+                                              bytes->size());
+                recovery.completed = true;
+                recovery.bytes.reset();
+                lock.unlock();
+                recovery.cv.notify_all();
+                request_admission_check();
+                return true;
+            } catch (const std::invalid_argument& error) {
+                resources_.cancel_durable_recovery(reservation_id);
+                const std::string_view message(error.what());
+                if (validation_completed && message.find("stale") != std::string_view::npos &&
+                    attempt == 0) {
+                    std::lock_guard lock(recovery.mutex);
+                    recovery.reservation_id = 0;
+                    request_admission_check();
+                    continue;
+                }
+                std::unique_lock lock(recovery.mutex);
+                recovery.reservation_id    = 0;
+                recovery.invalidate_record = !validation_completed;
+                recovery.fallback_reason =
+                    validation_completed
+                        ? (message.find("stale") != std::string_view::npos ? "ssd-stale-replanned"
+                                                                           : "ssd-adoption-failure")
+                        : (message.find("checksum") != std::string_view::npos
+                               ? "ssd-checksum-failure"
+                               : "ssd-validation-failure");
+                append_deferred_recovery_fact(recovery, CheckpointLifecycleStatus::Failed,
+                                              bytes->size());
+                recovery.completed = true;
+                recovery.bytes.reset();
+                lock.unlock();
+                recovery.cv.notify_all();
+                request_admission_check();
+                return true;
+            } catch (const std::bad_alloc&) {
+                return fail_recoverable_adoption();
+            } catch (const std::overflow_error&) {
+                return fail_recoverable_adoption();
+            } catch (const std::length_error&) { return fail_recoverable_adoption(); }
+        }
+        throw std::logic_error("deferred durable recovery exhausted its stale-plan retry bound");
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -2277,13 +2614,12 @@ private:
 
         const auto reserved = resources_.reserve_materialization(
             *instance_.program, std::move(choice), std::move(request->prompt),
-            CancellationFlagView{&request->cancelled}, request->durable_recovery_reservation_id);
+            CancellationFlagView{&request->cancelled});
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
             request_admission_check();
             return AdmissionProgress::ControlProgress;
         }
         if (reserved == ResourceManagement::MaterializationReserveResult::Aborted) {
-            request->durable_recovery_reservation_id = 0;
             if (!erase_pending(request)) {
                 throw std::logic_error("aborted materialization lost its waiting request");
             }
@@ -2293,7 +2629,6 @@ private:
             publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
-        request->durable_recovery_reservation_id = 0;
         if (!erase_pending(request)) {
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }
@@ -2337,6 +2672,8 @@ private:
                 continue;
             }
             if (Clock::now() >= head->deadline) {
+                settle_unresolved_recovery(head, "ssd-deadline",
+                                           CheckpointLifecycleStatus::Aborted);
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::QueueTimeout,
@@ -2349,6 +2686,29 @@ private:
                 ensure_base_plan(head);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
+            if (!resolve_deferred_recovery(head)) {
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
+            }
+            if (head->cancelled.load(std::memory_order_acquire)) {
+                if (erase_pending(head)) {
+                    on_waiting_removed(head);
+                    complete_detached_cancelled(head);
+                    publish_runtime_stats();
+                    control_progress = true;
+                }
+                continue;
+            }
+            if (Clock::now() >= head->deadline) {
+                settle_unresolved_recovery(head, "ssd-deadline",
+                                           CheckpointLifecycleStatus::Aborted);
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::QueueTimeout,
+                              "inference request expired while waiting for admission")));
                 control_progress = true;
                 continue;
             }
@@ -2402,6 +2762,12 @@ private:
             }
 
             for (const std::shared_ptr<Request>& candidate : queued.backfill_candidates()) {
+                // SSD adoption is a global topology transition and belongs to the selected FIFO
+                // head. A backfill candidate may become head later, but it cannot publish its
+                // staged recovery while an earlier request owns FIFO protection.
+                if (candidate->durable_recovery && !candidate->durable_recovery->completed) {
+                    continue;
+                }
                 if (candidate->cancelled.load(std::memory_order_acquire)) {
                     if (erase_pending(candidate)) {
                         on_waiting_removed(candidate);
@@ -2412,6 +2778,8 @@ private:
                     continue;
                 }
                 if (Clock::now() >= candidate->deadline) {
+                    settle_unresolved_recovery(candidate, "ssd-deadline",
+                                               CheckpointLifecycleStatus::Aborted);
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::QueueTimeout,

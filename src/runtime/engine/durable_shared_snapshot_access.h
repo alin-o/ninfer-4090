@@ -5,6 +5,7 @@
 // already prepared prompt and exchange opaque NINFSHR1 records.
 
 #include "ninfer/engine.h"
+#include "runtime/engine/deferred_durable_recovery.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h"
 
 #include <chrono>
@@ -70,7 +71,7 @@ struct DurableSharedSnapshotAccess {
     [[nodiscard]] static GenerationHandle
     submit(Engine& engine, PreparedPrompt prompt, RequestOptions options,
            OutputConsumerMode consumer_mode, std::chrono::steady_clock::time_point pending_deadline,
-           std::uint64_t recovery_reservation_id);
+           std::shared_ptr<DeferredDurableRecovery> recovery);
     [[nodiscard]] static ImportResult import(Engine& engine, const Candidate& candidate,
                                              std::shared_ptr<const std::vector<std::uint8_t>> bytes,
                                              const CancellationView& cancellation = {},
@@ -78,6 +79,7 @@ struct DurableSharedSnapshotAccess {
                                              std::chrono::steady_clock::time_point deadline =
                                                  std::chrono::steady_clock::time_point::max());
     static void cancel_recovery(Engine& engine, std::uint64_t reservation_id) noexcept;
+    static void wake_recovery(Engine& engine) noexcept;
     [[nodiscard]] static bool resident(Engine& engine, const Candidate& candidate);
     [[nodiscard]] static bool settle_export(Engine& engine, std::uint32_t slot, std::uint64_t owner,
                                             bool committed);

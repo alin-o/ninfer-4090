@@ -17,7 +17,8 @@ struct SharedSnapshotTestAccess;
 
 namespace runtime {
 struct DurableSharedSnapshotAccess;
-}
+struct DeferredDurableRecovery;
+} // namespace runtime
 
 class PreparedPrompt {
 public:
@@ -153,7 +154,7 @@ private:
     submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
                          OutputConsumerMode consumer_mode,
                          std::chrono::steady_clock::time_point pending_deadline,
-                         std::uint64_t recovery_reservation_id);
+                         std::shared_ptr<runtime::DeferredDurableRecovery> recovery);
 
     class Impl;
     std::shared_ptr<Impl> impl_;

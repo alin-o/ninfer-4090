@@ -498,12 +498,14 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
                                 std::chrono::steady_clock::time_point pending_deadline) {
     return submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
-                                pending_deadline, 0);
+                                pending_deadline, {});
 }
 
-GenerationHandle Engine::submit_with_recovery(
-    PreparedPrompt prompt, RequestOptions options, OutputConsumerMode consumer_mode,
-    std::chrono::steady_clock::time_point pending_deadline, std::uint64_t recovery_reservation_id) {
+GenerationHandle
+Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
+                             OutputConsumerMode consumer_mode,
+                             std::chrono::steady_clock::time_point pending_deadline,
+                             std::shared_ptr<runtime::DeferredDurableRecovery> recovery) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
@@ -522,7 +524,15 @@ GenerationHandle Engine::submit_with_recovery(
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
-        runtime::DurableSharedSnapshotAccess::cancel_recovery(*this, recovery_reservation_id);
+        if (recovery) {
+            {
+                std::lock_guard lock(recovery->mutex);
+                recovery->fallback_reason = "ssd-warm-or-root-selected";
+                recovery->completed       = true;
+                recovery->bytes.reset();
+            }
+            recovery->cv.notify_all();
+        }
 
         struct ImmediateSubmission {
             GenerationResult result;
@@ -561,7 +571,7 @@ GenerationHandle Engine::submit_with_recovery(
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, pending_deadline,
-                                 recovery_reservation_id);
+                                 std::move(recovery));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -571,9 +581,14 @@ GenerationHandle Engine::submit_with_recovery(
 
 GenerationHandle runtime::DurableSharedSnapshotAccess::submit(
     Engine& engine, PreparedPrompt prompt, RequestOptions options, OutputConsumerMode consumer_mode,
-    std::chrono::steady_clock::time_point pending_deadline, std::uint64_t recovery_reservation_id) {
+    std::chrono::steady_clock::time_point pending_deadline,
+    std::shared_ptr<DeferredDurableRecovery> recovery) {
+    if (recovery) {
+        if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+        recovery->model_binding = slot_model_binding(engine.impl_->load);
+    }
     return engine.submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
-                                       pending_deadline, recovery_reservation_id);
+                                       pending_deadline, std::move(recovery));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -962,6 +977,17 @@ void runtime::DurableSharedSnapshotAccess::cancel_recovery(Engine& engine,
                               core->cancel_durable_shared_prefix_recovery(reservation_id);
                           }) {
                 core->cancel_durable_shared_prefix_recovery(reservation_id);
+            }
+        },
+        engine.impl_->core);
+}
+
+void runtime::DurableSharedSnapshotAccess::wake_recovery(Engine& engine) noexcept {
+    if (!engine.impl_) { return; }
+    std::visit(
+        [](auto& core) {
+            if constexpr (requires { core->wake_durable_shared_prefix_recovery(); }) {
+                core->wake_durable_shared_prefix_recovery();
             }
         },
         engine.impl_->core);

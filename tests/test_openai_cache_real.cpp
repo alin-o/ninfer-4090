@@ -29,6 +29,17 @@
 #include <unistd.h>
 #include <vector>
 
+namespace ninfer::serve::testing {
+
+struct GenerationServiceTestAccess {
+    static void set_before_payload_read(GenerationService& service,
+                                        std::function<void()> callback) {
+        service.set_before_payload_read_for_test(std::move(callback));
+    }
+};
+
+} // namespace ninfer::serve::testing
+
 namespace {
 
 using Json = nlohmann::json;
@@ -460,9 +471,16 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
     require(shared_owner_count(service, filled) == 3,
             "Direct activity did not fill the three-cell resident shared catalog");
 
+    const std::uint64_t loads_before_direct_repeat =
+        service.runtime_stats().shared_ssd_loads_completed;
     const GenerationOutcome direct_repeated =
         generate(service, instructions("direct-a"), "Direct seed A.", false, true);
     trace_state(8);
+    std::cerr << "TRACE r8 reuse=" << direct_repeated.metrics.prefix_cache_hit_tokens
+              << " path=" << static_cast<unsigned>(direct_repeated.metrics.prefix_reuse_path)
+              << " durable=" << direct_repeated.metrics.durable_fallback_reason
+              << " frontier=" << direct_repeated.metrics.durable_restore_frontier
+              << " warm=" << direct_repeated.metrics.durable_warm_available << '\n';
     require(!direct_repeated.metrics.durable_loaded_from_ssd &&
                 direct_repeated.metrics.durable_warm_available &&
                 direct_repeated.metrics.durable_fallback_reason == "warm-source-selected" &&
@@ -473,7 +491,8 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
                 direct_repeated.prompt_tokens -
                         static_cast<int>(direct_repeated.metrics.prefix_cache_hit_tokens) ==
                     direct_repeated.prompt_tokens -
-                        static_cast<int>(direct_repeated.metrics.durable_restore_frontier),
+                        static_cast<int>(direct_repeated.metrics.durable_restore_frontier) &&
+                service.runtime_stats().shared_ssd_loads_completed == loads_before_direct_repeat,
             "repeated Direct lineage did not choose its deepest warm checkpoint");
     const RuntimeStats before_codex = settled_stats(service, true);
     const GenerationOutcome codex =
@@ -516,6 +535,100 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
               << " codex_reuse=" << codex.metrics.prefix_cache_hit_tokens << " codex_suffix="
               << codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens)
               << '\n';
+}
+
+void exercise_deferred_durable_deadline_settlement(const char* artifact) {
+    TemporaryDirectory temporary;
+    ServeOptions configured                      = options(artifact);
+    configured.max_concurrency                   = 1;
+    configured.max_pending_requests              = 2;
+    configured.context_cache.device_state_slots  = 2;
+    configured.context_cache.host_state_slots    = 2;
+    configured.context_cache.max_shared_prefixes = 1;
+    configured.shared_prefix_cache_dir           = temporary.path / "deadline-prefixes";
+    configured.shared_prefix_cache_max_records   = 2;
+    configured.shared_prefix_cache_max_bytes     = 4ULL << 30;
+    configured.shared_prefix_cache_staging_bytes = 2ULL << 30;
+    configured.shared_prefix_cache_workers       = 1;
+    configured.shared_prefix_cache_jobs          = 1;
+    std::string stable                           = "deferred-deadline ";
+    for (std::uint32_t index = 0; index < 900; ++index) { stable += "stable "; }
+    stable += "\n=== CACHE_BREAKPOINT ===\nvolatile deadline suffix";
+    const Json target_body{
+        {"model", "qwen3.8"},
+        {"messages", Json::array({Json{{"role", "system"}, {"content", stable}},
+                                  Json{{"role", "user"}, {"content", "Reply yes."}}})},
+        {"max_tokens", 3}};
+    const auto target_request = [&] {
+        return parse_chat_completion_request(target_body, RequestLimits{}).generation;
+    };
+    {
+        GenerationService seed(configured);
+        PreparedRequest prepared =
+            seed.prepare(target_request(), GenerationConsumerMode::Aggregate);
+        (void)seed.run(prepared, nullptr);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const RuntimeStats stats = seed.runtime_stats();
+            if (stats.shared_ssd_writes_completed != 0 && stats.shared_ssd_queued_jobs == 0 &&
+                stats.shared_ssd_active_jobs == 0 && stats.shared_ssd_pending_export_claims == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        require(seed.runtime_stats().shared_ssd_writes_completed != 0,
+                "deferred deadline fixture did not persist its SSD candidate");
+    }
+
+    const auto verify_terminal = [](const ApiException& exception, std::string_view code) {
+        return exception.error().code == code &&
+               std::any_of(exception.error().checkpoint_lifecycle.begin(),
+                           exception.error().checkpoint_lifecycle.end(), [](const auto& fact) {
+                               return fact.operation == CheckpointLifecycleOperation::Restored &&
+                                      fact.source_tier == CheckpointLifecycleTier::Ssd &&
+                                      fact.status == CheckpointLifecycleStatus::Aborted;
+                           });
+    };
+    const auto verify_released = [](const GenerationService& service, std::string_view label) {
+        const RuntimeStats settled = settled_stats(service, true);
+        if (settled.logical_state_reserved_slots != 0 ||
+            settled.logical_state_inflight_slots != 0 || settled.waiting_requests != 0) {
+            throw std::runtime_error(std::string(label) +
+                                     " retained deferred recovery reservations");
+        }
+    };
+
+    configured.pending_timeout_ms = 1000;
+    for (const GenerationConsumerMode mode :
+         {GenerationConsumerMode::Aggregate, GenerationConsumerMode::Streaming}) {
+        GenerationService service(configured);
+        testing::GenerationServiceTestAccess::set_before_payload_read(
+            service, [] { std::this_thread::sleep_for(std::chrono::milliseconds(1500)); });
+        bool deadline_reported = false;
+        try {
+            (void)service.prepare(target_request(), mode);
+        } catch (const ApiException& exception) {
+            deadline_reported = verify_terminal(exception, "request_queue_timeout");
+        }
+        require(deadline_reported, "deferred SSD deadline lost its mode-correct service lifecycle");
+        verify_released(service, "deferred SSD deadline");
+    }
+
+    configured.pending_timeout_ms = 30000;
+    GenerationService cancelled_service(configured);
+    std::atomic<bool> cancelled{false};
+    testing::GenerationServiceTestAccess::set_before_payload_read(
+        cancelled_service, [&] { cancelled.store(true, std::memory_order_release); });
+    bool cancellation_reported = false;
+    try {
+        (void)cancelled_service.prepare(target_request(), GenerationConsumerMode::Aggregate,
+                                        [&] { return cancelled.load(std::memory_order_acquire); });
+    } catch (const ApiException& exception) {
+        cancellation_reported = verify_terminal(exception, "client_disconnected");
+    }
+    require(cancellation_reported,
+            "aggregate deferred SSD cancellation lost its service lifecycle");
+    verify_released(cancelled_service, "aggregate deferred SSD cancellation");
 }
 
 std::string base64(std::span<const std::uint8_t> bytes) {
@@ -823,12 +936,14 @@ int main() {
     }
     try {
         if (scenario != nullptr && std::string_view(scenario) == "durable-two-lineage") {
+            exercise_deferred_durable_deadline_settlement(artifact);
             exercise_durable_two_lineage_replacement(artifact);
             return 0;
         }
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);
+        exercise_deferred_durable_deadline_settlement(artifact);
         exercise_durable_two_lineage_replacement(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);

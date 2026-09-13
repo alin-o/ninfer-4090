@@ -7,6 +7,8 @@
 #include "serve/request_events.h"
 #include "serve/request_log.h"
 
+#include <ninfer/build_identity.h>
+
 #include <cuda_runtime.h>
 #include <spdlog/logger.h>
 #include <spdlog/sinks/ostream_sink.h>
@@ -537,6 +539,232 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
               << '\n';
 }
 
+void exercise_service_ssd_winning_replacement(const char* artifact) {
+    TemporaryDirectory temporary;
+    ServeOptions configured                                    = options(artifact);
+    configured.max_concurrency                                 = 3;
+    configured.max_pending_requests                            = 3;
+    configured.context_cache.device_state_slots                = 3;
+    configured.context_cache.host_state_slots                  = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 2ULL << 30;
+    configured.context_cache.max_private_continuations         = 6;
+    configured.context_cache.max_shared_prefixes               = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    configured.auto_long_anchors                               = 1;
+    configured.shared_prefix_cache_dir           = temporary.path / "service-ssd-replacement";
+    configured.shared_prefix_cache_max_records   = 8;
+    configured.shared_prefix_cache_max_bytes     = 8ULL << 30;
+    configured.shared_prefix_cache_staging_bytes = 2ULL << 30;
+    configured.shared_prefix_cache_workers       = 1;
+    configured.shared_prefix_cache_jobs          = 2;
+
+    const auto instructions = [](std::string_view lineage, std::uint32_t stable_words = 900) {
+        std::string text = "service-ssd-lineage-" + std::string(lineage) + ' ';
+        for (std::uint32_t index = 0; index < stable_words; ++index) { text += "stable "; }
+        text += "\n=== CACHE_BREAKPOINT ===\nvolatile workspace ";
+        text += lineage;
+        for (std::uint32_t index = 0; index < 100; ++index) { text += " suffix"; }
+        return text;
+    };
+    const auto wait_for_writes = [](const GenerationService& service, std::uint64_t minimum) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const RuntimeStats stats = service.runtime_stats();
+            if (stats.shared_ssd_writes_completed >= minimum && stats.shared_ssd_queued_jobs == 0 &&
+                stats.shared_ssd_active_jobs == 0 && stats.shared_ssd_pending_export_claims == 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    const auto shared_owner_count = [](const GenerationService& service,
+                                       const RuntimeStats& stats) {
+        std::uint32_t all_owners = 0;
+        for (std::uint8_t role = 0; role < static_cast<std::uint8_t>(ContextCacheMetricRole::Count);
+             ++role) {
+            for (std::uint8_t placement = 0;
+                 placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
+                 ++placement) {
+                for (std::uint8_t pin = 0;
+                     pin < static_cast<std::uint8_t>(ContextCacheMetricPin::Count); ++pin) {
+                    for (std::uint8_t identity = 0;
+                         identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
+                         ++identity) {
+                        all_owners += stats.context_cache_owners[context_cache_owner_metric_index(
+                            static_cast<ContextCacheMetricRole>(role),
+                            static_cast<ContextCacheMetricPlacement>(placement),
+                            static_cast<ContextCacheMetricPin>(pin),
+                            static_cast<ContextCacheMetricIdentity>(identity))];
+                    }
+                }
+            }
+        }
+        const auto slots          = service.slot_states();
+        const auto private_owners = static_cast<std::uint32_t>(std::count_if(
+            slots.begin(), slots.end(), [](const auto& slot) { return slot.retained; }));
+        require(all_owners >= private_owners, "service replay lost a private continuation owner");
+        return all_owners - private_owners;
+    };
+
+    const std::string incoming_instructions   = instructions("incoming");
+    constexpr std::uint32_t expected_frontier = 917;
+    constexpr int expected_suffix_tokens      = 123;
+    GenerationOutcome oracle;
+    {
+        GenerationService publisher(configured);
+        oracle = generate(publisher, incoming_instructions, "SSD winner request.", false);
+        require(wait_for_writes(publisher, 1),
+                "service replay did not publish its incoming SSD checkpoint");
+    }
+
+    GenerationService service(configured);
+    const GenerationOutcome initial =
+        generate(service, incoming_instructions, "SSD winner request.", false);
+    const auto initial_restore =
+        std::find_if(initial.checkpoint_lifecycle.begin(), initial.checkpoint_lifecycle.end(),
+                     [](const CheckpointLifecycleFact& fact) {
+                         return fact.operation == CheckpointLifecycleOperation::Restored &&
+                                fact.scope == CheckpointLifecycleScope::Shared &&
+                                fact.source_tier == CheckpointLifecycleTier::Ssd &&
+                                fact.destination_tier == CheckpointLifecycleTier::Host &&
+                                fact.status == CheckpointLifecycleStatus::Committed;
+                     });
+    require(initial.metrics.durable_loaded_from_ssd &&
+                initial.metrics.durable_fallback_reason == "ssd-successful-restore" &&
+                initial.metrics.durable_restore_frontier == expected_frontier &&
+                initial_restore != initial.checkpoint_lifecycle.end() &&
+                initial_restore->frontier == expected_frontier &&
+                !initial_restore->content_digest.empty() &&
+                initial.generated_token_ids == oracle.generated_token_ids,
+            "service replay did not begin with the original SSD recovery");
+    require(initial.id_slot >= 0 && !initial.session_digest.empty() &&
+                service.slot_erase(static_cast<std::uint32_t>(initial.id_slot),
+                                   initial.session_digest) != 0,
+            "service replay did not retire the first request's warm continuation");
+    const GenerationOutcome resident_a =
+        generate(service, instructions("resident-a", 1400), "Resident A.", false);
+    const GenerationOutcome resident_b =
+        generate(service, instructions("resident-b", 1400), "Resident B.", false);
+    require(resident_a.id_slot >= 0 && !resident_a.session_digest.empty(),
+            "service replay did not retain resident activity");
+    const auto generate_explicit_resident = [&](std::string word, std::string suffix,
+                                                std::string session_key) {
+        std::string content;
+        for (std::uint32_t index = 0; index < 1400; ++index) { content += word + ' '; }
+        Json body{{"model", "qwen3.8"},
+                  {"messages",
+                   Json::array({Json{
+                       {"role", "user"},
+                       {"content", Json::array({Json{{"type", "text"}, {"text", content}},
+                                                Json{{"type", "text"}, {"text", suffix}}})}}})},
+                  {"max_tokens", 8}};
+        GenerationRequest generation =
+            parse_chat_completion_request(body, RequestLimits{}).generation;
+        ContextCacheHints hints;
+        hints.session_key                            = std::move(session_key);
+        hints.allow_engine_automatic_shared_prefixes = false;
+        hints.markers.push_back(PromptCacheMarker{
+            .after_message_count      = 1,
+            .kind                     = PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence                 = SharedCandidateEvidence::ExplicitBoundary,
+            .location                 = PromptCacheMarkerLocation::MessagePartBoundary,
+            .after_message_part_count = 1,
+        });
+        auto prepared =
+            service.prepare(generation, GenerationConsumerMode::Aggregate, {}, std::move(hints));
+        return service.run(prepared, nullptr);
+    };
+    const GenerationOutcome explicit_c =
+        generate_explicit_resident("resident", "explicit resident C", "churn-lineage");
+    require(explicit_c.id_slot >= 0,
+            "service replay did not retain its shared-displacement activity");
+    require(wait_for_writes(service, 2),
+            "service replay did not durably settle its resident owners");
+    const RuntimeStats before         = settled_stats(service, true);
+    const MemorySummary before_memory = service.memory_summary();
+    require(shared_owner_count(service, before) == 3,
+            "service replay did not fill the three-cell shared catalog");
+
+    const std::uint64_t loads_before = before.shared_ssd_loads_completed;
+    const GenerationOutcome restored =
+        generate(service, incoming_instructions, "SSD winner request.", false);
+    const RuntimeStats after = settled_stats(service, true);
+    const auto published =
+        std::find_if(restored.checkpoint_lifecycle.begin(), restored.checkpoint_lifecycle.end(),
+                     [&](const CheckpointLifecycleFact& fact) {
+                         return fact.operation == CheckpointLifecycleOperation::Restored &&
+                                fact.scope == CheckpointLifecycleScope::Shared &&
+                                fact.source_tier == CheckpointLifecycleTier::Ssd &&
+                                fact.destination_tier == CheckpointLifecycleTier::Host &&
+                                fact.status == CheckpointLifecycleStatus::Committed &&
+                                fact.content_digest == initial_restore->content_digest;
+                     });
+    const auto displaced = published != restored.checkpoint_lifecycle.begin() &&
+                                   published != restored.checkpoint_lifecycle.end()
+                               ? std::prev(published)
+                               : restored.checkpoint_lifecycle.end();
+    const auto identifies_preexisting_shared_owner = [&](const CheckpointLifecycleFact& victim) {
+        const std::array prior_outcomes{&initial, &resident_a, &resident_b, &explicit_c};
+        return std::any_of(prior_outcomes.begin(), prior_outcomes.end(), [&](const auto* outcome) {
+            return std::any_of(outcome->checkpoint_lifecycle.begin(),
+                               outcome->checkpoint_lifecycle.end(), [&](const auto& fact) {
+                                   return fact.scope == CheckpointLifecycleScope::Shared &&
+                                          fact.status == CheckpointLifecycleStatus::Committed &&
+                                          fact.key_digests == victim.key_digests &&
+                                          fact.frontier == victim.frontier;
+                               });
+        });
+    };
+    const int suffix_tokens =
+        restored.prompt_tokens - static_cast<int>(restored.metrics.prefix_cache_hit_tokens);
+    require(
+        before.logical_state_capacity_slots == 14 && before.logical_state_used_slots == 11 &&
+            before.logical_state_reserved_slots == 0 && before.logical_state_inflight_slots == 0 &&
+            before.device_state_occupied_slots == 6 && before.host_state_occupied_slots == 5 &&
+            before.shared_active_references == 0 && before_memory.host_state_capacity_slots == 8 &&
+            loads_before == 1 && restored.metrics.durable_loaded_from_ssd &&
+            !restored.metrics.durable_warm_available &&
+            restored.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
+            restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+            restored.metrics.prefix_cache_hit_tokens == restored.metrics.durable_restore_frontier &&
+            restored.metrics.durable_restore_frontier == expected_frontier &&
+            suffix_tokens == expected_suffix_tokens &&
+            restored.generated_token_ids == oracle.generated_token_ids &&
+            after.shared_ssd_loads_completed == loads_before + 1U &&
+            after.logical_state_capacity_slots == before.logical_state_capacity_slots &&
+            after.logical_state_used_slots == 14 && after.logical_state_reserved_slots == 0 &&
+            after.logical_state_inflight_slots == 0 &&
+            after.device_state_occupied_slots == before.device_state_occupied_slots &&
+            after.host_state_occupied_slots == before_memory.host_state_capacity_slots &&
+            after.shared_active_references == 0 && shared_owner_count(service, after) == 3 &&
+            displaced != restored.checkpoint_lifecycle.end() &&
+            published != restored.checkpoint_lifecycle.end() &&
+            displaced->operation == CheckpointLifecycleOperation::Evicted &&
+            displaced->scope == CheckpointLifecycleScope::Shared &&
+            displaced->source_tier == CheckpointLifecycleTier::Host &&
+            displaced->destination_tier == CheckpointLifecycleTier::Ssd &&
+            displaced->status == CheckpointLifecycleStatus::Committed &&
+            displaced->frontier > expected_frontier &&
+            displaced->key_digests != std::array<std::uint64_t, 2>{} &&
+            displaced->key_digests != published->key_digests &&
+            published->frontier == expected_frontier &&
+            published->content_digest == initial_restore->content_digest &&
+            identifies_preexisting_shared_owner(*displaced),
+        "service-level 6/6 Device, 5/8 Host replay did not commit SSD-winning replacement");
+    require(std::string_view(ninfer::build::revision) != "unknown" &&
+                std::string_view(ninfer::build::revision).size() == 40,
+            "service replay binary does not record an exact source revision");
+    std::cout << "service_ssd_replacement build_revision=" << ninfer::build::revision
+              << " source_dirty=" << ninfer::build::source_dirty
+              << " frontier=" << restored.metrics.durable_restore_frontier
+              << " suffix=" << suffix_tokens << " logical=" << before.logical_state_used_slots
+              << '/' << before.logical_state_capacity_slots
+              << " device=" << before.device_state_occupied_slots
+              << " host=" << before.host_state_occupied_slots << '/'
+              << before_memory.host_state_capacity_slots << '\n';
+}
+
 void exercise_deferred_durable_deadline_settlement(const char* artifact) {
     TemporaryDirectory temporary;
     ServeOptions configured                      = options(artifact);
@@ -940,11 +1168,16 @@ int main() {
             exercise_durable_two_lineage_replacement(artifact);
             return 0;
         }
+        if (scenario != nullptr && std::string_view(scenario) == "service-ssd-replacement") {
+            exercise_service_ssd_winning_replacement(artifact);
+            return 0;
+        }
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);
         exercise_deferred_durable_deadline_settlement(artifact);
         exercise_durable_two_lineage_replacement(artifact);
+        exercise_service_ssd_winning_replacement(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);
         return 0;

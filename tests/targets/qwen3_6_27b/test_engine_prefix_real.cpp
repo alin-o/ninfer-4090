@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -1771,11 +1772,16 @@ public:
     SharedSnapshotImportGate(const SharedSnapshotImportGate&)            = delete;
     SharedSnapshotImportGate& operator=(const SharedSnapshotImportGate&) = delete;
 
+    [[nodiscard]] bool triggered() const noexcept {
+        return triggered_.load(std::memory_order_acquire);
+    }
+
 private:
     static void checkpoint(void* context,
                            ninfer::runtime::testing::SharedSnapshotImportStage stage) {
         auto& gate = *static_cast<SharedSnapshotImportGate*>(context);
         if (stage != gate.stage_) { return; }
+        gate.triggered_.store(true, std::memory_order_release);
         switch (gate.action_) {
         case Action::Reject:
             throw std::invalid_argument("injected recoverable shared import rejection");
@@ -1799,6 +1805,7 @@ private:
     ninfer::runtime::testing::SharedSnapshotImportStage stage_;
     Action action_;
     std::atomic<bool>* cancellation_ = nullptr;
+    std::atomic<bool> triggered_{false};
 };
 
 class SharedSnapshotExportAllocationGate {
@@ -5243,6 +5250,371 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                               << '/' << fact.main_kv_pages << '/' << fact.backend_kv_pages;
                 }
                 std::cerr << '\n';
+                return 1;
+            }
+        }
+        {
+            // Fill the StateImage descriptor store itself, then force the only safe admission
+            // plan to detach a Host-only private checkpoint. Both injected paths fail after the
+            // detach and incoming State/Main-KV allocation, so byte-identical private snapshots
+            // and exact accounting prove the destructive Program transaction rolled back.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            record_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture incoming_record =
+                make_shared_record(artifact, record_options, 80, "descriptor-incoming");
+            const std::filesystem::path descriptor_directory =
+                directory / "logical-descriptor-reclamation";
+            ninfer::serve::DurableSharedPrefixCatalog descriptor_catalog({
+                .directory     = descriptor_directory,
+                .max_records   = 1,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            });
+            descriptor_catalog.enqueue(catalog_snapshot(incoming_record));
+            descriptor_catalog.drain();
+
+            ninfer::EngineOptions options                           = record_options;
+            options.max_concurrency                                 = 2;
+            options.max_pending_requests                            = 2;
+            options.context_cache.device_state_slots                = 4;
+            options.context_cache.host_state_slots                  = 5;
+            options.context_cache.host_kv_capacity_bytes            = 1ULL << 30U;
+            options.context_cache.max_private_continuations         = 6;
+            options.context_cache.max_shared_prefixes               = 3;
+            options.context_cache.max_long_anchors_per_continuation = 2;
+            ninfer::Engine engine(std::move(options));
+
+            const auto branch = [](std::string third) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                input.messages = {
+                    message(std::string(80, 'a') + " descriptor pressure prefix one"),
+                    message(std::string(160, 'b') + " descriptor pressure prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const ninfer::GenerationResult first =
+                engine.generate(engine.prepare(branch("descriptor first branch")), fixed_output(1));
+            const ninfer::GenerationResult second = engine.generate(
+                engine.prepare(branch(std::string(640, 'c') + " descriptor second branch")),
+                fixed_output(1));
+            const ninfer::GenerationResult third = engine.generate(
+                engine.prepare(pressure_turn("descriptor third head", "descriptor-third",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fourth = engine.generate(
+                engine.prepare(pressure_turn("descriptor fourth head", "descriptor-fourth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fifth = engine.generate(
+                engine.prepare(pressure_turn("descriptor fifth head", "descriptor-fifth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const std::array private_slots{first.slot, second.slot, third.slot, fourth.slot,
+                                           fifth.slot};
+            const ninfer::RuntimeStats full = engine.runtime_stats();
+            if (std::any_of(private_slots.begin(), private_slots.end(),
+                            [](int slot) { return slot < 0; }) ||
+                full.logical_state_capacity_slots != 11 || full.logical_state_used_slots != 11 ||
+                full.logical_state_reserved_slots != 0 || full.logical_state_inflight_slots != 0 ||
+                full.device_state_occupied_slots != 6 || full.host_state_occupied_slots != 5) {
+                std::cerr << "descriptor pressure fixture did not fill exact logical/physical "
+                             "capacity: logical="
+                          << full.logical_state_used_slots << '+'
+                          << full.logical_state_reserved_slots << '/'
+                          << full.logical_state_capacity_slots
+                          << " inflight=" << full.logical_state_inflight_slots
+                          << " physical=" << full.device_state_occupied_slots << '/'
+                          << full.host_state_occupied_slots << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.logical_state_capacity_slots == full.logical_state_capacity_slots &&
+                       observed.logical_state_used_slots == full.logical_state_used_slots &&
+                       observed.logical_state_reserved_slots == full.logical_state_reserved_slots &&
+                       observed.logical_state_inflight_slots == full.logical_state_inflight_slots &&
+                       observed.device_state_occupied_slots == full.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == full.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           full.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           full.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == full.host_kv_occupied_bytes &&
+                       observed.context_cache_owners == full.context_cache_owners;
+            };
+            const auto private_bytes = [&] {
+                std::array<std::vector<std::uint8_t>, private_slots.size()> snapshots;
+                for (std::size_t index = 0; index < private_slots.size(); ++index) {
+                    auto snapshot = Access::begin_private_export(
+                        engine, static_cast<std::uint32_t>(private_slots[index]));
+                    snapshot.await_transfer(snapshot.bytes);
+                    snapshots[index] = snapshot.bytes;
+                    snapshot.release_storage();
+                }
+                return snapshots;
+            };
+            const auto original_private_bytes = private_bytes();
+            const auto original_slots         = engine.slot_states();
+            if (!same_topology(engine.runtime_stats())) {
+                std::cerr << "descriptor fixture snapshot probes changed source ownership\n";
+                return 1;
+            }
+            const auto private_rollback_exact = [&] {
+                if (private_bytes() != original_private_bytes) { return false; }
+                const auto observed = engine.slot_states();
+                if (observed.size() != original_slots.size()) { return false; }
+                for (std::size_t index = 0; index < observed.size(); ++index) {
+                    if (observed[index].processing != original_slots[index].processing ||
+                        observed[index].retained != original_slots[index].retained ||
+                        observed[index].prompt_tokens != original_slots[index].prompt_tokens ||
+                        observed[index].cached_tokens != original_slots[index].cached_tokens ||
+                        observed[index].session_digest != original_slots[index].session_digest ||
+                        observed[index].checkpoints.size() !=
+                            original_slots[index].checkpoints.size()) {
+                        return false;
+                    }
+                    for (std::size_t checkpoint = 0;
+                         checkpoint < observed[index].checkpoints.size(); ++checkpoint) {
+                        if (observed[index].checkpoints[checkpoint].frontier !=
+                                original_slots[index].checkpoints[checkpoint].frontier ||
+                            observed[index].checkpoints[checkpoint].session_digest !=
+                                original_slots[index].checkpoints[checkpoint].session_digest) {
+                            return false;
+                        }
+                    }
+                }
+                return same_topology(engine.runtime_stats());
+            };
+
+            ninfer::PreparedPrompt failed_prompt = engine.prepare(incoming_record.prompt);
+            ninfer::serve::DurableSharedPrefixRestore failed;
+            bool rejection_reached_post_detach = false;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                failed = descriptor_catalog.restore_matching(
+                    engine, failed_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+                rejection_reached_post_detach = gate.triggered();
+            }
+            if (!rejection_reached_post_detach || failed.loaded_from_ssd ||
+                failed.fallback_reason != "ssd-adoption-failure" || !private_rollback_exact() ||
+                std::any_of(failed.lifecycle.begin(), failed.lifecycle.end(), [](const auto& fact) {
+                    return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                })) {
+                std::cerr << "post-detach descriptor rejection did not restore exact private "
+                             "checkpoints/accounting\n";
+                return 1;
+            }
+
+            std::atomic<bool> cancelled{false};
+            ninfer::PreparedPrompt cancelled_prompt = engine.prepare(incoming_record.prompt);
+            bool cancelled_without_commit           = false;
+            bool cancellation_reached_post_detach   = false;
+            try {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Cancel, &cancelled);
+                (void)descriptor_catalog.restore_matching(
+                    engine, cancelled_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    ninfer::CancellationView(
+                        [&] { return cancelled.load(std::memory_order_acquire); }),
+                    fixed_output(1));
+                cancellation_reached_post_detach = gate.triggered();
+            } catch (const ninfer::RequestError& error) {
+                cancellation_reached_post_detach = cancelled.load(std::memory_order_acquire);
+                cancelled_without_commit =
+                    error.kind() == ninfer::RequestErrorKind::Cancelled &&
+                    std::none_of(error.checkpoint_lifecycle().begin(),
+                                 error.checkpoint_lifecycle().end(), [](const auto& fact) {
+                                     return fact.status ==
+                                            ninfer::CheckpointLifecycleStatus::Committed;
+                                 });
+            }
+            if (!cancellation_reached_post_detach || !cancelled_without_commit ||
+                !private_rollback_exact()) {
+                std::cerr << "post-detach descriptor cancellation did not restore exact private "
+                             "checkpoints/accounting\n";
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = engine.prepare(incoming_record.prompt);
+            const auto restored             = descriptor_catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(1));
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            const auto logical_drop          = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Private &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::None &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto shared_restore = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Shared &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto committed_slots         = engine.slot_states();
+            const auto committed_private_bytes = private_bytes();
+            const bool identities_preserved =
+                committed_slots.size() == original_slots.size() &&
+                std::equal(committed_slots.begin(), committed_slots.end(), original_slots.begin(),
+                           [](const ninfer::SlotState& left, const ninfer::SlotState& right) {
+                               return left.processing == right.processing &&
+                                      left.retained == right.retained &&
+                                      left.prompt_tokens == right.prompt_tokens &&
+                                      left.cached_tokens == right.cached_tokens &&
+                                      left.session_digest == right.session_digest;
+                           });
+            const bool displaced_identity_existed =
+                logical_drop != restored.lifecycle.end() &&
+                std::any_of(original_slots.begin(), original_slots.end(), [&](const auto& slot) {
+                    return std::any_of(slot.checkpoints.begin(), slot.checkpoints.end(),
+                                       [&](const auto& checkpoint) {
+                                           return checkpoint.frontier == logical_drop->frontier;
+                                       });
+                });
+            std::size_t changed_snapshot_count = 0;
+            std::optional<std::size_t> changed_snapshot_slot;
+            for (std::size_t index = 0; index < original_private_bytes.size(); ++index) {
+                if (committed_private_bytes[index] != original_private_bytes[index]) {
+                    ++changed_snapshot_count;
+                    changed_snapshot_slot = index;
+                }
+            }
+            std::size_t changed_checkpoint_slot_count = 0;
+            std::optional<std::size_t> changed_checkpoint_slot;
+            std::optional<ninfer::SlotCheckpoint> removed_checkpoint;
+            const auto checkpoint_equal = [](const ninfer::SlotCheckpoint& left,
+                                             const ninfer::SlotCheckpoint& right) {
+                return left.frontier == right.frontier &&
+                       left.session_digest == right.session_digest;
+            };
+            const auto checkpoint_vectors_equal = [&](const auto& left, const auto& right) {
+                return left.size() == right.size() &&
+                       std::equal(left.begin(), left.end(), right.begin(), checkpoint_equal);
+            };
+            for (std::size_t index = 0; index < original_slots.size(); ++index) {
+                const auto& before_checkpoints = original_slots[index].checkpoints;
+                const auto& after_checkpoints  = committed_slots[index].checkpoints;
+                if (checkpoint_vectors_equal(before_checkpoints, after_checkpoints)) { continue; }
+                ++changed_checkpoint_slot_count;
+                changed_checkpoint_slot = index;
+                if (before_checkpoints.size() != after_checkpoints.size() + 1U) { continue; }
+                for (std::size_t removed = 0; removed < before_checkpoints.size(); ++removed) {
+                    bool equal_without_removed = true;
+                    for (std::size_t after_index = 0; after_index < after_checkpoints.size();
+                         ++after_index) {
+                        const std::size_t before_index =
+                            after_index < removed ? after_index : after_index + 1U;
+                        if (!checkpoint_equal(after_checkpoints[after_index],
+                                              before_checkpoints[before_index])) {
+                            equal_without_removed = false;
+                            break;
+                        }
+                    }
+                    if (equal_without_removed) {
+                        removed_checkpoint = before_checkpoints[removed];
+                        break;
+                    }
+                }
+            }
+            const std::size_t matching_original_frontiers =
+                logical_drop == restored.lifecycle.end()
+                    ? 0U
+                    : static_cast<std::size_t>(std::count_if(
+                          original_slots.begin(), original_slots.end(), [&](const auto& slot) {
+                              return std::any_of(slot.checkpoints.begin(), slot.checkpoints.end(),
+                                                 [&](const auto& checkpoint) {
+                                                     return checkpoint.frontier ==
+                                                            logical_drop->frontier;
+                                                 });
+                          }));
+            const ninfer::MemorySummary memory = engine.memory_summary();
+            const std::size_t imported_host_kv_bytes =
+                static_cast<std::size_t>(incoming_record.checkpoint.main_kv_pages) *
+                    memory.host_main_kv_page_bytes +
+                static_cast<std::size_t>(incoming_record.checkpoint.backend_kv_pages) *
+                    memory.host_backend_kv_page_bytes;
+            const auto owner_count = [](const ninfer::RuntimeStats& stats) {
+                return std::accumulate(stats.context_cache_owners.begin(),
+                                       stats.context_cache_owners.end(), std::uint64_t{0});
+            };
+            std::size_t changed_owner_metrics = 0;
+            bool exact_owner_delta            = true;
+            for (std::size_t index = 0; index < full.context_cache_owners.size(); ++index) {
+                if (after.context_cache_owners[index] == full.context_cache_owners[index]) {
+                    continue;
+                }
+                ++changed_owner_metrics;
+                exact_owner_delta = exact_owner_delta && after.context_cache_owners[index] ==
+                                                             full.context_cache_owners[index] + 1U;
+            }
+            if (!restored.loaded_from_ssd || restored.frontier != incoming_record.frontier ||
+                restored.fallback_reason != "ssd-successful-replacement" ||
+                logical_drop == restored.lifecycle.end() || logical_drop->state_images != 1 ||
+                logical_drop->role == ninfer::CheckpointLifecycleRole::SessionEndpoint ||
+                logical_drop->key_digests == std::array<std::uint64_t, 2>{} ||
+                shared_restore == restored.lifecycle.end() || shared_restore->state_images != 1 ||
+                shared_restore->frontier != incoming_record.frontier ||
+                shared_restore->content_digest != incoming_record.digest ||
+                shared_restore->main_kv_pages != incoming_record.checkpoint.main_kv_pages ||
+                shared_restore->backend_kv_pages != incoming_record.checkpoint.backend_kv_pages ||
+                after.logical_state_capacity_slots != 11 || after.logical_state_used_slots != 11 ||
+                after.logical_state_reserved_slots != 0 ||
+                after.logical_state_inflight_slots != 0 || after.device_state_occupied_slots != 6 ||
+                after.host_state_occupied_slots != 5 || !identities_preserved ||
+                after.device_main_kv_occupied_pages != full.device_main_kv_occupied_pages ||
+                after.device_backend_kv_occupied_pages != full.device_backend_kv_occupied_pages ||
+                after.host_kv_occupied_bytes !=
+                    full.host_kv_occupied_bytes + imported_host_kv_bytes ||
+                changed_snapshot_count != 1 || changed_checkpoint_slot_count != 1 ||
+                !changed_snapshot_slot || !changed_checkpoint_slot ||
+                *changed_snapshot_slot != *changed_checkpoint_slot || !removed_checkpoint ||
+                removed_checkpoint->frontier != logical_drop->frontier ||
+                removed_checkpoint->session_digest.empty() || matching_original_frontiers != 1 ||
+                changed_owner_metrics != 1 || !exact_owner_delta ||
+                owner_count(after) != owner_count(full) + 1U || !displaced_identity_existed) {
+                std::cerr << "full descriptor reclamation did not atomically drop one private "
+                             "checkpoint and publish SSD owner: loaded="
+                          << restored.loaded_from_ssd << " reason=" << restored.fallback_reason
+                          << " logical=" << after.logical_state_used_slots << '+'
+                          << after.logical_state_reserved_slots << '/'
+                          << after.logical_state_capacity_slots
+                          << " physical=" << after.device_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots
+                          << " kv=" << full.device_main_kv_occupied_pages << '/'
+                          << full.device_backend_kv_occupied_pages << '/'
+                          << full.host_kv_occupied_bytes << "->"
+                          << after.device_main_kv_occupied_pages << '/'
+                          << after.device_backend_kv_occupied_pages << '/'
+                          << after.host_kv_occupied_bytes << " changed=" << changed_snapshot_count
+                          << '/' << changed_checkpoint_slot_count << '/' << changed_owner_metrics
+                          << " lifecycle=" << restored.lifecycle.size() << '\n';
                 return 1;
             }
         }

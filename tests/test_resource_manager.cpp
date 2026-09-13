@@ -597,11 +597,15 @@ struct FakeDiscardResult {
 };
 
 struct FakePhysicalUsage {
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t logical_state_capacity_slots = 0;
+    std::uint32_t logical_state_used_slots     = 0;
+    std::uint32_t logical_state_reserved_slots = 0;
+    std::uint32_t logical_state_inflight_slots = 0;
+    std::uint32_t device_state_slots           = 0;
+    std::uint32_t host_state_slots             = 0;
+    std::uint32_t device_main_kv_pages         = 0;
+    std::uint32_t device_backend_kv_pages      = 0;
+    std::size_t host_kv_bytes                  = 0;
 };
 
 class FakeProgram;
@@ -1132,6 +1136,8 @@ public:
                         ? UniquePhysicalReclamation{.host_state_slots = 1,
                                                     .host_kv_bytes = durable_host_reclamation_bytes}
                         : UniquePhysicalReclamation{},
+                .replacement_alternate_coverage = durable_import_replacement_alternate_coverage &&
+                                                  replacement != nullptr && host_private != nullptr,
                 .physical_plan = std::make_shared<const std::uint32_t>(frontier)};
     }
 
@@ -1422,9 +1428,10 @@ public:
     std::vector<std::uint32_t> inspected_durable_frontiers;
     std::vector<std::uint32_t> released_continuations;
     std::vector<std::uint32_t> released_shared_prefixes;
-    std::uint64_t shared_import_adoptions         = 0;
-    std::uint32_t max_durable_import_frontier     = UINT32_MAX;
-    bool durable_import_requires_host_reclamation = false;
+    std::uint64_t shared_import_adoptions              = 0;
+    std::uint32_t max_durable_import_frontier          = UINT32_MAX;
+    bool durable_import_requires_host_reclamation      = false;
+    bool durable_import_replacement_alternate_coverage = false;
     DurableImportFeasibility durable_import_pressure_dimension =
         DurableImportFeasibility::HostStateCapacity;
     std::size_t durable_host_reclamation_bytes = 1;
@@ -2567,6 +2574,83 @@ void test_durable_recovery_uses_first_feasible_ssd_candidate() {
             "durable recovery stopped at an infeasible deepest SSD record");
 }
 
+void test_durable_recovery_prefers_pressure_feasible_warm_candidate() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    const ActiveRequest warm = start_active(manager, program, 17, make_base(17), 1);
+    (void)finish_active(manager, program, warm, 16);
+    const ActiveRequest victim = start_active(manager, program, 18, make_base(18), 2);
+    (void)finish_active(manager, program, victim, 16);
+
+    program.required_pressure_actions = 1;
+    const std::array candidates{DurableCandidate{.frontier = 8}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{17}, make_base(17),
+                                         std::span<const DurableCandidate>(candidates));
+
+    require(inspection.warm_frontier == 16 &&
+                inspection.warm_tier == FakeManager::WarmRecoveryTier::Device &&
+                !inspection.ssd_candidate_index && inspection.reservation_id == 0 &&
+                program.pressure_planning_sessions != 0 &&
+                program.inspected_durable_frontiers.empty(),
+            "pressure-feasible warm winner did not suppress shallower SSD adoption");
+
+    program.invalidate_resources();
+    auto admission = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 3);
+    require(admission.choice && admission.choice->summary().reusable_prompt_tokens == 16,
+            "FIFO admission did not re-plan the unreserved warm source");
+    const auto reserved = manager.reserve_materialization(program, std::move(*admission.choice),
+                                                          FakePreparedPrompt{17}, {});
+    require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+            "re-planned warm recovery was stale at admission");
+}
+
+void test_durable_shared_warm_recovery_does_not_pin_before_admission() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(1, 1, 1);
+    FakeProgram program;
+    const FakeValidatedSharedPrefixImport imported{
+        .imported_summary = FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(27, 32)},
+        .imported_metadata =
+            FakeSharedPrefixPersistenceMetadata{
+                .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                .ssd_eligible = true,
+            },
+        .content_key = 27,
+    };
+    const auto adopted = manager.adopt_imported_shared(program, imported, {}, {}, true);
+    require(adopted.disposition == FakeManager::SharedImportDisposition::Published,
+            "shared warm-lease fixture was not published");
+
+    const std::array candidates{DurableCandidate{.frontier = 16}};
+    const auto cancelled =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{27}, make_base(27),
+                                         std::span<const DurableCandidate>(candidates));
+    require(cancelled.warm_frontier == 32 && cancelled.reservation_id == 0 &&
+                !manager.shared_catalog_metadata(0).transaction_pinned,
+            "pre-admission warm inspection mutated shared topology");
+
+    auto released = manager.take_catalogued_shared(0);
+    require(program.release_shared_prefix(std::move(released)).status == ConsumeStatus::Consumed,
+            "earlier FIFO work could not consume the unpinned warm owner");
+    const auto replanned =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{27}, make_base(27),
+                                         std::span<const DurableCandidate>(candidates), 2);
+    require(replanned.warm_frontier == 0 && replanned.ssd_candidate_index == 0 &&
+                replanned.reservation_id != 0,
+            "warm invalidation did not re-evaluate and select the feasible SSD route");
+    manager.cancel_durable_recovery(replanned.reservation_id);
+    require(!manager.shared_catalog_metadata(0).transaction_pinned,
+            "cancelled admission-bound SSD plan retained its logical reservation");
+}
+
 void test_durable_recovery_replaces_full_catalog_transactionally() {
     struct DurableCandidate {
         std::uint32_t frontier = 0;
@@ -2614,6 +2698,7 @@ void test_durable_recovery_replaces_full_catalog_transactionally() {
                                          std::span<const DurableCandidate>(candidates));
     require(!stale_plan.ssd_candidate_index,
             "an exact warm resident owner incorrectly planned a duplicate SSD import");
+    manager.cancel_durable_recovery(stale_plan.reservation_id);
 
     const std::array deeper{DurableCandidate{.frontier = 128}};
     const auto reserved =
@@ -2632,6 +2717,98 @@ void test_durable_recovery_replaces_full_catalog_transactionally() {
     require(replanned.reservation_id != 0,
             "stale durable recovery did not release every logical reservation");
     manager.cancel_durable_recovery(replanned.reservation_id);
+}
+
+void test_durable_recovery_non_ssd_victim_reports_logical_eviction() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    const auto imported = [](std::uint32_t content, std::uint32_t frontier) {
+        return FakeValidatedSharedPrefixImport{
+            .imported_summary =
+                FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(content, frontier)},
+            .imported_metadata =
+                FakeSharedPrefixPersistenceMetadata{
+                    .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                    .ssd_eligible = true,
+                },
+            .content_key = content,
+        };
+    };
+
+    FakeManager manager = make_manager(1, 1, 1);
+    FakeProgram program;
+    const ActiveRequest private_seed = start_active(manager, program, 740, make_base(740), 1);
+    (void)finish_active(manager, program, private_seed);
+    const auto original = manager.adopt_imported_shared(program, imported(740, 16), {}, {}, false);
+    require(original.disposition == FakeManager::SharedImportDisposition::Published &&
+                !manager.shared_catalog_metadata(0).ssd_backed,
+            "alternate-coverage fixture did not retain a non-SSD shared owner");
+
+    program.durable_import_replacement_alternate_coverage = true;
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{741}, make_base(741),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.reservation_id != 0 && inspection.replacement_slot == 0,
+            "private alternate coverage did not admit non-SSD logical replacement");
+    const auto replaced = manager.adopt_imported_shared(program, imported(741, 96), {}, {}, true,
+                                                        inspection.reservation_id);
+    require(replaced.disposition == FakeManager::SharedImportDisposition::Replaced &&
+                replaced.displaced_checkpoint.has_value() &&
+                replaced.displaced_checkpoint->operation == CheckpointLifecycleOperation::Evicted &&
+                replaced.displaced_checkpoint->destination_tier == CheckpointLifecycleTier::None &&
+                manager.shared_catalog_metadata(0).ssd_backed,
+            "non-SSD logical replacement falsely reported durable displaced coverage");
+}
+
+void test_stale_durable_plan_cannot_coalesce_new_exact_owner() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    const auto imported = [](std::uint32_t content, std::uint32_t frontier) {
+        return FakeValidatedSharedPrefixImport{
+            .imported_summary =
+                FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(content, frontier)},
+            .imported_metadata =
+                FakeSharedPrefixPersistenceMetadata{
+                    .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                    .ssd_eligible = true,
+                },
+            .content_key = content,
+        };
+    };
+
+    FakeManager manager = make_manager(1, 1, 3);
+    FakeProgram program;
+    require(manager.adopt_imported_shared(program, imported(750, 32), {}, {}, true).disposition ==
+                FakeManager::SharedImportDisposition::Published,
+            "stale exact-coalescing fixture did not establish its resident owner");
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto reserved =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{751}, make_base(751),
+                                         std::span<const DurableCandidate>(candidates));
+    require(reserved.reservation_id != 0 && !reserved.replacement_slot,
+            "stale exact-coalescing fixture did not reserve its vacant publication cell");
+
+    const auto concurrent = manager.adopt_imported_shared(program, imported(751, 96));
+    require(concurrent.disposition == FakeManager::SharedImportDisposition::Published,
+            "concurrent exact warm owner did not change durable recovery feasibility");
+    program.invalidate_resources();
+    const auto stale = manager.adopt_imported_shared(program, imported(751, 96), {}, {}, true,
+                                                     reserved.reservation_id);
+    std::uint32_t exact_owners = 0;
+    for (std::uint32_t slot = 0; slot < 3; ++slot) {
+        const auto view = manager.shared_catalog_slot(slot);
+        if (view.metadata.state == FakeManager::SharedCatalogState::Catalogued && view.handle &&
+            view.summary.checkpoint.ref.frontier == 96) {
+            ++exact_owners;
+        }
+    }
+    require(stale.disposition == FakeManager::SharedImportDisposition::Stale && exact_owners == 1,
+            "stale durable reservation bypassed revision validation through exact coalescing");
 }
 
 void test_durable_recovery_never_replaces_active_capture_owner() {
@@ -4907,8 +5084,16 @@ int main() {
              test_equal_lower_bound_does_not_short_circuit_tie_break);
     run_test("shallower feasible durable recovery",
              test_durable_recovery_uses_first_feasible_ssd_candidate);
+    run_test("pressure-feasible warm durable recovery winner",
+             test_durable_recovery_prefers_pressure_feasible_warm_candidate);
+    run_test("shared warm recovery stays unpinned until FIFO admission",
+             test_durable_shared_warm_recovery_does_not_pin_before_admission);
     run_test("transactional full-catalog durable recovery",
              test_durable_recovery_replaces_full_catalog_transactionally);
+    run_test("stale durable plan cannot coalesce a new exact owner",
+             test_stale_durable_plan_cannot_coalesce_new_exact_owner);
+    run_test("non-SSD alternate-covered durable replacement lifecycle",
+             test_durable_recovery_non_ssd_victim_reports_logical_eviction);
     run_test("active capture durable replacement protection",
              test_durable_recovery_never_replaces_active_capture_owner);
     run_test("independent private Host duplicate durable recovery",

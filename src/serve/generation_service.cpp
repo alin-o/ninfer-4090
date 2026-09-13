@@ -340,6 +340,10 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
+    const auto settle_submitted_failure = [&] {
+        if (prepared.generation) { prepared.durable_lifecycle = cancel_and_settle(prepared); }
+    };
+    prepared.consumer_mode = consumer_mode;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(
@@ -354,6 +358,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         throw_invalid_input(error, "vision_disabled");
     }
     prepared.lifetime = acquire_request_lifetime(deadline_policy);
+    std::shared_ptr<runtime::DeferredDurableRecovery> deferred_recovery;
 
     try {
         const auto acquisition_started = Clock::now();
@@ -401,9 +406,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         if (durable_catalog_ && cache_participation == CacheParticipation::ReadWrite) {
-            const DurableSharedPrefixRestore restore =
-                durable_catalog_->restore_matching(*engine_, prompt, prepared.lifetime->deadline,
-                                                   control.cancellation, request_options);
+            const DurableSharedPrefixRestore restore = durable_catalog_->stage_matching(
+                *engine_, prompt, prepared.lifetime->deadline, control.cancellation);
             prepared.durable_restore_frontier   = restore.frontier;
             prepared.durable_restore_digest     = restore.content_digest;
             prepared.durable_restore_bytes      = restore.serialized_bytes;
@@ -412,6 +416,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             prepared.durable_loaded_from_ssd    = restore.loaded_from_ssd;
             prepared.durable_warm_available     = restore.warm_available;
             prepared.durable_fallback_reason    = restore.fallback_reason;
+            deferred_recovery                   = restore.deferred_recovery;
+            prepared.durable_recovery           = deferred_recovery;
             check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
@@ -422,24 +428,36 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         }
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              consumer_mode == GenerationConsumerMode::Streaming
-                                                  ? ninfer::OutputConsumerMode::Streaming
-                                                  : ninfer::OutputConsumerMode::Aggregate,
-                                              prepared.lifetime->deadline);
-        prepared.sampling   = prepared.generation.resolved_sampling();
+        prepared.generation = runtime::DurableSharedSnapshotAccess::submit(
+            *engine_, std::move(prompt), std::move(request_options),
+            consumer_mode == GenerationConsumerMode::Streaming
+                ? ninfer::OutputConsumerMode::Streaming
+                : ninfer::OutputConsumerMode::Aggregate,
+            prepared.lifetime->deadline, std::move(deferred_recovery));
+        if (durable_catalog_ && prepared.durable_recovery) {
+            durable_catalog_->load_staged(*engine_, prepared.durable_recovery,
+                                          prepared.lifetime->deadline, control.cancellation);
+            check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        }
+        prepared.sampling = prepared.generation.resolved_sampling();
     } catch (const ApiException& exception) {
+        settle_submitted_failure();
         throw_with_durable_lifecycle(exception.error(), prepared.durable_lifecycle);
     } catch (const ninfer::RequestError& exception) {
+        settle_submitted_failure();
         throw_with_durable_lifecycle(request_error_to_api_error(exception),
                                      prepared.durable_lifecycle);
     } catch (const std::invalid_argument& exception) {
+        settle_submitted_failure();
         ApiError error;
         error.status  = 400;
         error.param   = "messages";
         error.code    = "invalid_prompt";
         error.message = exception.what();
         throw_with_durable_lifecycle(std::move(error), prepared.durable_lifecycle);
+    } catch (...) {
+        settle_submitted_failure();
+        throw;
     }
     return prepared;
 }
@@ -479,7 +497,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
 }
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
-                                         std::function<bool()> is_cancelled) {
+                                         std::function<bool()> is_cancelled) const {
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
     ninfer::OutputSink* public_sink = output_sink.get();
@@ -492,12 +510,31 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
 
     ninfer::GenerationResult result;
+    const auto settle_durable = [&] {
+        if (!durable_catalog_ || !prepared.durable_recovery) { return; }
+        DurableSharedPrefixRestore settled =
+            durable_catalog_->settle_staged(prepared.durable_recovery);
+        prepared.durable_recovery.reset();
+        prepared.durable_restore_frontier   = settled.frontier;
+        prepared.durable_restore_digest     = std::move(settled.content_digest);
+        prepared.durable_restore_bytes      = settled.serialized_bytes;
+        prepared.durable_restore_elapsed_ns = settled.elapsed_ns;
+        prepared.durable_loaded_from_ssd    = settled.loaded_from_ssd;
+        prepared.durable_warm_available     = settled.warm_available;
+        prepared.durable_fallback_reason    = std::move(settled.fallback_reason);
+        prepared.durable_lifecycle.insert(prepared.durable_lifecycle.end(),
+                                          std::make_move_iterator(settled.lifecycle.begin()),
+                                          std::make_move_iterator(settled.lifecycle.end()));
+    };
     try {
         result = prepared.generation.wait(public_sink, cancellation);
+        settle_durable();
     } catch (const ninfer::RequestError& exception) {
+        settle_durable();
         throw_with_durable_lifecycle(request_error_to_api_error(exception),
                                      prepared.durable_lifecycle);
     } catch (...) {
+        settle_durable();
         prepared.failure_checkpoint_lifecycle = prepared.durable_lifecycle;
         std::vector<ninfer::CheckpointLifecycleFact> settled =
             prepared.generation.take_failure_checkpoint_lifecycle();
@@ -569,7 +606,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 std::vector<ninfer::CheckpointLifecycleFact>
-GenerationService::cancel_and_settle(PreparedRequest& prepared) noexcept {
+GenerationService::cancel_and_settle(PreparedRequest& prepared) const noexcept {
     try {
         if (!prepared.generation) {
             if (!prepared.failure_checkpoint_lifecycle.empty()) {
@@ -578,9 +615,18 @@ GenerationService::cancel_and_settle(PreparedRequest& prepared) noexcept {
             return std::move(prepared.durable_lifecycle);
         }
         StreamSink sink;
-        sink.is_cancelled = [] { return true; };
+        const bool deadline_expired =
+            prepared.lifetime && Clock::now() >= prepared.lifetime->deadline;
+        if (!deadline_expired) {
+            sink.is_cancelled = [] { return true; };
+        }
+        const StreamSink* settlement_sink =
+            prepared.consumer_mode == GenerationConsumerMode::Streaming ? &sink : nullptr;
         try {
-            GenerationOutcome outcome = run(prepared, &sink, [] { return true; });
+            GenerationOutcome outcome =
+                run(prepared, settlement_sink,
+                    deadline_expired ? std::function<bool()>{}
+                                     : std::function<bool()>{[] { return true; }});
             return std::move(outcome.checkpoint_lifecycle);
         } catch (const ApiException& exception) {
             return exception.error().checkpoint_lifecycle;
@@ -591,6 +637,11 @@ GenerationService::cancel_and_settle(PreparedRequest& prepared) noexcept {
             return std::move(prepared.durable_lifecycle);
         }
     } catch (...) { return {}; }
+}
+
+void GenerationService::set_before_payload_read_for_test(std::function<void()> callback) {
+    if (!durable_catalog_) { throw std::logic_error("GenerationService has no durable catalog"); }
+    durable_catalog_->set_before_payload_read_for_test(std::move(callback));
 }
 
 ninfer::RuntimeStats GenerationService::runtime_stats() const {

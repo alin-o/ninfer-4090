@@ -592,6 +592,7 @@ struct UniquePhysicalReclamation {
 enum class DurableImportFeasibility : std::uint8_t {
     Feasible,
     LogicalCapacity,
+    LogicalStateCapacity,
     HostStateCapacity,
     HostKvCapacity,
     DeviceCapacity,
@@ -603,6 +604,10 @@ struct DurableImportAssessment {
     DurableImportFeasibility feasibility = DurableImportFeasibility::Unsupported;
     ProgramResourceRevision resource_revision;
     UniquePhysicalReclamation reclamation;
+    // True only when Program proved that removing the proposed shared logical owner preserves an
+    // inactive private checkpoint with the same State and aliased KV prefix. ResourceManager may
+    // use that complete in-memory recovery source in place of SSD backing.
+    bool replacement_alternate_coverage = false;
     // Target-private, immutable physical release plan. ResourceManager carries the exact plan
     // selected during inspection back to the same Program at commit; Gateway never interprets it.
     std::shared_ptr<const void> physical_plan;

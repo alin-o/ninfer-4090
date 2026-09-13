@@ -148,6 +148,10 @@ int main() {
     memory.device_backend_kv_page_bytes      = 2048;
     memory.host_state_capacity_slots         = 3;
     memory.host_state_occupied_slots         = 1;
+    memory.logical_state_capacity_slots      = 7;
+    memory.logical_state_used_slots          = 5;
+    memory.logical_state_reserved_slots      = 1;
+    memory.logical_state_inflight_slots      = 1;
     memory.host_main_kv_page_bytes           = 5000;
     memory.host_backend_kv_page_bytes        = 3000;
     memory.host_kv_capacity_bytes            = 64ULL << 20;
@@ -172,6 +176,10 @@ int main() {
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("build").at("revision").is_string() &&
+                          !server.at("build").at("revision").get<std::string>().empty() &&
+                          server.at("build").at("source_dirty").is_boolean(),
+                      "server build revision identity missing");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
@@ -241,6 +249,11 @@ int main() {
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
                           server.at("memory").at("host_state_occupied_slots") == 1 &&
+                          server.at("memory").at("logical_state_capacity_slots") == 7 &&
+                          server.at("memory").at("logical_state_used_slots") == 5 &&
+                          server.at("memory").at("logical_state_free_slots") == 1 &&
+                          server.at("memory").at("logical_state_reserved_slots") == 1 &&
+                          server.at("memory").at("logical_state_inflight_slots") == 1 &&
                           server.at("memory").at("host_kv_capacity_bytes") == (64ULL << 20) &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
                       "Host context-cache memory ledger missing");
@@ -515,10 +528,12 @@ int main() {
             .at("durable_restore")
             .at("fallback_reason");
     };
-    failures += check(durable_reason("ssd-host-state-capacity") == "ssd-host-state-capacity" &&
-                          durable_reason("ssd-io-failure") == "ssd-io-failure" &&
-                          durable_reason("ssd-validation-failure") == "ssd-validation-failure",
-                      "pre-I/O capacity, I/O, and validation classifications collapsed in JSONL");
+    failures +=
+        check(durable_reason("ssd-logical-state-capacity") == "ssd-logical-state-capacity" &&
+                  durable_reason("ssd-host-state-capacity") == "ssd-host-state-capacity" &&
+                  durable_reason("ssd-io-failure") == "ssd-io-failure" &&
+                  durable_reason("ssd-validation-failure") == "ssd-validation-failure",
+              "pre-I/O capacity, I/O, and validation classifications collapsed in JSONL");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
@@ -706,6 +721,10 @@ int main() {
     throughput.current.state_h2d_seconds                = 0.25;
     throughput.current.device_state_occupied_slots      = 3;
     throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.logical_state_capacity_slots     = 8;
+    throughput.current.logical_state_used_slots         = 5;
+    throughput.current.logical_state_reserved_slots     = 2;
+    throughput.current.logical_state_inflight_slots     = 1;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
@@ -779,6 +798,26 @@ int main() {
     failures += check(
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
             throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("logical_state_images")
+                    .at("capacity_slots") == 8 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("logical_state_images")
+                    .at("used_slots") == 5 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("logical_state_images")
+                    .at("free_slots") == 1 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("logical_state_images")
+                    .at("reserved_slots") == 2 &&
+            throughput_json.at("context_cache")
+                    .at("occupancy")
+                    .at("logical_state_images")
+                    .at("inflight_slots") == 1 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
             throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&

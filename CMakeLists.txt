@@ -14,6 +14,19 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# Refresh the source identity before every serving-library build. The generated header changes
+# only when the commit or dirty state changes, so ordinary incremental builds remain cheap while
+# a rebuilt server can always report the exact repository revision it loaded.
+set(NINFER_BUILD_IDENTITY_HEADER
+    "${PROJECT_BINARY_DIR}/generated/ninfer/build_identity.h")
+add_custom_target(ninfer_build_identity
+  COMMAND "${CMAKE_COMMAND}"
+          -DNINFER_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+          -DNINFER_OUTPUT=${NINFER_BUILD_IDENTITY_HEADER}
+          -P "${PROJECT_SOURCE_DIR}/cmake/GenerateBuildIdentity.cmake"
+  BYPRODUCTS "${NINFER_BUILD_IDENTITY_HEADER}"
+  VERBATIM)
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)

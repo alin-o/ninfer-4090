@@ -2,6 +2,7 @@
 
 #include <ninfer/targets/qwen3_6/state_image.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -128,6 +129,21 @@ public:
 
     [[nodiscard]] std::uint32_t occupied() const noexcept {
         return capacity() - free_object_count_;
+    }
+
+    [[nodiscard]] std::uint32_t reserved() const noexcept {
+        return static_cast<std::uint32_t>(
+            std::count_if(objects_.begin(), objects_.end(), [](const Object& object) {
+                return object.role == StateImageRole::ReservedDestination;
+            }));
+    }
+
+    [[nodiscard]] std::uint32_t in_flight() const noexcept {
+        return static_cast<std::uint32_t>(
+            std::count_if(objects_.begin(), objects_.end(), [](const Object& object) {
+                return object.role != StateImageRole::Free &&
+                       (object.destination_pinned || has_pending_replica(object));
+            }));
     }
 
     [[nodiscard]] std::uint32_t device_occupied() const noexcept {

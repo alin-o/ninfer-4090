@@ -4,6 +4,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "runtime/engine/deferred_durable_recovery.h"
 #include "runtime/generation/generation_budget.h"
 
 #include <atomic>
@@ -113,12 +114,14 @@ struct RequestRecord {
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
                   double frontend_seconds, ResolvedRequestOptions request_options,
                   OutputConsumerMode output_consumer, Clock::time_point limit,
-                  Clock::time_point submit_time)
+                  Clock::time_point submit_time,
+                  std::shared_ptr<DeferredDurableRecovery> recovery = {})
         : generation_range(nvtx::Name::Generate, nvtx::Category::Runtime, request_identity),
           id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
           output(std::move(output_session)), prompt_summary(std::move(summary)),
           prepare_seconds(frontend_seconds), options(std::move(request_options)),
-          consumer_mode(output_consumer), deadline(limit), submitted(submit_time) {}
+          consumer_mode(output_consumer), deadline(limit), submitted(submit_time),
+          durable_recovery(std::move(recovery)) {}
 
     RequestRecord(const RequestRecord&)            = delete;
     RequestRecord& operator=(const RequestRecord&) = delete;
@@ -159,6 +162,7 @@ struct RequestRecord {
     const OutputConsumerMode consumer_mode;
     Clock::time_point deadline;
     Clock::time_point submitted;
+    std::shared_ptr<DeferredDurableRecovery> durable_recovery;
     std::optional<Clock::time_point> first_token;
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;

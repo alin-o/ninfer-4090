@@ -279,6 +279,12 @@ Session key 只是查找提示，不拥有 continuation。每个请求进入 Eng
 Scheduler 先确定唯一可尝试的 waiting request，ResourceManager 再为它选择缓存与资源终态。
 资源条件不能反向改变 FIFO 所有权。
 
+Durable SSD 候选在 submit 时只携带 immutable identity，不取得 topology claim。只有 Scheduler 选中
+FIFO admission owner 后，ResourceManager 才同时比较 warm 与 SSD 路径并预留所选 source/victim。
+若 SSD 胜出，Gateway 在 execution lock 外读取 bounded record，完成后重新触发 admission；期间已经
+admitted 的请求可以继续使用各自既有 reservation。stale revision 必须释放旧 reservation 并重新比较
+完整 warm/SSD 集合。
+
 FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
 后续请求只有在 Program 证明以下条件时才能 backfill：
 

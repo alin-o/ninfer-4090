@@ -155,8 +155,14 @@ ninfer_add_test(ninfer_openai_cache_real_test
   SOURCES test_openai_cache_real.cpp
   LIBRARIES ninfer_serve spdlog::spdlog CUDA::cudart)
 target_include_directories(ninfer_openai_cache_real_test PRIVATE
+  ${PROJECT_BINARY_DIR}/generated
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 set_tests_properties(ninfer_openai_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_8_service_ssd_replacement_test
+  COMMAND ${CMAKE_COMMAND} -E env NINFER_OPENAI_CACHE_SCENARIO=service-ssd-replacement
+          $<TARGET_FILE:ninfer_openai_cache_real_test>)
+set_tests_properties(ninfer_qwen3_8_service_ssd_replacement_test
+  PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)

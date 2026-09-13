@@ -22,6 +22,10 @@ class logger;
 
 namespace ninfer::serve {
 
+namespace testing {
+struct GenerationServiceTestAccess;
+}
+
 struct RequestLifetime;
 struct RequestCapacity;
 class DurableSharedPrefixCatalog;
@@ -102,8 +106,9 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    double prepare_seconds     = 0.0;
-    double acquisition_seconds = 0.0;
+    GenerationConsumerMode consumer_mode = GenerationConsumerMode::Aggregate;
+    double prepare_seconds               = 0.0;
+    double acquisition_seconds           = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;
@@ -115,6 +120,7 @@ struct PreparedRequest {
     std::uint64_t durable_restore_bytes      = 0;
     std::uint64_t durable_restore_elapsed_ns = 0;
     std::vector<ninfer::CheckpointLifecycleFact> durable_lifecycle;
+    std::shared_ptr<runtime::DeferredDurableRecovery> durable_recovery;
     // Populated only when generation propagates a non-RequestError exception after Engine
     // settlement (transport/render/generic failure). Gateways attach it to the classified
     // terminal failure without changing the original exception type.
@@ -197,13 +203,13 @@ public:
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {});
+                          std::function<bool()> is_cancelled = {}) const;
 
     // A gateway that cannot enter streaming generation after submit must still consume the
     // Engine handle. Cancellation is requested, settlement is awaited, and every immutable fact
     // committed before settlement is returned without changing the gateway's original failure.
     [[nodiscard]] std::vector<ninfer::CheckpointLifecycleFact>
-    cancel_and_settle(PreparedRequest& prepared) noexcept;
+    cancel_and_settle(PreparedRequest& prepared) const noexcept;
 
     void set_checkpoint_lifecycle_observer(
         std::function<void(const ninfer::CheckpointLifecycleFact&)> observer);
@@ -211,6 +217,8 @@ public:
     void warmup();
 
 private:
+    friend struct testing::GenerationServiceTestAccess;
+
     enum class CacheParticipation : std::uint8_t {
         Disabled,
         ReadWrite,
@@ -227,6 +235,7 @@ private:
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    void set_before_payload_read_for_test(std::function<void()> callback);
 
     ServeOptions options_;
     std::shared_ptr<spdlog::logger> logger_;

@@ -9639,12 +9639,17 @@ bool ProgramImplCore::persistent_backfill_safe(
 qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
     return qwen3_6::PhysicalUsageSnapshot{
-        .resource_revision       = resource_revision_,
-        .device_state_slots      = usage.device.state_slots,
-        .host_state_slots        = usage.host.state_slots,
-        .device_main_kv_pages    = usage.device.main_kv_pages,
-        .device_backend_kv_pages = usage.device.backend_kv_pages,
-        .host_kv_bytes           = usage.host.kv_bytes,
+        .resource_revision            = resource_revision_,
+        .logical_state_capacity_slots = state_store ? state_store->capacity() : 0U,
+        .logical_state_used_slots =
+            state_store ? state_store->occupied() - state_store->reserved() : 0U,
+        .logical_state_reserved_slots = state_store ? state_store->reserved() : 0U,
+        .logical_state_inflight_slots = state_store ? state_store->in_flight() : 0U,
+        .device_state_slots           = usage.device.state_slots,
+        .host_state_slots             = usage.host.state_slots,
+        .device_main_kv_pages         = usage.device.main_kv_pages,
+        .device_backend_kv_pages      = usage.device.backend_kv_pages,
+        .host_kv_bytes                = usage.host.kv_bytes,
     };
 }
 
@@ -12526,6 +12531,12 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
+    }
+    if (state_store) {
+        out.logical_state_capacity_slots = state_store->capacity();
+        out.logical_state_reserved_slots = state_store->reserved();
+        out.logical_state_used_slots = state_store->occupied() - out.logical_state_reserved_slots;
+        out.logical_state_inflight_slots = state_store->in_flight();
     }
     out.host_main_kv_page_bytes    = text_host_kv_page_stride;
     out.host_backend_kv_page_bytes = backend_host_kv_page_stride;

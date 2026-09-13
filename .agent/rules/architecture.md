@@ -9,6 +9,10 @@ description: Use when changing NInfer engine, CUDA operators, target programs, a
   groupwise-int `.ninfer` weights. Do not infer support for Blackwell NVFP4/W4A4
   execution from inherited code or converter tests. README.md identifies the
   inherited Windows and Qwen3.6-35B-A3B paths as untested on RTX 4090.
+- Qwen3.8-27B intentionally reuses the 27B implementation under historical
+  `qwen3_6` source, target, and test-binary names. Treat those identifiers as
+  shared implementation lineage, not as evidence that a separate Qwen3.6 model
+  is required. Validate the default target with the Qwen3.8 groupwise artifact.
 - C++20/CUDA20 builds use CMake/Ninja. Preserve `.clang-format` (four-space
   indentation, 100-column limit, existing include order). Python tooling lives
   under `tools/`; the evaluation coordinator is under `eval/ninfer_eval`.

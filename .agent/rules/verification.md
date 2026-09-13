@@ -38,33 +38,45 @@ Focused commands are documented in `tests/README.md`: build the affected test
 target, then `ctest --test-dir build-agent-verify -R '<test-name>'
 --output-on-failure`. Use `NINFER_OP_REPORT_STATS=1` with verbose CTest for
 numerical error evidence. The initial two-job native build took about eight
-minutes in this sandbox; CTest with the GPU free took about 196 seconds. The
-Python artifact/converter suites took about three seconds. Do not treat the
-full command as a fast lint gate.
+minutes in this sandbox. With the Qwen3.8 real artifact enabled, CTest took
+about 765 seconds on 2026-09-12; the Python artifact/converter suites took about
+two seconds. Do not treat the full command as a fast lint gate.
 
-GPU/device and real-artifact tests may skip with return code 77. Real engine
-checks need the corresponding `NINFER_QWEN3_6_27B_WEIGHTS` or
-`NINFER_QWEN3_6_35B_A3B_WEIGHTS` environment and supported hardware; skipped tests
-do not establish GPU correctness. Resident-server smoke tests, model downloads,
-performance benchmarks and external evaluation services are outside this gate.
+GPU/device and real-artifact tests may skip with return code 77. For this
+project's RTX 4090 target, the required real artifact is the known Qwen3.8-27B
+groupwise-int model at `/models/qwen3_8_27b.ninfer`; use
+`export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer`. Qwen3.8-27B uses
+the shared 27B implementation and real-test binary whose historical source and
+target names contain `qwen3_6_27b`; those names do not make a separate Qwen3.6
+artifact a prerequisite.
 
-The known Qwen3.8 model is `/models/qwen3_8_27b.ninfer`; use
-`export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer`.
+Do not request, require, or block on `NINFER_QWEN3_6_*`, Qwen3.6 model/tokenizer
+directories, an NVFP4 artifact, or Blackwell FP4 hardware unless the task
+explicitly targets that non-default path. Their canonical skips are expected
+non-target results: report them separately if useful, but they do not leave the
+Qwen3.8 groupwise acceptance boundary unverified and must not affect the stage
+verdict. A failure is relevant when it is reproduced on the Qwen3.8 artifact or
+on a model-independent path reachable by that target. A skipped applicable
+Qwen3.8 check still does not establish GPU correctness.
 
-Baseline observed during setup on 2026-09-07:
+Resident-server smoke tests, model downloads, performance benchmarks and
+external evaluation services are outside this gate.
+
+Baseline refreshed during setup on 2026-09-12:
 
 - CMake configure passes with CUDA 13.3.73 and required FFmpeg/libcurl libraries.
-- The Release application/test build passes. After the user freed the GPU,
-  CTest reports 96 passes, zero failures and seven skips out of 103 tests.
-  This supersedes the earlier GPU allocation failures. Real-artifact tests
-  and the NVFP4 A4 test remain skipped. Do not stop other GPU workloads to
-  make verification pass.
+- The Release application/test build passes. With
+  `NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer`, CTest has 108
+  registered tests: 102 pass, zero fail and six are expected non-target skips.
+  The skipped set is five inherited Qwen3.6-only real/load-plan checks plus the
+  Blackwell-only NVFP4 A4 check. Do not stop other GPU workloads to make
+  verification pass.
 - `NINFER_VERIFY_PYTHON=/opt/ninfer-venv/bin/python` now selects the provisioned
   Python 3.12 environment with pytest, torch, NumPy, safetensors, PyYAML and
   Rich installed. Evaluation coordinator tests pass (19 tests). The default
   harness Python remains separate; use the selected project interpreter.
 - Native Python imports pass. Artifact/converter and benchmark-consumer pytest
-  reports 77 passes. The user approved removing the three upstream-local
+  reports 95 passes. The user approved removing the three upstream-local
   official-source cases that required a developer's private model directories.
   Self-contained converter and hash-validation coverage remains; no official
   model source directory is required for this pytest command.

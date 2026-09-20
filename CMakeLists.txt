@@ -139,6 +139,7 @@ else()
   endif()
 endif()
 find_package(Threads REQUIRED)
+find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   # Product operational logging is an offline, repository-pinned dependency. Core-only builds do

@@ -606,7 +606,8 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
-    [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation,
+                                                     bool wait_for_exports = true) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
@@ -731,8 +732,8 @@ public:
         const SharedPrefixHandle& shared, std::string_view model_binding,
         const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
-    [[nodiscard]] std::vector<qwen3_6::DurableSharedPrefixCandidate>
-    durable_shared_prefix_candidates(const PreparedPromptData& prompt) const;
+    [[nodiscard]] static std::vector<qwen3_6::DurableSharedPrefixCandidate>
+    durable_shared_prefix_candidates(const PreparedPromptData& prompt);
     [[nodiscard]] bool
     durable_shared_prefix_matches(const qwen3_6::DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle& resident) const;
@@ -757,14 +758,14 @@ public:
                           const SharedPrefixHandle& resident) const;
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported);
-    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant> adopt_shared_prefix(
-        const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-        SharedPrefixHandle* replacement, runtime::CancellationFlagView cancellation = {},
-        const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
-        const ContinuationHandle* host_private                               = nullptr,
-        const SharedPrefixHandle* host_shared                                = nullptr,
-        const qwen3_6::SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
-        std::shared_ptr<const void> physical_plan                            = {});
+    [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
+                        SharedPrefixHandle* replacement,
+                        runtime::CancellationFlagView cancellation     = {},
+                        const std::function<void()>& commit_checkpoint = {},
+                        const ContinuationHandle* host_private         = nullptr,
+                        const SharedPrefixHandle* host_shared          = nullptr,
+                        std::shared_ptr<const void> physical_plan      = {});
     void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle& shared);
     void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle& victim,
                                                  const SharedPrefixHandle& separator);
@@ -779,6 +780,11 @@ public:
     qwen3_6::SessionSnapshotTraffic snapshot_traffic_;
 
 private:
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
+    begin_shared_prefix_snapshot(const SharedPrefixHandle& shared, std::string_view model_binding,
+                                 const qwen3_6::SharedPrefixPersistenceMetadata* metadata,
+                                 const std::function<std::shared_ptr<void>(std::size_t)>& reserve);
+
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix_impl(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
                              bool enable_failure_checkpoints,
@@ -1261,7 +1267,8 @@ private:
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
-    [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] std::uint32_t
+    owned_device_state_slots(const SequenceState& sequence) const noexcept;
     [[nodiscard]] std::uint32_t owned_checkpoint_references(const SequenceState& sequence,
                                                             StateImageHandle state) const noexcept;
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
@@ -1434,7 +1441,8 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                          std::span<const runtime::PlanningOwnerId> conversation_head_ids);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);

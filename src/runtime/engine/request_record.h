@@ -180,9 +180,11 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
-    std::uint64_t remaining_service_work = 0;
-    std::uint64_t backfill_epoch         = 0;
-    BackfillClass backfill_class         = BackfillClass::None;
+    std::uint64_t remaining_service_work   = 0;
+    std::uint32_t remaining_prefill_tokens = 0;
+    std::uint32_t prefill_wait_quanta      = 0;
+    std::uint64_t backfill_epoch           = 0;
+    BackfillClass backfill_class           = BackfillClass::None;
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;

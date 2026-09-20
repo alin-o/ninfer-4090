@@ -937,12 +937,14 @@ int test_explicit_rejections() {
                       }) == "truncation_not_supported",
                       "lossy server truncation is rejected explicitly");
 
-    value                  = base;
-    value["made_up_field"] = 1;
+    value                     = base;
+    value["made_up_field"]    = 1;
+    value["presence_penalty"] = 0.3;
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "unknown_parameter",
-                      "unknown request parameter is rejected");
+                          (void)parse_openai_responses_input_tokens_request(value, limits());
+                      }) == "",
+                      "unknown top-level request parameters are ignored");
 
     for (const Json invalid : {Json("trace"), Json::array(), Json(7)}) {
         value                    = base;

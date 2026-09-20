@@ -546,7 +546,7 @@ struct CommittedKvOffloadRange {
 enum class DeviceStateVictimClass : std::uint8_t {
     None,
     Intermediate,
-    ConversationHead,
+    PrivateEndpoint,
 };
 
 struct PressureOwnerOutcome {
@@ -554,8 +554,9 @@ struct PressureOwnerOutcome {
     VictimDisposition disposition     = VictimDisposition::Retained;
     std::uint32_t degradation_units   = 0;
     std::uint32_t dropped_checkpoints = 0;
-    // Program-owned attribution for the hard Device-State victim class. This includes demotion,
-    // duplicate release, checkpoint drop, and whole-owner eviction.
+    // Physical attribution only: a private endpoint may be a current session head or superseded
+    // history. ResourceManager supplies that logical distinction. Includes demotion, duplicate
+    // release, checkpoint drop, and whole-owner eviction.
     DeviceStateVictimClass device_state_victim_class = DeviceStateVictimClass::None;
 
     [[nodiscard]] friend constexpr bool operator==(const PressureOwnerOutcome&,

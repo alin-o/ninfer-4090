@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <typeinfo>
@@ -35,6 +36,9 @@ private:
 // Internal real-Program regression access. Production durable code consumes the same EngineCore
 // boundary; this adapter only avoids adding a client-visible anchor reference API.
 struct SharedSnapshotTestAccess {
+    // Hold the execution boundary while another thread exercises immutable ingress discovery.
+    // The callback must return before waiting for work that requires Engine execution.
+    static void with_execution_lock(Engine& engine, const std::function<void()>& callback);
     [[nodiscard]] static std::pair<std::uint32_t, targets::qwen3_6::RetainedSessionSnapshot>
     export_first_durable(Engine& engine);
     [[nodiscard]] static targets::qwen3_6::RetainedSessionSnapshot export_slot(Engine& engine,

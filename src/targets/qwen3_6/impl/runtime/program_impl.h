@@ -1342,7 +1342,10 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                 state_store->checkpoint_references(*protection.state) !=
                 protection.consumed_state_references;
 
-            if (is_rewrite_checkpoint_restore(admission.reuse)) {
+            if (admission.reuse == ReusePath::PrivateEndpoint ||
+                is_rewrite_checkpoint_restore(admission.reuse)) {
+                // Either consuming path retains optional checkpoint references. Pressure can
+                // transfer an aliased image into this lineage by evicting its external owners.
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
                         std::any_of(
@@ -2378,9 +2381,22 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             });
         }
         const bool evicted = owner.decision != nullptr && owner.decision->evicts_continuation;
+        const bool consumed =
+            candidate.has_source &&
+            candidate.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
+            owner.sequence == &continuation_states[candidate.source_index];
         for (CheckpointProjection& checkpoint : checkpoints) {
+            // Consumption transfers compatible sparse checkpoints into the active lineage,
+            // but executing the suffix advances the endpoint. Price that lost recovery point
+            // for identity and pressure plans alike; retaining/forking a source preserves it.
+            const bool retained_by_active =
+                checkpoint.checkpoint.ref.kind == runtime::CheckpointKind::LongAnchor
+                    ? checkpoint.checkpoint.ref.frontier <= candidate.reuse_base
+                    : checkpoint.checkpoint.ref.kind != runtime::CheckpointKind::SessionEndpoint &&
+                          candidate.rewrite_disposition ==
+                              RewriteCheckpointDisposition::RetainExisting;
             checkpoint.survives =
-                !evicted &&
+                !evicted && (!consumed || retained_by_active) &&
                 !(owner.decision != nullptr &&
                   std::find(owner.decision->dropped_checkpoints.begin(),
                             owner.decision->dropped_checkpoints.end(), checkpoint.checkpoint.ref) !=
@@ -7299,7 +7315,18 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            const auto describe = [](const detail::PhysicalResources& resources) {
+                return "lanes=" + std::to_string(resources.device.active_lanes) +
+                       ",device_state=" + std::to_string(resources.device.state_slots) +
+                       ",main_pages=" + std::to_string(resources.device.main_kv_pages) +
+                       ",backend_pages=" + std::to_string(resources.device.backend_kv_pages) +
+                       ",host_state=" + std::to_string(resources.host.state_slots) +
+                       ",host_kv_bytes=" + std::to_string(resources.host.kv_bytes);
+            };
+            throw std::logic_error(
+                "materialized sequence does not match its active entitlement: actual{" +
+                describe(actual) + "} expected{" + describe(expected) + "} frontier=" +
+                std::to_string(details.reuse_base));
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -9086,6 +9113,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 timing.resume_submit();
             }
 
+            bind_sequence_kv(sequence);
             materialize_sequence_kv(sequence, end,
                                     speculative_backend == SpeculativeBackend::None ? 0U : end);
 
@@ -9441,7 +9469,8 @@ AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
     return out;
 }
 
-ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continuation) noexcept {
+ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continuation,
+                                                    bool wait_for_exports) noexcept {
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(continuation);
     const std::uint64_t generation = ContractAccess::epoch(continuation);
@@ -9451,7 +9480,7 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     // Direct destructive callers have no open context transaction through which to revisit an
     // asynchronous eviction spill.  Settle that bounded handoff here; materialization pressure
     // instead defers at progress boundaries so unrelated admitted lanes remain runnable.
-    if (!snapshot_source_retirements_.empty()) { settle_snapshot_sources(); }
+    if (wait_for_exports && !snapshot_source_retirements_.empty()) { settle_snapshot_sources(); }
     try {
         if (!can_release_continuation_slot_strict(index)) { return out; }
     } catch (...) { return out; }
@@ -10108,21 +10137,6 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
-        if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
-                throw std::logic_error("DFlash prefill state is incomplete");
-            }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                backend_kv_addresses->bound_row(*sequence.kv->backend);
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
-        }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
@@ -10543,12 +10557,13 @@ StateImageSelectors ProgramImplCore::state_selectors(const SequenceState& sequen
     return state_store->selectors(sequence.state.read, sequence.state.write);
 }
 
-std::uint32_t ProgramImplCore::state_footprint(const SequenceState& sequence) const noexcept {
+std::uint32_t
+ProgramImplCore::owned_device_state_slots(const SequenceState& sequence) const noexcept {
     if (!state_store) { return 0; }
     std::array<StateImageHandle, 4> unique{};
     std::uint32_t count = 0;
     const auto add      = [&](StateImageHandle handle) {
-        if (!state_store->valid(handle)) { return; }
+        if (!state_exclusive_to_sequence(sequence, handle)) { return; }
         const StateReplicaResidency residency = state_store->residency(handle);
         if (residency != StateReplicaResidency::DeviceOnly &&
             residency != StateReplicaResidency::Both) {
@@ -10566,7 +10581,7 @@ std::uint32_t ProgramImplCore::state_footprint(const SequenceState& sequence) co
     for (std::size_t anchor_index = 0; anchor_index < sequence.long_anchors.size();
          ++anchor_index) {
         const StateImageHandle handle = sequence.long_anchors[anchor_index].state;
-        if (!state_store->valid(handle)) { continue; }
+        if (!state_exclusive_to_sequence(sequence, handle)) { continue; }
         const StateReplicaResidency residency = state_store->residency(handle);
         if (residency != StateReplicaResidency::DeviceOnly &&
             residency != StateReplicaResidency::Both) {
@@ -10621,7 +10636,7 @@ void ProgramImplCore::refresh_state_views(SequenceState& sequence) {
 }
 
 void ProgramImplCore::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
-    const std::uint32_t footprint = state_footprint(sequence);
+    const std::uint32_t footprint = owned_device_state_slots(sequence);
     if (slots == 0 || footprint > slots) {
         throw std::logic_error("sequence StateImage entitlement is inconsistent");
     }
@@ -10632,7 +10647,7 @@ void ProgramImplCore::reserve_state_entitlement(SequenceState& sequence, std::ui
     std::optional<StateImageHandle> reserved = state_store->reserve_destination();
     if (!reserved) { throw std::bad_alloc(); }
     sequence.reserved_state = *reserved;
-    if (state_footprint(sequence) != slots) {
+    if (owned_device_state_slots(sequence) != slots) {
         throw std::logic_error("sequence StateImage entitlement did not materialize exactly");
     }
 }
@@ -11607,6 +11622,25 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 .timing  = timing.finish(),
             };
         }
+        // The previous unit may belong to another admitted request. These scalar rows
+        // are shared execution controls, so bind the selected sequence at every chunk.
+        bind_sequence_kv(sequence);
+        if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
+                throw std::logic_error("DFlash prefill state is incomplete");
+            }
+            *dflash_host_ingress                       = {};
+            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
+            const StateImageSelectors selectors        = state_selectors(sequence);
+            dflash_host_ingress->state_source_slots[0] = selectors.source;
+            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+            dflash_host_ingress->dflash_kv_table_rows[0] =
+                backend_kv_addresses->bound_row(*sequence.kv->backend);
+            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
+
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;

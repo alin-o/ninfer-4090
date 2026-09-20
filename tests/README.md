@@ -68,6 +68,32 @@ cmake --build build --parallel --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
 
+For cached side-request scheduling and SSD recovery, build and run only the affected checks:
+
+```bash
+cmake --build build-agent-verify --target ninfer_admission_policy_test \
+  ninfer_resource_manager_test ninfer_qwen3_6_27b_prefix_real_test \
+  ninfer_openai_cache_real_test -j
+ctest --test-dir build-agent-verify \
+  -R '^ninfer_(admission_policy|resource_manager)_test$' --output-on-failure
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  NINFER_PREFIX_REAL_SCENARIO=prefill-interleave \
+  build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  NINFER_OPENAI_CACHE_SCENARIO=ssd-side-request \
+  build-agent-verify/tests/ninfer_openai_cache_real_test
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  NINFER_OPENAI_CACHE_SCENARIO=ssd-memory-only-victim \
+  build-agent-verify/tests/ninfer_openai_cache_real_test
+```
+
+The real-model cases require a free GPU. They check a cached short continuation completing during
+long prefill, and an SSD-backed second-session harness loading beside an active private continuation
+when an unused shared victim has no disk copy. They also compare generated tokens and MTP decisions
+against isolated execution; the CPU checks cover fairness, protected owners, and cancelled recovery.
+The memory-only victim case checks replacement of a non-durable user-content checkpoint, including
+restoration after allocation failure and cancellation. SSD export eligibility remains enforced.
+
 Enable uniform floating-point error records when establishing or reviewing an Op criterion:
 
 ```bash
@@ -110,6 +136,10 @@ The Python suites cover generic artifact framing and exact converter inventories
 encoders, and payload verification. Model execution and real-artifact binding are tested through
 the C++ target and Engine suites below; there is no Python inference implementation.
 
+`ninfer_qwen3_6_digest_test` needs no GPU or model. It checks SHA-256 against published known-answer
+vectors and fixed binary fixtures, including padding and chunk boundaries, incremental file
+hashing, corruption at the start/middle/end of the payload, and cancellation during a large checksum.
+
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
 
@@ -144,6 +174,24 @@ through Responses, requiring reuse through that reply (allowing the final pendin
 exact cold comparison. The separate `responses-host-continuation` scenario forces the completed
 private endpoint into RAM and requires at least 99% reuse of its longer prompt.
 It uses `NINFER_QWEN3_8_27B_WEIGHTS`.
+
+`ninfer_qwen3_8_concurrent_ingress_test` holds the execution lock while testing immutable candidate
+discovery and request-log memory observations, then submits short requests during a long MTP
+generation through SSD, warm, and cold routes. A control call must also get an execution boundary
+before that generation finishes. It requires overlapping execution, multi-row decode,
+exact cold-oracle output, and settled reservations. It also checks unchanged user-history reuse and
+safe fallback after historical channel instructions are removed. The bounded profile uses three
+lanes, six Device State slots, eight Host State slots and three shared owners.
+For a separate 19K-token-prefix replay with the same assertions:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_OPENAI_CACHE_SCENARIO=concurrent-ingress-long \
+  build-agent-verify/tests/ninfer_openai_cache_real_test
+```
+
+The long replay uses a 32,768-token per-request ceiling and 98,304-token shared KV capacity.
+Its printed timings describe this synthetic current-build fixture, not production acceptance.
 
 The calibration comparison and constrained four-request fallback are direct scenario invocations
 so their stdout (including fixture hashes) remains available:
@@ -230,3 +278,85 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## Generated reasoning continuation regression
+
+`ninfer_qwen3_6_frontend_test` includes a self-contained generated-reasoning replay regression
+that runs without an official tokenizer directory or GPU. It checks exact endpoint identity and
+shortlist equality while preserving rejection of changed historical text. Runtime-mechanism
+checks also cover position and media mismatches with request-local prefill boundaries.
+
+The same frontend test includes deterministic alternate-BPE histories: generated `>` and `|`
+remain separate when canonical encoding would merge them. It checks original token IDs and exact
+endpoint digests, survival after rendered log text and the prepared prompt are consumed, token
+counts/context limits, positions and capture/volatility boundaries, edited history, explicit
+session isolation, special-token provenance, and descendants after bounded CPU-history eviction.
+These cases are self-contained and run before the optional official-resource tests. Use:
+
+```bash
+ctest --test-dir build-agent-verify -R '^ninfer_qwen3_6_frontend_test$' --output-on-failure
+```
+
+The real-model integration below checks completion, endpoint reuse and save/restore with MTP.
+Alternate tokenization itself uses deterministic token fixtures rather than requiring a sampled
+model response to happen to contain a noncanonical BPE sequence. A cold continuation oracle must
+use the same preserved history; a fresh canonical text-only run is a different model input.
+
+The Qwen3.8 real-artifact case exercises MTP endpoint reuse and private snapshot round-trip
+continuation, including old-version rejection:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_OPENAI_CACHE_SCENARIO=reasoning-continuation \
+build-agent-verify/tests/ninfer_openai_cache_real_test
+```
+
+`ninfer_qwen3_6_27b_prefix_real_test` also covers endpoint continuation when a private long anchor
+and shared checkpoint reference the same StateImage. It checks both a surviving shared owner and
+full-capacity admission that evicts the shared owner, requires complete endpoint reuse, and compares
+generated tokens and MTP decisions with cold execution. Run just these Qwen3.8 cases with:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=shared-anchor-endpoint \
+build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test
+```
+
+The default prefix test also continues four generated responses in one named session with three
+Device State slots. Completed SSD saves keep the older endpoints eligible for residency; they
+must yield State capacity so each continuation reuses the
+latest complete response. The fixture requires actual State reclamation and compares final generated
+tokens and MTP decisions with cold execution. Run it alone with:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=latest-response-pressure \
+build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test
+```
+
+The `latest-response-catalog` variant caps the private catalog at two continuations. It reproduces
+the one-response lag caused by pricing eviction losses while ignoring consumed endpoint losses.
+Both variants run in the default prefix test and require full latest-endpoint reuse plus cold MTP
+parity.
+
+The `superseded-retirement` variant continues six turns without capacity pressure. It requires
+exactly the latest private owner plus one explicitly saved owner, exercises replacement of that
+file binding, and checks that a restored SSD-backed source stays resident after reuse. Ordinary
+superseded private owners must disappear without waiting for pressure. It also compares the last
+warm response's tokens and MTP decisions with cold execution.
+
+## Idle admission under cache pressure
+
+The ResourceManager regression `bounded pressure fallback readiness` exhausts the optional
+pressure search while a verified root fallback can satisfy both physical resources and private
+publication capacity. Admission must keep that feasible fallback.
+
+The default Qwen3.8 prefix test also fills all six Device and eight Host State slots across retained
+conversations, requires State reclamation, then checks fresh reasoning admission and subsequent
+Engine health with cold generated-token and MTP parity. Run the GPU case alone with:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+NINFER_PREFIX_REAL_SCENARIO=idle-cache-pressure \
+build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test
+```

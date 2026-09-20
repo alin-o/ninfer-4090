@@ -6,6 +6,9 @@
 #include "serve/openai_responses.h"
 #include "serve/request_events.h"
 #include "serve/request_log.h"
+#include "runtime/engine/durable_shared_snapshot_access.h"
+#include "runtime/engine/context_transfer_test_gate.h"
+#include "runtime/engine/shared_snapshot_test_access.h"
 
 #include <ninfer/build_identity.h>
 
@@ -15,10 +18,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <netinet/in.h>
 #include <optional>
@@ -34,6 +39,7 @@
 namespace ninfer::serve::testing {
 
 struct GenerationServiceTestAccess {
+    static Engine& engine(GenerationService& service) { return *service.engine_; }
     static void set_before_payload_read(GenerationService& service,
                                         std::function<void()> callback) {
         service.set_before_payload_read_for_test(std::move(callback));
@@ -345,7 +351,363 @@ std::string read_file(const std::filesystem::path& path) {
     return std::string((std::istreambuf_iterator<char>(input)), {});
 }
 
-void exercise_durable_two_lineage_replacement(const char* artifact) {
+void exercise_generated_reasoning_continuation(const char* artifact) {
+    TemporaryDirectory directory;
+    auto configured = options(artifact);
+    // This checks reasoning identity and persistence. Leave room to fork the preserved source
+    // and its rewrite State; a two-image pool can legitimately favor root over destroying the
+    // anonymous source's recovery point once consumption has a retention cost.
+    configured.context_cache.device_state_slots = 3;
+    // The second replay must use the restored private endpoint, not a shared checkpoint
+    // published while running the first replay.
+    configured.context_cache.max_shared_prefixes = 0;
+    GenerationService service(configured);
+    const auto run = [&](const Json& history, int max_tokens) {
+        const Json body{{"model", "qwen3.8"}, {"messages", history}, {"max_tokens", max_tokens}};
+        auto request              = parse_chat_completion_request(body, RequestLimits{}).generation;
+        request.enable_thinking   = true;
+        request.preserve_thinking = true;
+        auto prepared             = service.prepare(request, GenerationConsumerMode::Aggregate);
+        auto result               = service.run(prepared, nullptr);
+        (void)settled_stats(service, true);
+        return result;
+    };
+    Json history =
+        Json::array({Json{{"role", "user"}, {"content", "Hi. Reply with a short greeting."}}});
+    const auto source = run(history, 512);
+    require(source.finish_reason == FinishReason::StopToken && !source.reasoning.empty() &&
+                !source.text.empty() && source.id_slot >= 0,
+            "reasoning continuation fixture did not retain a completed thinking response");
+    const auto snapshot = directory.path / "reasoning.nss";
+    (void)service.slot_save(source.id_slot, snapshot.string(), source.session_digest);
+    history.push_back(Json{
+        {"role", "assistant"}, {"content", source.text}, {"reasoning_content", source.reasoning}});
+    history.push_back(Json{{"role", "user"}, {"content", "Say hello once more."}});
+    const auto warm = run(history, 8);
+    const auto endpoint =
+        static_cast<std::uint32_t>(source.prompt_tokens + source.completion_tokens - 1);
+    std::cout << "reasoning_warm endpoint=" << endpoint
+              << " reused=" << warm.metrics.prefix_cache_hit_tokens
+              << " path=" << static_cast<unsigned>(warm.metrics.prefix_reuse_path)
+              << " now_ns=" << warm.metrics.materialization.predicted_now_ns
+              << " loss_ns=" << warm.metrics.materialization.predicted_future_loss_ns << '\n';
+    require(warm.metrics.prefix_reuse_path == PrefixReusePath::PrivateEndpoint &&
+                warm.metrics.prefix_cache_hit_tokens >= endpoint,
+            "replayed reasoning closer rejected the warm generated endpoint");
+    for (std::uint32_t slot = 0; slot < service.slot_states().size(); ++slot) {
+        (void)service.slot_erase(slot);
+    }
+
+    // The old identity payload must not be loaded using the new digest semantics.
+    std::string old_bytes = read_file(snapshot);
+    require(old_bytes.size() > 12, "reasoning snapshot has no version field");
+    const std::uint32_t old_version = 3;
+    std::copy_n(reinterpret_cast<const char*>(&old_version), sizeof(old_version),
+                old_bytes.begin() + 8);
+    const auto old_snapshot = directory.path / "obsolete.nss";
+    {
+        std::ofstream output(old_snapshot, std::ios::binary);
+        output.write(old_bytes.data(), old_bytes.size());
+    }
+    bool rejected = false;
+    try {
+        (void)service.slot_restore(0, old_snapshot.string());
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "obsolete private identity snapshot was accepted");
+
+    (void)service.slot_restore(0, snapshot.string());
+    const auto restored = run(history, 8);
+    std::cout << "reasoning_continuation endpoint=" << endpoint
+              << " warm=" << warm.metrics.prefix_cache_hit_tokens
+              << " restored=" << restored.metrics.prefix_cache_hit_tokens
+              << " paths=" << static_cast<unsigned>(warm.metrics.prefix_reuse_path) << '/'
+              << static_cast<unsigned>(restored.metrics.prefix_reuse_path)
+              << " drafted=" << warm.metrics.speculative_draft_tokens << '/'
+              << restored.metrics.speculative_draft_tokens
+              << " accepted=" << warm.metrics.speculative_accepted_tokens << '/'
+              << restored.metrics.speculative_accepted_tokens
+              << " warm_tokens=" << Json(warm.generated_token_ids)
+              << " restored_tokens=" << Json(restored.generated_token_ids) << '\n';
+    require(restored.metrics.prefix_reuse_path == PrefixReusePath::PrivateEndpoint &&
+                restored.metrics.prefix_cache_hit_tokens >= endpoint &&
+                restored.generated_token_ids == warm.generated_token_ids &&
+                restored.metrics.speculative_draft_tokens ==
+                    warm.metrics.speculative_draft_tokens &&
+                restored.metrics.speculative_accepted_tokens ==
+                    warm.metrics.speculative_accepted_tokens,
+            "restored reasoning endpoint changed the continuation or MTP decisions");
+}
+
+void exercise_nonblocking_durable_ingress(const char* artifact, bool long_prefix = false) {
+    std::cout << std::unitbuf;
+    std::cout << "concurrent_ingress long_prefix=" << long_prefix << " phase=oracles\n";
+    TemporaryDirectory temporary;
+    ServeOptions configured    = options(artifact);
+    configured.max_context     = long_prefix ? 32768 : 4096;
+    configured.kv_capacity     = KvCapacityPolicy::explicit_capacity(long_prefix ? 98304 : 8192);
+    configured.max_concurrency = 3;
+    configured.max_pending_requests                            = 3;
+    configured.context_cache.device_state_slots                = 3;
+    configured.context_cache.host_state_slots                  = 8;
+    configured.context_cache.max_private_continuations         = 6;
+    configured.context_cache.max_shared_prefixes               = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    configured.shared_prefix_cache_dir                         = temporary.path / "shared";
+    configured.shared_prefix_cache_workers                     = 1;
+    configured.shared_prefix_cache_jobs                        = 2;
+    configured.shared_prefix_cache_staging_bytes               = 2ULL << 30;
+
+    const auto instructions = [long_prefix](std::string_view name) {
+        std::string result(name);
+        for (int index = 0; index < (long_prefix ? 19000 : 300); ++index) { result += " stable"; }
+        return result + "\n=== CACHE_BREAKPOINT ===\nFollow the user's request.";
+    };
+    const auto request = [&](std::string_view name, bool long_output) {
+        const Json body{
+            {"model", "qwen3.8"},
+            {"messages",
+             Json::array(
+                 {Json{{"role", "system"}, {"content", instructions(name)}},
+                  Json{
+                      {"role", "user"},
+                      {"content",
+                       long_output
+                           ? "Write an extensive PHP class with at least 100 methods. Include all "
+                             "method implementations. Continue writing code until the output limit."
+                           : "Write the numbers from one through fifty, separated by spaces."}}})},
+            {"max_tokens", long_output ? 1024 : 48}};
+        return parse_chat_completion_request(body, RequestLimits{}).generation;
+    };
+    const auto wait_until = [](auto predicate, std::chrono::seconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) { return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return predicate();
+    };
+
+    std::array<GenerationOutcome, 2> oracles;
+    {
+        auto cold_options               = configured;
+        cold_options.allow_prefix_reuse = false;
+        GenerationService cold(cold_options);
+        for (std::size_t index = 0; index < oracles.size(); ++index) {
+            auto prepared  = cold.prepare(request(index == 0 ? "restore" : "cold", false),
+                                          GenerationConsumerMode::Aggregate);
+            oracles[index] = cold.run(prepared, nullptr);
+        }
+    }
+    {
+        std::cout << "concurrent_ingress phase=publisher\n";
+        GenerationService publisher(configured);
+        auto prepared =
+            publisher.prepare(request("restore", false), GenerationConsumerMode::Aggregate);
+        (void)publisher.run(prepared, nullptr);
+        require(wait_until(
+                    [&] {
+                        const auto stats = publisher.runtime_stats();
+                        return stats.shared_ssd_writes_completed != 0 &&
+                               stats.shared_ssd_queued_jobs == 0 &&
+                               stats.shared_ssd_active_jobs == 0 &&
+                               stats.shared_ssd_pending_export_claims == 0;
+                    },
+                    std::chrono::seconds(30)),
+                "ingress fixture did not publish its durable prefix");
+    }
+
+    std::cout << "concurrent_ingress phase=service\n";
+    GenerationService service(configured);
+    Engine& engine = testing::GenerationServiceTestAccess::engine(service);
+    PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back(ChatMessage{.role  = ChatRole::System,
+                                         .parts = {MessagePart{.text = instructions("restore")}}});
+    input.messages.push_back(
+        ChatMessage{.role = ChatRole::User, .parts = {MessagePart{.text = "Reply briefly."}}});
+    auto prompt         = engine.prepare(std::move(input));
+    using Access        = runtime::DurableSharedSnapshotAccess;
+    const auto expected = Access::candidates(engine, prompt);
+    require(!expected.empty(), "ingress fixture has no exact durable identity");
+    std::future<std::vector<Access::Candidate>> discovery;
+    std::future<MemorySummary> accounting;
+    bool discovered_while_locked = false;
+    bool observed_while_locked   = false;
+    runtime::testing::SharedSnapshotTestAccess::with_execution_lock(engine, [&] {
+        discovery =
+            std::async(std::launch::async, [&] { return Access::candidates(engine, prompt); });
+        accounting = std::async(std::launch::async, [&] { return service.memory_summary(); });
+        discovered_while_locked =
+            discovery.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        observed_while_locked =
+            accounting.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    });
+    // Release the execution boundary before consuming a possibly blocked future. A regression
+    // must fail with a diagnosis, not deadlock teardown.
+    const auto discovered = discovery.get();
+    const auto memory     = accounting.get();
+    require(discovered_while_locked,
+            "durable identity discovery waited for the execution lock before FIFO submission");
+    require(discovered == expected, "concurrent discovery changed exact durable identities");
+    require(observed_while_locked,
+            "request logging waited for the execution lock to observe memory accounting");
+    require(memory.device_main_kv_capacity_pages != 0 && memory.host_state_capacity_slots == 8 &&
+                memory.logical_state_capacity_slots != 0,
+            "initial memory snapshot lost the configured physical/logical capacities");
+
+    for (const std::string_view route : {"ssd", "warm", "cold"}) {
+        std::cout << "concurrent_ingress route=" << route << " phase=start\n";
+        const auto before = service.runtime_stats();
+        std::atomic<bool> cancel_first{false};
+        std::atomic<bool> first_output{false};
+        std::atomic<bool> first_done{false};
+        auto first = std::async(std::launch::async, [&] {
+            struct Completion {
+                std::atomic<bool>& flag;
+                ~Completion() { flag.store(true); }
+            } completion{first_done};
+            auto prepared =
+                service.prepare(request("active", true), GenerationConsumerMode::Streaming,
+                                [&] { return cancel_first.load(); });
+            StreamSink sink;
+            sink.on_content   = [&](const std::string&) { first_output.store(true); };
+            sink.is_cancelled = [&] { return cancel_first.load(); };
+            return service.run(prepared, &sink);
+        });
+
+        struct CancelOnExit {
+            std::atomic<bool>& flag;
+
+            ~CancelOnExit() { flag.store(true); }
+        } cleanup{cancel_first};
+
+        require(wait_until(
+                    [&] {
+                        return first_done.load() ||
+                               (first_output.load() &&
+                                service.runtime_stats().decode_ready_requests != 0);
+                    },
+                    std::chrono::seconds(20)),
+                "first ingress request never began decoding");
+        require(!first_done.load(), "first ingress request finished before the overlap fixture");
+
+        // A real control operation also needs an execution boundary. Repeated decode rounds
+        // must hand it the boundary before finishing the whole generation; the same handoff
+        // lets Gateway export completion release the pins needed by the incoming request.
+        engine.reset_memory_peaks();
+        require(!first_done.load(),
+                "execution-boundary control was starved until the long generation completed");
+
+        std::atomic<bool> observed_overlap{false};
+        auto prepared = service.prepare(request(route == "cold" ? "cold" : "restore", false),
+                                        GenerationConsumerMode::Streaming);
+        // HttpServer reads this accounting when recording request_start before consuming the
+        // stream. It must not wait until the unrelated long generation releases execution.
+        const auto start_memory = service.memory_summary();
+        require(start_memory.device_main_kv_occupied_pages != 0 &&
+                    start_memory.device_main_kv_occupied_pages <=
+                        start_memory.device_main_kv_capacity_pages,
+                "request-start memory snapshot reports impossible KV occupancy");
+        const auto prepared_at = service.runtime_stats();
+        observed_overlap.store(prepared_at.running_requests >= 2);
+        StreamSink sink;
+        sink.on_content = [&](const std::string&) {
+            if (service.runtime_stats().running_requests >= 2) { observed_overlap.store(true); }
+        };
+        const auto second          = service.run(prepared, &sink);
+        const auto terminal_memory = service.memory_summary();
+        require(terminal_memory.device_main_kv_occupied_pages <=
+                    terminal_memory.device_main_kv_capacity_pages,
+                "request-terminal memory snapshot reports impossible KV occupancy");
+        const bool second_finished_first = !first_done.load();
+        std::cout << "concurrent_ingress route=" << route << " phase=cancel-first\n";
+        cancel_first.store(true);
+        const auto first_result   = first.get();
+        const auto after          = settled_stats(service, true);
+        const auto settled_memory = service.memory_summary();
+        require(settled_memory.logical_state_used_slots == after.logical_state_used_slots &&
+                    settled_memory.device_main_kv_occupied_pages ==
+                        after.device_main_kv_occupied_pages &&
+                    settled_memory.host_state_occupied_slots == after.host_state_occupied_slots,
+                "settled memory snapshot differs from published resource accounting");
+        std::cout << "concurrent_ingress route=" << route
+                  << " observed_overlap=" << observed_overlap.load()
+                  << " second_finished_first=" << second_finished_first
+                  << " prepare_seconds=" << second.metrics.prepare_seconds
+                  << " queue_seconds=" << second.metrics.engine_timing.queue_wait_seconds
+                  << " ttft_seconds=" << second.metrics.ttft_seconds << '\n';
+        require(observed_overlap.load() && second_finished_first,
+                "incoming service request did not progress before the long generation completed");
+        require(after.decode_row_rounds - before.decode_row_rounds >
+                    after.decode_rounds - before.decode_rounds,
+                "overlapping service requests never formed a multi-row decode batch");
+        require(first_result.metrics.speculative_rounds != 0,
+                "overlap fixture did not execute real MTP decode");
+        require(second.generated_token_ids == oracles[route == "cold" ? 1 : 0].generated_token_ids,
+                "concurrent service continuation differs from cache-disabled oracle");
+        if (route == "ssd") {
+            require(second.metrics.durable_loaded_from_ssd &&
+                        second.metrics.prefix_cache_hit_tokens != 0,
+                    "concurrent SSD route did not restore its exact checkpoint");
+        } else if (route == "warm") {
+            require(second.metrics.durable_warm_available &&
+                        !second.metrics.durable_loaded_from_ssd &&
+                        second.metrics.prefix_cache_hit_tokens != 0,
+                    "concurrent warm route lost the resident checkpoint");
+        } else {
+            require(second.metrics.prefix_reuse_path == PrefixReusePath::Root &&
+                        second.metrics.prefix_cache_hit_tokens == 0,
+                    "concurrent cold route reused a different harness");
+        }
+        require(after.logical_state_reserved_slots == 0 && after.logical_state_inflight_slots == 0,
+                "concurrent ingress retained an unfinished resource reservation");
+        std::cout << "concurrent_ingress route=" << route
+                  << " overlap=1 batched_decode=1 oracle=exact"
+                  << " prompt_tokens=" << second.prompt_tokens
+                  << " reused_tokens=" << second.metrics.prefix_cache_hit_tokens
+                  << " prepare_seconds=" << second.metrics.prepare_seconds
+                  << " ttft_seconds=" << second.metrics.ttft_seconds << '\n';
+    }
+}
+
+void exercise_changed_user_history(const char* artifact) {
+    ServeOptions configured                                    = options(artifact);
+    configured.context_cache.device_state_slots                = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    const std::string stable =
+        "Keep replies concise.\n=== CACHE_BREAKPOINT ===\nHistory regression.";
+    const std::string user      = "What is seven plus five?";
+    const std::string annotated = user + "\n\n[CHANNEL: direct]\nReply directly in this response.";
+    const Json initial          = Json::array({Json{{"role", "system"}, {"content", stable}},
+                                               Json{{"role", "user"}, {"content", annotated}}});
+    Json changed;
+    GenerationOutcome rewritten;
+    {
+        GenerationService service(configured);
+        const auto seed = generate_history(service, initial, true);
+        Json appended   = initial;
+        appended.push_back(Json{{"role", "assistant"}, {"content", seed.text}});
+        appended.push_back(Json{{"role", "user"}, {"content", "And eight plus six?"}});
+        const auto continued = generate_history(service, appended, true);
+        require(continued.metrics.prefix_cache_hit_tokens >=
+                    static_cast<std::uint32_t>(seed.prompt_tokens),
+                "unchanged historical user message lost its conversation checkpoint");
+
+        changed               = appended;
+        changed[1]["content"] = user;
+        rewritten             = generate_history(service, changed, true);
+        require(rewritten.metrics.prefix_cache_hit_tokens <
+                    static_cast<std::uint32_t>(seed.prompt_tokens),
+                "rewritten historical user message incorrectly reused the old conversation head");
+    }
+    configured.allow_prefix_reuse = false;
+    GenerationService oracle(configured);
+    const auto cold = generate_history(oracle, changed, true);
+    require(rewritten.generated_token_ids == cold.generated_token_ids,
+            "changed-history fallback differs from the exact cold prompt");
+}
+
+void exercise_durable_two_lineage_warm_reuse(const char* artifact) {
     TemporaryDirectory temporary;
     ServeOptions configured                                    = options(artifact);
     configured.max_concurrency                                 = 3;
@@ -383,35 +745,6 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
         }
         return false;
     };
-    const auto shared_owner_count = [](const GenerationService& service,
-                                       const RuntimeStats& stats) {
-        std::uint32_t all_owners = 0;
-        for (std::uint8_t role = 0; role < static_cast<std::uint8_t>(ContextCacheMetricRole::Count);
-             ++role) {
-            for (std::uint8_t placement = 0;
-                 placement < static_cast<std::uint8_t>(ContextCacheMetricPlacement::Count);
-                 ++placement) {
-                for (std::uint8_t pin = 0;
-                     pin < static_cast<std::uint8_t>(ContextCacheMetricPin::Count); ++pin) {
-                    for (std::uint8_t identity = 0;
-                         identity < static_cast<std::uint8_t>(ContextCacheMetricIdentity::Count);
-                         ++identity) {
-                        all_owners += stats.context_cache_owners[context_cache_owner_metric_index(
-                            static_cast<ContextCacheMetricRole>(role),
-                            static_cast<ContextCacheMetricPlacement>(placement),
-                            static_cast<ContextCacheMetricPin>(pin),
-                            static_cast<ContextCacheMetricIdentity>(identity))];
-                    }
-                }
-            }
-        }
-        const auto slots          = service.slot_states();
-        const auto private_owners = static_cast<std::uint32_t>(std::count_if(
-            slots.begin(), slots.end(), [](const auto& slot) { return slot.retained; }));
-        require(all_owners >= private_owners, "cache owner metrics lost a private continuation");
-        return all_owners - private_owners;
-    };
-
     GenerationOutcome codex_oracle;
     {
         GenerationService seed(configured);
@@ -470,8 +803,13 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
     require(wait_for_writes(service, 1),
             "Direct activity did not finish its durable exports before replacement");
     const RuntimeStats filled = settled_stats(service, true);
-    require(shared_owner_count(service, filled) == 3,
-            "Direct activity did not fill the three-cell resident shared catalog");
+    // The next repeat must select a deep warm checkpoint with the complete State pool full.
+    // Shared catalog occupancy is a policy choice; SSD replacement has a separate fixture.
+    require(filled.logical_state_capacity_slots == 14 && filled.logical_state_used_slots == 14 &&
+                filled.logical_state_reserved_slots == 0 &&
+                filled.logical_state_inflight_slots == 0 &&
+                filled.device_state_occupied_slots == 6 && filled.host_state_occupied_slots == 8,
+            "Direct activity did not fill the Device/Host State pool before warm reuse");
 
     const std::uint64_t loads_before_direct_repeat =
         service.runtime_stats().shared_ssd_loads_completed;
@@ -496,6 +834,9 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
                         static_cast<int>(direct_repeated.metrics.durable_restore_frontier) &&
                 service.runtime_stats().shared_ssd_loads_completed == loads_before_direct_repeat,
             "repeated Direct lineage did not choose its deepest warm checkpoint");
+    // Consuming obsolete history during the Direct repeat can free a descriptor. Device State
+    // remains full: require actual reclamation for Codex, plus exact output and deepest reuse,
+    // instead of assuming the preceding request retains every obsolete descriptor.
     const RuntimeStats before_codex = settled_stats(service, true);
     const GenerationOutcome codex =
         generate(service, instructions("codex-b"), "Codex seed B.", true, false, "codex-lineage");
@@ -521,14 +862,11 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
             codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens) ==
                 codex.prompt_tokens - static_cast<int>(codex.metrics.durable_restore_frontier) &&
             codex.generated_token_ids == codex_oracle.generated_token_ids &&
-            before_codex.logical_state_capacity_slots == 14 &&
-            before_codex.logical_state_used_slots == 14 &&
             before_codex.logical_state_reserved_slots == 0 &&
             before_codex.logical_state_inflight_slots == 0 &&
             before_codex.device_state_occupied_slots == 6 &&
-            before_codex.host_state_occupied_slots == 8,
-        "Codex repeat did not choose the deepest warm checkpoint under accumulated logical "
-        "State pressure");
+            codex.metrics.materialization.reclaimed_device_state_slots != 0,
+        "Codex repeat did not choose the deepest warm checkpoint while reclaiming Device State");
     std::cout << "two_lineage_replay logical=" << before_codex.logical_state_used_slots << '/'
               << before_codex.logical_state_capacity_slots
               << " device=" << before_codex.device_state_occupied_slots
@@ -537,6 +875,298 @@ void exercise_durable_two_lineage_replacement(const char* artifact) {
               << " codex_reuse=" << codex.metrics.prefix_cache_hit_tokens << " codex_suffix="
               << codex.prompt_tokens - static_cast<int>(codex.metrics.prefix_cache_hit_tokens)
               << '\n';
+}
+
+void exercise_ssd_replacement_beside_background(const char* artifact) {
+    TemporaryDirectory temporary;
+    auto configured                                    = options(artifact);
+    configured.max_concurrency                         = 3;
+    configured.max_pending_requests                    = 3;
+    configured.kv_capacity                             = KvCapacityPolicy::explicit_capacity(8192);
+    configured.context_cache.device_state_slots        = 6;
+    configured.context_cache.max_private_continuations = 6;
+    configured.context_cache.max_shared_prefixes       = 1;
+    configured.shared_prefix_cache_dir                 = temporary.path / "ssd-side-request";
+    // Exactly the side harness is durable. Background exports hit the record quota, so
+    // its inactive shared entry has no SSD backing; the private head is independently live.
+    configured.shared_prefix_cache_max_records = 1;
+    configured.shared_prefix_cache_workers     = 1;
+    const auto instructions                    = [](std::string name) {
+        for (int i = 0; i < 400; ++i) { name += " stable"; }
+        return name + "\n=== CACHE_BREAKPOINT ===\nAnswer the user.";
+    };
+    const auto incoming   = instructions("side-project");
+    const auto resident   = instructions("background-project");
+    const auto wait_until = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) { return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return predicate();
+    };
+    GenerationOutcome oracle;
+    {
+        GenerationService publisher(configured);
+        oracle = generate(publisher, incoming, "Hi", false);
+        require(wait_until([&] {
+                    const auto stats = publisher.runtime_stats();
+                    return stats.shared_ssd_writes_completed == 1 &&
+                           stats.shared_ssd_active_jobs == 0 &&
+                           stats.shared_ssd_pending_export_claims == 0;
+                }),
+                "side harness did not persist its sole SSD record");
+    }
+    GenerationService service(configured);
+    const auto seed = generate(service, resident, "Reply briefly.", false, false, "background");
+    require(wait_until([&] {
+                const auto stats = service.runtime_stats();
+                return stats.shared_ssd_quota_rejections != 0 &&
+                       stats.shared_ssd_queued_jobs == 0 && stats.shared_ssd_active_jobs == 0 &&
+                       stats.shared_ssd_pending_export_claims == 0;
+            }),
+            "background shared owner did not settle without SSD backing");
+    Json history = Json::array({
+        Json{{"role", "system"}, {"content", resident}},
+        Json{{"role", "user"}, {"content", "Reply briefly."}},
+        Json{{"role", "assistant"}, {"content", seed.text}},
+        Json{{"role", "user"},
+             {"content", "Write an extensive PHP class with at least 100 methods. Include all "
+                         "implementations."}},
+    });
+    Json body{{"model", "qwen3.8"}, {"messages", history}, {"max_tokens", 1024}};
+    auto background_request = parse_chat_completion_request(body, RequestLimits{}).generation;
+    ContextCacheHints hints;
+    hints.session_key = "background";
+    std::atomic<bool> cancel{false}, started{false}, done{false};
+    std::atomic<std::uint32_t> background_reuse{0};
+    auto background = std::async(std::launch::async, [&] {
+        struct Completion {
+            std::atomic<bool>& flag;
+            ~Completion() { flag.store(true); }
+        } completion{done};
+        auto prepared = service.prepare(
+            background_request, GenerationConsumerMode::Streaming, [&] { return cancel.load(); },
+            hints);
+        StreamSink sink;
+        sink.on_start = [&](const GenerationStart& start) {
+            background_reuse.store(start.reused_prompt_tokens);
+        };
+        sink.on_content   = [&](const std::string&) { started.store(true); };
+        sink.is_cancelled = [&] { return cancel.load(); };
+        return service.run(prepared, &sink);
+    });
+
+    struct CancelOnExit {
+        std::atomic<bool>& flag;
+
+        ~CancelOnExit() { flag.store(true); }
+    } cleanup{cancel};
+
+    require(wait_until([&] { return started.load() || done.load(); }) && !done.load(),
+            "background continuation did not remain active beside the side request");
+    const auto expected_endpoint = seed.prompt_tokens + seed.generated_token_ids.size() - 1U;
+    require(background_reuse.load() == expected_endpoint,
+            "background fixture did not reuse its complete private endpoint");
+    Json side_body{{"model", "qwen3.8"},
+                   {"max_tokens", 8},
+                   {"messages", Json::array({Json{{"role", "system"}, {"content", incoming}},
+                                             Json{{"role", "user"}, {"content", "Hi"}}})}};
+    auto side_request     = parse_chat_completion_request(side_body, RequestLimits{}).generation;
+    auto prepared         = service.prepare(side_request, GenerationConsumerMode::Aggregate);
+    const auto side       = service.run(prepared, nullptr);
+    const bool overlapped = !done.load();
+    cancel.store(true);
+    (void)background.get();
+    const auto stats            = settled_stats(service, true);
+    const bool replaced_unsaved = std::any_of(
+        side.checkpoint_lifecycle.begin(), side.checkpoint_lifecycle.end(), [](const auto& fact) {
+            return fact.scope == CheckpointLifecycleScope::Shared &&
+                   fact.operation == CheckpointLifecycleOperation::Evicted &&
+                   fact.status == CheckpointLifecycleStatus::Committed &&
+                   fact.destination_tier == CheckpointLifecycleTier::None;
+        });
+    require(
+        overlapped && side.metrics.durable_loaded_from_ssd &&
+            side.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
+            side.metrics.prefix_cache_hit_tokens != 0 && replaced_unsaved &&
+            side.generated_token_ids == oracle.generated_token_ids &&
+            side.metrics.speculative_draft_tokens == oracle.metrics.speculative_draft_tokens &&
+            side.metrics.speculative_accepted_tokens ==
+                oracle.metrics.speculative_accepted_tokens &&
+            stats.logical_state_reserved_slots == 0 && stats.logical_state_inflight_slots == 0,
+        "side request could not replace unused unsaved shared state beside a private continuation");
+    const auto resumed = generate_history(service, history, false, false, "background");
+    require(resumed.metrics.prefix_cache_hit_tokens == expected_endpoint &&
+                resumed.metrics.prefix_reuse_path == PrefixReusePath::PrivateEndpoint,
+            "SSD recovery disturbed the background session's successful endpoint");
+    std::cout << "ssd_side_request background_reused=" << expected_endpoint
+              << " side_reused=" << side.metrics.prefix_cache_hit_tokens
+              << " active_background_preserved=true exact_oracle_match=true\n";
+}
+
+void exercise_ssd_replaces_memory_only_checkpoint(const char* artifact) {
+    using Access = runtime::DurableSharedSnapshotAccess;
+    TemporaryDirectory temporary;
+    auto configured                              = options(artifact);
+    configured.context_cache.device_state_slots  = 4;
+    configured.context_cache.max_shared_prefixes = 1;
+    configured.shared_prefix_cache_dir           = temporary.path / "ssd-memory-only-victim";
+    const std::string incoming =
+        "Stable harness " + std::string(1800, 'a') + "\n=== CACHE_BREAKPOINT ===\nAnswer the user.";
+    GenerationOutcome oracle;
+    std::shared_ptr<const std::vector<std::uint8_t>> incoming_bytes;
+    std::string incoming_digest;
+    {
+        GenerationService publisher(configured);
+        oracle              = generate(publisher, incoming, "Hi", false);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (publisher.runtime_stats().shared_ssd_writes_completed == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(publisher.runtime_stats().shared_ssd_writes_completed != 0,
+                "memory-only replacement fixture did not persist its incoming harness");
+        auto [slot, snapshot] = runtime::testing::SharedSnapshotTestAccess::export_first_durable(
+            ninfer::serve::testing::GenerationServiceTestAccess::engine(publisher));
+        (void)slot;
+        snapshot.await_transfer(snapshot.bytes);
+        incoming_bytes =
+            std::make_shared<const std::vector<std::uint8_t>>(std::move(snapshot.bytes));
+        incoming_digest = snapshot.content_digest;
+    }
+    GenerationService service(configured);
+    std::string transient = "Transient user content";
+    for (int i = 0; i < 400; ++i) { transient += " volatile"; }
+    Json body{
+        {"model", "qwen3.8"},
+        {"max_tokens", 8},
+        {"messages",
+         Json::array({Json{
+             {"role", "user"},
+             {"content", Json::array({Json{{"type", "text"}, {"text", transient}},
+                                      Json{{"type", "text"}, {"text", "Reply briefly."}}})}}})}};
+    auto request = parse_chat_completion_request(body, RequestLimits{}).generation;
+    ContextCacheHints hints;
+    hints.allow_engine_automatic_shared_prefixes = false;
+    hints.markers.push_back(PromptCacheMarker{
+        .after_message_count      = 1,
+        .kind                     = PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence                 = SharedCandidateEvidence::ExplicitBoundary,
+        .location                 = PromptCacheMarkerLocation::MessagePartBoundary,
+        .after_message_part_count = 1,
+    });
+    auto prepared       = service.prepare(request, GenerationConsumerMode::Aggregate, {}, hints);
+    const auto resident = service.run(prepared, nullptr);
+    const bool created_shared =
+        std::any_of(resident.checkpoint_lifecycle.begin(), resident.checkpoint_lifecycle.end(),
+                    [](const auto& fact) {
+                        return fact.scope == CheckpointLifecycleScope::Shared &&
+                               fact.operation == CheckpointLifecycleOperation::Created &&
+                               fact.status == CheckpointLifecycleStatus::Committed;
+                    });
+    require(created_shared && service.runtime_stats().shared_ssd_writes_completed == 0,
+            "memory-only fixture did not create its non-durable shared victim");
+    auto& engine = ninfer::serve::testing::GenerationServiceTestAccess::engine(service);
+    require(resident.id_slot >= 0, "memory-only fixture did not retain its private endpoint");
+    (void)settled_stats(service, true);
+    engine.erase_slot(static_cast<std::uint32_t>(resident.id_slot));
+    const auto baseline       = engine.runtime_stats();
+    const auto same_ownership = [&](const RuntimeStats& observed) {
+        return observed.context_cache_owners == baseline.context_cache_owners &&
+               observed.device_state_occupied_slots == baseline.device_state_occupied_slots &&
+               observed.host_state_occupied_slots == baseline.host_state_occupied_slots &&
+               observed.device_main_kv_occupied_pages == baseline.device_main_kv_occupied_pages &&
+               observed.device_backend_kv_occupied_pages ==
+                   baseline.device_backend_kv_occupied_pages &&
+               observed.host_kv_occupied_bytes == baseline.host_kv_occupied_bytes;
+    };
+    PromptInput incoming_input;
+    incoming_input.messages = {
+        ChatMessage{.role = ChatRole::System, .parts = {MessagePart{.text = incoming}}},
+        ChatMessage{.role = ChatRole::User, .parts = {MessagePart{.text = "Hi"}}},
+    };
+    incoming_input.options.enable_thinking   = false;
+    incoming_input.options.preserve_thinking = true;
+    const auto incoming_prompt               = engine.prepare(std::move(incoming_input));
+    const auto candidates                    = Access::candidates(engine, incoming_prompt);
+    const auto candidate =
+        std::find_if(candidates.begin(), candidates.end(),
+                     [&](const auto& item) { return item.content_digest == incoming_digest; });
+    require(candidate != candidates.end(), "memory-only rollback lost its incoming SSD identity");
+    RequestOptions request_options;
+    request_options.execution.requested_output_tokens = 8;
+    // Both seams run after the victim has been physically released. Rollback must reconstruct
+    // the non-durable owner, including its original residency, before failure escapes.
+    for (const bool cancel : {false, true}) {
+        const auto decision = Access::decide_recovery(engine, incoming_prompt, request_options,
+                                                      std::span(&*candidate, 1));
+        require(decision.source == Access::RecoverySource::Ssd && decision.replacement,
+                "memory-only rollback fixture did not reserve a replacement");
+
+        struct Gate {
+            bool cancel;
+            bool triggered = false;
+            std::atomic<bool> cancelled{false};
+
+            ~Gate() { runtime::testing::clear_shared_snapshot_import_gate(); }
+        } gate{cancel};
+
+        const runtime::testing::SharedSnapshotImportTestGate registration{
+            .context = &gate,
+            .checkpoint =
+                [](void* context, runtime::testing::SharedSnapshotImportStage stage) {
+                    auto& gate = *static_cast<Gate*>(context);
+                    const auto selected =
+                        gate.cancel ? runtime::testing::SharedSnapshotImportStage::StateAllocated
+                                    : runtime::testing::SharedSnapshotImportStage::MainKvAllocated;
+                    if (stage != selected) { return; }
+                    gate.triggered = true;
+                    if (gate.cancel) {
+                        gate.cancelled.store(true);
+                    } else {
+                        throw std::bad_alloc();
+                    }
+                },
+        };
+        const auto pins_before = runtime::testing::shared_snapshot_export_pinned_sources();
+        runtime::testing::install_shared_snapshot_import_gate(&registration);
+        bool rejected = false;
+        try {
+            (void)Access::import(engine, decision.candidate, incoming_bytes,
+                                 CancellationView([&] { return gate.cancelled.load(); }),
+                                 decision.reservation_id);
+        } catch (const std::bad_alloc&) { rejected = !cancel; } catch (const RequestError& error) {
+            rejected = cancel && error.kind() == RequestErrorKind::Cancelled;
+        }
+        require(gate.triggered && rejected && engine.healthy() &&
+                    same_ownership(engine.runtime_stats()) &&
+                    runtime::testing::shared_snapshot_export_pinned_sources() == pins_before,
+                "failed SSD import did not restore its memory-only victim and source pins");
+    }
+    auto restored_request = service.prepare(request, GenerationConsumerMode::Aggregate, {}, hints);
+    const auto restored   = service.run(restored_request, nullptr);
+    require(restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
+                restored.metrics.prefix_cache_hit_tokens != 0 &&
+                restored.generated_token_ids == resident.generated_token_ids &&
+                restored.metrics.speculative_draft_tokens ==
+                    resident.metrics.speculative_draft_tokens &&
+                restored.metrics.speculative_accepted_tokens ==
+                    resident.metrics.speculative_accepted_tokens,
+            "rolled-back memory-only checkpoint lost exact generation or MTP state");
+    const auto side = generate(service, incoming, "Hi", false);
+    if (!side.metrics.durable_loaded_from_ssd) {
+        std::cerr << "memory_only_victim fallback=" << side.metrics.durable_fallback_reason << '\n';
+    }
+    require(side.metrics.durable_loaded_from_ssd &&
+                side.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
+                side.generated_token_ids == oracle.generated_token_ids &&
+                side.metrics.speculative_draft_tokens == oracle.metrics.speculative_draft_tokens &&
+                side.metrics.speculative_accepted_tokens ==
+                    oracle.metrics.speculative_accepted_tokens,
+            "in-memory rollback incorrectly required its victim to be SSD eligible");
+    std::cout << "ssd_memory_only_victim reused=" << side.metrics.prefix_cache_hit_tokens
+              << " allocation_rollback=true cancellation_rollback=true exact_oracle_match=true\n";
 }
 
 void exercise_service_ssd_winning_replacement(const char* artifact) {
@@ -1163,21 +1793,45 @@ int main() {
         return 77;
     }
     try {
+        if (scenario != nullptr && std::string_view(scenario) == "reasoning-continuation") {
+            exercise_generated_reasoning_continuation(artifact);
+            return 0;
+        }
+        if (scenario != nullptr && std::string_view(scenario) == "concurrent-ingress-long") {
+            exercise_nonblocking_durable_ingress(artifact, true);
+            return 0;
+        }
+        if (scenario != nullptr && std::string_view(scenario) == "concurrent-ingress") {
+            exercise_nonblocking_durable_ingress(artifact);
+            exercise_changed_user_history(artifact);
+            return 0;
+        }
         if (scenario != nullptr && std::string_view(scenario) == "durable-two-lineage") {
             exercise_deferred_durable_deadline_settlement(artifact);
-            exercise_durable_two_lineage_replacement(artifact);
+            exercise_durable_two_lineage_warm_reuse(artifact);
+            return 0;
+        }
+        if (scenario != nullptr && std::string_view(scenario) == "ssd-memory-only-victim") {
+            exercise_ssd_replaces_memory_only_checkpoint(artifact);
+            return 0;
+        }
+        if (scenario != nullptr && std::string_view(scenario) == "ssd-side-request") {
+            exercise_ssd_replacement_beside_background(artifact);
             return 0;
         }
         if (scenario != nullptr && std::string_view(scenario) == "service-ssd-replacement") {
             exercise_service_ssd_winning_replacement(artifact);
             return 0;
         }
+        exercise_generated_reasoning_continuation(artifact);
         exercise_harness(artifact);
         exercise_disconnect_after_checkpoint_reuse(artifact);
         exercise_stream_failure_before_wait(artifact);
         exercise_deferred_durable_deadline_settlement(artifact);
-        exercise_durable_two_lineage_replacement(artifact);
+        exercise_durable_two_lineage_warm_reuse(artifact);
         exercise_service_ssd_winning_replacement(artifact);
+        exercise_ssd_replacement_beside_background(artifact);
+        exercise_ssd_replaces_memory_only_checkpoint(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);
         return 0;

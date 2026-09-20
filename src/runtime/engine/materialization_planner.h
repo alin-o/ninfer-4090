@@ -153,6 +153,12 @@ public:
         std::vector<IdentityRoot> roots;
         roots.reserve(candidates.size());
         std::uint64_t projection_work = 0;
+        const bool consumes_private_history =
+            std::any_of(candidates.begin(), candidates.end(), [](const CandidateInput& input) {
+                return input.candidate->summary().reusable_prompt_tokens != 0 &&
+                       input.candidate->identity_assessment().source_mode ==
+                           PrivateSourceMode::ConsumeToActive;
+            });
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             const CandidateInput& input = candidates[index];
             const IdentityMaterializationAssessment& identity =
@@ -193,7 +199,7 @@ public:
             const bool needs_optional_search =
                 std::any_of(roots.begin(), roots.end(),
                             [](const IdentityRoot& root) { return root.expandable; });
-            if (!needs_optional_search) {
+            if (!needs_optional_search && !consumes_private_history) {
                 const CandidateInput& selected = candidates[identity_best->candidate_index];
                 const auto price_split         = [&](std::span<const std::uint32_t> frontiers) {
                     const std::uint64_t baseline =
@@ -253,6 +259,34 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        // Consuming a source advances its endpoint just as evicting it removes the old
+        // checkpoint. Compare both transitions against the same recovery portfolio, including
+        // identity plans which need no pressure actions. Otherwise replaying old history gets
+        // a zero-loss price while freeing that same history to fork the latest head is penalized.
+        if (consumes_private_history) {
+            identity_best.reset();
+            for (std::size_t index = 0; index < candidates.size(); ++index) {
+                const auto target      = session.identity_target(candidates[index].id);
+                auto assessed          = session.assess(target);
+                const auto& assessment = assessed.assessment();
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                const FoldedCost cost =
+                    fold_assessment(candidates[index], assessment, pressure.owner_policy,
+                                    pressure.checkpoint_policy, machine_cost);
+                identity_costs_[index]      = cost;
+                roots[index].lower_bound_ns = cost.lower_bound_ns;
+                std::optional<LogicalGoal> goal;
+                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(assessment.candidate, assessment.source_mode,
+                                        assessment.owner_outcomes);
+                }
+                if (goal && (!identity_best || cost.less(identity_best->cost))) {
+                    identity_best = make_incumbent(target, static_cast<std::uint32_t>(index),
+                                                   assessment, std::move(assessed), cost, *goal);
+                }
+            }
+        }
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
@@ -308,8 +342,7 @@ public:
                 oldest_head_epoch = floor.oldest_head_epoch;
                 return;
             }
-            if (victim_class ==
-                static_cast<std::uint8_t>(DeviceStateVictimClass::ConversationHead)) {
+            if (victim_class != 0) {
                 oldest_head_epoch = std::min(oldest_head_epoch, floor.oldest_head_epoch);
             }
         };
@@ -487,9 +520,12 @@ public:
                                  };
                   });
         std::vector<PlanningOwnerId> preferred_owner_ids;
+        std::vector<PlanningOwnerId> conversation_head_ids;
         preferred_owner_ids.reserve(preferred_owners.size());
+        conversation_head_ids.reserve(preferred_owners.size());
         for (const MaterializationOwnerPolicy* policy : preferred_owners) {
             preferred_owner_ids.push_back(policy->owner);
+            if (policy->conversation_head) { conversation_head_ids.push_back(policy->owner); }
         }
 
         std::vector<IdentityRoot> closure_order;
@@ -511,7 +547,7 @@ public:
             }
             const Clock::time_point step_started              = Clock::now();
             const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
-                candidates[root.candidate_index].id, preferred_owner_ids);
+                candidates[root.candidate_index].id, preferred_owner_ids, conversation_head_ids);
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
             if (!closure) { continue; }
             const PressureTargetGuidance closure_guidance = session.guidance(*closure);
@@ -603,7 +639,6 @@ public:
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
         }
 
-        bool hard_class_unresolved = false;
         for (;;) {
             while (!queue_.empty() &&
                    target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
@@ -668,16 +703,14 @@ public:
                 }
             } else {
                 if (optional_targets >= kTargetBudget) {
-                    stop_reason           = MaterializationStopReason::TargetBudget;
-                    budget_exhausted      = true;
-                    hard_class_unresolved = next_class < incumbent_class;
+                    stop_reason      = MaterializationStopReason::TargetBudget;
+                    budget_exhausted = true;
                     break;
                 }
                 const QueueEntry parent = queue_pop();
                 if (!expand_target(parent)) {
-                    stop_reason           = MaterializationStopReason::ExpansionCapacity;
-                    budget_exhausted      = true;
-                    hard_class_unresolved = next_class < incumbent_class;
+                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
+                    budget_exhausted = true;
                     break;
                 }
             }
@@ -685,7 +718,9 @@ public:
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
-        if (hard_class_unresolved) { return std::nullopt; }
+        // An unresolved cheaper victim class is an optimization question, not evidence that
+        // admission is impossible. The incumbent already passed physical and logical checks;
+        // keep it when bounded search runs out, including the verified maximal root fallback.
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
             const PressureTargetAssessment& assessment = assessed.assessment();
@@ -708,7 +743,9 @@ public:
         std::optional<ResourcePlan> sealed =
             session.seal(std::move(*incumbent.assessed), prompt,
                          FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        // Physical capacity can fit while an active sequence still has an unsettled State
+        // fork. As on the identity path, leave admission queued until execution settles it.
+        if (!sealed) { return std::nullopt; }
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
@@ -990,11 +1027,8 @@ private:
                 throw std::logic_error("pressure guidance references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
-            if (outcome.device_state_victim_class == DeviceStateVictimClass::ConversationHead) {
-                if (!policy->conversation_head) {
-                    throw std::logic_error(
-                        "pressure guidance classified a non-head owner as a conversation head");
-                }
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::PrivateEndpoint &&
+                policy->conversation_head) {
                 const bool first_head = cost.victim_class == 0;
                 cost.victim_class     = 1;
                 if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
@@ -1041,11 +1075,8 @@ private:
                 throw std::logic_error("pressure target references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
-            if (outcome.device_state_victim_class == DeviceStateVictimClass::ConversationHead) {
-                if (!policy->conversation_head) {
-                    throw std::logic_error(
-                        "pressure target classified a non-head owner as a conversation head");
-                }
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::PrivateEndpoint &&
+                policy->conversation_head) {
                 const bool first_head = cost.victim_class == 0;
                 cost.victim_class     = 1;
                 if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {

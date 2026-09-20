@@ -15,6 +15,19 @@ namespace ninfer::serve {
 
 namespace {
 
+constexpr std::string_view kDefaultModelAlias = "default";
+
+nlohmann::json model_metadata(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len, bool vision) {
+    return {{"id", model_id},
+            {"object", "model"},
+            {"created", created},
+            {"owned_by", "ninfer"},
+            {"max_model_len", max_model_len},
+            {"context_window", max_model_len},
+            {"modalities", nlohmann::json{{"vision", vision}}}};
+}
+
 std::string chat_identifier(std::string_view prefix) {
     static thread_local std::mt19937_64 random{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> distribution;
@@ -181,18 +194,13 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len, bool vision) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    // context_window and modalities are this fork's additions; clients that key on either
-    // spelling see a consistent answer.
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len},
-                                                     {"context_window", max_model_len},
-                                                     {"modalities", Json{{"vision", vision}}}}})}};
-    return payload.dump();
+    Json model  = model_metadata(model_id, created, max_model_len, vision);
+    Json models = Json::array({model});
+    if (model_id != kDefaultModelAlias) {
+        model["id"] = kDefaultModelAlias;
+        models.push_back(std::move(model));
+    }
+    return Json{{"object", "list"}, {"data", std::move(models)}}.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
@@ -200,14 +208,7 @@ std::string make_model_object(const std::string& model_id, std::int64_t created,
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
     // context_window and modalities are this fork's additions; clients that key on either
     // spelling see a consistent answer.
-    const Json payload = {{"id", model_id},
-                          {"object", "model"},
-                          {"created", created},
-                          {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len},
-                          {"context_window", max_model_len},
-                          {"modalities", Json{{"vision", vision}}}};
-    return payload.dump();
+    return model_metadata(model_id, created, max_model_len, vision).dump();
 }
 
 std::string make_error_body(const ApiError& error) {
@@ -224,7 +225,7 @@ std::int64_t unix_time_now() {
 }
 
 void validate_openai_model(std::string_view requested, std::string_view available) {
-    if (requested == available) { return; }
+    if (requested == available || requested == kDefaultModelAlias) { return; }
     ApiError error;
     error.status  = 404;
     error.type    = "invalid_request_error";

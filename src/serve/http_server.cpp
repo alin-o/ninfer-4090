@@ -563,16 +563,13 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
-        ApiError error;
-        error.status  = 404;
-        error.type    = "invalid_request_error";
-        error.code    = "model_not_found";
-        error.message = "model '" + id + "' not found";
-        write_openai_error(res, error);
+    try {
+        validate_openai_model(id, public_model_id_);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
+    res.set_content(make_model_object(id, unix_time_now(), options_.max_context,
                                       options_.enable_vision),
                     "application/json");
 }

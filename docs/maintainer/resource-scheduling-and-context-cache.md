@@ -157,6 +157,12 @@ Used_r(S)=
 同一个物理 allocation 被多个 checkpoints 或 address spaces 引用时只计一次。已经物化的容量计
 allocation，尚未物化但被保护的容量计 reservation；同一容量单位不能同时计入两项。
 
+When a consumed private endpoint retains an anchor that aliases a shared checkpoint, that
+StateImage remains shared occupancy. Its Device/Host replicas enter the active lineage's
+entitlement only when the complete admission target removes the last external reference.
+Planning, StateImage reservation, and materialized-resource accounting use the same exclusive
+ownership rule; retaining a checkpoint reference does not allocate another StateImage.
+
 每个稳定状态和 transition 中间状态都必须满足：
 
 \[
@@ -251,6 +257,12 @@ state 内容时，不改变全局可用容量，因此不推进 revision。
 4. token、position、Vision 和 mode identity 与 incoming prompt 精确一致。
 
 只有 token match、KV bytes 或 page match 时，缺少的是完整 continuation，不是一次部分 cache hit。
+
+Rendering and prefill execution boundaries are request-local scheduling metadata, not semantic
+prefix identity. In particular, replaying generated reasoning can introduce a boundary after
+`</think>` inside a complete retained endpoint. Reuse still requires exact tokens, token types,
+positions, media identity, and the full State/Main/backend continuation. It preserves the
+producer's numerical state rather than recomputing it with the new request's prefill schedule.
 
 ### 4.2 Continuation 组织
 
@@ -731,7 +743,39 @@ operation 之间检查 wall/value budget；identity assessments 和 root maximal
 optional budget。Shared capture 以固定 target budget 约束工作量，incumbent 始终为 Skip。任何 budget 只影响
 cache quality，不改变 mandatory request readiness。
 
+If the target or expansion budget expires before a preferred victim class is fully explored,
+materialization seals the best already verified feasible plan, including the maximal root fallback.
+An unresolved cache preference must not become a blocked idle Engine or latch service health.
+Physical feasibility, logical publication capacity, source protection, and active capture pins are
+still checked before any selected plan can be committed.
+If final revalidation reports temporary unavailability, such as an active State fork awaiting
+execution, both identity and pressure paths leave admission queued. Active work settles the fork
+before admission is retried. An invariant failure still propagates as an Engine error.
+
 ### 8.8 目标函数与确定性
+
+Device State pressure protects the currently bound conversation heads before comparing `J`;
+when head reclamation is necessary, authoritative publication order ranks the oldest head first.
+Program reports whether an action removes private endpoint State. ResourceManager determines
+whether that endpoint still owns a session binding and supplies the same distinction to guided
+closure search. Successful replacement retires the superseded private owner, including its
+endpoint, rewrite and anchor references, once readers, claims and export pins have settled.
+Retirement neither waits for transfers nor starts an eviction spill; a deferred owner is excluded
+from reuse and retried at worker boundaries. The latest owner's own checkpoints remain intact.
+A completed private SSD save/restore exempts its exact owner from eager retirement until its file
+binding is replaced. These superseded SSD-backed residents have zero private retention weight and
+zero demand credit, remain reusable, and yield capacity under pressure. Independent shared owners
+keep their existing SSD/residency policy. The last successful head remains the cancellation rollback
+point until replacement publication succeeds.
+
+Consuming a private source also contributes to portfolio loss, even when materialization needs no
+pressure actions. Executing its suffix advances the old endpoint; compatible rewrite checkpoints
+and sparse anchors transferred into the active lineage remain recovery alternatives. Identity and
+pressure plans use the same recovery projection, so consuming old history to replay from it cannot
+receive a free-retention price while evicting that history to fork the latest endpoint is penalized.
+Unbound private checkpoints offer both consuming and retaining admission candidates when consumption
+is supported. Bound heads remain retain-only. The planner therefore compares actual machine work
+and recovery loss for both source modes instead of forcing destruction simply because it is legal.
 
 对 exact feasible assessment：
 
@@ -862,6 +906,13 @@ same-or-deeper memory source prevents SSD I/O; SSD is eligible only when the log
 State/KV stores, temporary Device page capacity, address spaces, and an execution lane can accept
 the import.
 
+An inactive, unpinned shared owner can provide the logical import slot even without an SSD copy.
+Program must prove physical releasability and seal an exact in-memory rollback snapshot before
+replacing it. The rollback retains the original identity and copies State/KV directly; it does not
+require the victim's provenance to qualify for SSD export. Failed or cancelled import restores the
+victim; active references and export pins remain protected. Successful eviction reports destination
+`Ssd` only for a durably backed owner, and `None` otherwise.
+
 When SSD wins, Engine reserves the sealed source/victim plan and signals Gateway to load the chosen
 immutable record. Gateway performs the bounded read without the Engine execution lock; already
 admitted work continues using its existing reservations. Completion, failure, cancellation, and
@@ -967,9 +1018,9 @@ SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Pro
 每个可更新 SessionIndex 的请求取得单调 `publication_order`：
 
 - 新结果只有 order 更大时才能替换当前 binding；
-- 较旧请求晚完成时成为 anonymous cache 或按 policy 释放；
+- 较旧请求晚完成时标记为 superseded 并释放，不保留为 anonymous history；
 - 当前成功 conversation head 在 replacement 完整发布前保持 binding 和 rollback point；replacement 成功后才
-  原子替换 binding，并把旧 head 降为普通 `RecentPrivate` owner；
+  原子替换 binding，并退役旧 private owner；只有已完成 SSD save/restore 的旧 owner 保留到 pressure 回收；
 - active edge 与 transaction claim 保护使用中的旧 head，但 current-head 身份本身不是永久 pin；
 - 无 claim 的 head 可被 maximal-root correctness fallback 降级或删除；
 - shared source 始终保持 immutable；

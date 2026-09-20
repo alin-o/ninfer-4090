@@ -430,11 +430,11 @@ public:
                 bool protected_transaction = false;
                 for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                     const SharedCatalogEntry& entry = shared_catalog_[slot];
-                    // Complete durable coverage is the safety authority for destructive import
-                    // replacement.  A pending export does not set ssd_backed and therefore cannot
-                    // make an owner eligible.
-                    if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
-                        !entry.ssd_backed) {
+                    // SSD recovery competes for inactive shared cache capacity just like root
+                    // admission. Program seals an exact rollback image before replacement, so
+                    // an unused victim does not itself need SSD backing. Active/pinned owners
+                    // remain ineligible, and the portfolio loss ranks the feasible victims.
+                    if (entry.state != SharedCatalogState::Catalogued || !entry.handle) {
                         continue;
                     }
                     if (entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0 ||
@@ -488,11 +488,6 @@ public:
                             program.inspect_durable_shared_prefix_import(
                                 candidate.frontier, logical_replacement, private_handle,
                                 shared_handle);
-                        if (logical_slot != kInvalidCatalogSlot &&
-                            !shared_catalog_[logical_slot].ssd_backed &&
-                            !assessed.replacement_alternate_coverage) {
-                            return;
-                        }
                         if (assessed.feasibility != DurableImportFeasibility::Feasible) {
                             result.infeasibility = assessed.feasibility;
                             return;
@@ -671,7 +666,7 @@ public:
             current_session_cell = find_session_cell(*base.context_cache().session_key);
         }
         std::vector<Candidate> candidates;
-        candidates.reserve(1U + prefix_index_.size());
+        candidates.reserve(1U + 2U * prefix_index_.size());
         std::optional<AdmissionCandidate> root = program.inspect_admission(
             prompt, base, *destination, nullptr, nullptr, std::nullopt, false);
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
@@ -696,7 +691,7 @@ public:
                     // make cancellation erase the last successful head before a replacement
                     // exists. It is an ordinary unpinned pressure candidate again after the
                     // active edge is released.
-                    const bool retain = entry.session.has_value();
+                    const bool retain = entry.session.has_value() || entry.ssd_backed;
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -712,20 +707,53 @@ public:
                         session_index_[*current_session_cell].owner_id == entry.id &&
                         session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
-                    candidates.push_back(Candidate{
-                        .plan                    = std::move(*plan),
-                        .current_session_binding = current_session_binding,
-                        .private_source          = private_capability(index.slot),
-                        .selected_observation =
-                            PolicyObservationKey{
-                                .shared     = false,
-                                .slot       = index.slot,
-                                .owner_id   = entry.id,
-                                .revision   = entry.revision,
-                                .checkpoint = index.checkpoint,
-                            },
-                        .source_key = index.key,
-                    });
+                    const bool can_consume = plan->identity_assessment().source_mode ==
+                                             PrivateSourceMode::ConsumeToActive;
+                    const auto append = [&](AdmissionCandidate&& candidate) {
+                        candidates.push_back(Candidate{
+                            .plan                    = std::move(candidate),
+                            .current_session_binding = current_session_binding,
+                            .private_source          = private_capability(index.slot),
+                            .selected_observation =
+                                PolicyObservationKey{
+                                    .shared     = false,
+                                    .slot       = index.slot,
+                                    .owner_id   = entry.id,
+                                    .revision   = entry.revision,
+                                    .checkpoint = index.checkpoint,
+                                },
+                            .source_key = index.key,
+                        });
+                    };
+                    append(std::move(*plan));
+                    // An unbound checkpoint can either advance into the active lineage or
+                    // remain cached through a fork. Offer both so recovery loss and actual
+                    // allocation/transfer work determine the choice, even without pressure.
+                    if (can_consume) {
+                        auto retained =
+                            program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                      nullptr, index.checkpoint, true);
+                        if (!retained || retained->identity_assessment().source_mode !=
+                                             PrivateSourceMode::Retain) {
+                            throw std::logic_error("Program rejected retained private candidate");
+                        }
+                        append(std::move(*retained));
+                    } else if (!entry.session && entry.ssd_backed &&
+                               (candidates.back().plan->identity_assessment().physical_status !=
+                                    MaterializationPhysicalStatus::Feasible ||
+                                std::none_of(catalog_.begin(), catalog_.end(), [](const auto& cell) {
+                                    return cell.state == CatalogState::Vacant;
+                                }))) {
+                        // Keep a saved historical source resident when a fork fits without
+                        // pressure. Physical or descriptor pressure may instead consume it.
+                        auto consumed = program.inspect_admission(
+                            prompt, base, *destination, &*entry.handle, nullptr, index.checkpoint,
+                            false);
+                        if (consumed && consumed->identity_assessment().source_mode ==
+                                            PrivateSourceMode::ConsumeToActive) {
+                            append(std::move(*consumed));
+                        }
+                    }
                     continue;
                 }
 
@@ -1002,9 +1030,10 @@ public:
                                                        const auto& checkpoint) {
                 const CatalogEntry& entry = catalog_[slot];
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
-                    .owner                = owner,
-                    .checkpoint           = checkpoint.ref,
-                    .demand_mask          = committed_demand_mask_for(checkpoint.shortlist_key),
+                    .owner      = owner,
+                    .checkpoint = checkpoint.ref,
+                    .demand_mask =
+                        entry.superseded ? 0 : committed_demand_mask_for(checkpoint.shortlist_key),
                     .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_,
@@ -1034,7 +1063,7 @@ public:
                 });
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = private_retention_weight(entry),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(owner, slot, *entry.summary.endpoint);
@@ -1358,6 +1387,7 @@ public:
         }
 
         const ContinuationSummary before = publication.summary;
+        const auto previous_source       = active.retained_private_source;
         release_active_references(lane);
         publication.state = CatalogState::Catalogued;
         assign_continuation_summary(publication.summary, result.summary);
@@ -1375,7 +1405,17 @@ public:
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
                                  publication.revision, active.publication_order)) {
                 publication.session.reset();
-                publication.retention = RetentionClass::RecentPrivate;
+                publication.retention  = RetentionClass::RecentPrivate;
+                publication.superseded = true;
+            }
+            // The first chat turn may still be anonymous before an initial-prefix session key
+            // can be inferred. Its selected source belongs to this newly established lineage.
+            if (!publication.superseded && previous_source &&
+                previous_source->slot != active.publication_slot) {
+                auto& source = catalog_.at(previous_source->slot);
+                if (source.id == previous_source->owner.id && !source.session) {
+                    source.superseded = true;
+                }
             }
         }
         const auto append_created = [&](const auto& checkpoint) {
@@ -1392,7 +1432,62 @@ public:
         for (const auto& anchor : result.summary.long_anchors) { append_created(anchor); }
         reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
+        reclaim_superseded(program, &result.lifecycle);
+        if (publication.state == CatalogState::Vacant) {
+            result.disposition = FinishDisposition::Released;
+            result.summary     = {};
+        }
         return result;
+    }
+
+    // A successful replacement retires its previous private owner. Physical release waits for
+    // readers, transactions and exports; it never waits on GPU work or creates an eviction spill.
+    // Shared SSD anchors have independent ownership and are not part of this retirement.
+    void reclaim_superseded(Program& program,
+                            std::vector<CheckpointLifecycleFact>* lifecycle = nullptr) {
+        if (!std::holds_alternative<std::monostate>(transaction_) || durable_recovery_ ||
+            program.has_context_transaction()) {
+            return;
+        }
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            CatalogEntry& entry = catalog_[slot];
+            if (!entry.superseded || entry.ssd_backed || entry.state != CatalogState::Catalogued ||
+                !entry.handle || private_has_active_edge(slot)) {
+                continue;
+            }
+            if (lifecycle) {
+                lifecycle->reserve(lifecycle->size() +
+                                   continuation_checkpoint_count(entry.summary));
+            }
+            const auto released = program.release_continuation(std::move(*entry.handle), false);
+            if (released.status != ConsumeStatus::Consumed) { continue; }
+            const auto append = [&](const auto& checkpoint) {
+                if (!lifecycle) { return; }
+                lifecycle->push_back(lifecycle_fact(
+                    checkpoint, CheckpointLifecycleOperation::Evicted,
+                    checkpoint.state_residency == ReplicaResidency::HostOnly
+                        ? CheckpointLifecycleTier::Host
+                        : CheckpointLifecycleTier::Device,
+                    CheckpointLifecycleTier::None, CheckpointLifecycleStatus::Committed));
+            };
+            if (entry.summary.endpoint) { append(*entry.summary.endpoint); }
+            if (entry.summary.rewrite) { append(*entry.summary.rewrite); }
+            for (const auto& anchor : entry.summary.long_anchors) { append(anchor); }
+            clear_catalog_entry(entry);
+        }
+    }
+
+    // Only a completed save/restore can establish backing; an in-flight export is just a pin.
+    [[nodiscard]] bool set_private_ssd_backed(std::uint32_t slot, std::uint64_t expected_owner,
+                                              bool backed) noexcept {
+        if (slot >= catalog_count_) { return false; }
+        auto& entry = catalog_[slot];
+        if (entry.id != expected_owner || !entry.handle ||
+            (entry.state != CatalogState::Catalogued && entry.state != CatalogState::Claimed)) {
+            return false;
+        }
+        entry.ssd_backed = backed;
+        return true;
     }
 
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -1412,6 +1507,7 @@ public:
         clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
+        reclaim_superseded(program);
         return result;
     }
 
@@ -1703,8 +1799,7 @@ public:
     adopt_imported_shared(Program& program, const ValidatedSharedPrefixImport& imported,
                           CancellationFlagView cancellation               = {},
                           const std::function<void()>& before_publication = {},
-                          bool ssd_backed = false, std::uint64_t reservation_id = 0,
-                          std::string_view model_binding = {}) {
+                          bool ssd_backed = false, std::uint64_t reservation_id = 0) {
         if (!std::holds_alternative<std::monostate>(transaction_)) {
             throw std::logic_error("shared snapshot adoption requires a settled resource catalog");
         }
@@ -1774,7 +1869,6 @@ public:
         }
 
         std::optional<SharedPrefixSummary> displaced_summary;
-        std::optional<SharedPrefixPersistenceMetadata> displaced_metadata;
         std::optional<ContinuationSummary> reclaimed_private_before;
         std::optional<SharedPrefixSummary> reclaimed_shared_before;
         SharedPrefixHandle* replacement  = nullptr;
@@ -1783,13 +1877,6 @@ public:
         if (recovery && recovery->replacement) {
             SharedCatalogEntry& victim = shared_catalog_[recovery->replacement->slot];
             displaced_summary          = victim.summary;
-            displaced_metadata         = SharedPrefixPersistenceMetadata{
-                        .evidence             = victim.evidence,
-                        .structural_origins   = victim.structural_origins,
-                        .structural_role      = victim.structural_role,
-                        .ssd_eligible         = victim.ssd_eligible,
-                        .first_volatile_token = victim.first_volatile_token,
-            };
             replacement = &*victim.handle;
         }
         if (recovery && recovery->host_private) {
@@ -1806,15 +1893,13 @@ public:
             if constexpr (requires {
                               program.adopt_shared_prefix(
                                   imported, replacement, cancellation, before_publication,
-                                  model_binding, host_private, host_shared,
-                                  displaced_metadata ? &*displaced_metadata : nullptr,
+                                  host_private, host_shared,
                                   recovery ? recovery->physical_plan : nullptr);
                           }) {
                 try {
                     return program.adopt_shared_prefix(
-                        imported, replacement, cancellation, before_publication, model_binding,
+                        imported, replacement, cancellation, before_publication,
                         host_private, host_shared,
-                        displaced_metadata ? &*displaced_metadata : nullptr,
                         recovery ? recovery->physical_plan : nullptr);
                 } catch (...) {
                     cancel_durable_recovery(reservation_id);
@@ -2162,6 +2247,8 @@ private:
         std::vector<CheckpointObservation> observations;
         RetentionClass retention          = RetentionClass::RecentPrivate;
         std::uint64_t authoritative_epoch = 0;
+        bool superseded                   = false;
+        bool ssd_backed                   = false;
     };
 
     struct SharedCatalogEntry {
@@ -2210,7 +2297,6 @@ private:
                    publication.state == SharedCatalogState::Catalogued && publication.handle &&
                    publication.id == capability.owner.id &&
                    publication.revision == capability.generation &&
-                   (publication.ssd_backed || record.replacement_alternate_coverage) &&
                    (!record.replacement_alternate_coverage || record.host_private.has_value()) &&
                    publication.summary.active_references == 0 &&
                    shared_active_edge_count(capability.slot) == 0;
@@ -2571,8 +2657,12 @@ private:
         return count;
     }
 
-    [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept {
-        switch (retention) {
+    [[nodiscard]] static std::uint32_t
+    private_retention_weight(const CatalogEntry& entry) noexcept {
+        // Superseded SSD-backed residents are opportunistic: keeping them costs nothing without
+        // pressure, but their old conversation demand must not displace useful current state.
+        if (entry.superseded) { return 0; }
+        switch (entry.retention) {
         case RetentionClass::Disposable:
             return 1;
         case RetentionClass::RecentPrivate:
@@ -2715,6 +2805,8 @@ private:
         entry.observations.clear();
         entry.retention           = RetentionClass::RecentPrivate;
         entry.authoritative_epoch = 0;
+        entry.superseded          = false;
+        entry.ssd_backed          = false;
         advance_revision(entry.revision);
     }
 
@@ -2768,7 +2860,8 @@ private:
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                (entry.superseded && !entry.ssd_backed)) { continue; }
             if (entry.summary.endpoint) {
                 append(false, slot, entry.id, entry.revision, *entry.summary.endpoint);
             }
@@ -2880,14 +2973,15 @@ private:
         projected_owners.reserve(catalog_count_ + shared_catalog_count_ + shared_candidates.size());
         projected_checkpoints.reserve(prefix_index_.size() + shared_candidates.size());
         const auto append_existing = [&](PlanningOwnerId owner, const auto& handle,
-                                         const auto& checkpoint) {
+                                         const auto& checkpoint, bool superseded = false) {
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
-                .owner       = owner,
-                .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
-                .rebuild_ns  = rebuild,
+                .owner = owner,
+                .demand_mask =
+                    superseded ? 0 : demand_mask_for(checkpoint.shortlist_key, provisional_demand),
+                .rebuild_ns           = rebuild,
                 .baseline_recovery_ns = recovery,
                 .target_recovery_ns   = recovery,
             });
@@ -2903,16 +2997,16 @@ private:
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .owner                    = owner,
-                .private_retention_weight = private_retention_weight(entry.retention),
+                .private_retention_weight = private_retention_weight(entry),
             });
             if (entry.summary.endpoint) {
-                append_existing(owner, *entry.handle, *entry.summary.endpoint);
+                append_existing(owner, *entry.handle, *entry.summary.endpoint, entry.superseded);
             }
             if (entry.summary.rewrite) {
-                append_existing(owner, *entry.handle, *entry.summary.rewrite);
+                append_existing(owner, *entry.handle, *entry.summary.rewrite, entry.superseded);
             }
             for (const auto& checkpoint : entry.summary.long_anchors) {
-                append_existing(owner, *entry.handle, checkpoint);
+                append_existing(owner, *entry.handle, checkpoint, entry.superseded);
             }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -3082,13 +3176,14 @@ private:
                     }
                     selected_hits = std::max(selected_hits, observation->selected_hit_count);
                     checkpoint_policies.push_back(MaterializationCheckpointPolicy{
-                        .owner              = owner,
-                        .checkpoint         = checkpoint.ref,
-                        .retention_class    = observation->retention_class,
-                        .selected_hit_count = observation->selected_hit_count,
-                        .last_hit_epoch     = observation->last_hit_epoch,
-                        .demand_mask =
-                            demand_mask_for(checkpoint.shortlist_key, provisional_demand),
+                        .owner                = owner,
+                        .checkpoint           = checkpoint.ref,
+                        .retention_class      = observation->retention_class,
+                        .selected_hit_count   = observation->selected_hit_count,
+                        .last_hit_epoch       = observation->last_hit_epoch,
+                        .demand_mask          = entry.superseded ? 0
+                                                                 : demand_mask_for(checkpoint.shortlist_key,
+                                                                                   provisional_demand),
                         .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
                         .baseline_recovery_ns = price_checkpoint_recovery_work(
                             cost_model_,
@@ -3105,8 +3200,8 @@ private:
                     .retention_class          = entry.retention,
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
-                    .private_retention_weight = private_retention_weight(entry.retention),
-                    .conversation_head        = true,
+                    .private_retention_weight = private_retention_weight(entry),
+                    .conversation_head        = entry.session.has_value(),
                     .authoritative_epoch      = entry.authoritative_epoch,
                 });
             }
@@ -4758,7 +4853,8 @@ private:
             return;
         }
         prior.session.reset();
-        prior.retention = RetentionClass::RecentPrivate;
+        prior.superseded = true;
+        prior.retention  = RetentionClass::RecentPrivate;
         for (CheckpointObservation& observation : prior.observations) {
             observation.observation.retention_class = RetentionClass::RecentPrivate;
         }

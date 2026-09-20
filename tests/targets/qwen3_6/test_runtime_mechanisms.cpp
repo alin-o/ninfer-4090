@@ -285,24 +285,24 @@ void test_prefix_identity() {
            "different MRoPE positions must not reuse resident state");
 
     q36::PreparedPromptData changed_decomposition              = identity_prompt();
-    changed_decomposition.identity.rewrite_execution_frontiers = {1};
-    expect(!q36::detail::prefix_matches(changed_decomposition, ledger, resident,
-                                        changed_decomposition.token_ids.size()),
-           "different GDN execution decomposition must not reuse resident state");
-    changed_decomposition.identity.rewrite_execution_frontiers = {4};
+    changed_decomposition.prefill_execution_frontiers          = {1};
+    expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident,
+                                       changed_decomposition.token_ids.size()),
+           "prefill scheduling changed semantic prefix identity");
+    changed_decomposition.prefill_execution_frontiers = {4};
     expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident, 3),
            "execution decomposition wholly after the frontier changed prefix identity");
 
     q36::PreparedPromptData resident_future              = identity_prompt();
-    resident_future.identity.rewrite_execution_frontiers = {1, 4};
+    resident_future.prefill_execution_frontiers          = {1, 4};
     q36::detail::ResidentPrefixIdentity resident_with_future;
     resident_with_future.assign(resident_future);
     q36::PreparedPromptData incoming_future              = identity_prompt();
-    incoming_future.identity.rewrite_execution_frontiers = {1, 3};
+    incoming_future.prefill_execution_frontiers          = {1, 3};
     expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 1),
            "resident execution decomposition after the frontier changed prefix identity");
-    expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
-           "different execution decomposition inside the frontier reused resident state");
+    expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
+           "interior prefill boundaries rejected matching model inputs");
 
     q36::detail::PrefixShortlistDigests future_digest;
     future_digest.assign(resident_future);
@@ -310,8 +310,8 @@ void test_prefix_identity() {
     incoming_digest.assign(incoming_future);
     expect(future_digest.at(1) == incoming_digest.at(1),
            "future execution boundaries changed an earlier content shortlist");
-    expect(future_digest.at(3) != incoming_digest.at(3),
-           "different in-prefix execution boundaries shared a shortlist digest");
+    expect(future_digest.at(3) == incoming_digest.at(3),
+           "interior prefill boundaries changed the semantic shortlist digest");
 
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);

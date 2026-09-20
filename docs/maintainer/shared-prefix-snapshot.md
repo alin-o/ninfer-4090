@@ -1,13 +1,13 @@
 # Complete shared-prefix snapshot format
 
 `NINFSHR1` is the target-private persistence envelope for one complete immutable
-`SharedPrefixHandle`. It is distinct from the `NINFSES1` private-continuation format: adding this
-format does not change the `NINFSES1` version 3 writer, reader, bytes, or slot restore semantics.
+`SharedPrefixHandle`. It is distinct from the `NINFSES1` private-continuation format, currently
+version 4. Both formats use model-input identity without request-local rendering boundaries.
 The implementation and codec live in `Program`; Engine selects publication boundaries and
 ResourceManager owns the logical shared catalog. A shared import never borrows, addresses, or
 evicts a private continuation slot.
 
-## Version 1 envelope
+## Version 2 envelope
 
 All integers and trivially-copyable records use the serving host representation. The supported
 deployment is x86-64 little-endian; cross-endian transport is not supported. Fields are packed in
@@ -16,7 +16,7 @@ the following order without implicit envelope padding:
 | Field | Encoding |
 |---|---|
 | magic | 8 bytes, ASCII `NINFSHR1` |
-| version | `uint32`, currently 1 |
+| version | `uint32`, currently 2 |
 | total size | `uint64`, entire envelope and payload |
 | payload size | `uint64`, bytes after this 60-byte header |
 | payload checksum | 32-byte SHA-256 of every byte after the header |
@@ -28,7 +28,7 @@ the following order without implicit envelope padding:
 | physical payload | one terminal StateImage, Main KV pages in logical order, then MTP KV pages in logical order |
 
 The exact identity payload contains counted vectors for token IDs, token types, all three position
-axes, media identity records, and rewrite execution frontiers. Version 1 deliberately requires an
+axes, and media identity records. Version 2 deliberately requires an
 empty media record set: media serving and in-memory prefix reuse remain supported, but media-aware
 durable persistence is not yet defined. The identity digest binds semantic prefix identity; the
 envelope checksum additionally binds State and every KV byte.
@@ -42,10 +42,19 @@ ends at `frontier - 1`; without a backend it is empty. DFlash shared persistence
 Import requires exact equality for:
 
 - target, model ID, and weights ID;
-- tokenizer/rendered token identity, token types, three-axis positions, and rewrite frontiers;
+- tokenizer/rendered token identity, token types, and three-axis positions;
 - max context, token domain, position/layout geometry, KV format flags and strides;
 - StateImage geometry; and
 - speculative backend, draft window, proposal head, and derived identity tag.
+
+Identity schema 2 excludes prefill execution boundaries. Rendering a generated response as history
+can add a boundary after its reasoning closer without changing any model input. These boundaries
+remain part of request-local scheduling, and never invalidate an otherwise complete exact prefix.
+The retained StateImage and KV preserve the producer's actual numerical state; this does not imply
+bitwise equality with a cold prefill using another floating-point schedule.
+
+Shared snapshots from version 1 and private snapshots older than version 4 are rejected. They use
+the previous identity payload and rolling-digest semantics; caches must be rebuilt with this build.
 
 Structural role and origin are provenance, not semantic identity. Coincident or repeated imports
 therefore coalesce into one exact physical owner and merge cumulative provenance. A durable export
@@ -71,8 +80,12 @@ coalescing nor allocation accepts that plan through another `Program`, even when
 the same target Variant; callers must parse again against the receiving Program.
 
 ResourceManager first coalesces an exact resident identity. Otherwise it proves a vacant shared
-catalog cell, asks Program to adopt the physical owner, revalidates the returned summary, and then
-publishes it transactionally. Cancellation or capacity failure releases any unpublished owner;
+catalog cell or reserves an inactive, unpinned shared victim. Before replacing a victim, Program
+copies its State/KV payload and retains its exact in-memory identity for rollback. This internal
+copy does not use the durable envelope or require SSD-eligible provenance, so a memory-only
+checkpoint can also yield its slot. Public exports still enforce all durable validation rules.
+Program adopts the physical owner, revalidates the returned summary, and publishes it
+transactionally. Cancellation or capacity failure releases any unpublished owner;
 checksum and compatibility failures allocate nothing. Valid existing shared and private owners and
 their accounting remain unchanged. Recoverable validation, capacity, allocation, and cancellation
 outcomes refresh physical accounting after rollback. CUDA failures and invariant violations use

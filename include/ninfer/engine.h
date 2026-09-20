@@ -89,6 +89,8 @@ public:
     Engine(const Engine&)            = delete;
     Engine& operator=(const Engine&) = delete;
 
+    // Unchanged text assistant history may preserve this Engine's original generated token IDs.
+    // This is independent of KV residency and continues that trajectory rather than re-encoding it.
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
 
@@ -103,6 +105,7 @@ public:
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
 
+    // Includes the same retained generated-history resolution as prepare().
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
@@ -124,6 +127,8 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    // Generation Engines return the latest complete boundary snapshot without waiting for
+    // active model execution. Initialized before admission and refreshed after resource changes.
     [[nodiscard]] MemorySummary memory_summary() const;
     // Whether the engine can still accept work. A latched failure is permanent.
     [[nodiscard]] bool healthy() const;

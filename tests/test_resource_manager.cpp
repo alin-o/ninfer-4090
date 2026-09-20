@@ -342,6 +342,7 @@ struct FakeAdmissionCandidate {
     std::uint32_t shared_source_id          = 0;
     std::uint32_t shared_source_content_key = 0;
     std::uint32_t shared_source_frontier    = 0;
+    std::optional<std::uint64_t> consumed_endpoint_recovery_ns;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
 
@@ -635,7 +636,8 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(PlanningCandidateId candidate,
-                          std::span<const PlanningOwnerId> preferred_owner_ids);
+                          std::span<const PlanningOwnerId> preferred_owner_ids,
+                          std::span<const PlanningOwnerId> conversation_head_ids);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion prepare_expansion(FakePressureTargetHandle parent);
@@ -755,7 +757,7 @@ public:
         if (source != nullptr) {
             plan.private_source_id = source->id;
             plan.source_mode =
-                must_retain_source ? PrivateSourceMode::Retain : PrivateSourceMode::ConsumeToActive;
+                (must_retain_source || force_retain_source) ? PrivateSourceMode::Retain : PrivateSourceMode::ConsumeToActive;
         } else if (shared_source != nullptr) {
             plan.shared_source_id          = shared_source->id;
             plan.shared_source_content_key = shared_source->content_key;
@@ -1278,8 +1280,9 @@ public:
                                .speculative = FakeSpeculativeStats{.value = 9}};
     }
 
-    [[nodiscard]] FakeReleaseResult
-    release_continuation(FakeContinuationHandle&& continuation) noexcept {
+    [[nodiscard]] FakeReleaseResult release_continuation(FakeContinuationHandle&& continuation,
+                                                         bool wait_for_exports = true) noexcept {
+        if (!wait_for_exports && release_pinned) { return {}; }
         released_continuations.push_back(continuation.id);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
@@ -1303,10 +1306,9 @@ public:
     [[nodiscard]] FakeSharedPrefixPublication
     adopt_shared_prefix(const FakeValidatedSharedPrefixImport& imported,
                         FakeSharedPrefixHandle* replacement, CancellationFlagView cancellation = {},
-                        const std::function<void()>& commit_checkpoint = {}, std::string_view = {},
+                        const std::function<void()>& commit_checkpoint = {},
                         const FakeContinuationHandle* host_private = nullptr,
                         const FakeSharedPrefixHandle* host_shared  = nullptr,
-                        const FakeSharedPrefixPersistenceMetadata* = nullptr,
                         std::shared_ptr<const void> physical_plan  = {}) {
         if ((replacement != nullptr || host_private != nullptr || host_shared != nullptr) &&
             !physical_plan) {
@@ -1395,6 +1397,8 @@ public:
     std::uint32_t delayed_transfer_units                 = 0;
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
+    bool release_pinned                                  = false;
+    bool force_retain_source                             = false;
     bool finish_with_rewrite                             = false;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
@@ -1627,7 +1631,8 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
 }
 
 std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_closure_target(
-    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids) {
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
+    std::span<const PlanningOwnerId> conversation_head_ids) {
     require(!scratch_live_, "fake guided pressure closure conflicts with expansion scratch");
     const std::uint32_t selected_candidate = candidate_index(candidate);
     populate_options(selected_candidate);
@@ -1646,6 +1651,17 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
         if (found != owners_.end()) { append(static_cast<std::size_t>(found - owners_.begin())); }
     }
     for (std::size_t index = 0; index < owners_.size(); ++index) { append(index); }
+    const auto is_head_state = [&](std::size_t index) {
+        return !owners_[index].shared &&
+               program_->intermediate_device_state_owner != owners_[index].private_handle->id &&
+               std::find(conversation_head_ids.begin(), conversation_head_ids.end(),
+                         owners_[index].id) != conversation_head_ids.end();
+    };
+    if (program_->target_reclamation.device_state_slots != 0) {
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            return is_head_state(left) < is_head_state(right);
+        });
+    }
 
     const auto selected_decisions = [&] {
         std::vector<FakeTargetDecision> decisions;
@@ -1717,7 +1733,7 @@ FakePressurePlanningSession::guidance(FakePressureTargetHandle handle) {
                 : (owners_[index].shared ||
                            program_->intermediate_device_state_owner == owner_handle_id
                        ? ninfer::runtime::DeviceStateVictimClass::Intermediate
-                       : ninfer::runtime::DeviceStateVictimClass::ConversationHead);
+                       : ninfer::runtime::DeviceStateVictimClass::PrivateEndpoint);
         guidance_outcomes_.push_back(ninfer::runtime::PressureOwnerOutcome{
             .owner                     = owners_[index].id,
             .disposition               = decision.evicts_continuation ? VictimDisposition::Evicted
@@ -1786,6 +1802,19 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         const std::uint16_t choice = target.choices[index];
         const auto& alternatives   = options_[target.candidate_index][index];
         if (choice == 0) {
+            if (candidate.consumed_endpoint_recovery_ns && !owners_[index].shared &&
+                owners_[index].private_handle->id == candidate.private_source_id) {
+                assessment_recovery_work_.push_back(
+                    fake_recovery_work(*candidate.consumed_endpoint_recovery_ns));
+                assessment_impacts_.push_back(ninfer::runtime::PressureCheckpointRecoveryImpact{
+                    .owner                = owners_[index].id,
+                    .checkpoint           = {.kind     = CheckpointKind::SessionEndpoint,
+                                             .frontier = program_->finish_frontier},
+                    .target_recovery_work = std::span<const CheckpointRecoveryAlternativeWork>(
+                        &assessment_recovery_work_.back(), 1),
+                    .survives = false,
+                });
+            }
             expandable = expandable || !alternatives.empty();
             continue;
         }
@@ -1803,7 +1832,7 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
                 : (owners_[index].shared ||
                            program_->intermediate_device_state_owner == owner_handle_id
                        ? ninfer::runtime::DeviceStateVictimClass::Intermediate
-                       : ninfer::runtime::DeviceStateVictimClass::ConversationHead);
+                       : ninfer::runtime::DeviceStateVictimClass::PrivateEndpoint);
         assessment_outcomes_.push_back(ninfer::runtime::PressureOwnerOutcome{
             .owner                     = owners_[index].id,
             .disposition               = decision.evicts_continuation ? VictimDisposition::Evicted
@@ -1872,7 +1901,8 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         digest ^= target.candidate_index;
     }
     ninfer::runtime::PressureTargetAssessment assessment{
-        .physical_status    = program_->target_feasible(selected)
+        .physical_status    = identity ? candidate.identity.physical_status
+                              : program_->target_feasible(selected)
                                   ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                                   : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
         .source_mode        = candidate.source_mode,
@@ -2763,6 +2793,62 @@ void test_durable_recovery_non_ssd_victim_reports_logical_eviction() {
             "non-SSD logical replacement falsely reported durable displaced coverage");
 }
 
+void test_ssd_recovery_replaces_unsaved_shared_without_disturbing_background() {
+    struct DurableCandidate {
+        std::uint32_t frontier = 0;
+    };
+
+    FakeManager manager = make_manager(2, 3, 1);
+    FakeProgram program;
+    const auto background_base =
+        make_base(740, FakeCacheSessionKey{740}, RetentionClass::LiveSession, true);
+    const auto seed = start_active(manager, program, 740, background_base, 1);
+    (void)finish_active(manager, program, seed);
+    const auto background = start_active(manager, program, 740, background_base, 2);
+    const auto imported   = [](std::uint32_t content) {
+        return FakeValidatedSharedPrefixImport{
+              .imported_summary =
+                FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(content, 96)},
+              .imported_metadata =
+                FakeSharedPrefixPersistenceMetadata{
+                      .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                      .ssd_eligible = true},
+              .content_key = content,
+        };
+    };
+    (void)manager.adopt_imported_shared(program, imported(742), {}, {}, false);
+    const auto old_id = manager.shared_catalog_slot(0).id;
+    const std::array candidates{DurableCandidate{.frontier = 96}};
+    const auto inspection =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{741}, make_base(741),
+                                         std::span<const DurableCandidate>(candidates));
+    require(inspection.reservation_id != 0 && inspection.replacement_slot == 0 &&
+                manager.shared_catalog_slot(0).id == old_id,
+            "matching SSD record was rejected merely because the unused shared victim was unsaved");
+    // Failed/cancelled loading releases only the claim, keeping both original owners intact.
+    manager.cancel_durable_recovery(inspection.reservation_id);
+    require(manager.shared_catalog_slot(0).id == old_id &&
+                manager.lane_state(background.lane) == ninfer::runtime::LogicalLaneState::Active,
+            "cancelled SSD replacement disturbed the background request or unused shared owner");
+    const auto retry =
+        manager.inspect_durable_recovery(program, FakePreparedPrompt{741}, make_base(741),
+                                         std::span<const DurableCandidate>(candidates));
+    const auto replaced =
+        manager.adopt_imported_shared(program, imported(741), {}, {}, true, retry.reservation_id);
+    require(replaced.disposition == FakeManager::SharedImportDisposition::Replaced &&
+                replaced.displaced_checkpoint &&
+                replaced.displaced_checkpoint->destination_tier == CheckpointLifecycleTier::None &&
+                program.released_continuations.empty() && manager.catalog_slot(0).handle &&
+                manager.catalog_slot(0).handle->id == seed.sequence.id &&
+                manager.lane_state(background.lane) == ninfer::runtime::LogicalLaneState::Active,
+            "SSD import evicted the protected background checkpoint or misreported disk coverage");
+    (void)manager.abort(program, background.lane, background.sequence);
+    const auto resumed = start_active(manager, program, 740, background_base, 3);
+    require(program.started_source_id == seed.sequence.id,
+            "background endpoint stopped reusing after unrelated SSD replacement");
+    (void)manager.abort(program, resumed.lane, resumed.sequence);
+}
+
 void test_stale_durable_plan_cannot_coalesce_new_exact_owner() {
     struct DurableCandidate {
         std::uint32_t frontier = 0;
@@ -3242,6 +3328,174 @@ void test_device_state_pressure_uses_hard_victim_classes() {
                 !oldest_head_demotion->plan->private_actions.empty() &&
                 !oldest_head_demotion->plan->private_actions.front().evicts_continuation,
             "Device State pressure demoted a newer head before the oldest eligible head");
+}
+
+void test_exhausted_pressure_search_keeps_feasible_fallback() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+    program.required_pressure_actions             = 1;
+    program.target_reclamation.device_state_slots = 1;
+    program.private_pressure_alternatives         = 5000;
+    FakeAdmissionCandidate root;
+    root.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.expandable      = true;
+    set_fake_machine_costs(root.identity.machine_work, 1'000'000'000, 1'000'000'000);
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate = &root, .id = {.value = 0}},
+    };
+    FakeContinuationHandle head{31, 0};
+    FakeSharedPrefixHandle shared;
+    shared.id = 41;
+    const std::array<const FakeContinuationHandle*, 1> private_owners{&head};
+    const std::array<const FakeSharedPrefixHandle*, 1> shared_owners{&shared};
+    const std::array<PlanningOwnerId, 1> private_ids{PlanningOwnerId{.value = 0}};
+    const std::array<PlanningOwnerId, 1> shared_ids{PlanningOwnerId{.value = 1}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 2> policies{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner             = private_ids[0],
+                                                    .conversation_head = true},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = shared_ids[0]},
+    };
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return {.private_owners    = private_owners,
+                .private_owner_ids = private_ids,
+                .shared_owners     = shared_owners,
+                .shared_owner_ids  = shared_ids,
+                .owner_policy      = policies};
+    };
+    // Demoting the shared State solves the physical deficit, but the full private catalog
+    // still needs a publication slot. The assessed maximal fallback can free that slot.
+    const auto logical_goal = [&](PlanningCandidateId, PrivateSourceMode,
+                                  std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+        -> std::optional<Planner::LogicalGoal> {
+        for (const auto& outcome : outcomes) {
+            if (outcome.owner == private_ids[0] &&
+                outcome.disposition == VictimDisposition::Evicted) {
+                return Planner::LogicalGoal{.publication_slot = 0};
+            }
+        }
+        return std::nullopt;
+    };
+    Planner planner;
+    const auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates,
+                                     0, pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->plan && result->diagnostics.budget_exhausted &&
+                result->diagnostics.selected_maximal_fallback &&
+                result->plan->private_owner_ids == std::vector{31U},
+            "bounded cache search discarded a feasible admission and stranded an idle Engine");
+}
+
+void test_latest_endpoint_can_reclaim_superseded_state() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+    program.required_pressure_actions             = 1;
+    program.target_reclamation.device_state_slots = 1;
+    program.pressure_action_immediate_ns          = 1'000'000;
+
+    // The older endpoint can be consumed without allocation. The latest endpoint must be
+    // forked to preserve the successful session head until its replacement completes.
+    FakeAdmissionCandidate older;
+    older.private_source_id            = 1;
+    older.value.reusable_prompt_tokens = 13'419;
+    older.identity.physical_status     = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    set_fake_machine_costs(older.identity.machine_work, 4'000'000'000, 4'000'000'000);
+    FakeAdmissionCandidate latest;
+    latest.private_source_id            = 2;
+    latest.source_mode                  = PrivateSourceMode::Retain;
+    latest.value.reusable_prompt_tokens = 21'108;
+    latest.identity.source_mode         = PrivateSourceMode::Retain;
+    latest.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    latest.identity.expandable      = true;
+    set_fake_machine_costs(latest.identity.machine_work, 100'000'000, 100'000'000);
+    const std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate = &older, .id = {.value = 0}},
+        Planner::CandidateInput{.candidate               = &latest,
+                                .id                      = {.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    FakeContinuationHandle superseded{1, 0};
+    const std::array<const FakeContinuationHandle*, 1> owners{&superseded};
+    const std::array<PlanningOwnerId, 1> ids{PlanningOwnerId{.value = 0}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> policies{
+        ninfer::runtime::MaterializationOwnerPolicy{
+            .owner = ids[0], .private_retention_weight = 4, .conversation_head = false},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoints{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = ids[0],
+            .checkpoint = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+            .rebuild_ns = 4'000'000'000},
+    };
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return {.private_owners    = owners,
+                .private_owner_ids = ids,
+                .owner_policy      = policies,
+                .checkpoint_policy = checkpoints};
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    Planner planner;
+    const auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates,
+                                     0, pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->plan && result->candidate == PlanningCandidateId{.value = 1} &&
+                result->source_mode == PrivateSourceMode::Retain &&
+                result->plan->private_owner_ids == std::vector{1U} &&
+                !result->plan->private_actions.front().evicts_continuation,
+            "superseded endpoint protection forced replay instead of forking the latest response");
+}
+
+void test_consumed_endpoint_recovery_is_priced_without_pressure() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+    FakeAdmissionCandidate consumed;
+    consumed.private_source_id            = 1;
+    consumed.value.reusable_prompt_tokens = 100;
+    consumed.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    consumed.consumed_endpoint_recovery_ns = 100'000'000;
+    set_fake_machine_costs(consumed.identity.machine_work, 10'000'000, 10'000'000);
+    FakeAdmissionCandidate retained;
+    retained.source_mode                  = PrivateSourceMode::Retain;
+    retained.identity.source_mode         = PrivateSourceMode::Retain;
+    retained.value.reusable_prompt_tokens = 200;
+    retained.identity.physical_status = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    set_fake_machine_costs(retained.identity.machine_work, 20'000'000, 20'000'000);
+    const std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate = &consumed, .id = {.value = 0}},
+        Planner::CandidateInput{.candidate = &retained, .id = {.value = 1}, .stable_ordinal = 1},
+    };
+    FakeContinuationHandle old{1, 0};
+    const std::array<const FakeContinuationHandle*, 1> owners{&old};
+    const std::array<PlanningOwnerId, 1> ids{PlanningOwnerId{.value = 0}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> policies{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner = ids[0], .private_retention_weight = 4},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoints{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = ids[0],
+            .checkpoint = {.kind = CheckpointKind::SessionEndpoint, .frontier = 16},
+            .rebuild_ns = 100'000'000},
+    };
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return {.private_owners    = owners,
+                .private_owner_ids = ids,
+                .owner_policy      = policies,
+                .checkpoint_policy = checkpoints};
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    Planner planner;
+    const auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates,
+                                     0, pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->candidate == PlanningCandidateId{.value = 1} &&
+                result->diagnostics.predicted_future_loss_ns == 0 &&
+                result->plan->private_actions.empty(),
+            "identity selection treated consuming an old endpoint as free checkpoint retention");
 }
 
 void test_machine_cost_changes_selection_without_changing_physical_assessment() {
@@ -3807,7 +4061,10 @@ void test_session_publication_order_controls_tied_source() {
     const ActiveRequest older = start_active(manager, program, 42, base, 10);
     const ActiveRequest newer = start_active(manager, program, 42, base, 20);
     (void)finish_active(manager, program, newer, 16);
-    (void)finish_active(manager, program, older, 16);
+    const auto rejected = finish_active(manager, program, older, 16);
+    require(rejected.disposition == FinishDisposition::Released &&
+                program.released_continuations == std::vector<std::uint32_t>{older.sequence.id},
+            "late publication retained an obsolete continuation");
 
     auto next = manager.inspect(program, FakePreparedPrompt{42}, base, 30);
     require(next.choice && next.choice->summary().reusable_prompt_tokens == 16,
@@ -3822,12 +4079,13 @@ void test_session_publication_order_controls_tied_source() {
     const ActiveRequest replacement = start_active(
         manager, program, 99, make_base(99, session, RetentionClass::LiveSession, true), 40);
     (void)finish_active(manager, program, replacement, 16);
-    require(program.released_continuations.empty(),
-            "session publication synchronously released an old physical continuation");
+    require(program.released_continuations ==
+                std::vector<std::uint32_t>{older.sequence.id, newer.sequence.id},
+            "successful replacement did not release its superseded continuation");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
-                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued &&
-                manager.catalog_state(2) == FakeManager::CatalogState::Catalogued,
-            "session replacement did not retain its old binding as anonymous cache");
+                manager.catalog_state(1) == FakeManager::CatalogState::Vacant &&
+                manager.catalog_state(2) == FakeManager::CatalogState::Vacant,
+            "session replacement retained an obsolete private owner");
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
     require(stats.session_publications_explicit_total == 2 &&
@@ -3837,18 +4095,138 @@ void test_session_publication_order_controls_tied_source() {
                     ContextCacheMetricRole::ConversationHead, ContextCacheMetricPlacement::Device,
                     ContextCacheMetricPin::Unpinned, ContextCacheMetricIdentity::Explicit)] == 1,
             "session publication/supersession or current-head gauges are inconsistent");
+}
 
-    program.required_pressure_actions = 1;
-    program.require_evictions         = true;
-    auto pressure = manager.inspect(program, FakePreparedPrompt{100}, make_base(100), 50);
-    require(pressure.choice.has_value(),
-            "out-of-order publication test could not plan full-catalog pressure");
+void test_superseded_ssd_endpoint_is_kept_until_pressure() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const ActiveRequest unrelated = start_active(
+        manager, program, 7, make_base(7, FakeCacheSessionKey{7}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, unrelated, 16);
+    const auto base = make_base(42, FakeCacheSessionKey{42}, RetentionClass::LiveSession, true);
+    const ActiveRequest older = start_active(manager, program, 42, base, 2);
+    (void)finish_active(manager, program, older, 16);
+    const auto saved_owner = manager.catalog_slot(1).id;
+    require(manager.set_private_ssd_backed(1, saved_owner, true),
+            "completed private snapshot did not bind its exact owner");
+    const ActiveRequest latest = start_active(manager, program, 42, base, 3);
+    (void)finish_active(manager, program, latest, 16);
+
+    manager.reclaim_superseded(program);
+    require(program.released_continuations.empty() &&
+                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+            "SSD-backed superseded checkpoint was discarded without pressure");
+
+    program.required_pressure_actions             = 1;
+    program.target_reclamation.device_state_slots = 1;
+    auto pressure = manager.inspect(program, FakePreparedPrompt{99}, make_base(99), 4);
+    require(pressure.choice.has_value(), "superseded endpoint fixture found no pressure plan");
     program.abort_start = true;
     (void)manager.reserve_materialization(program, std::move(*pressure.choice),
-                                          FakePreparedPrompt{100}, {});
-    require(!program.started_action_ids.empty() &&
-                program.started_action_ids.back() == 2000U + older.sequence.id,
-            "completion order made the older conversation head appear newer to pressure");
+                                          FakePreparedPrompt{99}, {});
+    require(program.started_action_ids == std::vector<std::uint64_t>{1000U + older.sequence.id},
+            "SSD-backed obsolete endpoint kept priority ahead of a current conversation");
+    require(!manager.set_private_ssd_backed(1, saved_owner + 1, false),
+            "stale save completion changed another owner backing");
+    require(manager.set_private_ssd_backed(1, saved_owner, false),
+            "rebound snapshot did not invalidate previous backing");
+    manager.reclaim_superseded(program);
+    require(program.released_continuations == std::vector<std::uint32_t>{older.sequence.id},
+            "superseded checkpoint remained after losing its SSD backing");
+}
+
+void test_superseded_retirement_waits_for_export_and_active_reader() {
+    for (const bool reader : {false, true}) {
+        FakeManager manager = make_manager(2, 4);
+        FakeProgram program;
+        const auto base = make_base(42, FakeCacheSessionKey{42}, RetentionClass::LiveSession, true);
+        const auto head = start_active(manager, program, 42, base, 1);
+        (void)finish_active(manager, program, head);
+        std::optional<ActiveRequest> active_reader;
+        if (reader) {
+            active_reader = start_active(
+                manager, program, 42,
+                make_base(42, FakeCacheSessionKey{99}, RetentionClass::LiveSession), 2);
+        } else {
+            program.release_pinned = true;
+        }
+        const auto replacement = start_active(
+            manager, program, 43,
+            make_base(43, FakeCacheSessionKey{42}, RetentionClass::LiveSession, true), 3);
+        (void)finish_active(manager, program, replacement);
+        require(program.released_continuations.empty() &&
+                    manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+                "retirement released an owner still used by a reader/export");
+        const auto obsolete = manager.inspect(program, FakePreparedPrompt{42}, base, 4);
+        require(obsolete.choice && obsolete.choice->summary().reusable_prompt_tokens == 0,
+                "pending retirement offered obsolete non-SSD history for reuse");
+        if (reader) {
+            (void)manager.abort(program, active_reader->lane, active_reader->sequence);
+        } else {
+            program.release_pinned = false;
+            manager.reclaim_superseded(program);
+        }
+        require(program.released_continuations == std::vector<std::uint32_t>{head.sequence.id} &&
+                    manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+                "unpinning did not retire the superseded private continuation");
+        manager.reclaim_superseded(program);
+        require(program.released_continuations.size() == 1,
+                "deferred retirement released the same continuation twice");
+    }
+}
+
+void test_saved_source_is_preserved_without_pressure() {
+    for (const std::uint32_t capacity : {1U, 3U}) {
+        FakeManager manager = make_manager(1, capacity);
+        FakeProgram program;
+        const auto first = start_active(manager, program, 42, make_base(42), 1);
+        (void)finish_active(manager, program, first);
+        require(manager.set_private_ssd_backed(0, manager.catalog_slot(0).id, true),
+                "saved-source fixture did not establish backing");
+        const auto next = start_active(
+            manager, program, 42,
+            make_base(42, FakeCacheSessionKey{42}, RetentionClass::LiveSession, true), 2);
+        require(program.started_source_id == first.sequence.id &&
+                    program.started_source_mode == (capacity == 1
+                                                        ? PrivateSourceMode::ConsumeToActive
+                                                        : PrivateSourceMode::Retain),
+                "saved source was consumed without pressure or blocked descriptor-pressure reuse");
+        (void)finish_active(manager, program, next);
+        require(program.released_continuations.empty(),
+                "successful continuation eagerly discarded its saved source");
+    }
+}
+
+void test_anonymous_source_retirement_preserves_shared_ssd_owner() {
+    FakeManager manager = make_manager(1, 3, 1);
+    FakeProgram program;
+    const auto first = start_active(manager, program, 42, make_base(42), 1);
+    (void)finish_active(manager, program, first);
+    FakeValidatedSharedPrefixImport imported{
+        .imported_summary = FakeSharedPrefixSummary{.checkpoint = shared_checkpoint(77, 16)},
+        .imported_metadata =
+            FakeSharedPrefixPersistenceMetadata{
+                .evidence     = ninfer::SharedCandidateEvidence::EngineStructural,
+                .ssd_eligible = true,
+            },
+        .content_key = 77,
+    };
+    const auto shared = manager.adopt_imported_shared(program, imported, {}, {}, true);
+    require(shared.disposition == FakeManager::SharedImportDisposition::Published,
+            "retirement fixture did not import its shared SSD checkpoint");
+    // Force a retained source as a rewrite/long-anchor admission would, before the first
+    // complete multi-turn request supplies its inferred session identity.
+    program.force_retain_source = true;
+    const auto next =
+        start_active(manager, program, 42,
+                     make_base(42, FakeCacheSessionKey{42}, RetentionClass::LiveSession, true), 2);
+    (void)finish_active(manager, program, next);
+    require(program.released_continuations == std::vector<std::uint32_t>{first.sequence.id},
+            "first anonymous source survived successful named continuation");
+    require(manager.shared_catalog_metadata(0).ssd_backed &&
+                manager.shared_catalog_metadata(0).state ==
+                    FakeManager::SharedCatalogState::Catalogued,
+            "private retirement discarded the independent shared SSD checkpoint");
 }
 
 void test_cancelled_replacement_preserves_successful_head_until_atomic_publish() {
@@ -5092,6 +5470,8 @@ int main() {
              test_durable_recovery_replaces_full_catalog_transactionally);
     run_test("stale durable plan cannot coalesce a new exact owner",
              test_stale_durable_plan_cannot_coalesce_new_exact_owner);
+    run_test("unsaved shared SSD replacement beside background",
+             test_ssd_recovery_replaces_unsaved_shared_without_disturbing_background);
     run_test("non-SSD alternate-covered durable replacement lifecycle",
              test_durable_recovery_non_ssd_victim_reports_logical_eviction);
     run_test("active capture durable replacement protection",
@@ -5108,6 +5488,14 @@ int main() {
              test_machine_cost_changes_selection_without_changing_physical_assessment);
     run_test("candidate-stratified reuse closure",
              test_candidate_search_prefers_deep_reuse_without_eviction);
+    run_test("latest endpoint under superseded State pressure",
+             test_latest_endpoint_can_reclaim_superseded_state);
+    run_test("bounded pressure fallback readiness",
+             test_exhausted_pressure_search_keeps_feasible_fallback);
+    run_test("consumed endpoint recovery without pressure",
+             test_consumed_endpoint_recovery_is_priced_without_pressure);
+    run_test("superseded SSD endpoint pressure retention",
+             test_superseded_ssd_endpoint_is_kept_until_pressure);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",
@@ -5130,6 +5518,11 @@ int main() {
     run_test("aborted source is not a hit",
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("superseded retirement pins", test_superseded_retirement_waits_for_export_and_active_reader);
+    run_test("saved source retention without pressure",
+             test_saved_source_is_preserved_without_pressure);
+    run_test("anonymous retirement preserves shared SSD",
+             test_anonymous_source_retirement_preserves_shared_ssd_owner);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("cancelled atomic session replacement",
              test_cancelled_replacement_preserves_successful_head_until_atomic_publish);

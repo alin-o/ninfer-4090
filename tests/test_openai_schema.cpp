@@ -747,9 +747,14 @@ int test_stream_response() {
 int test_common_objects() {
     int failures      = 0;
     const Json models = Json::parse(make_models_list("qwen", 7, 240000));
-    failures +=
-        check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
-              "models list advertises the configured context limit");
+    failures += check(models["data"].size() == 2 && models["data"][0]["id"] == "qwen" &&
+                          models["data"][0]["max_model_len"] == 240000 &&
+                          models["data"][1]["id"] == "default" &&
+                          models["data"][1]["max_model_len"] == 240000 &&
+                          api_error([] { validate_openai_model("default", "qwen"); }).status == 0 &&
+                          api_error([] { validate_openai_model("qwen", "qwen"); }).status == 0 &&
+                          api_error([] { validate_openai_model("other", "qwen"); }).status == 404,
+                      "configured model and default alias share the context limit and routing");
     const Json model = Json::parse(make_model_object("qwen", 7, 240000));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
@@ -764,11 +769,12 @@ int test_common_objects() {
     failures += check(model["context_window"] == 240000 &&
                           model["modalities"]["vision"] == false,
                       "model lookup carries context_window and text-only modalities");
-    const Json vision_models = Json::parse(make_models_list("qwen", 7, 240000, true));
-    const Json vision_model  = Json::parse(make_model_object("qwen", 7, 240000, true));
-    failures += check(vision_models["data"][0]["modalities"]["vision"] == true &&
+    const Json vision_models = Json::parse(make_models_list("default", 7, 240000, true));
+    const Json vision_model  = Json::parse(make_model_object("default", 7, 240000, true));
+    failures += check(vision_models["data"].size() == 1 && vision_model["id"] == "default" &&
+                          vision_models["data"][0]["modalities"]["vision"] == true &&
                           vision_model["modalities"]["vision"] == true,
-                      "a vision deployment advertises the vision modality");
+                      "a default-named vision deployment advertises one model with vision");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

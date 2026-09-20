@@ -158,7 +158,7 @@ device_state_victim_class(const qwen3_6::detail::PressureDecision& decision) noe
                     [](runtime::CheckpointRef ref) {
                         return ref.kind == runtime::CheckpointKind::SessionEndpoint;
                     })) {
-        return runtime::DeviceStateVictimClass::ConversationHead;
+        return runtime::DeviceStateVictimClass::PrivateEndpoint;
     }
     return runtime::DeviceStateVictimClass::Intermediate;
 }
@@ -635,7 +635,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
 inline std::optional<qwen3_6::PressureTargetHandle>
 PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     runtime::PlanningCandidateId admission,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const runtime::PlanningOwnerId> conversation_head_ids) {
     if (scratch_live) {
         throw std::logic_error("guided pressure closure conflicts with expansion scratch");
     }
@@ -665,6 +666,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         }
     }
     for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+
+    // Session bindings are logical policy owned by ResourceManager. Physical endpoint State
+    // alone does not distinguish the current rollback point from superseded cached history.
+    std::vector<bool> conversation_heads(options.victims.size(), false);
+    for (std::size_t index = 0; index < options.victims.size(); ++index) {
+        const auto owner = owners[options.victims[index].owner_index].id;
+        conversation_heads[index] =
+            std::find(conversation_head_ids.begin(), conversation_head_ids.end(), owner) !=
+            conversation_head_ids.end();
+    }
 
     const auto projected_residual = [&](std::span<const std::uint16_t> target_choices,
                                         std::optional<std::size_t> override_owner,
@@ -763,9 +774,13 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
 
         std::optional<Selection> selected;
         const auto selection_key = [&](const Selection& value) {
-            const runtime::DeviceStateVictimClass victim_class =
+            runtime::DeviceStateVictimClass victim_class =
                 NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(value.decision);
-            const bool head = victim_class == runtime::DeviceStateVictimClass::ConversationHead;
+            if (victim_class == runtime::DeviceStateVictimClass::PrivateEndpoint &&
+                !conversation_heads[value.victim_index]) {
+                victim_class = runtime::DeviceStateVictimClass::Intermediate;
+            }
+            const bool head = victim_class == runtime::DeviceStateVictimClass::PrivateEndpoint;
             return std::tuple{
                 static_cast<std::uint8_t>(victim_class),
                 head ? value.victim_rank : static_cast<std::size_t>(value.adds_destruction),
@@ -1056,6 +1071,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     for (std::size_t index = 0; index < owners.size(); ++index) {
         const Owner& owner               = owners[index];
         const PressureDecision* decision = projected_owner_decisions[index];
+        // With no pressure actions, only the consumed source changes recovery. Keep all other
+        // owners at their cached baseline instead of walking every unaffected KV prefix again.
+        if (identity_target &&
+            (!candidate.has_source || owner.shared ||
+             RuntimeContractAccess<NINFER_QWEN36_VARIANT>::index(*owner.private_handle) !=
+                 candidate.source_index)) {
+            continue;
+        }
         if (owner.shared) {
             recovery_shared_owners.push_back(owner.shared_handle);
             recovery_shared_decisions.push_back(decision);
@@ -1068,7 +1091,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     }
 
     bool recovery_projection_valid = true;
-    if (!identity_target) {
+    if (!identity_target ||
+        (candidate.has_source &&
+         candidate.source_mode == runtime::PrivateSourceMode::ConsumeToActive)) {
         recovery_projection_valid = program->pressure_checkpoint_recovery_impacts(
             candidate, recovery_private_owners, recovery_private_decisions,
             recovery_private_owner_ids, recovery_shared_owners, recovery_shared_decisions,
@@ -1486,8 +1511,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::seal(
     std::optional<AdmissionCandidate> sealed = std::move(assessed.executable_);
     assessed.reset();
     program->select_shared_captures(*sealed, prompt, intent.shared_capture_frontiers);
-    if (sealed->impl_->blocked_host_allocation_bytes != 0 ||
-        program->revalidate_materialization(*sealed, prompt) != runtime::PreflightStatus::Ready) {
+    if (sealed->impl_->blocked_host_allocation_bytes != 0) { return std::nullopt; }
+    const auto status = program->revalidate_materialization(*sealed, prompt);
+    if (status == runtime::PreflightStatus::InvariantFailure) {
+        throw std::logic_error("pressure materialization assessment is internally invalid");
+    }
+    if (status != runtime::PreflightStatus::Ready) {
         return std::nullopt;
     }
     return sealed;

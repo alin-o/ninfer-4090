@@ -35,7 +35,8 @@ combined with `--vision`.
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
-select or alter the artifact.
+select or alter the artifact. The additional alias `default` always selects the same loaded model.
+OpenAI model discovery lists both names, or one entry when the configured name is already `default`.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
@@ -49,8 +50,8 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
-| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
+| `GET /v1/models` | configured OpenAI model name and `default` alias, with effective `max_model_len` |
+| `GET /v1/models/{id}` | lookup of either model name and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -74,12 +75,19 @@ content digests, checks deepest candidates first, and loads a matching payload o
 I/O, Engine evaluates exact private/shared memory sources with its physical readiness assessment
 and measured context cost model. A same-or-deeper ready Device/Host source wins over SSD; an SSD
 load is attempted only after Engine reserves a feasible vacant slot or a value-selected inactive,
-unpinned owner with complete SSD coverage. Program projects the exact Host State, Host KV, Device
-KV and descriptor reclamation before the reservation. Serving then reads immutable bytes without
+unpinned shared owner. The victim need not have its own SSD copy: Program seals an exact
+in-memory rollback snapshot before replacement and restores it if import fails or is cancelled.
+This internal copy also supports memory-only checkpoints that are ineligible for SSD publication.
+Program projects the exact Host State, Host KV, Device KV and descriptor reclamation before the
+reservation; active references and export/transaction pins remain protected. Serving then reads immutable bytes without
 the Engine execution lock; Program revalidates the record and resource revision before Engine
 atomically publishes it. A selected load completes (or falls back) before that request is submitted
 for prefill and uses the existing pending deadline. Corrupt, truncated, wrong-model/configuration
 and over-budget records receive no hit credit or Device reservation.
+
+Snapshot checksums cover the complete payload with SHA-256. OpenSSL supplies the accelerated CPU
+implementation for both publication and validation. Validation checks cancellation/deadlines
+between 1 MiB chunks and before finalization.
 
 Publication holds Program's immutable source pins through bounded assembly and write settlement.
 Each replacement uses a new record filename: it is written to a temporary file, synced, renamed and
@@ -144,11 +152,17 @@ candidate lookup heuristic; Program still verifies the complete token, position,
 identity. Explicit keys always take precedence, even if their bytes resemble the internal
 `initial_prefix:` label.
 
-When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry (format version 2; a snapshot with an empty ring stays version 1,
-which binaries without ring support keep reading). The restored ring lets a later
-mid-history edit reuse the session; see
-[turn-checkpoint-ring.md](turn-checkpoint-ring.md).
+After a successful continuation replaces a conversation head, Engine retires the superseded
+private owner instead of keeping anonymous copies of earlier turns. Cancellation preserves the
+last successful head, and retirement waits for active readers, transactions, and snapshot exports.
+Completed SSD-backed private snapshots and independent shared snapshots remain resident until
+pressure needs their capacity. Superseded private snapshots carry no conversation retention or
+demand credit. Rebinding a snapshot file invalidates the old owner's backing. The latest owner's
+rewrite checkpoints and long anchors still provide recovery for edits within its current prompt.
+
+Private snapshots use format version 4 and carry the endpoint plus retained rewrite checkpoints
+and long anchors, each with its required StateImage. These permit reuse before a changed suffix
+after restore. Earlier snapshot versions are rejected because their prefix identity format differs.
 
 A successful save or restore binds the slot to its file. With `--auto-save-evicted`, an
 involuntary eviction (a fresh session claiming the slot, a restore over it, or a
@@ -247,7 +261,7 @@ server-error codes. Failures in the normalized prompt contract use `invalid_prom
 and availability failures retain their dedicated codes. Internal invariant failures are not
 relabeled as client input errors.
 
-The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
+The request `model` accepts `default` or the public model ID: the artifact `identity.model_id`, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
@@ -435,7 +449,7 @@ wire response contains typed `output` Items.
 
 | Field | NInfer Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | required non-empty string; accepts `default`, the artifact-derived public model ID, or its explicit `--model-id` replacement |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
@@ -462,8 +476,14 @@ wire response contains typed `output` Items.
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
-Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+Unknown top-level fields are ignored for both Response creation and input-token counting, including
+`presence_penalty`, which has no effect on the Responses route. Supported fields still undergo
+type and value validation. Recognized but unsupported features fail with a field-specific 400 error.
+
+When `max_output_tokens` is omitted, the default output budget is 32,768 tokens, including reasoning.
+Set `--default-max-tokens` to change that server default, or supply an explicit request limit.
+The Engine clamps generation to the remaining context capacity. Reaching either limit produces
+`response.incomplete`; a long reasoning response can exhaust its budget before final answer text.
 
 ### Input Item contract
 
@@ -831,7 +851,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-max-tokens N` | output limit when omitted by a request | `32768` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -896,6 +916,11 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
+On startup the server grants owner, group, and other users read permission on the JSONL file,
+including an existing file. New files are normally mode `0644`, even with `umask 077`.
+Existing write permissions are preserved; no group or other write permission is added.
+Parent directories must allow readers to traverse the path.
+
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.
 
@@ -903,10 +928,14 @@ the log at that path.
 
 `--request-log-content-dir DIR` is a separate, explicit opt-in and is rejected unless
 `--request-log-jsonl` is also enabled. The server creates `DIR` when necessary and verifies that it
-is a writable directory before readiness. **Enabling this option persists sensitive user text,
-assistant text, reasoning, and tool arguments/results. Operators are responsible for restrictive
-directory permissions, access control, retention, backup policy, and rotation.** NInfer does not
-rotate or delete these files.
+is a writable directory before readiness. It grants all users read and traversal permission on
+`DIR` (normally mode `0755`) and read permission on published prompt/response files (normally
+`0644`), independently of the process umask. Startup also updates existing generated
+`promptserve-*.md` and `responseserve-*.md` files in `DIR`. Existing write permissions are preserved;
+no group or other write permission is added. **Enabling this option persists user text, assistant
+text, reasoning, and tool arguments/results in files readable by all OS users with access through
+the parent directories.** Operators own parent-directory access, retention, backup policy, and
+rotation. NInfer does not rotate or delete these files.
 
 Each accepted request uses the collision-free suffix
 `{server_instance_id}-request-{request_id}` and atomically publishes the pair
@@ -1037,8 +1066,9 @@ response rendering, Responses storage, or terminal transport failures are operat
 events only and do not add a second JSONL terminal. Schema/model validation rejections before
 preparation and token-count-only calls are not measurement requests and do not receive request IDs.
 
-The `kv_capacity` object on accepted-request start and terminal records is one Program-boundary
-snapshot, not a sample of CUDA's general free-memory counter. `device.main` and `device.backend`
+The `kv_capacity` object on accepted-request start and terminal records uses the latest published
+Program-boundary memory snapshot without waiting for an active model execution unit. It is not a
+sample of CUDA's general free-memory counter. `device.main` and `device.backend`
 each report `capacity_pages`, `used_pages`, `free_pages`, `page_bytes`, and corresponding byte
 values. Host KV reports capacity/used/free bytes. Used values come from the physical page pools and
 Host KV arena, including reservations; shared aliases are therefore not double-counted. Free is
@@ -1051,7 +1081,12 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 The operational field `average_decode_batch` and JSONL `average_size` are decode row-rounds divided
 by decode rounds during the same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
-`terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
+`terminal_pending` fields are the Engine scheduler snapshot at the end of the interval.
+`decode_ready` counts admitted requests eligible for the next decode round and is included in
+`running`; it is not an additional waiting session. `waiting` counts submitted requests in the
+Engine FIFO and excludes callers still preparing their input. Durable candidate discovery during
+preparation reads immutable prompt data without waiting for the execution lock; recovery selection
+and reservation occur at FIFO admission. The JSONL
 `context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
 owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, maximal fallback, and historical-fork
 counters as interval deltas; `occupancy` and `last_selection` are end-of-interval gauges. Materialization predictions are
@@ -1089,7 +1124,7 @@ raw counters and seconds over rounded stderr rates.
 The server owns one resident Engine with a startup-fixed capacity of `1..8` active generation
 requests. At each decode boundary, every decode-ready request is compacted into one batch and
 processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay. A
-request joins that batch only after its single-request prefill finishes; when it completes or is
+request joins that batch only after its prefill finishes; when it completes or is
 cancelled, the next boundary rebuilds the batch without an empty row.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
@@ -1113,6 +1148,10 @@ resolves once at startup.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.
+Consequently, a fully cached request can still wait for capacity. Raising `--default-max-tokens`
+increases this reservation for requests that omit an output limit, reducing the room for concurrent
+requests; it does not increase the startup allocation. An explicit request limit overrides the
+default. Use an output allowance appropriate to the expected response length.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
@@ -1145,9 +1184,44 @@ later request that diverges before every retained checkpoint starts from root. T
 record exposes the restored checkpoint as `prefix_reuse_path`. Reasoning-effort changes participate
 in rendered-token identity and exact-prefix selection.
 
+Replaying generated reasoning as historical input may add an execution boundary after `</think>`.
+That scheduling boundary does not change cache identity: an exact token, position, and media match
+can still reuse the complete private endpoint. The retained KV and recurrent state remain those
+of the producing request. Actual changes to historical reasoning or other prompt text still
+invalidate checkpoints beyond the first changed token.
+
+For text-only conversations, the Frontend preserves the original generated token IDs when the
+completed assistant response is replayed unchanged. BPE can generate two tokens whose combined
+text would normally encode as one token; preserving that sequence allows the next request to
+reuse the complete generated endpoint. The prior rendered prompt, its canonical source tokens,
+the response bytes, special-token interpretation, and any explicit session key must match.
+Without an explicit key, matching uses the complete prior prompt and response. The deepest
+matching history wins; identical histories select the most recently completed trajectory.
+
+This continues the original model trajectory, so output can differ from a fresh canonical
+text-only run. `count_tokens`, prompt usage, context limits, and cache lookup all use the resolved
+tokens. Disabling prefix reuse still uses the same resolved history for cold execution; raw
+`prepare_tokens` and `tokenize_text` retain their literal token and canonical encoding semantics.
+
+History is kept in CPU memory independently of KV/State residency, bounded to 64 MiB and 128
+completed records per Frontend. It adds no startup VRAM reservation. It is process-local and is
+not included in saved cache snapshots. Restart, history eviction, changed/filtered response text,
+or a nonmatching token boundary can require canonical preparation and an earlier checkpoint.
+Prompts containing media retain their existing tokenization. History retention failure does not
+fail generation, and cancelled or failed requests do not publish history.
+
+This identity format uses private snapshot version 4 and shared snapshot version 2. Earlier saved
+snapshots are incompatible and their cached prefixes must be rebuilt after upgrading.
+
 An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior
 history remains eligible for `private_endpoint`. If the client modifies, removes, or moves a
 historical system message, the token prefix genuinely differs and a miss/reset is correct.
+
+The same rule applies to historical user messages. If a client appends channel/context instructions
+to the current user message and removes them when replaying that message on the next turn, the
+prefix changes before the previous answer. Its final checkpoint is then invalid even when retained
+in VRAM or RAM. Preserve earlier model-visible messages when continued-head reuse is intended;
+NInfer does not strip or normalize those instructions to manufacture a cache hit.
 
 Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
 truncates a multi-token MTP or DFlash round, the Engine commits the exact accepted target prefix so

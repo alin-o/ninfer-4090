@@ -60,7 +60,6 @@ using DigestPair = std::array<std::uint64_t, 2>;
 constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
 constexpr DigestPair kDigestPrime{1099511628211ULL, 14029467366897019727ULL};
 constexpr std::uint64_t kTokenDigestDomain   = 0x6e696e6665722d74ULL;
-constexpr std::uint64_t kRewriteDigestDomain = 0x6e696e6665722d72ULL;
 constexpr std::uint64_t kVisionDigestDomain  = 0x6e696e6665722d76ULL;
 
 void mix_digest(DigestPair& digest, std::uint64_t value) noexcept {
@@ -95,20 +94,13 @@ void mix_vision_item(DigestPair& digest, const VisionItem& item) noexcept {
 }
 
 void append_digest(std::vector<DigestPair>& digests, TokenId token, std::uint8_t token_type,
-                   const std::array<std::int32_t, 3>& positions,
-                   std::span<const std::uint32_t> rewrite_frontiers, std::size_t& next_rewrite) {
+                   const std::array<std::int32_t, 3>& positions) {
     DigestPair digest = digests.back();
     mix_digest(digest, kTokenDigestDomain);
     mix_digest(digest, static_cast<std::uint32_t>(token));
     mix_digest(digest, token_type);
     for (const std::int32_t position : positions) {
         mix_digest(digest, static_cast<std::uint32_t>(position));
-    }
-    const std::size_t frontier = digests.size();
-    while (next_rewrite < rewrite_frontiers.size() && rewrite_frontiers[next_rewrite] == frontier) {
-        mix_digest(digest, kRewriteDigestDomain);
-        mix_digest(digest, rewrite_frontiers[next_rewrite]);
-        ++next_rewrite;
     }
     for (std::uint64_t& lane : digest) {
         if (lane == 0) { lane = 1; }
@@ -142,7 +134,6 @@ void ResidentPrefixIdentity::clear() noexcept {
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
-    rewrite_execution_frontiers_.clear();
 }
 
 void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
@@ -155,15 +146,13 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
         const auto begin = prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * tokens);
         positions_[axis].assign(begin, begin + static_cast<std::ptrdiff_t>(tokens));
     }
-    vision_items_                = prompt.vision_items;
-    rewrite_execution_frontiers_ = prompt.identity.rewrite_execution_frontiers;
+    vision_items_ = prompt.vision_items;
 }
 
 void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     token_types_.swap(other.token_types_);
     positions_.swap(other.positions_);
     vision_items_.swap(other.vision_items_);
-    rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
 }
 
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta) {
@@ -188,8 +177,7 @@ void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t ro
 
 void ResidentPrefixIdentity::restore(std::vector<std::uint8_t> token_types,
                                      std::array<std::vector<std::int32_t>, 3> positions,
-                                     std::vector<VisionItem> vision_items,
-                                     std::vector<std::uint32_t> rewrite_execution_frontiers) {
+                                     std::vector<VisionItem> vision_items) {
     const std::size_t tokens = token_types.size();
     for (const auto& axis : positions) {
         if (axis.size() != tokens) {
@@ -201,20 +189,11 @@ void ResidentPrefixIdentity::restore(std::vector<std::uint8_t> token_types,
         prefix_items != vision_items.size()) {
         throw std::invalid_argument("restored prefix identity vision items exceed its tokens");
     }
-    std::uint32_t previous_rewrite = 0;
-    for (const std::uint32_t frontier : rewrite_execution_frontiers) {
-        if (frontier == 0 || frontier > tokens || frontier <= previous_rewrite) {
-            throw std::invalid_argument(
-                "restored rewrite execution frontiers must be ordered unique prompt positions");
-        }
-        previous_rewrite = frontier;
-    }
     token_types_ = std::move(token_types);
     for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
         positions_[axis] = std::move(positions[axis]);
     }
-    vision_items_                = std::move(vision_items);
-    rewrite_execution_frontiers_ = std::move(rewrite_execution_frontiers);
+    vision_items_ = std::move(vision_items);
 }
 
 void ResidentPrefixIdentity::truncate(std::size_t tokens) {
@@ -228,9 +207,6 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     token_types_.resize(tokens);
     for (auto& axis : positions_) { axis.resize(tokens); }
     vision_items_.resize(retained_items);
-    rewrite_execution_frontiers_.erase(std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                                        rewrite_execution_frontiers_.end(), tokens),
-                                       rewrite_execution_frontiers_.end());
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
@@ -263,15 +239,7 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     for (std::size_t i = 0; i < incoming_items; ++i) {
         if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
-    const auto incoming_end =
-        std::upper_bound(prompt.identity.rewrite_execution_frontiers.begin(),
-                         prompt.identity.rewrite_execution_frontiers.end(), count);
-    const auto resident_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                               rewrite_execution_frontiers_.end(), count);
-    return std::distance(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end) ==
-               std::distance(rewrite_execution_frontiers_.begin(), resident_end) &&
-           std::equal(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end,
-                      rewrite_execution_frontiers_.begin());
+    return true;
 }
 
 bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {
@@ -301,14 +269,7 @@ bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
     for (std::size_t index = 0; index < left_items; ++index) {
         if (!same_item(vision_items_[index], other.vision_items_[index])) { return false; }
     }
-    const auto left_end  = std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                            rewrite_execution_frontiers_.end(), count);
-    const auto right_end = std::upper_bound(other.rewrite_execution_frontiers_.begin(),
-                                            other.rewrite_execution_frontiers_.end(), count);
-    return std::distance(rewrite_execution_frontiers_.begin(), left_end) ==
-               std::distance(other.rewrite_execution_frontiers_.begin(), right_end) &&
-           std::equal(rewrite_execution_frontiers_.begin(), left_end,
-                      other.rewrite_execution_frontiers_.begin());
+    return true;
 }
 
 void PrefixShortlistDigests::reserve(std::size_t tokens) {
@@ -325,18 +286,9 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3U * tokens) {
         throw std::invalid_argument("prepared prompt shortlist metadata has an invalid shape");
     }
-    std::uint32_t previous_rewrite = 0;
-    for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
-        if (frontier == 0 || frontier > tokens || frontier <= previous_rewrite) {
-            throw std::invalid_argument(
-                "rewrite execution frontiers must be ordered unique prompt positions");
-        }
-        previous_rewrite = frontier;
-    }
     digests_.clear();
     reserve(tokens);
     digests_.push_back(kDigestOffset);
-    std::size_t next_rewrite = 0;
     std::size_t next_vision  = 0;
     std::size_t next_vision_end =
         prompt.vision_items.empty() ? 0 : checked_vision_end(prompt.vision_items.front(), tokens);
@@ -344,8 +296,7 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
         const std::array<std::int32_t, 3> positions{prompt.positions[index],
                                                     prompt.positions[tokens + index],
                                                     prompt.positions[2U * tokens + index]};
-        append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions,
-                      prompt.identity.rewrite_execution_frontiers, next_rewrite);
+        append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions);
         const std::size_t frontier = index + 1U;
         while (next_vision < prompt.vision_items.size() && next_vision_end == frontier) {
             mix_vision_item(digests_.back(), prompt.vision_items[next_vision]);
@@ -357,9 +308,6 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
                 }
             }
         }
-    }
-    if (next_rewrite != prompt.identity.rewrite_execution_frontiers.size()) {
-        throw std::invalid_argument("rewrite execution frontier exceeds the prompt");
     }
     if (next_vision != prompt.vision_items.size()) {
         throw std::invalid_argument("Vision shortlist item exceeds the prompt");
@@ -379,7 +327,6 @@ void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,
     if (tokens.size() > std::numeric_limits<std::size_t>::max() - begin) {
         throw std::overflow_error("generated shortlist length overflows size_t");
     }
-    std::size_t no_rewrite = 0;
     for (std::size_t offset = 0; offset < tokens.size(); ++offset) {
         const std::size_t index = begin + offset;
         if (index > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -391,7 +338,7 @@ void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,
             throw std::overflow_error("generated shortlist MRoPE position exceeds int32");
         }
         const std::int32_t value = static_cast<std::int32_t>(position);
-        append_digest(digests_, tokens[offset], 0, {value, value, value}, {}, no_rewrite);
+        append_digest(digests_, tokens[offset], 0, {value, value, value});
     }
 }
 

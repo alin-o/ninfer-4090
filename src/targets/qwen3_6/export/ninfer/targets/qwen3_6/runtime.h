@@ -665,7 +665,8 @@ public:
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] std::optional<PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                          std::span<const runtime::PlanningOwnerId> conversation_head_ids);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget<Variant> assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);
@@ -1107,8 +1108,11 @@ public:
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
+    // Deferred retirement uses wait_for_exports=false: a pinned source remains unconsumed
+    // until a later worker boundary, without synchronizing unrelated snapshot transfers.
     [[nodiscard]] ReleaseResult<Variant>
-    release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
+    release_continuation(ContinuationHandle<Variant>&& continuation,
+                         bool wait_for_exports = true) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_shared_prefix(SharedPrefixHandle<Variant>&& shared) noexcept;
     void fail_all_cleanup() noexcept;
@@ -1156,8 +1160,10 @@ public:
         const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
         const SharedPrefixPersistenceMetadata& metadata,
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
-    [[nodiscard]] std::vector<DurableSharedPrefixCandidate>
-    durable_shared_prefix_candidates(const PreparedPrompt& prompt) const;
+    // Pure codec identity discovery: reads only the immutable prepared prompt, never a live
+    // Program or its State/KV stores. Engine applies startup policy before calling this.
+    [[nodiscard]] static std::vector<DurableSharedPrefixCandidate>
+    durable_shared_prefix_candidates(const PreparedPrompt& prompt);
     [[nodiscard]] bool
     durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
                                   const SharedPrefixHandle<Variant>& resident) const;
@@ -1183,10 +1189,9 @@ public:
     [[nodiscard]] SharedPrefixPublication<Variant> adopt_shared_prefix(
         const ValidatedSharedPrefixImport<Variant>& imported,
         SharedPrefixHandle<Variant>* replacement, runtime::CancellationFlagView cancellation = {},
-        const std::function<void()>& commit_checkpoint = {}, std::string_view model_binding = {},
+        const std::function<void()>& commit_checkpoint = {},
         const ContinuationHandle<Variant>* host_private             = nullptr,
         const SharedPrefixHandle<Variant>* host_shared              = nullptr,
-        const SharedPrefixPersistenceMetadata* replacement_metadata = nullptr,
         std::shared_ptr<const void> physical_plan                   = {});
     void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle<Variant>& shared);
     void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle<Variant>& victim,

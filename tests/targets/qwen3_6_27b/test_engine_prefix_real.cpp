@@ -442,6 +442,10 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
     }
 
     ninfer::PromptInput continuation = retained_input();
+    // Keep the source as a bound head too. This fixture measures duplicate backing release;
+    // superseding it would let pressure choose cheaper obsolete history instead of the
+    // intended pair of retained heads.
+    continuation.context_cache.session_key = "host-restore-continuation";
     ninfer::ChatMessage assistant;
     assistant.role              = ninfer::ChatRole::Assistant;
     assistant.reasoning_content = retained.reasoning;
@@ -540,9 +544,8 @@ int exercise_host_restore(const char* artifact, bool groupwise_backing = false) 
         return 1;
     }
     // Keep the restored head catalogued through pressure so production must retain its Host
-    // replica while reclaiming only duplicate Device residency. Atomic head replacement can keep
-    // the demoted source in a separate RecentPrivate cell, and both owners may alias unchanged
-    // backing.
+    // replica while reclaiming only duplicate Device residency. The demoted source and restored
+    // continuation remain independently bound, and both owners alias unchanged backing.
     const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
     if (before_duplicate_pressure.host_kv_occupied_bytes == 0) {
         std::cerr << "consuming Host restore released its backing before pressure\n";
@@ -757,6 +760,275 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
                   << after_reuse.shared_active_references << '\n';
         return 1;
     }
+    return 0;
+}
+
+int exercise_endpoint_with_shared_anchor(const char* artifact, bool evict_shared_owner = false) {
+    std::cout << std::unitbuf;
+    auto configured                             = engine_options(artifact);
+    configured.max_context                      = 1024;
+    configured.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    configured.prefill_chunk                    = 128;
+    configured.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    configured.context_cache.device_state_slots = 6;
+    configured.context_cache.host_state_slots   = evict_shared_owner ? 0 : 8;
+    configured.context_cache.host_kv_capacity_bytes    = evict_shared_owner ? 0 : 512ULL << 20;
+    configured.context_cache.max_private_continuations = 4;
+    configured.context_cache.max_shared_prefixes       = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(configured);
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage value;
+        value.role = role;
+        value.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return value;
+    };
+    ninfer::PromptInput input;
+    std::string instructions = "Reply with a short greeting. Stable context:";
+    for (int i = 0; i < 160; ++i) { instructions += " stable"; }
+    input.messages.push_back(message(ninfer::ChatRole::System, std::move(instructions)));
+    input.messages.push_back(message(ninfer::ChatRole::User, "Hi."));
+    input.options.enable_thinking   = false;
+    input.options.preserve_thinking = true;
+    for (const auto kind : {ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                            ninfer::PromptCacheMarkerKind::PrivateLongAnchor}) {
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 1,
+            .kind                = kind,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+    }
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 128;
+    request.execution.sampling.temperature    = 0.0F;
+    const auto source                         = engine.generate(engine.prepare(input), request);
+    if (source.finish_reason != ninfer::FinishReason::StopToken || source.content.empty()) {
+        std::cerr << "shared-anchor endpoint fixture did not finish its greeting\n";
+        return 1;
+    }
+    std::uint32_t shared_frontier = 0;
+    for (const auto& fact : source.checkpoint_lifecycle) {
+        if (fact.role == ninfer::CheckpointLifecycleRole::SharedStablePrefix &&
+            fact.operation == ninfer::CheckpointLifecycleOperation::Created) {
+            shared_frontier = fact.frontier;
+        }
+    }
+    const bool coincident_anchor =
+        std::any_of(source.checkpoint_lifecycle.begin(), source.checkpoint_lifecycle.end(),
+                    [&](const auto& fact) {
+                        return fact.role == ninfer::CheckpointLifecycleRole::LongAnchor &&
+                               fact.operation == ninfer::CheckpointLifecycleOperation::Created &&
+                               fact.frontier == shared_frontier;
+                    });
+    if (shared_frontier == 0 || !coincident_anchor) {
+        std::cerr << "endpoint fixture did not co-publish shared and private anchor roles\n";
+        return 1;
+    }
+    input.messages.push_back(message(ninfer::ChatRole::Assistant, source.content));
+    input.messages.push_back(message(ninfer::ChatRole::User, "Say hello once more."));
+    auto continuation_request = request;
+    // A full-pool entitlement cannot coexist with the shared partial KV tail when Host
+    // storage is disabled. Admission must evict that owner and transfer its anchor state
+    // into the consumed private lineage instead of counting it twice or losing it.
+    continuation_request.execution.requested_output_tokens =
+        evict_shared_owner ? std::numeric_limits<std::uint32_t>::max() : 8;
+    continuation_request.stop.include_model_defaults = evict_shared_owner;
+    const auto before                                = engine.runtime_stats();
+    const auto warm     = engine.generate(engine.prepare(input), continuation_request);
+    const auto after    = engine.runtime_stats();
+    const auto endpoint = source.prompt.prompt_tokens + source.generated_token_ids.size() - 1U;
+    if (!engine.healthy() || warm.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        warm.reused_prompt_tokens != endpoint || warm.generated_token_ids.empty() ||
+        (!evict_shared_owner && warm.generated_token_ids.size() != 8)) {
+        std::cerr << "shared anchor prevented complete endpoint continuation: reused="
+                  << warm.reused_prompt_tokens << " endpoint=" << endpoint << '\n';
+        return 1;
+    }
+    if (evict_shared_owner &&
+        after.pressure_shared_owners_evicted <= before.pressure_shared_owners_evicted) {
+        std::cerr << "full-capacity endpoint did not exercise shared-anchor ownership transfer\n";
+        return 1;
+    }
+    auto cold_request                         = continuation_request;
+    cold_request.execution.allow_prefix_reuse = false;
+    const auto cold = engine.generate(engine.prepare(input), cold_request);
+    if (cold.generated_token_ids != warm.generated_token_ids ||
+        cold.speculative.drafted_tokens != warm.speculative.drafted_tokens ||
+        cold.speculative.accepted_tokens != warm.speculative.accepted_tokens) {
+        std::cerr << "shared-anchor endpoint continuation differs from the cold MTP result\n";
+        return 1;
+    }
+    std::cout << "shared_anchor_endpoint evict_shared=" << evict_shared_owner
+              << " frontier=" << shared_frontier << " endpoint=" << endpoint
+              << " reused=" << warm.reused_prompt_tokens << " exact_cold_match=true\n";
+    return 0;
+}
+
+int exercise_latest_response_under_state_pressure(const char* artifact,
+                                                  bool full_private_catalog = false,
+                                                  bool retire_history       = false) {
+    std::cout << std::unitbuf;
+    auto configured                                            = engine_options(artifact);
+    configured.enable_vision                                   = false;
+    configured.kv_cache                                        = ninfer::KvCacheStorage::RK4V4E8;
+    configured.context_cache.device_state_slots                = retire_history ? 6 : 2;
+    configured.context_cache.host_state_slots                  = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    configured.context_cache.max_private_continuations         = full_private_catalog ? 2 : 8;
+    configured.context_cache.max_shared_prefixes               = 0;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(configured);
+    const auto directory =
+        std::filesystem::temp_directory_path() / "ninfer-latest-response-retention";
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } guard{directory};
+
+    const auto settled_slots = [&](const ninfer::GenerationResult& result) {
+        // Completion wakes the caller before the worker publishes its final slot gauges.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            auto slots = engine.slot_states();
+            if (result.slot >= 0 && slots[result.slot].retained &&
+                slots[result.slot].session_digest == result.session_digest) {
+                return slots;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("completed continuation did not publish its slot gauges");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return result;
+    };
+    ninfer::PromptInput input;
+    input.options.enable_thinking   = false;
+    input.options.preserve_thinking = true;
+    input.context_cache.session_key = "latest-response-state-pressure";
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    std::string instructions        = "Follow the user's formatting request. Stable context:";
+    for (int i = 0; i < 800; ++i) { instructions += " stable"; }
+    input.messages.push_back(message(ninfer::ChatRole::System, std::move(instructions)));
+    input.messages.push_back(
+        message(ninfer::ChatRole::User,
+                "Reply with the integers 1 to 60 in order, separated by spaces. No other text."));
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 512;
+    request.execution.sampling.temperature    = 0.0F;
+
+    std::uint32_t endpoint = 0;
+    ninfer::GenerationResult last;
+    const int turns = retire_history ? 6 : 4;
+    int saved_slot  = -1;
+    ninfer::PromptInput saved_input;
+    ninfer::GenerationResult saved_result;
+    for (int turn = 0; turn < turns; ++turn) {
+        const auto before = engine.runtime_stats();
+        last              = engine.generate(engine.prepare(input), request);
+        std::cout << "latest_response_pressure full_catalog=" << full_private_catalog
+                  << " turn=" << turn << " expected=" << endpoint
+                  << " reused=" << last.reused_prompt_tokens
+                  << " state=" << before.device_state_occupied_slots << '/'
+                  << before.host_state_occupied_slots << '\n';
+        if (last.finish_reason != ninfer::FinishReason::StopToken || last.content.empty() ||
+            (turn != 0 && (last.reused_prompt_tokens != endpoint ||
+                           last.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint))) {
+            std::cerr
+                << "State pressure replayed an earlier response instead of the latest endpoint\n";
+            return 1;
+        }
+        const auto slots    = settled_slots(last);
+        const auto retained = std::count_if(slots.begin(), slots.end(),
+                                            [](const auto& slot) { return slot.retained; });
+        if (retire_history) {
+            // Keep one explicitly saved old endpoint. All other old private owners must
+            // disappear as soon as the replacement is published, with no pressure required.
+            const int expected_retained = turn == 0 ? 1 : 2;
+            if (retained != expected_retained || (saved_slot >= 0 && !slots[saved_slot].retained)) {
+                std::cerr << "retirement kept obsolete history or lost SSD-backed state: turn="
+                          << turn << " retained=" << retained << '\n';
+                return 1;
+            }
+        }
+        if (!retire_history || turn == 0 || turn == 3) {
+            // The pressure cases deliberately preserve old owners with completed SSD saves.
+            // The retirement case rebinds its file at turn 3, invalidating the old backing.
+            const auto path =
+                directory /
+                (retire_history ? "saved.bin" : ("saved-" + std::to_string(turn) + ".bin"));
+            (void)engine.save_slot(static_cast<std::uint32_t>(last.slot), path.string(),
+                                   last.session_digest);
+            saved_slot = last.slot;
+            if (retire_history) {
+                saved_input  = input;
+                saved_result = last;
+            }
+        }
+        if (retire_history) {
+            std::cout << "retirement turn=" << turn << " resident_private=" << retained
+                      << " saved_slot=" << saved_slot << '\n';
+        }
+        endpoint = last.prompt.prompt_tokens + last.generated_token_ids.size() - 1U;
+        if (turn != turns - 1) {
+            input.messages.push_back(message(ninfer::ChatRole::Assistant, last.content));
+            input.messages.push_back(message(ninfer::ChatRole::User, "Repeat the same list."));
+        }
+    }
+    const auto stats = engine.runtime_stats();
+    if (!engine.healthy() || (!retire_history && (stats.state_d2h_count == 0 ||
+                                                  stats.reclaimed_device_state_slots_total == 0))) {
+        std::cerr << "latest-response fixture did not exercise Device State reclamation\n";
+        return 1;
+    }
+    if (retire_history) {
+        const auto slots = settled_slots(last);
+        for (std::uint32_t slot = 0; slot < slots.size(); ++slot) {
+            if (slots[slot].retained) { (void)engine.erase_slot(slot); }
+        }
+        const auto restored = engine.restore_slot(0, (directory / "saved.bin").string());
+        saved_input.messages.push_back(message(ninfer::ChatRole::Assistant, saved_result.content));
+        saved_input.messages.push_back(message(ninfer::ChatRole::User, "Repeat the same list."));
+        request.execution.allow_prefix_reuse = true;
+        const auto resumed  = engine.generate(engine.prepare(saved_input), request);
+        const auto after    = settled_slots(resumed);
+        const auto retained = std::count_if(after.begin(), after.end(),
+                                            [](const auto& slot) { return slot.retained; });
+        const auto saved_endpoint =
+            saved_result.prompt.prompt_tokens + saved_result.generated_token_ids.size() - 1U;
+        if (resumed.reused_prompt_tokens != saved_endpoint || retained != 2 || !after[0].retained ||
+            resumed.slot == 0) {
+            std::cerr << "restored SSD checkpoint was consumed without pressure: reused="
+                      << resumed.reused_prompt_tokens << " saved=" << restored.tokens
+                      << " expected=" << saved_endpoint << " slot=" << resumed.slot
+                      << " reclaimed=" << resumed.materialization.selected_degradation_units
+                      << " retained=" << retained << '\n';
+            return 1;
+        }
+        std::cout << "retirement restored_reuse=" << resumed.reused_prompt_tokens
+                  << " saved_source_preserved=true\n";
+    }
+    request.execution.allow_prefix_reuse = false;
+    const auto cold                      = engine.generate(engine.prepare(input), request);
+    if (cold.generated_token_ids != last.generated_token_ids ||
+        cold.speculative.drafted_tokens != last.speculative.drafted_tokens ||
+        cold.speculative.accepted_tokens != last.speculative.accepted_tokens) {
+        std::cerr << "latest response under State pressure differs from cold MTP execution\n";
+        return 1;
+    }
+    std::cout << "latest_response_pressure exact_cold_match=true\n";
     return 0;
 }
 
@@ -1516,6 +1788,167 @@ ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
+}
+
+int exercise_short_prefill_during_long_prefill(const char* artifact) {
+    auto configured                 = engine_options(artifact);
+    configured.enable_vision        = false;
+    configured.kv_cache             = ninfer::KvCacheStorage::RK4V4E8;
+    configured.max_context          = 16384;
+    configured.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(49152);
+    configured.prefill_chunk        = 256;
+    configured.max_concurrency      = 3;
+    configured.max_pending_requests = 3;
+    configured.context_cache.device_state_slots                = 6;
+    configured.context_cache.host_state_slots                  = 4;
+    configured.context_cache.host_kv_capacity_bytes            = 256ULL << 20;
+    configured.context_cache.max_private_continuations         = 4;
+    configured.context_cache.max_shared_prefixes               = 0;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(configured);
+    const auto request = fixed_output(8);
+    std::vector<ninfer::TokenId> short_prompt(512, 220);
+    short_prompt[0] = 846;
+    const auto seed = engine.generate(engine.prepare_tokens(short_prompt), request);
+    short_prompt.insert(short_prompt.end(), seed.generated_token_ids.begin(),
+                        seed.generated_token_ids.end());
+    short_prompt.insert(short_prompt.end(), 16, 198);
+    const auto expected_endpoint = seed.prompt.prompt_tokens + seed.generated_token_ids.size() - 1U;
+    std::vector<ninfer::TokenId> long_prompt(12000, 100);
+    const auto before   = engine.runtime_stats();
+    auto long_request   = engine.submit(engine.prepare_tokens(long_prompt), fixed_output(8, false));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    bool long_prefilling = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto stats = engine.runtime_stats();
+        if (stats.prefilling_requests == 1 &&
+            stats.computed_prefill_tokens >= before.computed_prefill_tokens + 512) {
+            long_prefilling = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!long_prefilling) {
+        std::cerr << "long prompt did not reach the prefill overlap fixture\n";
+        return 1;
+    }
+    const auto started      = std::chrono::steady_clock::now();
+    const auto short_result = engine.generate(engine.prepare_tokens(short_prompt), request);
+    const auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    const auto overlap = engine.runtime_stats();
+    const bool short_finished_during_long_prefill =
+        overlap.prefilling_requests == 1 &&
+        overlap.computed_prefill_tokens < before.computed_prefill_tokens + long_prompt.size();
+    const auto long_result = long_request.wait();
+    if (!short_finished_during_long_prefill ||
+        short_result.reused_prompt_tokens != expected_endpoint ||
+        short_result.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+        std::cerr << "cached side request waited for long prefill: elapsed=" << elapsed
+                  << " reused=" << short_result.reused_prompt_tokens
+                  << " expected=" << expected_endpoint
+                  << " prefilling=" << overlap.prefilling_requests << '\n';
+        return 1;
+    }
+    auto cold_request                         = request;
+    cold_request.execution.allow_prefix_reuse = false;
+    const auto short_cold = engine.generate(engine.prepare_tokens(short_prompt), cold_request);
+    const auto long_cold  = engine.generate(engine.prepare_tokens(long_prompt), cold_request);
+    const auto same       = [](const auto& a, const auto& b) {
+        return a.generated_token_ids == b.generated_token_ids &&
+               a.speculative.drafted_tokens == b.speculative.drafted_tokens &&
+               a.speculative.accepted_tokens == b.speculative.accepted_tokens;
+    };
+    if (!engine.healthy() || !same(short_result, short_cold) || !same(long_result, long_cold)) {
+        const auto report = [](const char* name, const auto& result) {
+            std::cerr << name << " drafted=" << result.speculative.drafted_tokens
+                      << " accepted=" << result.speculative.accepted_tokens << " tokens=";
+            for (const auto token : result.generated_token_ids) { std::cerr << token << ','; }
+            std::cerr << '\n';
+        };
+        report("short interleaved", short_result);
+        report("short cold", short_cold);
+        report("long interleaved", long_result);
+        report("long cold", long_cold);
+        std::cerr << "interleaved prefill changed output or MTP decisions\n";
+        return 1;
+    }
+    std::cout << "prefill_interleave reused=" << short_result.reused_prompt_tokens
+              << " side_seconds=" << elapsed
+              << " completed_during_long_prefill=true exact_cold_match=true\n";
+    return 0;
+}
+
+int exercise_idle_cache_pressure(const char* artifact) {
+    std::cout << std::unitbuf;
+    auto configured                             = engine_options(artifact);
+    configured.enable_vision                    = false;
+    configured.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    configured.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    configured.max_concurrency                  = 3;
+    configured.max_pending_requests             = 3;
+    configured.context_cache.device_state_slots = 3;
+    configured.context_cache.host_state_slots   = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    configured.context_cache.max_private_continuations         = 6;
+    configured.context_cache.max_shared_prefixes               = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(configured);
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        return ninfer::ChatMessage{
+            .role  = role,
+            .parts = {{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)}}};
+    };
+    std::string padding;
+    for (int i = 0; i < 300; ++i) { padding += " stable"; }
+    std::uint32_t peak_states = 0;
+    for (int turn = 0; turn < 8; ++turn) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking                 = false;
+        input.context_cache.session_key               = "idle-pressure-" + std::to_string(turn);
+        input.context_cache.retention                 = ninfer::CacheRetentionHint::LiveSession;
+        input.context_cache.automatic_private_anchors = 2;
+        input.messages                                = {
+            message(ninfer::ChatRole::System, "Harness " + std::to_string(turn % 3) + padding),
+            message(ninfer::ChatRole::User, "First turn " + std::to_string(turn) + padding),
+            message(ninfer::ChatRole::User, "Second turn " + padding),
+        };
+        input.context_cache.markers.push_back({
+            .after_message_count = 1,
+            .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        });
+        const auto result = engine.generate(engine.prepare(input), fixed_output(1));
+        const auto stats  = engine.runtime_stats();
+        peak_states       = std::max(peak_states, stats.logical_state_used_slots);
+        std::cout << "idle_pressure turn=" << turn << " logical=" << stats.logical_state_used_slots
+                  << '/' << stats.logical_state_capacity_slots
+                  << " device=" << stats.device_state_occupied_slots
+                  << " host=" << stats.host_state_occupied_slots
+                  << " fallback=" << stats.pressure_maximal_fallback_selections << '\n';
+        if (!engine.healthy() || result.generated_token_ids.size() != 1) { return 1; }
+    }
+    const auto pressured = engine.runtime_stats();
+    if (peak_states != pressured.logical_state_capacity_slots ||
+        pressured.reclaimed_device_state_slots_total == 0) {
+        std::cerr << "idle pressure fixture did not fill and reclaim State capacity\n";
+        return 1;
+    }
+    ninfer::PromptInput fresh;
+    fresh.options.enable_thinking   = true;
+    fresh.context_cache.session_key = "idle-pressure-fresh";
+    fresh.messages    = {message(ninfer::ChatRole::User, "What is 7 plus 5? Answer briefly.")};
+    const auto warm   = engine.generate(engine.prepare(fresh), fixed_output(8));
+    auto cold_options = fixed_output(8);
+    cold_options.execution.allow_prefix_reuse = false;
+    const auto cold = engine.generate(engine.prepare(fresh), cold_options);
+    if (!engine.healthy() || warm.generated_token_ids != cold.generated_token_ids ||
+        warm.speculative.drafted_tokens != cold.speculative.drafted_tokens ||
+        warm.speculative.accepted_tokens != cold.speculative.accepted_tokens) {
+        std::cerr << "idle admission did not recover with exact cold MTP parity\n";
+        return 1;
+    }
+    std::cout << "idle_pressure subsequent_requests_healthy=true exact_cold_match=true\n";
+    return 0;
 }
 
 constexpr std::size_t kSharedSnapshotHeaderBytes    = 60;
@@ -3322,8 +3755,10 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
         return 1;
     }
 
+    // This case verifies current-head protection, so the long endpoint must own a real binding.
     const ninfer::GenerationResult long_result = engine.generate(
-        engine.prepare(pressure_turn(*long_text, "", ninfer::CacheRetentionHint::Disposable)),
+        engine.prepare(pressure_turn(*long_text, "pressure-long",
+                                     ninfer::CacheRetentionHint::Disposable)),
         fixed_output(kLongOutputTokens));
     if (long_result.prompt.prompt_tokens != kLongPromptTokens ||
         long_result.generated_token_ids.size() != kLongOutputTokens) {
@@ -3344,8 +3779,11 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
     }
 
     const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    // Keep the long head bound during admission, then supersede it only when short_b finishes.
+    // The later resume can consume that old checkpoint instead of forking a current rollback
+    // point in a pool with no spare State slot.
     const ninfer::GenerationResult short_b =
-        engine.generate(engine.prepare(pressure_turn(*short_b_text, "pressure-short-b",
+        engine.generate(engine.prepare(pressure_turn(*short_b_text, "pressure-long",
                                                      ninfer::CacheRetentionHint::LiveSession)),
                         fixed_output(1));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
@@ -3424,7 +3862,8 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact,
     }
     const ninfer::RuntimeStats before_resume = engine.runtime_stats();
     const ninfer::GenerationResult resumed   = engine.generate(
-        engine.prepare(pressure_turn(*long_text, "", ninfer::CacheRetentionHint::Disposable)),
+        engine.prepare(pressure_turn(*long_text, "pressure-long",
+                                     ninfer::CacheRetentionHint::Disposable)),
         fixed_output(1));
     const ninfer::RuntimeStats after_resume = engine.runtime_stats();
     const std::uint64_t restored_pages =
@@ -4473,6 +4912,12 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                 return false;
             };
 
+            const auto version = snapshot_pod<std::uint32_t>(bytes, 8);
+            set_snapshot_pod<std::uint32_t>(bytes, 8, 1);
+            const bool old_identity_rejected = expect_rejected(bytes, "obsolete-identity-version");
+            set_snapshot_pod(bytes, 8, version);
+            if (!old_identity_rejected) { return 1; }
+
             bytes.back() ^= 0x1U;
             const bool corrupt_rejected = expect_rejected(bytes, "corrupt");
             bytes.back() ^= 0x1U;
@@ -5112,7 +5557,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
             options.context_cache.max_long_anchors_per_continuation = 2;
             ninfer::Engine engine(std::move(options));
 
-            const auto branch = [](std::string third) {
+            const auto branch = [](std::string third, std::string session_key) {
                 const auto message = [](std::string text) {
                     return ninfer::ChatMessage{
                         .role  = ninfer::ChatRole::User,
@@ -5122,6 +5567,9 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                     };
                 };
                 ninfer::PromptInput input;
+                // Independent heads keep the occupancy fixture stable across history
+                // supersession policy; both branches must remain current rollback points.
+                input.context_cache.session_key = std::move(session_key);
                 input.messages = {
                     message(std::string(80, 'a') + " logical pressure prefix one"),
                     message(std::string(160, 'b') + " logical pressure prefix two"),
@@ -5132,10 +5580,11 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                 input.context_cache.automatic_private_anchors = 2;
                 return input;
             };
-            const ninfer::GenerationResult first =
-                engine.generate(engine.prepare(branch("logical first branch")), fixed_output(1));
+            const ninfer::GenerationResult first = engine.generate(
+                engine.prepare(branch("logical first branch", "logical-first")), fixed_output(1));
             const ninfer::GenerationResult second = engine.generate(
-                engine.prepare(branch(std::string(640, 'c') + " logical second branch")),
+                engine.prepare(branch(std::string(640, 'c') + " logical second branch",
+                                      "logical-second")),
                 fixed_output(1));
             const ninfer::GenerationResult third = engine.generate(
                 engine.prepare(pressure_turn("logical pressure third head", "logical-third",
@@ -5286,7 +5735,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
             options.context_cache.max_long_anchors_per_continuation = 2;
             ninfer::Engine engine(std::move(options));
 
-            const auto branch = [](std::string third) {
+            const auto branch = [](std::string third, std::string session_key) {
                 const auto message = [](std::string text) {
                     return ninfer::ChatMessage{
                         .role  = ninfer::ChatRole::User,
@@ -5296,6 +5745,7 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                     };
                 };
                 ninfer::PromptInput input;
+                input.context_cache.session_key = std::move(session_key);
                 input.messages = {
                     message(std::string(80, 'a') + " descriptor pressure prefix one"),
                     message(std::string(160, 'b') + " descriptor pressure prefix two"),
@@ -5306,10 +5756,12 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                 input.context_cache.automatic_private_anchors = 2;
                 return input;
             };
-            const ninfer::GenerationResult first =
-                engine.generate(engine.prepare(branch("descriptor first branch")), fixed_output(1));
+            const ninfer::GenerationResult first = engine.generate(
+                engine.prepare(branch("descriptor first branch", "descriptor-first")),
+                fixed_output(1));
             const ninfer::GenerationResult second = engine.generate(
-                engine.prepare(branch(std::string(640, 'c') + " descriptor second branch")),
+                engine.prepare(branch(std::string(640, 'c') + " descriptor second branch",
+                                      "descriptor-second")),
                 fixed_output(1));
             const ninfer::GenerationResult third = engine.generate(
                 engine.prepare(pressure_turn("descriptor third head", "descriptor-third",
@@ -6829,6 +7281,43 @@ int main() {
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
     }
+    if (scenario != nullptr && std::string_view(scenario) == "prefill-interleave") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        return exercise_short_prefill_during_long_prefill(qwen38_groupwise);
+    }
+    if (scenario != nullptr && (std::string_view(scenario) == "latest-response-pressure" ||
+                                std::string_view(scenario) == "latest-response-catalog" ||
+                                std::string_view(scenario) == "superseded-retirement")) {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "latest-response-pressure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_latest_response_under_state_pressure(
+            qwen38_groupwise, std::string_view(scenario) == "latest-response-catalog",
+            std::string_view(scenario) == "superseded-retirement");
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "idle-cache-pressure") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "idle-cache-pressure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_idle_cache_pressure(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-anchor-endpoint") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-anchor-endpoint requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_endpoint_with_shared_anchor(qwen38_groupwise);
+        if (result != 0) { return result; }
+        const int pressure = exercise_endpoint_with_shared_anchor(qwen38_groupwise, true);
+        if (pressure == 0) { std::cout << "ok\n"; }
+        return pressure;
+    }
     if (scenario != nullptr && std::string_view(scenario) == "pressure-resume") {
         if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
             std::cerr << "pressure-resume requires NINFER_QWEN3_8_27B_WEIGHTS\n";
@@ -7051,6 +7540,33 @@ int main() {
         }
     }
     if (qwen38_groupwise != nullptr && *qwen38_groupwise != '\0') {
+        if (const int result = exercise_idle_cache_pressure(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_short_prefill_during_long_prefill(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_latest_response_under_state_pressure(qwen38_groupwise, false, true);
+            result != 0) {
+            return result;
+        }
+        if (const int result = exercise_latest_response_under_state_pressure(qwen38_groupwise);
+            result != 0) {
+            return result;
+        }
+        if (const int result =
+                exercise_latest_response_under_state_pressure(qwen38_groupwise, true);
+            result != 0) {
+            return result;
+        }
+        if (const int result = exercise_endpoint_with_shared_anchor(qwen38_groupwise);
+            result != 0) {
+            return result;
+        }
+        if (const int result = exercise_endpoint_with_shared_anchor(qwen38_groupwise, true);
+            result != 0) {
+            return result;
+        }
         if (const int result = exercise_host_restore(qwen38_groupwise, true); result != 0) {
             return result;
         }

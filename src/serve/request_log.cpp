@@ -32,6 +32,15 @@ namespace {
 
 using Json = nlohmann::json;
 
+void make_log_readable(const std::filesystem::path& path, bool directory = false) {
+    using Perms   = std::filesystem::perms;
+    auto required = Perms::owner_read | Perms::group_read | Perms::others_read;
+    if (directory) { required |= Perms::owner_exec | Perms::group_exec | Perms::others_exec; }
+    if ((std::filesystem::status(path).permissions() & required) != required) {
+        std::filesystem::permissions(path, required, std::filesystem::perm_options::add);
+    }
+}
+
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
     return current >= previous ? current - previous : T{};
@@ -1005,6 +1014,7 @@ publish_content_file(const std::filesystem::path& content_dir,
         }
         output.close();
         const std::string digest = sink.digest();
+        make_log_readable(temporary);
         if (checkpoint) { checkpoint("before_rename", temporary, final); }
         std::filesystem::rename(temporary, final, error);
         if (error) {
@@ -1292,6 +1302,15 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
             throw std::runtime_error("failed to create request-log content directory: " +
                                      content_dir_.string());
         }
+        make_log_readable(content_dir_, true);
+        for (const auto& entry : std::filesystem::directory_iterator(content_dir_)) {
+            const auto name = entry.path().filename().string();
+            if (std::filesystem::is_regular_file(entry.symlink_status()) &&
+                (name.starts_with("promptserve-") || name.starts_with("responseserve-")) &&
+                name.ends_with(".md")) {
+                make_log_readable(entry.path());
+            }
+        }
         const std::filesystem::path probe = content_dir_ / ("." + server_instance_id_ + ".probe");
         {
             std::ofstream output(probe, std::ios::binary | std::ios::out | std::ios::trunc);
@@ -1313,6 +1332,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
     }
+    make_log_readable(path_);
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,

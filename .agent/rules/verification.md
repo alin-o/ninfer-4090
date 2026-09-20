@@ -3,17 +3,55 @@ trigger: model_decision
 description: Use when implementing, testing, or reviewing NInfer changes, running verification, or diagnosing sandbox test prerequisites.
 ---
 
-# Canonical verification
+# Verification
 
-From the repository root run `bash .agent/verify.sh`. The command runs existing
-Linux launcher checks, native Python artifact/converter and benchmark-consumer
+## Choose checks by impact
+
+Default to focused verification that covers the changed behavior and realistic
+regressions. Choose the scope by behavioral impact, not by the number of changed
+lines. A full suite is not an automatic completion requirement.
+
+- Documentation and rule edits: review the affected text and references, then
+  run `git diff --check`. No build or runtime tests are needed.
+- Local changes to file permissions, logging, CLI options, or other host-side
+  behavior: build the affected targets and run the relevant existing tests or a
+  direct behavior check. For example, verify log permissions under a restrictive
+  umask; do not launch unrelated model or GPU tests.
+- Engine, cache, scheduling, model, or CUDA changes: run the affected correctness
+  and integration regressions, including the relevant real-model/GPU cases when
+  their behavior is affected. Broaden verification when impact crosses several
+  paths or a failure leaves the regression boundary uncertain.
+
+Run the full canonical command only when the user explicitly requests it, an
+applicable release/acceptance requirement calls for it, or broad changes or
+unresolved failures cannot be adequately checked with a focused selection.
+Before launching it, state the concrete reason the full suite is needed.
+
+Coding, independent Testing, and Review use the same scope-selection rule.
+Entering a stage does not by itself require a full suite or duplicate run.
+Review uses existing evidence when it covers the current implementation. Once
+the selected checks pass, stop testing; repeat or broaden only when new changes,
+failures, or unresolved concerns invalidate that evidence. Distinguish focused
+passes, full-suite results, baseline failures, regressions, and skips. Never
+weaken checks to obtain a pass or claim results for checks that were not run.
+
+Focused commands are documented in `tests/README.md`: build the affected test
+target, then `ctest --test-dir build-agent-verify -R '<test-name>'
+--output-on-failure`. Use `NINFER_OP_REPORT_STATS=1` with verbose CTest for
+numerical error evidence.
+
+## Full canonical command
+
+When full verification is warranted, run `bash .agent/verify.sh` from the
+repository root. The command runs existing Linux launcher checks, native
+Python artifact/converter and benchmark-consumer
 suites, evaluation coordinator unittests, then a Release sm_89 application/test
 build and CTest. Independent suites continue after failures; the command exits
 nonzero if any step fails. No dependencies are installed and no persistent
 server is started. There is no repository CI workflow or browser UI.
 
 Prerequisites: Bash, CMake ≥3.28, Ninja, C++20 compiler, CUDA ≥12.8, FFmpeg dev
-libraries and libcurl meeting CMake's constraints. Python needs pytest, torch,
+libraries, libcurl and OpenSSL Crypto meeting CMake's constraints. Python needs pytest, torch,
 NumPy and converter dependencies; evaluation tests need PyYAML and Rich (see
 `eval/requirements.txt` for the separate evaluation environment). The sandbox
 Python environment is not evidence that project test dependencies are present.
@@ -28,17 +66,8 @@ to invoke or manage worktree lifecycle hooks. Python dependencies come from the
 provisioned container environment, not hook-installed packages. Verification
 sets `TMPDIR` to the checkout's `.local/test-tmp` because `/tmp` is noexec.
 
-Coding runs focused checks while iterating and the canonical command before
-completion. Independent Testing runs the canonical command and applicable
-regressions. With a Testing stage, Review assesses the diff and evidence without
-rerunning validation. Distinguish baseline failures, regressions, and skips;
-never weaken the checks to obtain a pass.
-
-Focused commands are documented in `tests/README.md`: build the affected test
-target, then `ctest --test-dir build-agent-verify -R '<test-name>'
---output-on-failure`. Use `NINFER_OP_REPORT_STATS=1` with verbose CTest for
-numerical error evidence. The initial two-job native build took about eight
-minutes in this sandbox. With the Qwen3.8 real artifact enabled, CTest took
+The initial two-job native build took about eight minutes in this sandbox.
+With the Qwen3.8 real artifact enabled, CTest took
 about 765 seconds on 2026-09-12; the Python artifact/converter suites took about
 two seconds. Do not treat the full command as a fast lint gate.
 

@@ -1223,70 +1223,11 @@ void reject_unsupported_platform_fields(const Json& body) {
     }
 }
 
-void validate_common_top_level(const Json& body, bool create) {
-    static const std::unordered_set<std::string> create_fields = {"background",
-                                                                  "chat_template_kwargs",
-                                                                  "client_metadata",
-                                                                  "context_management",
-                                                                  "conversation",
-                                                                  "include",
-                                                                  "input",
-                                                                  "instructions",
-                                                                  "max_output_tokens",
-                                                                  "max_tool_calls",
-                                                                  "metadata",
-                                                                  "model",
-                                                                  "moderation",
-                                                                  "parallel_tool_calls",
-                                                                  "previous_response_id",
-                                                                  "preserve_thinking",
-                                                                  "prompt",
-                                                                  "prompt_cache_key",
-                                                                  "prompt_cache_options",
-                                                                  "prompt_cache_retention",
-                                                                  "reasoning",
-                                                                  "safety_identifier",
-                                                                  "service_tier",
-                                                                  "store",
-                                                                  "stream",
-                                                                  "stream_options",
-                                                                  "temperature",
-                                                                  "text",
-                                                                  "tool_choice",
-                                                                  "tools",
-                                                                  "top_logprobs",
-                                                                  "top_p",
-                                                                  "truncation",
-                                                                  "user"};
-    static const std::unordered_set<std::string> count_fields  = {"chat_template_kwargs",
-                                                                  "conversation",
-                                                                  "input",
-                                                                  "instructions",
-                                                                  "model",
-                                                                  "parallel_tool_calls",
-                                                                  "personality",
-                                                                  "previous_response_id",
-                                                                  "preserve_thinking",
-                                                                  "reasoning",
-                                                                  "text",
-                                                                  "tool_choice",
-                                                                  "tools",
-                                                                  "truncation"};
-    const auto& allowed = create ? create_fields : count_fields;
-    for (auto iterator = body.begin(); iterator != body.end(); ++iterator) {
-        if (!allowed.contains(iterator.key())) {
-            bad_request("unknown parameter: " + iterator.key(), iterator.key(),
-                        "unknown_parameter");
-        }
-    }
-}
-
 } // namespace
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& body,
                                                                    const RequestLimits& limits) {
     require_object(body);
-    validate_common_top_level(body, true);
     reject_unsupported_platform_fields(body);
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
@@ -1400,7 +1341,6 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
-    validate_common_top_level(body, false);
     reject_unsupported_platform_fields(body);
     if (body.contains("personality") && !body.at("personality").is_null()) {
         bad_request("personality changes prompt construction and is not supported", "personality",

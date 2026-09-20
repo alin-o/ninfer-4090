@@ -35,7 +35,9 @@ struct SchedulerRequest {
         }
     };
 
-    enum class State : std::uint8_t { Decode, Control };
+    enum class State : std::uint8_t { Decode, Control, Prefill };
+
+    [[nodiscard]] bool is_prefilling() const noexcept { return state == State::Prefill; }
 
     [[nodiscard]] bool is_decode_ready() const noexcept { return state == State::Decode; }
 
@@ -46,7 +48,10 @@ struct SchedulerRequest {
     std::uint64_t backfill_epoch                  = 0;
     ninfer::runtime::BackfillClass backfill_class = ninfer::runtime::BackfillClass::None;
     State state                                   = State::Decode;
-    bool capture_pending                          = false;
+    ninfer::PromptSummary prompt_summary;
+    std::uint32_t remaining_prefill_tokens = 0;
+    std::uint32_t prefill_wait_quanta      = 0;
+    bool capture_pending                   = false;
     std::optional<Budget> budget;
     std::optional<SequenceHandle> sequence;
     Output output;
@@ -180,15 +185,40 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
                           scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
-    scheduler.set_prefill_lane(0);
-    failures +=
-        check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
-              "prefill/decode alternation changed");
-    scheduler.clear_prefill_lane(0);
-
+    failures += check(scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
+                          scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                      "prefill/decode alternation changed");
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
+    for (std::uint32_t lane = 0; lane < 3; ++lane) {
+        slots[lane]                           = std::make_shared<SchedulerRequest>();
+        slots[lane]->id                       = lane + 1;
+        slots[lane]->state                    = SchedulerRequest::State::Prefill;
+        slots[lane]->remaining_prefill_tokens = lane == 0 ? 36000 : 108;
+    }
+    failures += check(scheduler.should_attempt_admission(true, true, false, false, false) &&
+                          scheduler.can_admit_prefill(slots, 3, false) &&
+                          scheduler.choose_prefill_lane(slots, 3) == 1,
+                      "a long prefill blocked admission or selection of a cached short suffix");
+    // A continuously ready stream of small requests cannot starve the long prompt.
+    for (std::uint32_t step = 0; step < 3; ++step) {
+        const auto lane = scheduler.choose_prefill_lane(slots, 3);
+        failures += check(lane.has_value() && *lane != 0,
+                          "short suffix was not favored before the fairness bound");
+        scheduler.observe_prefill_step(slots, 3, *lane);
+    }
+    failures += check(scheduler.choose_prefill_lane(slots, 3) == 0,
+                      "short suffixes starved the long prompt beyond the fairness bound");
+    slots[0]->capture_pending = true;
+    failures += check(scheduler.choose_prefill_lane(slots, 3) != 0,
+                      "capture-pending prefill was scheduled");
+    slots[0]->capture_pending          = false;
+    slots[0]->prompt_summary.has_media = true;
+    failures += check(!scheduler.can_admit_prefill(slots, 3, false),
+                      "new prefill overlapped shared Vision staging");
+    slots[0]->prompt_summary.has_media = false;
+    failures += check(!scheduler.can_admit_prefill(slots, 3, true),
+                      "Vision prefill entered while text prefills were unfinished");
+    slots                         = {};
     slots[0]                      = std::make_shared<SchedulerRequest>();
     slots[0]->id                  = 21;
     slots[0]->budget              = SchedulerRequest::Budget{.tokens = 11};

@@ -39,19 +39,15 @@ public:
     [[nodiscard]] const std::vector<VisionItem>& vision_items() const noexcept {
         return vision_items_;
     }
-    [[nodiscard]] const std::vector<std::uint32_t>& rewrite_execution_frontiers() const noexcept {
-        return rewrite_execution_frontiers_;
-    }
+
     void restore(std::vector<std::uint8_t> token_types,
                  std::array<std::vector<std::int32_t>, 3> positions,
-                 std::vector<VisionItem> vision_items,
-                 std::vector<std::uint32_t> rewrite_execution_frontiers = {});
+                 std::vector<VisionItem> vision_items);
 
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
     std::vector<VisionItem> vision_items_;
-    std::vector<std::uint32_t> rewrite_execution_frontiers_;
 };
 
 // One rolling digest per token frontier. This is only a content shortlist: exact token and

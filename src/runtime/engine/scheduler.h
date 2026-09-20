@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -233,7 +235,7 @@ public:
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, bool previous_unit_was_decode,
                                                 bool context_transaction) const noexcept {
-        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
+        return have_pending && admission_check_pending && !context_transaction &&
                (!have_decode || previous_unit_was_decode);
     }
 
@@ -246,24 +248,54 @@ public:
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> prefill_lane() const noexcept {
-        return prefill_lane_;
-    }
-
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
         return protection_ ? std::optional<std::uint64_t>(protection_->epoch_id) : std::nullopt;
     }
 
-    void set_prefill_lane(std::uint32_t lane) {
-        if (prefill_lane_) { throw std::logic_error("multiple requests own staged prefill"); }
-        prefill_lane_ = lane;
+    template <class Slots>
+    [[nodiscard]] bool can_admit_prefill(const Slots& slots, std::uint32_t max_concurrency,
+                                         bool incoming_has_media) const noexcept {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
+            // Vision handoff tensors occupy shared staging across chunks. Preserve their
+            // existing exclusive prefill lifetime; text prefills have lane-local progress.
+            if (request && request->is_prefilling() &&
+                (incoming_has_media || request->prompt_summary.has_media)) {
+                return false;
+            }
+        }
+        return true;
     }
 
-    void clear_prefill_lane(std::uint32_t lane) {
-        if (!prefill_lane_ || *prefill_lane_ != lane) {
-            throw std::logic_error("request does not own staged prefill");
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    choose_prefill_lane(const Slots& slots, std::uint32_t max_concurrency) const noexcept {
+        std::optional<std::uint32_t> selected;
+        const auto rank = [&](const auto& request) {
+            const bool due = request->prefill_wait_quanta >= max_concurrency;
+            return std::tuple{!due,
+                              due ? kMaximumConcurrency * 2U - request->prefill_wait_quanta : 0U,
+                              due ? 0U : request->remaining_prefill_tokens, request->id};
+        };
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || !request->is_prefilling() || request->capture_pending) { continue; }
+            if (!selected || rank(request) < rank(slots[*selected])) { selected = lane; }
         }
-        prefill_lane_.reset();
+        return selected;
+    }
+
+    template <class Slots>
+    void observe_prefill_step(const Slots& slots, std::uint32_t max_concurrency,
+                              std::uint32_t selected) const noexcept {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || !request->is_prefilling() || request->capture_pending) { continue; }
+            request->prefill_wait_quanta =
+                lane == selected
+                    ? 0U
+                    : std::min(request->prefill_wait_quanta + 1U, kMaximumConcurrency * 2U);
+        }
     }
 
     void observe_fifo_head(std::optional<std::uint64_t> request_id) noexcept {
@@ -354,13 +386,11 @@ public:
     }
 
     void reset() noexcept {
-        prefill_lane_.reset();
         fifo_head_id_.reset();
         protection_.reset();
     }
 
 private:
-    std::optional<std::uint32_t> prefill_lane_;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

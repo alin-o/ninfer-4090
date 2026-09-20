@@ -103,6 +103,8 @@ Full configurations, method, and raw numbers:
 ## Quick start (Linux)
 
 Requirements: an RTX 4090, a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
+Native builds also require OpenSSL 3 development libraries (`libssl-dev`) for accelerated
+full-payload SHA-256. The container installs this dependency.
 
 Build the image and download the model once:
 

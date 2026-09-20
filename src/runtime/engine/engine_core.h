@@ -7,6 +7,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/context_transfer_test_gate.h"
+#include "runtime/engine/execution_mutex.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/resource_manager.h"
 #include "runtime/engine/scheduler.h"
@@ -39,6 +40,10 @@
 
 namespace ninfer::runtime {
 
+namespace testing {
+struct SharedSnapshotTestAccess;
+}
+
 // Private type-erasure carrier used only between EngineCore and GenerationHandle. Public callers
 // continue to observe the original OutputSink/engine exception; GenerationHandle separately
 // retains these already-settled facts for the serving boundary.
@@ -65,6 +70,8 @@ private:
 
 template <class Instance>
 class EngineCore {
+
+    friend struct testing::SharedSnapshotTestAccess;
 
 public:
     using Package                     = typename Instance::Package;
@@ -98,6 +105,8 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           context_cache_enabled_(options.context_cache.enabled),
+          durable_prefixes_enabled_(options.context_cache.enabled &&
+                                    options.speculative.backend != SpeculativeBackend::DFlash),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -126,6 +135,7 @@ public:
         // session's file.
         resources_.set_slot_release_observer(
             [this](std::uint32_t slot) { clear_slot_session(slot); });
+        published_memory_ = collect_memory_summary();
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -277,21 +287,11 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    // Serving/logging observes the latest complete Engine boundary without waiting behind GPU
+    // execution. Program stores are read only by their mutation owner when publishing it.
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
+        std::lock_guard lock(stats_mutex_);
+        return published_memory_;
     }
 
     // False once the worker has latched a failure or begun shutting down. The latch is
@@ -331,6 +331,7 @@ public:
         try {
             std::scoped_lock lock(execution_mutex_);
             instance_.program->reset_memory_peaks();
+            publish_memory_summary();
         } catch (...) {}
     }
 
@@ -347,7 +348,8 @@ public:
     // never outlive its session and be applied to the next one.
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t slot, std::string_view model_binding,
-                       std::string_view expected_digest, std::string_view session_path = {}) {
+                       std::string_view expected_digest, std::string_view session_path = {},
+                       std::uint64_t* saved_owner = nullptr) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
@@ -356,8 +358,17 @@ public:
         }
         require_session_digest(view, expected_digest);
         auto snapshot = instance_.program->save_continuation(*view.handle, model_binding);
+        if (saved_owner) { *saved_owner = view.id; }
         bind_slot_session(slot, session_path);
+        publish_memory_summary();
         return snapshot;
+    }
+
+    void complete_retained_save(std::uint32_t slot, std::uint64_t owner, std::string_view path) {
+        std::scoped_lock lock(execution_mutex_);
+        if (slot < slot_session_paths_.size() && slot_session_paths_[slot] == path) {
+            (void)resources_.set_private_ssd_backed(slot, owner, true);
+        }
     }
 
     [[nodiscard]] std::pair<std::uint32_t, std::string>
@@ -400,6 +411,9 @@ public:
             throw;
         }
         bind_slot_session(slot, session_path);
+        if (!session_path.empty()) {
+            (void)resources_.set_private_ssd_backed(slot, resources_.catalog_slot(slot).id, true);
+        }
         publish_runtime_stats();
         return {tokens, std::move(digest)};
     }
@@ -452,9 +466,14 @@ public:
 
     [[nodiscard]] std::vector<targets::qwen3_6::DurableSharedPrefixCandidate>
     durable_shared_prefix_candidates(const PreparedPrompt& prompt) const {
-        std::scoped_lock lock(execution_mutex_);
+        // Ingress must reach the FIFO while another request executes. A mutex taken by every
+        // decode round can starve an ingress caller until that generation finishes. Discovery
+        // reads immutable prompt/codec data only; residency selection and reservation remain
+        // worker-owned at admission. Health uses the short queue lock and is checked again by
+        // submit, so no live Program access or execution-lock handoff is needed here.
         require_shared_snapshot_engine_healthy();
-        return instance_.program->durable_shared_prefix_candidates(prompt);
+        if (!durable_prefixes_enabled_) { return {}; }
+        return Program::durable_shared_prefix_candidates(prompt);
     }
 
     [[nodiscard]] typename ResourceManagement::DurableRecoveryInspection
@@ -488,6 +507,7 @@ public:
                                                            bool committed) {
         std::scoped_lock lock(execution_mutex_);
         instance_.program->retire_completed_snapshot_sources();
+        publish_memory_summary();
         return committed && resources_.mark_shared_ssd_backed(slot, expected_owner);
     }
 
@@ -591,7 +611,7 @@ private:
                             testing::SharedSnapshotImportStage::BeforeCatalogPublication);
                         checkpoint();
                     },
-                    ssd_backed, reservation_id, model_binding);
+                    ssd_backed, reservation_id);
                 if (adoption_nanoseconds != nullptr) {
                     *adoption_nanoseconds = elapsed_ns(adoption_started, Clock::now());
                 }
@@ -798,6 +818,28 @@ public:
     }
 
 private:
+    [[nodiscard]] MemorySummary collect_memory_summary() const {
+        MemorySummary out                      = instance_.program->memory_summary();
+        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
+        out.kv_capacity_mode                   = resolution.mode;
+        out.kv_capacity_page_groups            = resolution.main_page_groups;
+        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
+        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
+        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
+        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
+        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
+        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
+        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
+        out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        return out;
+    }
+
+    void publish_memory_summary() {
+        const MemorySummary memory = collect_memory_summary();
+        std::lock_guard lock(stats_mutex_);
+        published_memory_ = memory;
+    }
+
     void require_shared_snapshot_engine_healthy() const {
         std::lock_guard lock(queue_mutex_);
         if (stopping_ || failed_) {
@@ -822,7 +864,11 @@ private:
         require_shared_snapshot_engine_healthy();
         try {
             auto result = std::forward<Operation>(operation)();
-            if (publish_on_success) { publish_runtime_stats(); }
+            if (publish_on_success) {
+                publish_runtime_stats();
+            } else {
+                publish_memory_summary();
+            }
             return result;
         } catch (const RequestError& error) {
             // Request-scoped cancellation during checksum/identity validation is an expected
@@ -906,6 +952,7 @@ private:
 
     void clear_slot_session(std::uint32_t slot) noexcept {
         if (slot >= slot_session_paths_.size()) { return; }
+        (void)resources_.set_private_ssd_backed(slot, resources_.catalog_slot(slot).id, false);
         slot_session_paths_[slot].clear();
     }
 
@@ -922,9 +969,10 @@ private:
         if (session_path.empty() || slot >= slot_session_paths_.size()) { return; }
         for (std::size_t other = 0; other < slot_session_paths_.size(); ++other) {
             if (other != slot && slot_session_paths_[other] == session_path) {
-                slot_session_paths_[other].clear();
+                clear_slot_session(static_cast<std::uint32_t>(other));
             }
         }
+        clear_slot_session(slot);
         slot_session_paths_[slot] = std::string(session_path);
     }
 
@@ -1182,6 +1230,7 @@ private:
         const Clock::time_point detail_started = Clock::now();
         std::optional<nvtx::ScopedRange> detail_range;
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
+        const MemorySummary memory = collect_memory_summary();
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
         {
@@ -1207,14 +1256,13 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
-        if (const auto lane = scheduler_.prefill_lane();
-            lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
-            snapshot.prefilling_requests = 1;
-        }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
+            if (slots_[lane]->is_prefilling() && !slots_[lane]->capture_pending) {
+                ++snapshot.prefilling_requests;
+            }
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
@@ -1262,6 +1310,7 @@ private:
         finish_engine_phase(measurement, EngineHostPhase::Maintenance);
         snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
+        published_memory_ = memory;
         published_stats_ = snapshot;
         published_slots_ = std::move(slot_snapshot);
     }
@@ -1559,6 +1608,9 @@ private:
         }
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
+        if (reason != FinishReason::Cancelled) {
+            instance_.loaded->frontend.remember_generation(request->output, request->generated);
+        }
         result.generated_token_ids     = std::move(request->generated);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
@@ -1718,7 +1770,6 @@ private:
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
-            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
@@ -2063,6 +2114,10 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
+        if (progress.processed_prompt_tokens > request->remaining_prefill_tokens) {
+            throw std::logic_error("prefill progress exceeded the admitted uncached suffix");
+        }
+        request->remaining_prefill_tokens -= progress.processed_prompt_tokens;
         Scheduling::consume_service_work(*request, 1);
         if (progress.capture) {
             if (progress.complete || progress.pending) {
@@ -2081,10 +2136,7 @@ private:
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) {
-            scheduler_.clear_prefill_lane(lane);
-            request_admission_check();
-        }
+        request_admission_check();
         request->begin = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
@@ -2092,13 +2144,11 @@ private:
         progress.pending.reset();
     }
 
-    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+    void run_prefill_step(std::uint32_t lane,
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-        const auto prefill_lane = scheduler_.prefill_lane();
-        if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane;
-        const auto request       = slots_[lane];
+        const auto request = slots_[lane];
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
@@ -2113,6 +2163,7 @@ private:
         cumulative_stats_.prefill_seconds_total +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         program_call.finish(progress.timing);
+        scheduler_.observe_prefill_step(slots_, max_concurrency_, lane);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -2204,7 +2255,10 @@ private:
             return true;
         }
         if (materializing_ || instance_.program->has_context_transaction()) { return false; }
-        if (std::none_of(slots_.begin(), slots_.end(),
+        // Unconfigured entries stay null but cannot admit work. Inspecting SSD feasibility
+        // before a configured lane is free can turn temporary active-request pressure into
+        // a permanent root fallback and lose the FIFO head's right to its replacement victim.
+        if (std::none_of(slots_.begin(), slots_.begin() + max_concurrency_,
                          [](const auto& slot) { return slot == nullptr; })) {
             return false;
         }
@@ -2528,8 +2582,9 @@ private:
                     request->queue_wait_recorded = true;
                     slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
+                    request->remaining_prefill_tokens =
+                        control.summary.prompt_tokens - control.summary.reusable_prompt_tokens;
                     materializing_.reset();
-                    scheduler_.set_prefill_lane(lane);
                     request_admission_check();
                     publish_runtime_stats();
                     return AdmissionProgress::ControlProgress;
@@ -2682,6 +2737,11 @@ private:
                 continue;
             }
 
+            if (!scheduler_.can_admit_prefill(slots_, max_concurrency_,
+                                              head->prompt_summary.has_media)) {
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
+            }
             try {
                 ensure_base_plan(head);
             } catch (...) {
@@ -2762,6 +2822,10 @@ private:
             }
 
             for (const std::shared_ptr<Request>& candidate : queued.backfill_candidates()) {
+                if (!scheduler_.can_admit_prefill(slots_, max_concurrency_,
+                                                  candidate->prompt_summary.has_media)) {
+                    continue;
+                }
                 // SSD adoption is a global topology transition and belongs to the selected FIFO
                 // head. A backfill candidate may become head later, but it cannot publish its
                 // staged recovery while an earlier request owns FIFO protection.
@@ -3000,6 +3064,11 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
+                // Completed export pins must retire even when no materialization/capture
+                // transaction is open. Admission and cancellation cannot depend on a Gateway
+                // writer getting back into the Engine after its filesystem work completes.
+                instance_.program->retire_completed_snapshot_sources();
+                resources_.reclaim_superseded(*instance_.program);
                 (void)progress_context_transaction(have_pending);
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
@@ -3032,19 +3101,16 @@ private:
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
-                bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
-                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
-                        throw std::logic_error("prefill owner has no active Engine request");
-                    }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
-                }
+                const auto prefill_lane =
+                    instance_.program->has_context_transaction()
+                        ? std::nullopt
+                        : scheduler_.choose_prefill_lane(slots_, max_concurrency_);
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    !membership.empty(), prefill_lane.has_value(), previous_unit_was_decode);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                    run_prefill_step(cancelled_at_unit_start);
+                    run_prefill_step(*prefill_lane, cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     continue;
                 }
@@ -3080,9 +3146,10 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool context_cache_enabled_;
+    const bool durable_prefixes_enabled_;
     ResourceManagement resources_;
 
-    mutable std::mutex execution_mutex_;
+    mutable ExecutionMutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
@@ -3100,6 +3167,7 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    MemorySummary published_memory_;
     // Auto-save sink installed by the Engine when auto_save_evicted is on; the writer thread
     // that drains it lives in Engine::Impl. Guarded by execution_mutex_.
     std::string eviction_model_binding_;

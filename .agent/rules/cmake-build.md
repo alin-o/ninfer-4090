@@ -7,9 +7,11 @@ description: Use when configuring or building ninfer with CMake and Ninja in thi
 
 The native build dependencies were confirmed by CMake configuration in this
 sandbox: the FFmpeg dev libs (`libavformat`, `libavcodec`, `libavutil`,
-`libswscale`), CUDA (≥ 12.8, at `/usr/local/cuda`), and `libcurl`. This does not
-cover Python test dependencies; see `verification.md` for the canonical gate
-and its prerequisites.
+`libswscale`), CUDA (≥ 12.8, at `/usr/local/cuda`), `libcurl`, and OpenSSL Crypto (≥ 3;
+3.5.5 confirmed on 2026-09-13). Full-payload SHA-256 uses OpenSSL's accelerated implementation;
+native builds need `libssl-dev`, which the Docker build also installs. This does not
+cover Python test dependencies; see `verification.md` for test-scope selection
+and the full suite's prerequisites.
 
 ## Configure and build
 
@@ -30,8 +32,10 @@ default), so the minimum command is:
   `NINFER_BUILD_BENCHMARKS`. `cmake --build` compiles whichever are enabled.
 - Outputs land in `<builddir>/apps/` as `ninfer`, `ninfer-serve`, and
   `ninfer-perplexity`.
-- Use `bash .agent/verify.sh` for the application/test build and test suites.
-  The application-only command above is not the verification gate.
+- Select checks using `verification.md`. Build the affected targets and run
+  focused checks by default; use `bash .agent/verify.sh` when full verification
+  is warranted. An application-only build does not replace relevant behavior
+  checks.
 
 ## Verifying the environment
 

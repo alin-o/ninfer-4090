@@ -39,19 +39,21 @@
 // warm one. Restore degrades gracefully: checkpoints whose StateImage does not fit the state
 // pools, or whose anchor ordinal exceeds the server's configured capacity, are dropped while
 // the endpoint remains mandatory.
+// Version 4 removes rendering/scheduling frontiers from model-input identity and its digests.
+// Earlier versions are rejected instead of mixing the old and new shortlist semantics.
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 constexpr char kSessionSnapshotMagic[8]         = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
-constexpr std::uint32_t kSessionSnapshotVersion = 3;
+constexpr std::uint32_t kSessionSnapshotVersion = 4;
 constexpr char kSharedSnapshotMagic[8]          = {'N', 'I', 'N', 'F', 'S', 'H', 'R', '1'};
-constexpr std::uint32_t kSharedSnapshotVersion  = 1;
+constexpr std::uint32_t kSharedSnapshotVersion  = 2;
 constexpr std::size_t kSharedChecksumBytes      = 32;
 constexpr std::size_t kSharedEnvelopeHeaderBytes =
     sizeof(kSharedSnapshotMagic) + sizeof(std::uint32_t) + 2U * sizeof(std::uint64_t) +
     kSharedChecksumBytes;
-constexpr std::uint32_t kSharedIdentitySchema = 1;
+constexpr std::uint32_t kSharedIdentitySchema = 2;
 
 constexpr std::uint32_t kKvFlagPackedV   = 1U << 0;
 constexpr std::uint32_t kKvFlagRotateK   = 1U << 1;
@@ -357,9 +359,9 @@ std::size_t shared_snapshot_max_bytes(std::uint32_t capacity, std::size_t state_
                                            2U * sizeof(std::uint32_t);
     constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
                                              3U * sizeof(std::uint8_t) + sizeof(std::uint32_t);
-    constexpr std::size_t identity_fixed_bytes = 6U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
+    constexpr std::size_t identity_fixed_bytes = 5U * sizeof(std::uint64_t) + sizeof(std::uint32_t);
     constexpr std::size_t identity_bytes_per_token =
-        sizeof(TokenId) + sizeof(std::uint8_t) + 3U * sizeof(std::int32_t) + sizeof(std::uint32_t);
+        sizeof(TokenId) + sizeof(std::uint8_t) + 3U * sizeof(std::int32_t);
     constexpr std::size_t identity_directory_bytes =
         kSharedChecksumBytes + 3U * sizeof(std::uint64_t);
 
@@ -656,7 +658,6 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
         write_vector(writer, sequence.prefix_identity.position_axis(axis));
     }
     write_vision_items(writer, sequence.prefix_identity.vision_items());
-    write_vector(writer, sequence.prefix_identity.rewrite_execution_frontiers());
     write_vector(writer, sequence.prefix_digests.image());
 
     // Checkpoint directory: rewrite checkpoint, long anchors, and the StateImage table map.
@@ -952,7 +953,7 @@ ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::ui
     const std::uint32_t version = reader.pod<std::uint32_t>();
     if (version < kSessionSnapshotVersion) {
         throw std::invalid_argument(
-            "session snapshot predates the context-cache reconciliation and cannot be restored");
+            "session snapshot uses an obsolete prefix identity format and cannot be restored");
     }
     if (version != kSessionSnapshotVersion) {
         throw std::invalid_argument("session snapshot version is unsupported");
@@ -1043,8 +1044,6 @@ ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::ui
         axis = read_vector<std::int32_t>(reader, session.tokens, "position");
     }
     std::vector<VisionItem> vision_items = read_vision_items(reader, session.tokens);
-    std::vector<std::uint32_t> rewrite_frontiers =
-        read_vector<std::uint32_t>(reader, session.tokens, "rewrite frontier");
     std::vector<std::array<std::uint64_t, 2>> digest_image =
         read_vector<std::array<std::uint64_t, 2>>(
             reader, static_cast<std::size_t>(session.tokens) + 1U, "shortlist digest");
@@ -1259,7 +1258,7 @@ ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::ui
 
         sequence.ledger.assign(ledger.begin(), ledger.end());
         sequence.prefix_identity.restore(std::move(token_types), std::move(positions),
-                                         std::move(vision_items), std::move(rewrite_frontiers));
+                                         std::move(vision_items));
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_digests.restore(std::move(digest_image));
         sequence.prefix_digests.reserve(static_cast<std::size_t>(capacity) + 1ULL);
@@ -1372,10 +1371,9 @@ ProgramImplCore::export_shared_prefix(const SharedPrefixHandle& handle,
 }
 
 std::vector<qwen3_6::DurableSharedPrefixCandidate>
-ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prompt) const {
+ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prompt) {
     std::vector<qwen3_6::DurableSharedPrefixCandidate> candidates;
-    if (!context_cache.enabled || speculative_backend == SpeculativeBackend::DFlash ||
-        !prompt.vision_items.empty() || prompt.token_types.size() != prompt.token_ids.size() ||
+    if (!prompt.vision_items.empty() || prompt.token_types.size() != prompt.token_ids.size() ||
         prompt.positions.size() != 3U * prompt.token_ids.size()) {
         return candidates;
     }
@@ -1407,11 +1405,6 @@ ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prom
                                    .subspan(axis * prompt.token_ids.size(), opportunity.frontier));
         }
         write_vision_items(writer, {});
-        const auto rewrite_end = std::upper_bound(
-            prompt.identity.rewrite_execution_frontiers.begin(),
-            prompt.identity.rewrite_execution_frontiers.end(), opportunity.frontier);
-        write_span(writer, std::span<const std::uint32_t>(
-                               prompt.identity.rewrite_execution_frontiers.begin(), rewrite_end));
         candidates.push_back(qwen3_6::DurableSharedPrefixCandidate{
             .content_digest =
                 frontend_internal::sha256_hex(frontend_internal::sha256(identity_bytes)),
@@ -1449,10 +1442,6 @@ bool ProgramImplCore::durable_shared_prefix_matches(
             std::span<const std::int32_t>(identity->position_axis(axis)).first(candidate.frontier));
     }
     write_vision_items(writer, {});
-    const auto& rewrite_frontiers = identity->rewrite_execution_frontiers();
-    const auto rewrite_end =
-        std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), candidate.frontier);
-    write_span(writer, std::span<const std::uint32_t>(rewrite_frontiers.begin(), rewrite_end));
     return frontend_internal::sha256_hex(frontend_internal::sha256(identity_bytes)) ==
            candidate.content_digest;
 }
@@ -1892,6 +1881,15 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     const SharedPrefixHandle& handle, std::string_view model_binding,
     const qwen3_6::SharedPrefixPersistenceMetadata& metadata,
     const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
+    return begin_shared_prefix_snapshot(handle, model_binding, &metadata, reserve);
+}
+
+// A null metadata pointer selects a transaction-local payload, with no durable envelope.
+// The caller retains the exact in-memory identity; SSD policy applies only to publication.
+qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_shared_prefix_snapshot(
+    const SharedPrefixHandle& handle, std::string_view model_binding,
+    const qwen3_6::SharedPrefixPersistenceMetadata* metadata,
+    const std::function<std::shared_ptr<void>(std::size_t)>& reserve) {
     if (!valid_shared_prefix(handle)) {
         throw std::invalid_argument("shared snapshot source is not catalogued");
     }
@@ -1901,7 +1899,7 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     if (pending_transaction_ || has_context_transaction()) {
         throw std::logic_error("cannot export a shared prefix during a resource transaction");
     }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (metadata && speculative_backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("shared snapshot does not support the DFlash backend");
     }
 
@@ -1912,12 +1910,12 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
         state_store->residency(shared.state) == StateReplicaResidency::None) {
         throw std::logic_error("shared snapshot source is incomplete");
     }
-    validate_durable_metadata(metadata, shared.frontier);
+    if (metadata) { validate_durable_metadata(*metadata, shared.frontier); }
     const auto* identity = shared.identity->prefix_identity();
     if (identity == nullptr || identity->size() < shared.frontier) {
         throw std::logic_error("shared snapshot exact identity is incomplete");
     }
-    if (!identity->vision_items().empty()) {
+    if (metadata && !identity->vision_items().empty()) {
         throw std::invalid_argument("shared snapshot media persistence is not supported");
     }
 
@@ -1985,57 +1983,56 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
         throw std::logic_error("shared snapshot KV coverage is incomplete");
     }
 
-    std::vector<std::uint8_t> identity_bytes;
-    SnapshotWriter identity_writer(identity_bytes);
-    write_span(identity_writer, shared.identity->ledger());
-    write_span(identity_writer,
-               std::span<const std::uint8_t>(identity->token_types()).first(shared.frontier));
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        write_span(
-            identity_writer,
-            std::span<const std::int32_t>(identity->position_axis(axis)).first(shared.frontier));
-    }
-    write_vision_items(identity_writer, {});
-    const auto& rewrite_frontiers = identity->rewrite_execution_frontiers();
-    const auto rewrite_end =
-        std::upper_bound(rewrite_frontiers.begin(), rewrite_frontiers.end(), shared.frontier);
-    write_span(identity_writer,
-               std::span<const std::uint32_t>(rewrite_frontiers.begin(), rewrite_end));
-    const auto identity_digest = frontend_internal::sha256(identity_bytes);
-
     qwen3_6::RetainedSessionSnapshot snapshot;
-    snapshot.tokens         = shared.frontier;
-    snapshot.session_digest = ledger_prefix_digest(shared.identity->ledger());
-    snapshot.content_digest = frontend_internal::sha256_hex(identity_digest);
+    snapshot.tokens = shared.frontier;
     SnapshotWriter writer(snapshot.bytes);
-    writer.bytes(kSharedSnapshotMagic, sizeof(kSharedSnapshotMagic));
-    writer.pod(kSharedSnapshotVersion);
-    const std::size_t total_size_offset = snapshot.bytes.size();
-    writer.pod<std::uint64_t>(0);
-    const std::size_t payload_size_offset = snapshot.bytes.size();
-    writer.pod<std::uint64_t>(0);
-    const std::size_t checksum_offset = snapshot.bytes.size();
-    std::array<std::uint8_t, kSharedChecksumBytes> empty_checksum{};
-    writer.bytes(empty_checksum.data(), empty_checksum.size());
-    if (snapshot.bytes.size() != kSharedEnvelopeHeaderBytes) {
-        throw std::logic_error("shared snapshot envelope geometry changed");
-    }
+    std::size_t total_size_offset   = 0;
+    std::size_t payload_size_offset = 0;
+    std::optional<std::size_t> checksum_offset;
+    if (metadata) {
+        std::vector<std::uint8_t> identity_bytes;
+        SnapshotWriter identity_writer(identity_bytes);
+        write_span(identity_writer, shared.identity->ledger());
+        write_span(identity_writer,
+                   std::span<const std::uint8_t>(identity->token_types()).first(shared.frontier));
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            write_span(identity_writer, std::span<const std::int32_t>(identity->position_axis(axis))
+                                            .first(shared.frontier));
+        }
+        write_vision_items(identity_writer, {});
+        const auto identity_digest = frontend_internal::sha256(identity_bytes);
 
-    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(model_binding.size()));
-    writer.bytes(model_binding.data(), model_binding.size());
-    write_shared_config(writer, config);
-    write_shared_boundary(writer, boundary);
-    writer.pod<std::uint8_t>(static_cast<std::uint8_t>(metadata.evidence));
-    writer.pod(metadata.structural_origins);
-    writer.pod(metadata.structural_role);
-    writer.pod<std::uint8_t>(metadata.ssd_eligible ? 1U : 0U);
-    writer.pod<std::uint8_t>(metadata.first_volatile_token ? 1U : 0U);
-    writer.pod<std::uint32_t>(metadata.first_volatile_token.value_or(0));
-    writer.bytes(identity_digest.data(), identity_digest.size());
-    writer.pod(shared.identity->shortlist_key.digests[0]);
-    writer.pod(shared.identity->shortlist_key.digests[1]);
-    writer.pod<std::uint64_t>(identity_bytes.size());
-    writer.bytes(identity_bytes.data(), identity_bytes.size());
+        snapshot.session_digest = ledger_prefix_digest(shared.identity->ledger());
+        snapshot.content_digest = frontend_internal::sha256_hex(identity_digest);
+        writer.bytes(kSharedSnapshotMagic, sizeof(kSharedSnapshotMagic));
+        writer.pod(kSharedSnapshotVersion);
+        total_size_offset = snapshot.bytes.size();
+        writer.pod<std::uint64_t>(0);
+        payload_size_offset = snapshot.bytes.size();
+        writer.pod<std::uint64_t>(0);
+        checksum_offset = snapshot.bytes.size();
+        std::array<std::uint8_t, kSharedChecksumBytes> empty_checksum{};
+        writer.bytes(empty_checksum.data(), empty_checksum.size());
+        if (snapshot.bytes.size() != kSharedEnvelopeHeaderBytes) {
+            throw std::logic_error("shared snapshot envelope geometry changed");
+        }
+
+        writer.pod<std::uint32_t>(static_cast<std::uint32_t>(model_binding.size()));
+        writer.bytes(model_binding.data(), model_binding.size());
+        write_shared_config(writer, config);
+        write_shared_boundary(writer, boundary);
+        writer.pod<std::uint8_t>(static_cast<std::uint8_t>(metadata->evidence));
+        writer.pod(metadata->structural_origins);
+        writer.pod(metadata->structural_role);
+        writer.pod<std::uint8_t>(metadata->ssd_eligible ? 1U : 0U);
+        writer.pod<std::uint8_t>(metadata->first_volatile_token ? 1U : 0U);
+        writer.pod<std::uint32_t>(metadata->first_volatile_token.value_or(0));
+        writer.bytes(identity_digest.data(), identity_digest.size());
+        writer.pod(shared.identity->shortlist_key.digests[0]);
+        writer.pod(shared.identity->shortlist_key.digests[1]);
+        writer.pod<std::uint64_t>(identity_bytes.size());
+        writer.bytes(identity_bytes.data(), identity_bytes.size());
+    }
 
     const std::size_t state_bytes = state_images->host_layout().image_bytes;
     const std::size_t text_bytes =
@@ -2048,10 +2045,12 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
     if (transfer_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
         throw std::overflow_error("shared snapshot double residency overflows host accounting");
     }
-    const std::uint64_t total_u64   = transfer_bytes;
-    const std::uint64_t payload_u64 = transfer_bytes - kSharedEnvelopeHeaderBytes;
-    std::memcpy(snapshot.bytes.data() + total_size_offset, &total_u64, sizeof(total_u64));
-    std::memcpy(snapshot.bytes.data() + payload_size_offset, &payload_u64, sizeof(payload_u64));
+    if (metadata) {
+        const std::uint64_t total_u64   = transfer_bytes;
+        const std::uint64_t payload_u64 = transfer_bytes - kSharedEnvelopeHeaderBytes;
+        std::memcpy(snapshot.bytes.data() + total_size_offset, &total_u64, sizeof(total_u64));
+        std::memcpy(snapshot.bytes.data() + payload_size_offset, &payload_u64, sizeof(payload_u64));
+    }
 
     if (reserve) {
         snapshot.queue_reservation = reserve(transfer_bytes * 2U);
@@ -2233,9 +2232,11 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_export_shared_prefix(
         if (pending->failure) { std::rethrow_exception(pending->failure); }
         bytes.resize(transfer_bytes);
         std::memcpy(bytes.data(), pending->backing->data(), transfer_bytes);
-        const auto checksum = frontend_internal::sha256(
-            std::span<const std::uint8_t>(bytes).subspan(kSharedEnvelopeHeaderBytes));
-        std::memcpy(bytes.data() + checksum_offset, checksum.data(), checksum.size());
+        if (checksum_offset) {
+            const auto checksum = frontend_internal::sha256(
+                std::span<const std::uint8_t>(bytes).subspan(kSharedEnvelopeHeaderBytes));
+            std::memcpy(bytes.data() + *checksum_offset, checksum.data(), checksum.size());
+        }
     };
     snapshot.settle_transfer = [pending] { pending->settle(); };
     snapshot_source_retirements_.push_back(SnapshotSourceRetirement{
@@ -2380,8 +2381,6 @@ qwen3_6::ValidatedSharedPrefixImport<Variant> ProgramImplCore::parse_shared_pref
         axis = read_vector<std::int32_t>(identity_reader, boundary.frontier, "shared position");
     }
     std::vector<VisionItem> vision_items = read_vision_items(identity_reader, boundary.frontier);
-    std::vector<std::uint32_t> rewrite_frontiers =
-        read_vector<std::uint32_t>(identity_reader, boundary.frontier, "shared rewrite frontier");
     if (identity_reader.remaining() != 0 || ledger.size() != boundary.frontier ||
         token_types.size() != boundary.frontier || positions[0].size() != boundary.frontier ||
         positions[1].size() != boundary.frontier || positions[2].size() != boundary.frontier ||
@@ -2395,8 +2394,7 @@ qwen3_6::ValidatedSharedPrefixImport<Variant> ProgramImplCore::parse_shared_pref
     }
     auto capture_backing    = std::make_shared<PreparedCaptureBacking>();
     capture_backing->ledger = ledger;
-    capture_backing->prefix_identity.restore(std::move(token_types), std::move(positions), {},
-                                             std::move(rewrite_frontiers));
+    capture_backing->prefix_identity.restore(std::move(token_types), std::move(positions), {});
     PreparedPromptData prompt;
     prompt.token_ids   = ledger;
     prompt.token_types = capture_backing->prefix_identity.token_types();
@@ -2404,8 +2402,6 @@ qwen3_6::ValidatedSharedPrefixImport<Variant> ProgramImplCore::parse_shared_pref
         const auto& values = capture_backing->prefix_identity.position_axis(axis);
         prompt.positions.insert(prompt.positions.end(), values.begin(), values.end());
     }
-    prompt.identity.rewrite_execution_frontiers =
-        capture_backing->prefix_identity.rewrite_execution_frontiers();
     PrefixShortlistDigests digests;
     digests.assign(prompt);
     if (digests.at(boundary.frontier) != expected_shortlist) {
@@ -2794,9 +2790,7 @@ ProgramImplCore::private_host_reclamation_observation_for_test(
 qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported, SharedPrefixHandle* replacement,
     runtime::CancellationFlagView cancellation, const std::function<void()>& commit_checkpoint,
-    std::string_view model_binding, const ContinuationHandle* host_private,
-    const SharedPrefixHandle* host_shared,
-    const qwen3_6::SharedPrefixPersistenceMetadata* replacement_metadata,
+    const ContinuationHandle* host_private, const SharedPrefixHandle* host_shared,
     std::shared_ptr<const void> physical_plan) {
     if (replacement == nullptr && host_private == nullptr && host_shared == nullptr) {
         return adopt_shared_prefix_impl(imported, true, commit_checkpoint);
@@ -3023,10 +3017,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     // intact. The imported allocation/copy path remains genuinely fallible after teardown; any
     // exception reconstructs the victim and rewrites the caller-owned capability before it can
     // escape to ResourceManager. This is deliberately not an evict-first failure seam.
-    if (replacement != nullptr && model_binding.empty()) {
-        throw std::invalid_argument("durable replacement requires its model binding");
-    }
-    std::optional<qwen3_6::ValidatedSharedPrefixImport<Variant>> rollback_import;
+    std::shared_ptr<SharedImportBacking> rollback_backing;
     StateReplicaResidency rollback_state_residency = StateReplicaResidency::None;
     std::vector<std::pair<bool, bool>> rollback_text_residency;
     std::vector<std::pair<bool, bool>> rollback_backend_residency;
@@ -3088,15 +3079,28 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
                               rollback_backend_residency, rollback_backend_aliases,
                               RollbackHostPageSource::VictimBackendSnapshot);
         }
-        if (replacement_metadata == nullptr) {
-            throw std::invalid_argument("durable replacement requires victim persistence metadata");
+        auto rollback_snapshot = begin_shared_prefix_snapshot(*replacement, {}, nullptr, {});
+        if (rollback_snapshot.await_transfer) {
+            rollback_snapshot.await_transfer(rollback_snapshot.bytes);
         }
-        qwen3_6::RetainedSessionSnapshot rollback_snapshot =
-            export_shared_prefix(*replacement, model_binding, *replacement_metadata);
-        auto rollback_bytes =
-            std::make_shared<const std::vector<std::uint8_t>>(std::move(rollback_snapshot.bytes));
-        rollback_import.emplace(
-            parse_shared_prefix(*rollback_bytes, model_binding, {}, rollback_bytes));
+        retire_ready_snapshot_sources();
+        rollback_backing                = std::make_shared<SharedImportBacking>();
+        rollback_backing->owned_storage = std::move(rollback_snapshot.bytes);
+        rollback_backing->identity      = original.identity;
+        rollback_backing->boundary      = SharedSnapshotBoundary{
+                 .frontier          = original.frontier,
+                 .backend_frontier  = original.backend_frontier,
+                 .rope_delta        = original.rope_delta,
+                 .tail_hidden_valid = static_cast<std::uint8_t>(original.tail_hidden_valid),
+                 .rebuild_work      = original.rebuild_work,
+                 .text_pages        = kv_pages_for_frontier(original.frontier),
+                 .backend_pages     = kv_pages_for_frontier(original.backend_frontier),
+        };
+        rollback_backing->text_offset    = state_images->host_layout().image_bytes;
+        rollback_backing->backend_offset = checked_snapshot_sum(
+            rollback_backing->text_offset,
+            static_cast<std::size_t>(rollback_backing->boundary.text_pages) *
+                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()).page_stride);
     }
     if (!plan->reclaimed_private_checkpoints.empty()) {
         if (host_private == nullptr || !plan->reclaimed_private_state) {
@@ -3222,19 +3226,16 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     } catch (...) {
         const std::exception_ptr failure = std::current_exception();
         try {
-            std::shared_ptr<const SharedImportBacking> rollback_backing;
             std::optional<StateImageHandle> restored_state;
             std::optional<StateImageTransfer> restored_state_transfer;
             std::optional<KVAddressSpaceHandle> restored_text;
             std::optional<KVAddressSpaceHandle> restored_backend;
-            if (rollback_import) {
+            if (rollback_backing) {
                 if (!rollback_shared_index || !replacement) {
                     throw std::logic_error("durable rollback lost its publication slot");
                 }
-                rollback_backing = std::static_pointer_cast<const SharedImportBacking>(
-                    ContractAccess::implementation(*rollback_import));
-                if (!rollback_backing || shared_prefix_slots[*rollback_shared_index].role !=
-                                             SharedPrefixSlotRole::Free) {
+                if (shared_prefix_slots[*rollback_shared_index].role !=
+                    SharedPrefixSlotRole::Free) {
                     throw std::logic_error("durable rollback slot is unavailable");
                 }
                 const qwen3_6::HostStateImageConstView state_view{
@@ -3417,7 +3418,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
 
             if (private_rollback.detached) {
                 std::optional<StateImageHandle> private_state;
-                if (private_rollback.shared_state_alias && rollback_import && restored_state) {
+                if (private_rollback.shared_state_alias && rollback_backing && restored_state) {
                     private_state = *restored_state;
                 } else {
                     private_state = state_store->adopt_host_image(qwen3_6::HostStateImageConstView{

@@ -5,7 +5,7 @@ FROM carapa-llama-cpp:latest AS build
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ccache \
+    && apt-get install --yes --no-install-recommends ccache libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set to 1 to disable parallel CUDA optimization passes.
@@ -50,6 +50,7 @@ RUN apt-get update \
     libavformat62 \
     libavutil60 \
     libcurl4t64 \
+    libssl3t64 \
     libswscale9 \
     && rm -rf /var/lib/apt/lists/*
 

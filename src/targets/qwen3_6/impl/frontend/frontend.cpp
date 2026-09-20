@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/generated_history.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
@@ -1092,6 +1093,7 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
+    mutable fi::GeneratedHistory generated_history;
 };
 
 class OutputSession::Impl {
@@ -1128,6 +1130,7 @@ public:
     SemanticThinkingState preview_semantic;
     PublishedOutput preview_output;
     fi::ToolCallOutputDecoder tool_call_output;
+    std::shared_ptr<const fi::GeneratedHistorySource> generated_history_source;
     std::vector<GeneratedToolCall> tool_calls;
     bool preview_ready = false;
 };
@@ -1603,8 +1606,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
-        result.identity.rewrite_execution_frontiers =
-            std::move(processed.rewrite_execution_frontiers);
+        result.prefill_execution_frontiers = std::move(processed.rewrite_execution_frontiers);
         message_boundaries    = std::move(processed.message_boundaries);
         cache_boundaries      = std::move(processed.cache_boundaries);
         structural_boundaries = std::move(processed.structural_boundaries);
@@ -1614,18 +1616,22 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
-            *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
+            *impl_->tokenizer, rendered, impl_->generated_history.tokenization_limit(
+                                            rendered, cache_hints.session_key, impl_->max_context));
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
+        result.generated_history_source = impl_->generated_history.prepare(
+            *impl_->tokenizer, rendered, encoded, message_roles, cache_hints.session_key);
+        // Preserved generation can use more tokens than canonical BPE for the same bytes.
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
         }
+        fi::check_preparation_control(control, "generated history");
         result.token_ids = std::move(encoded.input_ids);
         if (options.capture_rendered_text) { result.rendered_text = std::move(rendered.text); }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
-        result.identity.rewrite_execution_frontiers =
-            std::move(encoded.rewrite_execution_frontiers);
+        result.prefill_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
         message_boundaries    = std::move(encoded.message_boundaries);
         cache_boundaries      = std::move(encoded.cache_boundaries);
         structural_boundaries = std::move(encoded.structural_boundaries);
@@ -1645,9 +1651,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // A retained State image is numerically tied to the GDN chunk decomposition that produced
     // it. Make every interior cache opportunity an execution boundary even when this request
     // disables reuse or policy declines the capture. These boundaries are request-local: a later
-    // chat envelope can expose a new structural opportunity inside tokens that were already
-    // decoded by the retained continuation, so they must not become durable prefix identity.
-    result.prefill_execution_frontiers = result.identity.rewrite_execution_frontiers;
+    // chat envelope can expose new rendering or structural boundaries inside tokens that were
+    // already decoded by the retained continuation. Neither kind is durable prefix identity.
     auto& execution_frontiers          = result.prefill_execution_frontiers;
     execution_frontiers.reserve(execution_frontiers.size() +
                                 result.context_cache.opportunities.size() +
@@ -1686,10 +1691,14 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
+        std::vector<ChatRole> roles;
+        for (const auto& message : messages) { roles.push_back(message.role); }
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
-        const std::uint32_t count = checked_token_count(
-            fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids.size());
+        auto encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        (void)impl_->generated_history.prepare(*impl_->tokenizer, rendered, encoded, roles,
+                                               input.context_cache.session_key);
+        const auto count = checked_token_count(encoded.input_ids.size());
         fi::check_preparation_control(control, "tokenization");
         return count;
     }
@@ -1763,9 +1772,19 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(std::make_unique<OutputSession::Impl>(
+    auto session = std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output);
+    session->generated_history_source = prompt.data_->generated_history_source;
+    return OutputSession(std::move(session));
+}
+
+void Frontend::remember_generation(OutputSession& output,
+                                    std::span<const TokenId> generated) const noexcept {
+    if (output.impl_) {
+        impl_->generated_history.remember(
+            *impl_->tokenizer, std::move(output.impl_->generated_history_source), generated);
+    }
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

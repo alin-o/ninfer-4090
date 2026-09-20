@@ -148,6 +148,8 @@ public:
                         const OutputOptions& output            = {},
                         const ThinkingControlOptions& thinking = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    // Engine calls this only for completed, non-cancelled generation, before publishing its result.
+    void remember_generation(OutputSession& output, std::span<const TokenId> generated) const noexcept;
 
 private:
     class Impl;

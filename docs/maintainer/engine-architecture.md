@@ -87,6 +87,18 @@ Frontend 拥有模型家族的输入与输出语义：
 Frontend 可以预览一次模型输出将产生的语义效果，但只有 Engine 完成提交后才能发布该效果。
 Frontend 不拥有等待队列、cache catalog 或物理模型状态。
 
+For text-only chat, Frontend also owns a bounded immutable generated-token history (64 MiB,
+128 completed records). Engine publishes it through `remember_generation` at successful,
+non-cancelled completion. `OutputSession` keeps the source proof alive after Program consumes the
+prepared prompt and serving moves its rendered log text. History is independent of ResourceManager
+and GPU residency; no State/KV identity comparison is weakened. Preparation verifies the canonical
+source tokens, exact rendered prefix, assistant role, special-token byte positions, and explicit
+session namespace, then resolves the original token sequence before rebuilding positions and cache
+frontiers. Non-exact optional frontiers are dropped; a crossing volatile boundary moves backward.
+Token counting uses the same resolution. New records include previously preserved choices, so
+removing an older record cannot change a retained descendant. Retention is process-local and absent
+from snapshots; media and raw-token inputs bypass this text-history resolution.
+
 ### 2.3 Engine
 
 Engine 是请求控制平面，拥有：
@@ -134,7 +146,7 @@ Program 不维护 FIFO、SessionIndex、cache retention 价值或用户可见输
 Scheduler 维护：
 
 - 当前 FIFO head；
-- staged-prefill owner；
+- 每个 admitted prefill 的剩余 suffix 与等待轮数；
 - admission、prefill 与 decode 的公平门；
 - 每轮紧凑执行成员；
 - blocked head 的 backfill protection。
@@ -237,6 +249,28 @@ release_capacity =
 两者可以任意先后，但 capacity 只释放一次。请求句柄被放弃只设置 cancellation 和
 `consumer_released`，不会从 consumer thread 调用 Program。
 
+Durable-prefix candidate discovery before submission reads only immutable prepared-prompt data
+through the target's static codec operation. It must not acquire the execution mutex or inspect a
+live Program: a worker repeatedly decoding can otherwise starve ingress before the request enters
+the FIFO. Engine applies fixed cache/backend eligibility and checks health under the queue mutex;
+submission checks health again. Candidate discovery establishes exact identity only. Warm/SSD
+selection, capacity inspection, reservation and adoption remain worker-owned at FIFO admission.
+Deferred recovery waits for a free configured lane; unused entries in the fixed-capacity lane
+array are not available execution capacity. Active-request pressure must not prematurely seal a
+root fallback while the FIFO head is waiting for its lane.
+
+Generation Engine memory accounting is published with runtime/slot observations at complete
+execution boundaries and initialized before the worker starts. Request logging reads that snapshot
+under the observation mutex, so recording request start or completion cannot wait behind another
+request's decode. Synchronous resource mutations and peak resets also refresh the memory snapshot;
+committed checkpoint lifecycle facts retain their operation-owned accounting.
+
+Execution-boundary locking serves queued callers in arrival order so a worker cannot repeatedly
+reacquire ahead of an export settlement or control call. This serializes physical mutations without
+changing Scheduler request ordering. The worker also polls completed snapshot-source retirements
+at every boundary, including when no context transaction is open; releasing completed transfer pins
+does not wait for filesystem publication or add a blanket execution-stream wait.
+
 ### 4.4 Continuation 与 session
 
 Active continuation 是可写的模型状态；published checkpoint 是不可变的可复用状态。一个可复用
@@ -298,13 +332,18 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 
 Scheduler 保证：
 
-- 同时最多一个 staged-prefill request；
+- text-only requests 可在 chunk 边界 admission，并交替推进各自的 staged prefill；
+- 优先运行剩余 uncached suffix 最短的 request；等待达到 `max_concurrency` 个 prefill units 后，
+  按等待轮数优先服务，避免长 prompt 饥饿；
+- 每次只执行一个 prefill chunk；Vision prefill 独占 staging，直到其 handoff lifetime 结束；
+- context transaction 未完成时不启动新的 prefill unit；
 - 已有 decode work 不会被连续 prefill 饿死；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 
 Program 接收紧凑的 `SequenceHandle[B]` 和每行预算。Prefix reuse 只减少 materialization 或 suffix
-prefill，不创建另一条调度路径。
+prefill，不创建另一条调度路径。每个 prefill unit 重新绑定所选 sequence 的 Main/MTP KV row
+controls；DFlash 的 ingress 同样在该 unit 重新发布，不能继承上次 admission 或其他 request 的值。
 
 ### 5.4 Admission invalidation
 
@@ -312,7 +351,7 @@ prefill，不创建另一条调度路径。
 
 - waiting queue 或 FIFO head 变化；
 - lane 释放；
-- staged-prefill gate 变化；
+- prefill 完成或取消，释放 Vision staging gate；
 - resource transition 到达终态；
 - Program 的全局资源 revision 变化。
 

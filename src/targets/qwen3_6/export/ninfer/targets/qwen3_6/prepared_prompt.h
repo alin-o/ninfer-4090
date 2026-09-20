@@ -15,6 +15,7 @@ namespace ninfer::targets::qwen3_6 {
 
 namespace frontend_internal {
 struct ToolCallOutputContract;
+struct GeneratedHistorySource;
 }
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
@@ -83,9 +84,6 @@ struct RewriteCheckpointSpec {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
-    // Exact token frontiers at which this serialization can agree with a typed rewrite captured
-    // by an earlier turn. These are durable prefix-identity facts, not capture requests.
-    std::vector<std::uint32_t> rewrite_execution_frontiers;
 };
 
 inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
@@ -169,6 +167,7 @@ struct PrepareStats {
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::string rendered_text;
+    std::shared_ptr<const frontend_internal::GeneratedHistorySource> generated_history_source;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
@@ -176,10 +175,9 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
-    // Request-local prefill boundaries include the durable rewrite identity above plus interior
-    // cache opportunities. Keeping them outside PromptIdentity makes cold and cache-participating
-    // execution use the same GDN decomposition without making an envelope-local opportunity a
-    // durable continuation-identity requirement.
+    // Request-local prefill boundaries include assistant rendering and cache opportunities.
+    // They keep cold and cache-participating prefill scheduling aligned, but are not model-input
+    // identity: replaying generated text can introduce a boundary inside a valid continuation.
     std::vector<std::uint32_t> prefill_execution_frontiers;
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;

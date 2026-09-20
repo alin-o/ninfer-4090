@@ -180,9 +180,10 @@ PressurePlanningSession<Variant>::root_maximal_target(runtime::PlanningCandidate
 template <>
 std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_closure_target(
     runtime::PlanningCandidateId candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const runtime::PlanningOwnerId> conversation_head_ids) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->guided_closure_target(candidate, preferred_owner_ids);
+    return impl_->guided_closure_target(candidate, preferred_owner_ids, conversation_head_ids);
 }
 
 template <>
@@ -543,8 +544,9 @@ AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) n
 
 template <>
 ReleaseResult<Variant>
-Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation) noexcept {
-    return impl_->release_continuation(std::move(continuation));
+Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation,
+                                      bool wait_for_exports) noexcept {
+    return impl_->release_continuation(std::move(continuation), wait_for_exports);
 }
 
 template <>
@@ -644,8 +646,9 @@ RetainedSessionSnapshot Program<Variant>::begin_export_shared_prefix(
 
 template <>
 std::vector<DurableSharedPrefixCandidate>
-Program<Variant>::durable_shared_prefix_candidates(const PreparedPrompt& prompt) const {
-    return impl_->durable_shared_prefix_candidates(PreparedPromptAccess::view(prompt));
+Program<Variant>::durable_shared_prefix_candidates(const PreparedPrompt& prompt) {
+    return detail::ProgramImpl<Variant>::durable_shared_prefix_candidates(
+        PreparedPromptAccess::view(prompt));
 }
 
 template <>
@@ -713,16 +716,13 @@ template <>
 SharedPrefixPublication<Variant> Program<Variant>::adopt_shared_prefix(
     const ValidatedSharedPrefixImport<Variant>& imported, SharedPrefixHandle<Variant>* replacement,
     runtime::CancellationFlagView cancellation, const std::function<void()>& commit_checkpoint,
-    std::string_view model_binding, const ContinuationHandle<Variant>* host_private,
-    const SharedPrefixHandle<Variant>* host_shared,
-    const SharedPrefixPersistenceMetadata* replacement_metadata,
+    const ContinuationHandle<Variant>* host_private, const SharedPrefixHandle<Variant>* host_shared,
     std::shared_ptr<const void> physical_plan) {
     if (imported.validating_program_ != shared_import_identity_) {
         throw std::invalid_argument("validated shared import belongs to a different Program");
     }
     return impl_->adopt_shared_prefix(imported, replacement, cancellation, commit_checkpoint,
-                                      model_binding, host_private, host_shared,
-                                      replacement_metadata, std::move(physical_plan));
+                                      host_private, host_shared, std::move(physical_plan));
 }
 
 template <>

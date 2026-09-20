@@ -327,15 +327,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             previous = frontier;
         }
     };
-    validate_execution_frontiers(prompt.identity.rewrite_execution_frontiers,
-                                 "rewrite execution frontiers");
     validate_execution_frontiers(prompt.prefill_execution_frontiers, "prefill execution frontiers");
-    if (!std::includes(prompt.prefill_execution_frontiers.begin(),
-                       prompt.prefill_execution_frontiers.end(),
-                       prompt.identity.rewrite_execution_frontiers.begin(),
-                       prompt.identity.rewrite_execution_frontiers.end())) {
-        throw std::invalid_argument("prefill execution frontiers omit a rewrite boundary");
-    }
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
@@ -641,6 +633,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                     continue;
                 }
                 unique.push_back(state);
+                // Aliased checkpoint state remains shared occupancy until the complete
+                // pressure target removes its last external owner.
+                if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
                     residency == StateReplicaResidency::Both) {

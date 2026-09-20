@@ -694,12 +694,13 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
     // A pending auto-save of the same path must not land after this explicit save.
     impl_->drain_writes();
     const std::string binding                          = slot_model_binding(impl_->load);
+    std::uint64_t saved_owner                          = 0;
     targets::qwen3_6::RetainedSessionSnapshot snapshot = std::visit(
         [&](auto& core) -> targets::qwen3_6::RetainedSessionSnapshot {
             if constexpr (requires {
                               core->save_retained_lane(lane, binding, expected_digest, path);
                           }) {
-                return core->save_retained_lane(lane, binding, expected_digest, path);
+                return core->save_retained_lane(lane, binding, expected_digest, path, &saved_owner);
             } else {
                 throw std::logic_error("session persistence requires a generation Engine");
             }
@@ -707,6 +708,13 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
         impl_->core);
 
     Impl::write_snapshot_file(path, snapshot.bytes);
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->complete_retained_save(lane, saved_owner, path); }) {
+                core->complete_retained_save(lane, saved_owner, path);
+            }
+        },
+        impl_->core);
     if (impl_->auto_save_writer) {
         impl_->auto_save_writer->note_authoritative(path, snapshot.tokens);
     }
@@ -1076,6 +1084,21 @@ runtime::DurableSharedSnapshotAccess::begin_exports(
         }
     }
     return exports;
+}
+
+void runtime::testing::SharedSnapshotTestAccess::with_execution_lock(
+    Engine& engine, const std::function<void()>& callback) {
+    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& core) {
+            if constexpr (requires { core->execution_mutex_; }) {
+                std::scoped_lock lock(core->execution_mutex_);
+                callback();
+            } else {
+                throw std::logic_error("shared snapshots require a generation Engine");
+            }
+        },
+        engine.impl_->core);
 }
 
 std::pair<std::uint32_t, targets::qwen3_6::RetainedSessionSnapshot>

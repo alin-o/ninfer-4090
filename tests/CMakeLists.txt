@@ -107,6 +107,9 @@ set_tests_properties(
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
+ninfer_add_test(ninfer_qwen3_6_digest_test
+  SOURCES targets/qwen3_6/test_digest.cpp
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_qwen3_6_frontend_test
   SOURCES targets/qwen3_6/test_frontend.cpp
   NEEDS_SOURCE_DIR
@@ -156,6 +159,7 @@ ninfer_add_test(ninfer_openai_cache_real_test
   LIBRARIES ninfer_serve spdlog::spdlog CUDA::cudart)
 target_include_directories(ninfer_openai_cache_real_test PRIVATE
   ${PROJECT_BINARY_DIR}/generated
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 set_tests_properties(ninfer_openai_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME ninfer_qwen3_8_service_ssd_replacement_test
@@ -163,6 +167,11 @@ add_test(NAME ninfer_qwen3_8_service_ssd_replacement_test
           $<TARGET_FILE:ninfer_openai_cache_real_test>)
 set_tests_properties(ninfer_qwen3_8_service_ssd_replacement_test
   PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_8_concurrent_ingress_test
+  COMMAND ${CMAKE_COMMAND} -E env NINFER_OPENAI_CACHE_SCENARIO=concurrent-ingress
+          $<TARGET_FILE:ninfer_openai_cache_real_test>)
+set_tests_properties(ninfer_qwen3_8_concurrent_ingress_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)

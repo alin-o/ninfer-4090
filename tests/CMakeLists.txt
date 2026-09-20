@@ -162,6 +162,10 @@ target_include_directories(ninfer_openai_cache_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 set_tests_properties(ninfer_openai_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_http_engine_failure_test
+  COMMAND ${CMAKE_COMMAND} -E env NINFER_OPENAI_CACHE_SCENARIO=engine-failure-shutdown
+          $<TARGET_FILE:ninfer_openai_cache_real_test>)
+set_tests_properties(ninfer_http_engine_failure_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_test(NAME ninfer_qwen3_8_service_ssd_replacement_test
   COMMAND ${CMAKE_COMMAND} -E env NINFER_OPENAI_CACHE_SCENARIO=service-ssd-replacement
           $<TARGET_FILE:ninfer_openai_cache_real_test>)

@@ -49,7 +49,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | engine health; returns 503 after a fatal engine failure |
 | `GET /v1/models` | configured OpenAI model name and `default` alias, with effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of either model name and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -62,6 +62,14 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
+
+A fatal Engine failure permanently disables inference. The server checks Engine health every
+250 ms, stops accepting HTTP connections, and exits with status 1 so its supervisor can restart
+it. This check remains enabled with `--log-stats-interval-ms 0`; ordinary request errors,
+cancellations, and queue timeouts do not trigger it. Run the container with
+`--restart unless-stopped` (without `--rm`) to reload the model automatically after such an exit.
+In-memory Responses and private continuations are lost on restart; durable shared prefixes remain
+available in the configured cache directory.
 
 ### Durable shared-prefix persistence
 

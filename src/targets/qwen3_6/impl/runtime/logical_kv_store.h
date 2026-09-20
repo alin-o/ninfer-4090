@@ -1590,7 +1590,11 @@ public:
         if (target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
-            if (!pages_->can_destructive_truncate(membership(address, target - 1U), columns)) {
+            const LogicalKVPageHandle tail = membership(address, target - 1U);
+            // Dropping a private suffix may leave a shared or Host-backed boundary page.
+            // It needs exclusive ownership only when its committed coverage actually changes.
+            if (columns != pages_->committed_columns(tail) &&
+                !pages_->can_destructive_truncate(tail, columns)) {
                 throw std::logic_error("KV truncate would overwrite protected coverage");
             }
         }
@@ -1604,7 +1608,10 @@ public:
         if (target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
-            pages_->destructive_truncate(membership(address, target - 1U), columns);
+            const LogicalKVPageHandle tail = membership(address, target - 1U);
+            if (columns != pages_->committed_columns(tail)) {
+                pages_->destructive_truncate(tail, columns);
+            }
         }
         address.committed_frontier = frontier;
     }

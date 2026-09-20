@@ -413,8 +413,6 @@ void test_kv_store(ninfer::DeviceContext& device) {
                                   remaining_restore_destination, device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[1]);
-    expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
-           "KV Host extent releases only after both restored replicas are resident");
     auto activation = addresses.prepare_activation(*address, 3, 1);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2 &&
                physical_pages.reserved_pages() == 1,
@@ -423,6 +421,18 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(pages.active_address_references(logical_pages[0]) == 1 &&
                pages.active_address_references(logical_pages[1]) == 1,
            "KV reactivation republishes logical-page active references");
+    const auto restored_tail_epoch = pages.content_epoch(logical_pages[1]);
+    addresses.materialize_to_tokens(*address, 129, device.stream);
+    device.synchronize();
+    addresses.destructive_truncate(*address, 65);
+    expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
+               addresses.committed_frontier(*address) == 65 &&
+               pages.content_epoch(logical_pages[1]) == restored_tail_epoch &&
+               pages.host_replica_current(logical_pages[1]) &&
+               host_arena.occupied_bytes() == 2U * host_layout.page_stride,
+           "same-frontier active trim preserves the restored tail and its Host replica");
+    expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
+           "KV Host extent releases only after both restored replicas are resident");
     addresses.destructive_truncate(*address, 32);
     expect(addresses.mapped_pages(*address) == 1 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 32 &&
@@ -633,6 +643,25 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(branch_two_tail != shared_tail && branch_two_tail != branch_one_tail &&
                pages.address_references(shared_full) == 3,
            "independent shared branches own distinct partial tails and one shared full page");
+    const auto shared_epoch = pages.content_epoch(shared_full);
+    addresses.materialize_to_tokens(*branch_two, 129, device.stream);
+    device.synchronize();
+    addresses.destructive_truncate(*branch_two, 64);
+    expect(addresses.mapped_pages(*branch_two) == 1 &&
+               addresses.committed_frontier(*branch_two) == 64 &&
+               addresses.entitlement(*branch_two) == 3 &&
+               pages.content_epoch(shared_full) == shared_epoch &&
+               pages.committed_columns(shared_full) == 64 &&
+               pages.protected_columns(shared_full) == 64 &&
+               pages.address_references(shared_full) == 3,
+           "active trim to a shared page boundary preserves the retained checkpoint");
+    bool protected_trim_rejected = false;
+    try {
+        addresses.destructive_truncate(*branch_two, 63);
+    } catch (const std::logic_error&) { protected_trim_rejected = true; }
+    expect(protected_trim_rejected && addresses.committed_frontier(*branch_two) == 64 &&
+               pages.content_epoch(shared_full) == shared_epoch,
+           "active trim still refuses to change shared protected coverage");
     addresses.deactivate(*branch_two);
     expect(addresses.release(*branch_one) && pages.address_references(shared_full) == 2 &&
                addresses.release(*branch_two) && pages.address_references(shared_full) == 1 &&

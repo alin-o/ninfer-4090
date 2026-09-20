@@ -44,6 +44,7 @@ public:
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationService& service);
+    // Returns false on listener failure or a latched Engine failure; the latter also stops HTTP.
     bool listen();
     void stop();
 
@@ -97,8 +98,8 @@ private:
     void record_request_failure(RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
-    void run_stats_reporter();
-    void stop_stats_reporter();
+    void run_monitor();
+    void stop_monitor();
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
@@ -114,10 +115,10 @@ private:
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
-    std::mutex stats_mutex_;
-    std::condition_variable stats_cv_;
-    std::thread stats_thread_;
-    bool stats_stopping_ = false;
+    std::mutex monitor_mutex_;
+    std::condition_variable monitor_cv_;
+    std::thread monitor_thread_;
+    bool monitor_stopping_ = false;
 };
 
 } // namespace ninfer::serve

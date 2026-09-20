@@ -176,6 +176,11 @@ int main(int argc, char** argv) {
 
         const bool ok = server.listen();
         g_server.store(nullptr);
+        if (!service.healthy()) {
+            logger->critical("server status=failed phase=engine detail=\"inference engine is "
+                             "unavailable; exiting for supervisor restart\"");
+            return 1;
+        }
         if (!ok) {
             logger->error("server status=failed phase=listen host={} port={}",
                           ninfer::product::quote_log_value(options.host), options.port);

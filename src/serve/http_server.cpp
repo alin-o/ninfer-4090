@@ -322,18 +322,31 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
     operational_log_.throughput(report);
 }
 
-void HttpServer::run_stats_reporter() {
+void HttpServer::run_monitor() {
     using Clock                     = std::chrono::steady_clock;
     ninfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    Clock::time_point next_report   = previous_time + interval;
 
     for (;;) {
         {
-            std::unique_lock lock(stats_mutex_);
-            if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
+            std::unique_lock lock(monitor_mutex_);
+            const auto health_deadline = Clock::now() + std::chrono::milliseconds(250);
+            const auto deadline = interval.count() == 0 ? health_deadline
+                                                        : std::min(health_deadline, next_report);
+            if (monitor_cv_.wait_until(lock, deadline, [this] { return monitor_stopping_; })) {
+                break;
+            }
         }
 
+        // Engine failure is latched, so waiting for another HTTP request cannot recover it.
+        // Supervise independently of throughput logging, including when it is disabled.
+        if (!service_->healthy()) {
+            server_.stop();
+            break;
+        }
+        if (interval.count() == 0 || Clock::now() < next_report) { continue; }
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
@@ -341,8 +354,10 @@ void HttpServer::run_stats_reporter() {
         if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
         previous_time = now;
+        next_report   = now + interval;
     }
 
+    if (interval.count() == 0) { return; }
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
@@ -350,14 +365,14 @@ void HttpServer::run_stats_reporter() {
     if (report_has_activity(tail)) { record_throughput(tail); }
 }
 
-void HttpServer::stop_stats_reporter() {
-    if (!stats_thread_.joinable()) { return; }
+void HttpServer::stop_monitor() {
+    if (!monitor_thread_.joinable()) { return; }
     {
-        std::lock_guard lock(stats_mutex_);
-        stats_stopping_ = true;
+        std::lock_guard lock(monitor_mutex_);
+        monitor_stopping_ = true;
     }
-    stats_cv_.notify_one();
-    stats_thread_.join();
+    monitor_cv_.notify_one();
+    monitor_thread_.join();
 }
 
 void HttpServer::register_routes() {
@@ -453,9 +468,7 @@ void HttpServer::register_routes() {
             }
         });
 
-    // A latched engine failure is permanent - every request then returns 503 "inference
-    // engine is unavailable" and only a restart recovers - so a hardcoded ok here would
-    // hide exactly the state a supervisor, load balancer or fleet dashboard needs to see.
+    // Report the latched failure during the short interval before the monitor stops HTTP.
     // Before a service is attached the server is still binding ahead of model load, which
     // is healthy by design.
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
@@ -717,16 +730,15 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
-    }
+    if (!service_->healthy()) { return false; }
+    monitor_stopping_ = false;
+    monitor_thread_   = std::thread([this] { run_monitor(); });
     try {
         const bool result = server_.listen_after_bind();
-        stop_stats_reporter();
-        return result;
+        stop_monitor();
+        return result && service_->healthy();
     } catch (...) {
-        stop_stats_reporter();
+        stop_monitor();
         throw;
     }
 }

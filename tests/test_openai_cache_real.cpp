@@ -1678,6 +1678,85 @@ int reserve_loopback_port() {
     return port;
 }
 
+void exercise_http_engine_failure(const char* artifact) {
+    using Access = runtime::testing::SharedSnapshotTestAccess;
+    std::vector<std::uint8_t> bytes;
+    {
+        auto configured = options(artifact);
+        configured.context_cache.device_state_slots = 4;
+        GenerationService publisher(configured);
+        (void)generate(publisher,
+                       "Stable harness " + std::string(1800, 'a') +
+                           "\n=== CACHE_BREAKPOINT ===\nAnswer briefly.",
+                       "Hi", false);
+        (void)settled_stats(publisher, true);
+        auto [slot, snapshot] = Access::export_first_durable(
+            testing::GenerationServiceTestAccess::engine(publisher));
+        (void)slot;
+        snapshot.await_transfer(snapshot.bytes);
+        bytes = std::move(snapshot.bytes);
+        snapshot.release_storage();
+    }
+    for (const std::uint32_t stats_interval : {0U, 60000U}) {
+        auto configured = options(artifact);
+        configured.host = "127.0.0.1";
+        configured.port = reserve_loopback_port();
+        configured.log_stats_interval_ms = stats_interval;
+        configured.context_cache.device_state_slots = 4;
+        std::ostringstream logs;
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(logs);
+        auto logger = std::make_shared<spdlog::logger>("engine-failure-test", sink);
+        GenerationService service(configured, {}, logger);
+        auto& engine = testing::GenerationServiceTestAccess::engine(service);
+
+        HttpServer server(configured, logger);
+        require(server.bind(), "failed to bind engine-failure regression server");
+        server.attach(service);
+        std::promise<bool> stopped;
+        auto result = stopped.get_future();
+        struct Listener {
+            HttpServer& server;
+            std::thread thread;
+            ~Listener() {
+                server.stop();
+                if (thread.joinable()) { thread.join(); }
+            }
+        } listener{server, std::thread([&] {
+                       try { stopped.set_value(server.listen()); }
+                       catch (...) { stopped.set_exception(std::current_exception()); }
+                   })};
+        httplib::Client client(configured.host, configured.port);
+        client.set_read_timeout(5);
+        const auto healthy = client.Get("/health");
+        require(healthy && healthy->status == 200, "healthy engine did not serve HTTP");
+        const auto invalid = client.Post("/v1/chat/completions", "{}", "application/json");
+        require(invalid && invalid->status == 400 && service.healthy() &&
+                    result.wait_for(std::chrono::milliseconds(500)) == std::future_status::timeout,
+                "recoverable request rejection stopped the server");
+
+        struct ImportFailure {
+            runtime::testing::SharedSnapshotImportTestGate gate{
+                .checkpoint = [](void*, runtime::testing::SharedSnapshotImportStage stage) {
+                    if (stage == runtime::testing::SharedSnapshotImportStage::StateAllocated) {
+                        throw std::logic_error("injected fatal engine failure");
+                    }
+                }};
+            ImportFailure() { runtime::testing::install_shared_snapshot_import_gate(&gate); }
+            ~ImportFailure() { runtime::testing::clear_shared_snapshot_import_gate(); }
+        } failure;
+        bool injected = false;
+        try { (void)Access::import(engine, bytes); }
+        catch (const std::logic_error&) { injected = true; }
+        require(injected && !service.healthy(), "fixture did not latch an engine failure");
+        // No health probe or new inference request is needed to shut the listener down.
+        require(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "failed engine left the HTTP listener alive");
+        require(!result.get(), "fatal engine shutdown was reported as successful");
+        require(!client.Get("/health"), "failed engine continued accepting HTTP connections");
+        std::cout << "engine_failure_shutdown stats_interval=" << stats_interval << " ok\n";
+    }
+}
+
 void exercise_http_secret_exclusion(const char* artifact) {
     TemporaryDirectory temporary;
     constexpr std::string_view authorization_secret = "authorization-secret-6cb22c";
@@ -1793,6 +1872,10 @@ int main() {
         return 77;
     }
     try {
+        if (scenario != nullptr && std::string_view(scenario) == "engine-failure-shutdown") {
+            exercise_http_engine_failure(artifact);
+            return 0;
+        }
         if (scenario != nullptr && std::string_view(scenario) == "reasoning-continuation") {
             exercise_generated_reasoning_continuation(artifact);
             return 0;
@@ -1834,6 +1917,7 @@ int main() {
         exercise_ssd_replaces_memory_only_checkpoint(artifact);
         exercise_protocol_content_capture(artifact);
         exercise_http_secret_exclusion(artifact);
+        exercise_http_engine_failure(artifact);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

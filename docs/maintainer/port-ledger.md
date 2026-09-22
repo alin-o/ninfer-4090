@@ -315,6 +315,21 @@ DFlash2 K=3 133.3/111.0 tok/s (code/prose) versus MTP3 122.0/97.5 on the same bu
 collapses prose acceptance to 24%. It also pins the v3 artifact gate to upstream `98dada0e`
 (jinja templates) plus the v3 loader (`4cde7ad0`, `04350ba9`).
 
+### Recommended order after the 2026-09-22 triage
+
+1. Catch-up #4, scoped before merging: upstream `9e163eee` is +41, and its v3 refactor moved 39 of the
+   81 source files this fork changed since `d4929686` (runtime now under `src/models/qwen3_5/`), so it
+   is a re-homing of the runtime delta. Payload = v3 artifact loader + jinja templates (unblocks new
+   users; the download pin is a stopgap). Fold in upstream #297 and #294 if merged. The #9 filter must
+   travel to `program/planning/request_plan.cpp`.
+2. soohl INT8 dense prefill: kernel-bench + temp-0 quality gate (unchanged).
+3. DFlash2 only after the quality gate (greedy text differs from MTP3) and a fit decision (224K no
+   vision or 192K + vision on 24 GB).
+4. Parked: the two #9 robustness follow-ups; gzenz tool-call pair and the UDP structured-JSON port,
+   re-judged against upstream #294/#299 at catch-up #4.
+
+Hand-off for the next session: `ninfer-recon-notes/HANDOFF.md` top (2026-09-22).
+
 ## Inbound sweep 2026-09-12 (all remotes, upstream issues, forks)
 
 Counts vs `rtx4090-port` `1bd56c9a`. Upstream +93 (taken above). The rest, ranked:

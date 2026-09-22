@@ -288,11 +288,15 @@ being watched (fixed the same day). Everything was answered on 2026-09-22 agains
   0 errors, 23 private-endpoint + 3 shared-prefix reuses; `ctest -j1` 109 passed, 11 expected
   skips, 0 failed. Upstream has the same code at
   `src/models/qwen3_5/program/planning/request_plan.cpp` line 613 (filtered loop at 651);
-  report draft in `ninfer-recon-notes/issue9-20260922/upstream-issue-draft.md`, not filed.
+  report draft in `ninfer-recon-notes/issue9-20260922/upstream-issue-draft.md`, not filed. Note
+  that upstream never exercises that loop: automatic long anchors are this fork's feature
+  (`9f63c77b`, 2026-09-02) and no OpenAI or Anthropic request can place an anchor marker
+  upstream, so for them it is a latent defect; the trigger was ours.
   Also merged: the abort path now rethrows the ORIGINAL invariant when an acknowledgement fails
   (`2c046095`), and the entitlement mismatch names both sides and every StateImage (`81b68a20`).
-  NOT deployed: production runs `community-01c22ab6` (PRs #6/#8 on catch-up #3) since
-  2026-09-22 18:14Z and is safe at its `2/1/2` geometry. Open follow-ups, low priority now:
+  DEPLOYED 2026-09-22 18:44Z as `issue9-81b68a20` (binary sha `f2cf00e4`, the gate build;
+  rollback `bin/ninfer-serve.pre-issue9-81b68a20-20260922-1844` = `community-01c22ab6`, the
+  PRs #6/#8 build that served 18:14Z to 18:44Z). Open follow-ups, low priority now:
   an abort after `start_request` consumed the source still asserts on it (needs a
   ResourceManager contract for a source lost on abort), and an empty device pool still surfaces
   as an exception rather than a root fallback. Diagnostic instrumentation (pool tags, core

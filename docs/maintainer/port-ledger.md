@@ -251,6 +251,33 @@ being watched (fixed the same day). Everything was answered on 2026-09-22 agains
 | Issue #1 two times the output of llama.cpp | OPEN | Sampling defaults, effort mapping, `--preserve-thinking`; waiting for request-log lines |
 | Issue #3 thanks | CLOSED | |
 
+### Follow-up results, same day (magnus experiments)
+
+- **Issue #9 root cause: device StateImage exhaustion.** Capacity is `max-concurrency +
+  --device-state-slots` (default extra = concurrency); retained endpoints, up to two automatic long
+  anchors per continuation, and shared prefixes all hold one. With the defaults a single retained
+  tool-call turn exhausts the pool at one lane (`std::bad_alloc` on the first continuation) and the
+  second conversation exhausts it at two lanes (`retained materialization source is unavailable`,
+  thrown from inside `abort_transaction()` at `program_impl.h:5961` when `start_request`'s
+  per-request invariant aborts publication; the abort handler asserts the consume-to-active source
+  is still catalogued, throws out of the catch, masks the real invariant, and the engine latches).
+  Production is safe only because it runs `--max-shared-prefixes 1`: 240/240 requests, 43K contexts
+  under eviction, no failure. Verified workarounds keeping prefix reuse: `--device-state-slots 8`
+  (two lanes) or `4` (one lane), `--auto-long-anchors 0`, or `--max-shared-prefixes 1` (two lanes).
+  The six `inspect_lane` throws discussed on the issue never fire. Deterministic repro: two
+  2K-token tool conversations fail within 30 s (`ninfer-recon-notes/issue9-20260922/`). Branch
+  `fix/materialization-abort-invariant` rethrows the original invariant; the fix proper is (1) an
+  abort path tolerant of a consumed source, (2) an exhausted pool as a root fallback at planning
+  time, (3) StateImage accounting in the planner.
+- **DFlash2 on the 4090** (`dc370fb6295a`, issue #4 closed): loads; MTP3 on it is unchanged
+  (140/107 tok/s code/prose, bit-identical across boots). DFlash2 K=3 does not fit 262K on 24 GB
+  (about 1.0 GiB short with vision, 0.53 GiB without): 224K without vision or 192K with vision,
+  149.8/104.0 tok/s; K=5 190.3/94.2. At temperature 0 DFlash2 does not reproduce MTP3's text and
+  K=3 differs from K=5, so the verify path is not exact on `rk4v4-e8`: quality gate before any
+  default change.
+- PR #8's bug was observed live at 13:42Z (a dropped client mid-generation logged as a response-render
+  500); the merged #6/#8 binary (sha `58ae3ea0`) is built in `ninfer-catchup` and not deployed.
+
 External data worth keeping: the PR #7 thread has a K sweep on a 4090D 48 GB (`xwfl15632`):
 DFlash2 K=3 133.3/111.0 tok/s (code/prose) versus MTP3 122.0/97.5 on the same build, and K=7
 collapses prose acceptance to 24%. It also pins the v3 artifact gate to upstream `98dada0e`

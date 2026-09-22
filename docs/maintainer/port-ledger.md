@@ -274,6 +274,29 @@ being watched (fixed the same day). Everything was answered on 2026-09-22 agains
   entitlement (or `start_sequence`) for host-resident sources, (2) an abort path tolerant of a
   consumed source, (3) an exhausted device pool as a root fallback instead of `bad_alloc` at
   `reserve_destination()`.
+- **Issue #9 FIXED 2026-09-22, merged as `539ccdcd` (tip `81b68a20`).** The entitlement
+  counter above was the symptom; the cause is the admission planner's private-endpoint consume
+  branch in `request_plan_impl.h`, which adds every long anchor of the source to
+  `active_optional_resources` by residency without `state_exclusive_to_sequence`, while the
+  sibling rewrite-restore branch and the actual-side `sequence_exclusive_state_resources` both
+  filter. An anchor image another checkpoint owner also references (instrumented: `refs=2
+  owned=1`) is counted as a slot the sequence does not own; the miscount became visible once the
+  device pool filled and that anchor was demoted to host (`optional_host=1` vs actual 0), and at
+  one lane as `std::bad_alloc` from the state reservation. Fix = one `continue` on the
+  non-exclusive case. Gate on the merged tip: fast geometries (`4/4/2`, `4/1/2` at one lane,
+  `2/1/2`) 14, 15, 18 requests, 0 errors; long run 3 x 43K tokens, two passes, 35 requests,
+  0 errors, 23 private-endpoint + 3 shared-prefix reuses; `ctest -j1` 109 passed, 11 expected
+  skips, 0 failed. Upstream has the same code at
+  `src/models/qwen3_5/program/planning/request_plan.cpp` line 613 (filtered loop at 651);
+  report draft in `ninfer-recon-notes/issue9-20260922/upstream-issue-draft.md`, not filed.
+  Also merged: the abort path now rethrows the ORIGINAL invariant when an acknowledgement fails
+  (`2c046095`), and the entitlement mismatch names both sides and every StateImage (`81b68a20`).
+  NOT deployed: production runs `community-01c22ab6` (PRs #6/#8 on catch-up #3) since
+  2026-09-22 18:14Z and is safe at its `2/1/2` geometry. Open follow-ups, low priority now:
+  an abort after `start_request` consumed the source still asserts on it (needs a
+  ResourceManager contract for a source lost on abort), and an empty device pool still surfaces
+  as an exception rather than a root fallback. Diagnostic instrumentation (pool tags, core
+  `bad_alloc` tags, state dump) kept as `issue9-20260922/diag-instrumentation.patch`.
 - **DFlash2 on the 4090** (`dc370fb6295a`, issue #4 closed): loads; MTP3 on it is unchanged
   (140/107 tok/s code/prose, bit-identical across boots). DFlash2 K=3 does not fit 262K on 24 GB
   (about 1.0 GiB short with vision, 0.53 GiB without): 224K without vision or 192K with vision,

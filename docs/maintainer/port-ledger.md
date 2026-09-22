@@ -233,6 +233,29 @@ Deliberately NOT taken: nothing dropped this time. Upstream PR #211 (the stream-
 membership publish we carry as `e565fe50`) was closed unmerged by its author on 09-10 and master
 still publishes unordered - the patch stays fork-only.
 
+## Community triage 2026-09-22 (issues and PRs opened on this fork)
+
+Six issues and four PRs had accumulated since 2026-08-30 without a reply; the fork was not
+being watched (fixed the same day). Everything was answered on 2026-09-22 against tip `a889ce43`.
+
+| Item | Verdict | Notes |
+|---|---|---|
+| PR #8 cancelled Anthropic stream rendered as a 500 | MERGED | Mirrors the existing `ClientDisconnected` pattern; upstream copy of the file is unchanged, worth offering upstream |
+| PR #6 request accounting from `RequestCapacity::active` | MERGED | Metrics no longer lose accepted work during prepare; `ninfer_serve_metrics_test` passes; `ServeMetrics::active_snapshot` had no other users |
+| PR #10 native Windows (MSVC) build | CHANGES REQUESTED | Linux path untouched; the MSVC `u128` shim is wrong (`!` for `~`, shifts >= 32 treat 64-bit limbs as 32-bit), so `q32_product_ns` returns 0 on Windows and the context-cost model runs blind there. Verified by compiling the emulated branch on GCC |
+| PR #7 DFlash2 for sm_89 (78 commits) | CLOSED, superseded | 77 commits are upstream's DFlash2 series already in catch-up #3; the remaining commit reverts the `kv_storage_is_int8_family` widening in `small_t.cu` (E8 regression) and uses the pre-`d4929686` `post_mixer` signature. Its BM32/C96 SwiGLU tile versus our r64/c80 fallback (`87189c68`) is an open kernel-bench question |
+| Issue #9 engine latches after a stale reuse candidate | OPEN, highest priority | Six invariants in `request_plan_impl.h` throw when a catalogued endpoint frontier disagrees with the live `execution_frontier`; lifts to HTTP 500 and a permanent 503. Both reporters run Claude Code on the Anthropic path; production (OpenAI chat only) has never hit it. Reporter offered a throw-to-logged-skip PR (accepted with logging requirements); gzenz `20213d4b` is a sibling fix plus an admission re-arm. A scripted Anthropic tool-call sequence did not reproduce it at 1.7K tokens |
+| Issue #5 planner 5 ms budget | CLOSED | Superseded by `d4929686` in catch-up #3 (`budget_exhausted` 0 of 129 in the soak) |
+| Issue #4 DFlash2 artifact fails to load | OPEN | The original error is fixed at tip. New problem: Hugging Face `main` is container v3 since 2026-09-15 and the download scripts pointed at it; pinned to `3526913004b1` with SHA-256. The DFlash2 revision `dc370fb6295a` is expected to load but is untested on this 4090 |
+| Issue #2 dual 4090 / 1M | CLOSED | Single GPU by design; YaRN forks named |
+| Issue #1 two times the output of llama.cpp | OPEN | Sampling defaults, effort mapping, `--preserve-thinking`; waiting for request-log lines |
+| Issue #3 thanks | CLOSED | |
+
+External data worth keeping: the PR #7 thread has a K sweep on a 4090D 48 GB (`xwfl15632`):
+DFlash2 K=3 133.3/111.0 tok/s (code/prose) versus MTP3 122.0/97.5 on the same build, and K=7
+collapses prose acceptance to 24%. It also pins the v3 artifact gate to upstream `98dada0e`
+(jinja templates) plus the v3 loader (`4cde7ad0`, `04350ba9`).
+
 ## Inbound sweep 2026-09-12 (all remotes, upstream issues, forks)
 
 Counts vs `rtx4090-port` `1bd56c9a`. Upstream +93 (taken above). The rest, ranked:

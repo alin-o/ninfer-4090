@@ -266,9 +266,14 @@ being watched (fixed the same day). Everything was answered on 2026-09-22 agains
   (two lanes) or `4` (one lane), `--auto-long-anchors 0`, or `--max-shared-prefixes 1` (two lanes).
   The six `inspect_lane` throws discussed on the issue never fire. Deterministic repro: two
   2K-token tool conversations fail within 30 s (`ninfer-recon-notes/issue9-20260922/`). Branch
-  `fix/materialization-abort-invariant` rethrows the original invariant; the fix proper is (1) an
-  abort path tolerant of a consumed source, (2) an exhausted pool as a root fallback at planning
-  time, (3) StateImage accounting in the planner.
+  `fix/materialization-abort-invariant` (pushed) rethrows the original invariant and prints both
+  sides of the mismatch: the invariant is `materialized sequence does not match its active
+  entitlement` at `program_impl.h:7234`, and the only disagreeing field is `host.state_slots`
+  (expected 1, actual 0): once a source's StateImage has been demoted to host, the restore drops the
+  host replica while the planner's `active_entitlement` keeps it. The fix proper is (1) that
+  entitlement (or `start_sequence`) for host-resident sources, (2) an abort path tolerant of a
+  consumed source, (3) an exhausted device pool as a root fallback instead of `bad_alloc` at
+  `reserve_destination()`.
 - **DFlash2 on the 4090** (`dc370fb6295a`, issue #4 closed): loads; MTP3 on it is unchanged
   (140/107 tok/s code/prose, bit-identical across boots). DFlash2 K=3 does not fit 262K on 24 GB
   (about 1.0 GiB short with vision, 0.53 GiB without): 224K without vision or 192K with vision,

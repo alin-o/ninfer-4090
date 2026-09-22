@@ -383,12 +383,19 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 ## Artifact
 
-| Model | Artifact | Size |
-|---|---|---:|
-| Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB |
+| Model | Artifact | Revision | Size | SHA-256 |
+|---|---|---|---:|---|
+| Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `3526913004b1` (2026-08-14, container v2) | 16.96 GiB | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| Qwen3.8-27B + DFlash2 weights | same repository | `dc370fb6295a` (2026-09-06, container v2) | 19.03 GiB | `0634abb07024221de141456cf04a42ab74b18bc38e1b781c6eb2e062a467eec3` |
 
-The artifact is architecture-independent; the model card's RTX 5090 requirement describes the
-upstream engine, not the file. Verify the download against the SHA-256 published on the card.
+The download scripts fetch the pinned `3526913004b1` revision, which is the artifact this fork is
+validated with. The artifact is architecture-independent; the model card's RTX 5090 requirement
+describes the upstream engine, not the file. The `dc370fb6295a` revision adds the DFlash2 draft
+weights and loads on the same engine (`--spec dflash2 --draft-tokens 3` to use them).
+
+**Do not download the `main` revision.** Since 2026-09-15 it is a container-v3 artifact with a
+maintained jinja chat template. This fork reads container v2 only and rejects v3 with
+`artifact magic is not NInfer v2`; v3 support arrives with the next upstream catch-up.
 
 ## Reasoning effort
 

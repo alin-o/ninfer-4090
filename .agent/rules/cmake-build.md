@@ -67,10 +67,10 @@ depend on hook exports surviving. Explicit container `CCACHE_*` overrides still
 take precedence over ccache configuration. Setup rejects symlinked local
 configuration to avoid overwriting provisioned shared files.
 
-The hook disables CMake C++ module scanning because the project has no C++
-modules and the resulting GCC module flags prevent ccache reuse. Other CMake
-build directories retain their existing defaults. Keep source paths, compiler
-options and build-directory layout consistent to maximize cross-checkout hits.
+The hook and Docker build disable CMake C++ module scanning because the project
+has no C++ modules and the resulting GCC module flags prevent ccache reuse.
+Other CMake build directories retain their existing defaults. Keep source paths,
+compiler options and build-directory layout consistent to maximize cross-checkout hits.
 Do not share or copy CMake caches/build directories across worktrees. The first
 cached compilation populates the cache; configuration, linking (including CUDA
 device linking), and tests still run. The default ccache size limit applies.

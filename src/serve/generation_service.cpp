@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/durable_shared_prefix_catalog.h"
+#include "serve/media_budget_recovery.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include "product/media_acquire/acquire.h"
@@ -403,7 +404,18 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        std::size_t omitted_media = 0;
+        ninfer::PreparedPrompt prompt = prepare_with_media_budget_recovery(
+            std::move(input),
+            [&](ninfer::PromptInput attempt) {
+                check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+                return engine_->prepare(std::move(attempt), control);
+            },
+            omitted_media);
+        if (omitted_media != 0 && logger_) {
+            logger_->warn("omitted {} historical media items to fit the request media budget",
+                          omitted_media);
+        }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         if (durable_catalog_ && cache_participation == CacheParticipation::ReadWrite) {
             const DurableSharedPrefixRestore restore = durable_catalog_->stage_matching(
@@ -485,8 +497,14 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             .deadline     = deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        const int prompt_tokens =
-            static_cast<int>(engine_->count_tokens(std::move(input), control));
+        std::size_t omitted_media = 0;
+        const int prompt_tokens = static_cast<int>(prepare_with_media_budget_recovery(
+            std::move(input),
+            [&](ninfer::PromptInput attempt) {
+                check_preparation_control(deadline, is_cancelled);
+                return engine_->count_tokens(std::move(attempt), control);
+            },
+            omitted_media));
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {

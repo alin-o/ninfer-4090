@@ -19,8 +19,9 @@ COPY . .
 # The toolchain stamp forces a clean tree if the base image's compilers move.
 # Cache-mount contents are invisible outside this RUN (COPY --from=build sees
 # only the image filesystem), so the finished binaries are staged to /out.
-RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build \
-    --mount=type=cache,id=ninfer-4090-sm89-ccache,target=/root/.cache/ccache \
+# Disable unused C++ module scanning so GCC compilation stays cacheable.
+RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build,sharing=locked \
+    --mount=type=cache,id=ninfer-4090-sm89-ccache,target=/root/.cache/ccache,sharing=locked \
     set -eux; \
     case "$CUDA_SPLIT_COMPILE" in ''|0*|*[!0-9]*) echo "CUDA_SPLIT_COMPILE must be a positive integer" >&2; exit 1;; esac; \
     export CCACHE_DIR=/root/.cache/ccache; \
@@ -32,6 +33,7 @@ RUN --mount=type=cache,id=ninfer-4090-sm89,target=/build \
     printf '%s' "$toolchain" > /build/.toolchain; \
     cmake -S /src -B /build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
       -DCMAKE_CUDA_FLAGS="--split-compile=${CUDA_SPLIT_COMPILE}" \
       -DNINFER_BUILD_APPS=ON \
       -DBUILD_TESTING=OFF \

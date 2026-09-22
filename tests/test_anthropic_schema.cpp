@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
+#include "serve/media_budget_recovery.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -510,6 +511,24 @@ int test_content_and_cache_hints() {
                           translated.context_cache.markers[1].location ==
                               ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
                       "message-part cache boundary was not represented in PromptInput");
+
+    auto history = translated;
+    history.messages.push_back(history.messages.front());
+    std::size_t omitted = 0;
+    const auto recovered = prepare_with_media_budget_recovery(
+        history,
+        [](ninfer::PromptInput attempt) {
+            if (attempt.messages.front().parts.back().kind == ninfer::MessagePartKind::Media) {
+                throw ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
+                                           "vision raw patches exceed processor budget");
+            }
+            return attempt;
+        },
+        omitted);
+    failures += check(omitted == 1 && recovered.messages.front().parts.front().text == "look" &&
+                          recovered.messages.back().parts.back().kind == ninfer::MessagePartKind::Media &&
+                          recovered.context_cache.markers == history.context_cache.markers,
+                      "media recovery preserves Anthropic text, newest media and cache boundaries");
 
     body                           = base_request();
     body["messages"][0]["content"] = Json::array(

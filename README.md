@@ -109,9 +109,16 @@ full-payload SHA-256. The container installs this dependency.
 Build the image and download the model once:
 
 ```bash
-docker build --tag ninfer-4090:sm89 .
+./build.sh
 NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 ```
+
+`build.sh` uses the sibling `carapa/my-stacks` helper and Docker's integrated
+builder. Images, layers, the Ninja tree and ccache share the Docker store at
+`/mnt/S/.cache/docker/engine`; set `CARAPA_STACKS_DIR` if the checkout is elsewhere.
+There is no registry or cache export. `./build.sh --warm-cache` populates the
+same cache without replacing `ninfer-4090:sm89`. Ordinary builds write directly
+to the local Docker image store and reuse the shared Carapa CUDA layers.
 
 The Docker build enables `--split-compile=2` to parallelize CUDA compiler
 optimization passes without disabling Release optimizations. Override the positive
@@ -217,8 +224,11 @@ docker run --rm --gpus all --publish 8080:8080 \
 The scratchpad bounds the image tokens per request, not the conversation depth:
 a 51K-token conversation with an attached image completes normally. One
 1024x1024 image costs 1026 vision tokens, so the default fits about seven
-maximum-size images per request. The server rejects a request over the limit
-with `media_budget_exceeded` before the request reaches the encoder. For dense
+maximum-size images per request. When conversation history exceeds the limit,
+the server omits older image/video groups and retries, preserving text and the
+newest media-bearing message. If that newest group alone exceeds the budget,
+the server returns `media_budget_exceeded` before the encoder. See
+[media recovery](docs/serving.md) for the shared serving policy. For dense
 video workloads, raise the limit with `--vision-max-tokens`. Each additional
 1024 tokens of scratchpad costs about 62 MiB of VRAM.
 
@@ -377,7 +387,8 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 - **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
   and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
   fork additionally wires the processor media budget to the same limit, so an over-limit
-  request fails as `media_budget_exceeded` instead of reaching an undersized encoder.
+  request triggers historical-media recovery or fails as `media_budget_exceeded`
+  instead of reaching an undersized encoder.
 
 ## Known limits on the RTX 4090
 

@@ -1,4 +1,5 @@
 #include "serve/generation_service.h"
+#include "serve/media_budget_recovery.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
@@ -440,6 +441,32 @@ int test_messages_and_media() {
                           tool_image.messages.back().content[0].kind == ContentKind::Text &&
                           tool_image.messages.back().content[1].kind == ContentKind::Image,
                       "tool result text and image parts normalize to one tool turn");
+
+    body["messages"][0]["content"] = Json::array({
+        Json{{"type", "text"}, {"text", "capture it"}},
+        Json{{"type", "image_url"},
+             {"image_url", Json{{"url", "https://example.test/earlier.png"}}}},
+    });
+    const auto history = parse(body).generation;
+    auto input = to_prompt_input(history, semantics(history), [](const ContentPart& part) {
+        return ninfer::OwnedMedia{.bytes = {1}, .source_name = part.source.value};
+    });
+    std::size_t omitted = 0;
+    const auto recovered = prepare_with_media_budget_recovery(
+        std::move(input),
+        [](ninfer::PromptInput attempt) {
+            if (attempt.messages.front().parts.back().kind == ninfer::MessagePartKind::Media) {
+                throw ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
+                                           "vision raw patches exceed processor budget");
+            }
+            return attempt;
+        },
+        omitted);
+    failures += check(omitted == 1 && recovered.messages.front().parts.front().text == "capture it" &&
+                          recovered.messages.back().tool_call_id == "call_capture" &&
+                          recovered.messages.back().parts.back().media.source_name ==
+                              "https://example.test/capture.png",
+                      "media recovery preserves text and the newest tool-result screenshot");
 
     body["messages"].back()["content"] = Json::array(
         {Json{{"type", "video_url"}, {"video_url", "https://example.test/capture.mp4"}}});

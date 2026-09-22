@@ -374,6 +374,18 @@ not invalidate a request reference, and live bytes are returned only when the fi
 released. A request-level preparation gate derived from the live limit prevents concurrent partial
 builds from deadlocking the memory account.
 
+When Engine preparation rejects a conversation with `media_budget_exceeded`, the shared serving
+service retries before generation, replacing media in the oldest media-bearing message with text
+markers. It repeats only as needed and always keeps the newest media-bearing message intact,
+including all images in a comparison or tool result. Text, reasoning, tool calls/results, and the
+client's saved history are preserved. This applies to Chat Completions, Responses (including
+reconstructed continuations), Anthropic Messages, and token counting without client changes.
+The model sees where earlier images/videos were omitted; the server logs the omitted item count.
+Prefix reuse is resolved against the rewritten prompt, so pruning may require a fresh prefill.
+This policy handles Engine media budgets; acquisition failures and the raw HTTP body limit still
+reject the request. If the newest media-bearing message alone exceeds the budget, the request
+still returns `media_budget_exceeded`; reduce that message's image count or resolution.
+
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
 the prepared token count and configured context ceiling. A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request

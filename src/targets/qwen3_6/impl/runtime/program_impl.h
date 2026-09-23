@@ -9667,12 +9667,12 @@ bool ProgramImplCore::persistent_backfill_safe(
 
 qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
+    const std::uint32_t reserved_state    = state_store ? state_store->reserved() : 0U;
     return qwen3_6::PhysicalUsageSnapshot{
         .resource_revision            = resource_revision_,
         .logical_state_capacity_slots = state_store ? state_store->capacity() : 0U,
-        .logical_state_used_slots =
-            state_store ? state_store->occupied() - state_store->reserved() : 0U,
-        .logical_state_reserved_slots = state_store ? state_store->reserved() : 0U,
+        .logical_state_used_slots     = state_store ? state_store->occupied() - reserved_state : 0U,
+        .logical_state_reserved_slots = reserved_state,
         .logical_state_inflight_slots = state_store ? state_store->in_flight() : 0U,
         .device_state_slots           = usage.device.state_slots,
         .host_state_slots             = usage.host.state_slots,

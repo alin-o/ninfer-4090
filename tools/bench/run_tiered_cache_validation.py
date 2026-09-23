@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import json
 import os
 import subprocess
 import sys
@@ -17,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if __package__ in {None, ""}:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.bench.tiered_cache_replay import sha256_file
+from tools.bench.tiered_cache_replay import sha256_file, source_identity, write_json
 from tools.artifact.container import Artifact, ResourceObject
 from tools.convert.qwen3_8_27b.convert import OFFICIAL_RESOURCE_SHA256
 
@@ -108,57 +107,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         frontend_identity = artifact_frontend_identity(weights)
     except (KeyError, OSError, ValueError) as error:
         parser.error(str(error))
+
+    executable_hashes: dict[Path, str] = {}
+
+    def executable_sha256(executable: Path) -> str:
+        if executable not in executable_hashes:
+            executable_hashes[executable] = sha256_file(executable)
+        return executable_hashes[executable]
+
+    def run_case(name: str, executable: Path, env: dict[str, str] | None = None) -> str:
+        command = [str(executable)]
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=args.timeout_seconds,
+            check=False,
+        )
+        log = log_root / f"{name}.log"
+        log.write_text(result.stdout + result.stderr, encoding="utf-8")
+        status = "PASS" if result.returncode == 0 else "SKIP" if result.returncode == 77 else "FAIL"
+        cases[name] = {
+            "status": status,
+            "command": command,
+            "returncode": result.returncode,
+            "evidence": str(log),
+            "test_executable_sha256": executable_sha256(executable),
+        }
+        return status
+
     base_environment = dict(os.environ)
     base_environment["NINFER_QWEN3_8_27B_WEIGHTS"] = str(weights)
     for scenario in REAL_SCENARIOS:
         environment = dict(base_environment)
         environment["NINFER_PREFIX_REAL_SCENARIO"] = scenario
-        command = [str(prefix_test)]
-        result = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=args.timeout_seconds,
-            check=False,
-        )
-        log = log_root / f"{scenario}.log"
-        log.write_text(result.stdout + result.stderr, encoding="utf-8")
-        status = "PASS" if result.returncode == 0 else "SKIP" if result.returncode == 77 else "FAIL"
-        failed = failed or status == "FAIL"
-        cases[scenario] = {
-            "status": status,
-            "command": command,
-            "returncode": result.returncode,
-            "evidence": str(log),
-            "test_executable_sha256": sha256_file(prefix_test),
-        }
+        failed = run_case(scenario, prefix_test, environment) == "FAIL" or failed
 
     for case, target in NATIVE_CASES.items():
         executable = build / f"tests/{target}"
         if not executable.is_file():
             parser.error(f"native validation executable is unavailable: {executable}")
-        command = [str(executable)]
-        result = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            timeout=args.timeout_seconds,
-            check=False,
-        )
-        log = log_root / f"{case}.log"
-        log.write_text(result.stdout + result.stderr, encoding="utf-8")
-        status = "PASS" if result.returncode == 0 else "SKIP" if result.returncode == 77 else "FAIL"
-        failed = failed or status == "FAIL"
-        cases[case] = {
-            "status": status,
-            "command": command,
-            "returncode": result.returncode,
-            "evidence": str(log),
-            "test_executable_sha256": sha256_file(executable),
-        }
+        failed = run_case(case, executable) == "FAIL" or failed
 
     artifact_frontend_status = str(cases["host-restore"]["status"])
     cases["official-tokenizer-lineage"] = {
@@ -169,40 +160,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             "embedded official-source Qwen3.8 frontend objects matched their pinned hashes; "
             "the artifact-backed public Engine Frontend path passed host-restore"
         ),
-        "test_executable_sha256": sha256_file(prefix_test),
+        "test_executable_sha256": executable_sha256(prefix_test),
         "artifact_frontend": frontend_identity,
     }
 
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
+    revision, dirty = source_identity(REPO_ROOT)
     evidence = {
         "artifact_type": "ninfer_tiered_cache_validation_evidence",
         "schema_version": 1,
         "date": dt.date.today().isoformat(),
         "source_revision": revision,
-        "source_dirty": bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout
-        ),
+        "source_dirty": dirty,
         "serve_path": str(serve),
         "serve_sha256": sha256_file(serve),
         "weights_path": str(weights),
         "weights_bytes": weights.stat().st_size,
         "cases": cases,
     }
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, output)
+    write_json(output, evidence)
     print(output)
     return 1 if failed else 0
 

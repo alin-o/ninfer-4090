@@ -511,20 +511,6 @@ public:
         return committed && resources_.mark_shared_ssd_backed(slot, expected_owner);
     }
 
-    [[nodiscard]] bool durable_shared_prefix_resident(
-        const targets::qwen3_6::DurableSharedPrefixCandidate& candidate) const {
-        std::scoped_lock lock(execution_mutex_);
-        for (std::uint32_t slot = 0; slot < resources_.shared_catalog_capacity(); ++slot) {
-            const auto view = resources_.shared_catalog_slot(slot);
-            if (view.metadata.state == ResourceManagement::SharedCatalogState::Catalogued &&
-                view.handle != nullptr &&
-                instance_.program->durable_shared_prefix_matches(candidate, *view.handle)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     void cancel_durable_shared_prefix_recovery(std::uint64_t reservation_id) noexcept {
         {
             std::scoped_lock lock(execution_mutex_);
@@ -544,7 +530,6 @@ public:
         runtime::CancellationFlagView cancellation                        = {},
         std::uint64_t* validation_nanoseconds                             = nullptr,
         std::uint64_t* adoption_nanoseconds                               = nullptr,
-        const std::function<void()>& external_checkpoint                  = {},
         std::shared_ptr<const std::vector<std::uint8_t>> retained_storage = {},
         bool ssd_backed                                                   = false,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate =
@@ -554,8 +539,8 @@ public:
         std::scoped_lock lock(execution_mutex_);
         return import_shared_prefix_locked(
             snapshot, model_binding, cancellation, validation_nanoseconds, adoption_nanoseconds,
-            external_checkpoint, std::move(retained_storage), ssd_backed,
-            std::move(expected_candidate), validation_completed, reservation_id, deadline);
+            std::move(retained_storage), ssd_backed, std::move(expected_candidate),
+            validation_completed, reservation_id, deadline);
     }
 
 private:
@@ -563,7 +548,7 @@ private:
     import_shared_prefix_locked(
         std::span<const std::uint8_t> snapshot, std::string_view model_binding,
         runtime::CancellationFlagView cancellation, std::uint64_t* validation_nanoseconds,
-        std::uint64_t* adoption_nanoseconds, const std::function<void()>& external_checkpoint,
+        std::uint64_t* adoption_nanoseconds,
         std::shared_ptr<const std::vector<std::uint8_t>> retained_storage, bool ssd_backed,
         std::optional<targets::qwen3_6::DurableSharedPrefixCandidate> expected_candidate,
         bool* validation_completed, std::uint64_t reservation_id, Clock::time_point deadline) {
@@ -576,7 +561,6 @@ private:
                                "shared catalog is busy with a resource transaction");
         }
         const auto checkpoint = [&] {
-            if (external_checkpoint) { external_checkpoint(); }
             if (cancellation.requested()) {
                 throw RequestError(RequestErrorKind::Cancelled,
                                    "shared snapshot import was cancelled");
@@ -681,17 +665,6 @@ public:
         require_shared_snapshot_engine_healthy();
         return run_shared_snapshot_operation(
             [&] { return resources_.adopt_imported_shared(*instance_.program, imported); }, true);
-    }
-
-    [[nodiscard]] std::optional<typename Package::SharedPrefixSummary>
-    shared_prefix_slot_summary(std::uint32_t slot) const {
-        std::scoped_lock lock(execution_mutex_);
-        const auto view = resources_.shared_catalog_slot(slot);
-        if (view.metadata.state != ResourceManagement::SharedCatalogState::Catalogued ||
-            view.handle == nullptr) {
-            return std::nullopt;
-        }
-        return view.summary;
     }
 
     void erase_shared_prefixes_except_for_test(std::span<const std::uint32_t> retained_slots) {
@@ -2388,8 +2361,7 @@ private:
                 };
                 auto adopted = import_shared_prefix_locked(
                     std::span<const std::uint8_t>(*bytes), recovery.model_binding, cancellation,
-                    &recovery.validation_nanoseconds, &recovery.adoption_nanoseconds, {}, bytes,
-                    true,
+                    &recovery.validation_nanoseconds, &recovery.adoption_nanoseconds, bytes, true,
                     targets::qwen3_6::DurableSharedPrefixCandidate{
                         .content_digest = selected_candidate.content_digest,
                         .frontier       = selected_candidate.frontier},

@@ -435,15 +435,6 @@ public:
                                                                  allocations);
     }
 
-    // Complete import preflight: in addition to arena bytes, prove that releasing these exact
-    // last references leaves enough bounded extent and membership descriptors for every new Host
-    // allocation. The release marks already deduplicate aliased pages and extents.
-    [[nodiscard]] bool can_prepare_after_last_reference_releases(
-        std::span<const HostKVPageReplicaRelease> releases,
-        std::span<const HostKVAllocationRequest> allocations) const {
-        return can_prepare_after_page_releases({}, releases, allocations);
-    }
-
     [[nodiscard]] bool can_prepare_after_page_releases(
         std::span<const HostKVPageReplicaRelease> duplicate_releases,
         std::span<const HostKVPageReplicaRelease> last_reference_releases,

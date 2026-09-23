@@ -15,12 +15,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.bench.tiered_cache_replay import (
+    BASELINE_REVISION,
+    CACHE_BREAKPOINT_MARKER,
     EVIDENCE_TYPE,
     EVIDENCE_VERSION,
     ReplayError,
@@ -34,7 +36,9 @@ from tools.bench.tiered_cache_replay import (
     require_unchanged_frozen_threshold,
     request_measurement,
     sha256_file,
+    source_identity,
     validate_manifest,
+    write_json,
 )
 from tools.ninfer_serve.anthropic import anthropic_request
 from tools.ninfer_serve.client import NInferServeClient, ProtocolRequest, ServeExchangeResult
@@ -51,7 +55,6 @@ DEFAULT_SERVE = REPO_ROOT / "build-agent-verify/apps/ninfer-serve"
 DEFAULT_WEIGHTS = Path("/models/qwen3_8_27b.ninfer")
 REQUEST_LOG_SCHEMA = 21
 BASELINE_REQUEST_LOG_SCHEMA = 19
-BASELINE_REVISION = "c7dca9acfef663acd10d4ec2817f184bc50547fe"
 
 
 class RunningServe:
@@ -228,7 +231,7 @@ def request_for(model: str, fixture: dict[str, Any]) -> ProtocolRequest:
             system=stable,
         )
         if fixture.get("measurement"):
-            marker = "=== CACHE_BREAKPOINT ==="
+            marker = CACHE_BREAKPOINT_MARKER
             boundary = stable.index(marker) + len(marker)
             if boundary < len(stable) and stable[boundary] == "\n":
                 boundary += 1
@@ -369,34 +372,48 @@ def server_command(
     return command
 
 
-def wait_for_idle_catalog(port: int, timeout: float) -> dict[str, float]:
+SSD_TRANSFER_SETTLE_METRICS = (
+    'ninfer:shared_ssd_transfer_jobs{state="queued"}',
+    'ninfer:shared_ssd_transfer_jobs{state="active"}',
+    'ninfer:shared_ssd_export_claims{state="pending"}',
+)
+
+
+def ssd_transfers_settled(metrics: dict[str, float]) -> bool:
+    return all(metrics.get(name, 0) == 0 for name in SSD_TRANSFER_SETTLE_METRICS)
+
+
+def wait_for_metrics(
+    port: int,
+    timeout: float,
+    predicate: Callable[[dict[str, float]], bool],
+    failure: str,
+) -> dict[str, float]:
     deadline = time.monotonic() + timeout
     last: dict[str, float] = {}
     while time.monotonic() < deadline:
         last = get_metrics(port)
-        queued = last.get('ninfer:shared_ssd_transfer_jobs{state="queued"}', 0)
-        active = last.get('ninfer:shared_ssd_transfer_jobs{state="active"}', 0)
-        claims = last.get('ninfer:shared_ssd_export_claims{state="pending"}', 0)
-        if queued == 0 and active == 0 and claims == 0:
+        if predicate(last):
             return last
         time.sleep(0.1)
-    raise ReplayError(f"durable catalog did not settle: {last}")
+    raise ReplayError(f"{failure}: {last}")
+
+
+def wait_for_idle_catalog(port: int, timeout: float) -> dict[str, float]:
+    return wait_for_metrics(
+        port, timeout, ssd_transfers_settled, "durable catalog did not settle"
+    )
 
 
 def wait_for_durable_record(port: int, timeout: float) -> dict[str, float]:
-    deadline = time.monotonic() + timeout
-    last: dict[str, float] = {}
-    while time.monotonic() < deadline:
-        last = get_metrics(port)
-        completed = last.get('ninfer:shared_ssd_writes_total{result="completed"}', 0)
-        records = last.get("ninfer:shared_ssd_manifest_records", 0)
-        queued = last.get('ninfer:shared_ssd_transfer_jobs{state="queued"}', 0)
-        active = last.get('ninfer:shared_ssd_transfer_jobs{state="active"}', 0)
-        claims = last.get('ninfer:shared_ssd_export_claims{state="pending"}', 0)
-        if completed > 0 and records > 0 and queued == 0 and active == 0 and claims == 0:
-            return last
-        time.sleep(0.1)
-    raise ReplayError(f"durable seed did not publish a settled SSD record: {last}")
+    return wait_for_metrics(
+        port,
+        timeout,
+        lambda metrics: ssd_transfers_settled(metrics)
+        and metrics.get('ninfer:shared_ssd_writes_total{result="completed"}', 0) > 0
+        and metrics.get("ninfer:shared_ssd_manifest_records", 0) > 0,
+        "durable seed did not publish a settled SSD record",
+    )
 
 
 def latest_done(
@@ -469,6 +486,66 @@ def done_by_response_id(
     return indexed
 
 
+def run_concurrent_exchanges(
+    args: argparse.Namespace,
+    fixtures: Sequence[dict[str, Any]],
+    request_log: Path,
+    done_count: int,
+    *,
+    label: str,
+    allowed_schemas: tuple[int, ...],
+) -> tuple[list[dict[str, Any]], float, int]:
+    """Release all fixtures behind one barrier and pair each wire result with its done event."""
+    results: list[tuple[float, ServeExchangeResult, str] | BaseException | None] = [
+        None
+    ] * len(fixtures)
+    barrier = threading.Barrier(len(fixtures))
+
+    def execute(index: int) -> None:
+        try:
+            barrier.wait()
+            results[index] = run_exchange(
+                args.port, fixtures[index], args.request_timeout_seconds
+            )
+        except BaseException as error:
+            results[index] = error
+
+    threads = [
+        threading.Thread(target=execute, args=(index,)) for index in range(len(fixtures))
+    ]
+    started = time.perf_counter_ns()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    makespan_ms = (time.perf_counter_ns() - started) / 1.0e6
+    failures = [value for value in results if isinstance(value, BaseException)]
+    if failures:
+        raise failures[0]
+    response_ids = [value[2] for value in results if isinstance(value, tuple)]
+    if len(response_ids) != len(results):
+        raise ReplayError(f"{label} worker produced no result")
+    done = done_by_response_id(
+        request_log,
+        done_count,
+        response_ids,
+        args.request_timeout_seconds,
+        allowed_schemas=allowed_schemas,
+    )
+    measurements = []
+    for index, value in enumerate(results):
+        assert isinstance(value, tuple)
+        measurements.append(
+            request_measurement(
+                f"{label}-{index}",
+                value[0],
+                done[value[2]],
+                payload_sha256=fixtures[index]["payload_sha256"],
+            )
+        )
+    return measurements, makespan_ms, done_count + len(done)
+
+
 def run_profile(
     profile: str,
     fixtures: Sequence[dict[str, Any]],
@@ -478,14 +555,13 @@ def run_profile(
     seed: dict[str, Any] | None,
     cache_dir: Path | None = None,
     setup_fixtures: Sequence[dict[str, Any]] = (),
-    concurrent_setup: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     request_log = root / "request-log" / f"{profile}.jsonl"
     serve_log = root / "serve" / f"{profile}.log"
     cache_dir = cache_dir or root / "shared-cache"
     request_log.parent.mkdir(parents=True, exist_ok=True)
     baseline_profile = profile == "existing"
-    historical_baseline = baseline_profile and getattr(args, "historical_baseline", False)
+    historical_baseline = baseline_profile and args.historical_baseline
     serve = args.baseline_serve if baseline_profile else args.serve
     allowed_schemas = (
         (BASELINE_REQUEST_LOG_SCHEMA,) if historical_baseline else (REQUEST_LOG_SCHEMA,)
@@ -523,129 +599,25 @@ def run_profile(
                 wait_for_idle_catalog(args.port, args.request_timeout_seconds)
             if profile == "ssd-seed":
                 wait_for_durable_record(args.port, args.request_timeout_seconds)
-        if concurrent_setup and setup_fixtures:
-            setup_results: list[
-                tuple[float, ServeExchangeResult, str] | BaseException | None
-            ] = [None] * len(setup_fixtures)
-            barrier = threading.Barrier(len(setup_fixtures))
-
-            def execute_setup(index: int) -> None:
-                try:
-                    barrier.wait()
-                    setup_results[index] = run_exchange(
-                        args.port, setup_fixtures[index], args.request_timeout_seconds
-                    )
-                except BaseException as error:
-                    setup_results[index] = error
-
-            threads = [
-                threading.Thread(target=execute_setup, args=(index,))
-                for index in range(len(setup_fixtures))
-            ]
-            setup_started = time.perf_counter_ns()
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
-            setup_makespan_ms = (time.perf_counter_ns() - setup_started) / 1.0e6
-            response_ids = [
-                value[2]
-                for value in setup_results
-                if isinstance(value, tuple)
-            ]
-            failures = [value for value in setup_results if isinstance(value, BaseException)]
-            if failures:
-                raise failures[0]
-            if len(response_ids) != len(setup_results):
-                raise ReplayError("concurrent setup worker produced no result")
-            done = done_by_response_id(
+        if setup_fixtures:
+            setup_measurements, setup_makespan_ms, done_count = run_concurrent_exchanges(
+                args,
+                setup_fixtures,
                 request_log,
                 done_count,
-                response_ids,
-                args.request_timeout_seconds,
+                label=f"{profile}-setup",
                 allowed_schemas=allowed_schemas,
             )
-            for index, value in enumerate(setup_results):
-                assert isinstance(value, tuple)
-                setup_measurements.append(
-                    request_measurement(
-                        f"{profile}-setup-{index}",
-                        value[0],
-                        done[value[2]],
-                        payload_sha256=setup_fixtures[index]["payload_sha256"],
-                    )
-                )
-            done_count += len(done)
-        else:
-            for index, fixture in enumerate(setup_fixtures):
-                external, _, response_id = run_exchange(
-                    args.port, fixture, args.request_timeout_seconds
-                )
-                event, done_count = latest_done(
-                    request_log,
-                    done_count,
-                    args.request_timeout_seconds,
-                    expected_response_id=None if historical_baseline else response_id,
-                    allowed_schemas=allowed_schemas,
-                )
-                setup_measurements.append(
-                    request_measurement(
-                        f"{profile}-setup-{index}",
-                        external,
-                        event,
-                        payload_sha256=fixture["payload_sha256"],
-                    )
-                )
-        if setup_fixtures:
             wait_for_idle_catalog(args.port, args.request_timeout_seconds)
         if profile == "overlap":
-            results: list[tuple[float, ServeExchangeResult, str] | BaseException | None] = [
-                None
-            ] * len(fixtures)
-            barrier = threading.Barrier(len(fixtures))
-
-            def execute(index: int) -> None:
-                try:
-                    barrier.wait()
-                    results[index] = run_exchange(
-                        args.port, fixtures[index], args.request_timeout_seconds
-                    )
-                except BaseException as error:
-                    results[index] = error
-
-            threads = [
-                threading.Thread(target=execute, args=(index,))
-                for index in range(len(fixtures))
-            ]
-            started = time.perf_counter_ns()
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
-            makespan_ms = (time.perf_counter_ns() - started) / 1.0e6
-            response_ids = [value[2] for value in results if isinstance(value, tuple)]
-            failures = [value for value in results if isinstance(value, BaseException)]
-            if failures:
-                raise failures[0]
-            if len(response_ids) != len(results):
-                raise ReplayError("overlap worker produced no result")
-            done = done_by_response_id(
+            measurements, makespan_ms, done_count = run_concurrent_exchanges(
+                args,
+                fixtures,
                 request_log,
                 done_count,
-                response_ids,
-                args.request_timeout_seconds,
+                label=profile,
                 allowed_schemas=allowed_schemas,
             )
-            for index, value in enumerate(results):
-                assert isinstance(value, tuple)
-                measurements.append(
-                    request_measurement(
-                        f"{profile}-{index}",
-                        value[0],
-                        done[value[2]],
-                        payload_sha256=fixtures[index]["payload_sha256"],
-                    )
-                )
             profile_extra: dict[str, Any] = {"makespan_ms": makespan_ms}
         else:
             for index, fixture in enumerate(fixtures):
@@ -728,9 +700,7 @@ def require_profile_evidence(
         raise ReplayError("SSD seed profile published no durable manifest record")
 
     cleanup_metrics = (
-        'ninfer:shared_ssd_transfer_jobs{state="queued"}',
-        'ninfer:shared_ssd_transfer_jobs{state="active"}',
-        'ninfer:shared_ssd_export_claims{state="pending"}',
+        *SSD_TRANSFER_SETTLE_METRICS,
         "ninfer:shared_ssd_staging_bytes",
         "ninfer:auto_save_queued_jobs",
         "ninfer:auto_save_in_flight_jobs",
@@ -750,7 +720,7 @@ def require_profile_evidence(
 def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) -> dict[str, Any]:
     throughput = detail["throughput_events"]
 
-    def peak(*path: str) -> float:
+    def interval_values(*path: str) -> list[float]:
         values: list[float] = []
         for event in throughput:
             value: Any = event
@@ -758,17 +728,13 @@ def summarize_profile(rows: Sequence[dict[str, Any]], detail: dict[str, Any]) ->
                 value = value.get(component, {}) if isinstance(value, dict) else {}
             if isinstance(value, (int, float)):
                 values.append(float(value))
-        return max(values, default=0.0)
+        return values
+
+    def peak(*path: str) -> float:
+        return max(interval_values(*path), default=0.0)
 
     def total(*path: str) -> float:
-        values: list[float] = []
-        for event in throughput:
-            value: Any = event
-            for component in path:
-                value = value.get(component, {}) if isinstance(value, dict) else {}
-            if isinstance(value, (int, float)):
-                values.append(float(value))
-        return sum(values)
+        return sum(interval_values(*path))
 
     # request_log.cpp publishes these as interval deltas. Totals must sum intervals; only live
     # occupancy is a gauge for which a peak is meaningful.
@@ -1097,22 +1063,7 @@ def load_baseline_identity(path: Path, serve: Path) -> dict[str, Any]:
 
 
 def current_build_control_identity(serve: Path) -> dict[str, Any]:
-    source_revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout.strip()
-    source_dirty = bool(
-        subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-    )
+    source_revision, source_dirty = source_identity(REPO_ROOT)
     return {
         "kind": "current-build-configuration-control",
         "source_revision": source_revision,
@@ -1424,13 +1375,6 @@ def campaign_verdict(
 
 def campaign_exit_status(verdict: dict[str, Any]) -> int:
     return 0 if verdict["overall"] == "PASS" else 3
-
-
-def write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
 
 
 def write_report(path: Path, evidence: dict[str, Any]) -> None:
@@ -1849,7 +1793,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             output / "host" / f"trial-{index}",
             seed=seed,
             setup_fixtures=[pressure_fixture(seed, pressure) for pressure in range(4)],
-            concurrent_setup=True,
         )
         rows[0]["label"] = f"host-{index}"
         measurements["host"].extend(rows)
@@ -1893,18 +1836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile: compare_profile(measurements["existing"], measurements[profile], threshold)
         for profile in ("device", "host", "ssd")
     }
-    source_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, capture_output=True, check=True
-    ).stdout.strip()
-    dirty = bool(
-        subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-    )
+    source_commit, dirty = source_identity(REPO_ROOT)
     def combine_details(details: Sequence[dict[str, Any]]) -> dict[str, Any]:
         combined_final: dict[str, float] = {}
         for item in details:

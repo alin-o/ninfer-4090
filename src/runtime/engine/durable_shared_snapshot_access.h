@@ -80,7 +80,6 @@ struct DurableSharedSnapshotAccess {
                                                  std::chrono::steady_clock::time_point::max());
     static void cancel_recovery(Engine& engine, std::uint64_t reservation_id) noexcept;
     static void wake_recovery(Engine& engine) noexcept;
-    [[nodiscard]] static bool resident(Engine& engine, const Candidate& candidate);
     [[nodiscard]] static bool settle_export(Engine& engine, std::uint32_t slot, std::uint64_t owner,
                                             bool committed);
     [[nodiscard]] static std::vector<Export>

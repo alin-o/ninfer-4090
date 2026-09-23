@@ -734,18 +734,11 @@ public:
         const std::function<std::shared_ptr<void>(std::size_t)>& reserve = {});
     [[nodiscard]] static std::vector<qwen3_6::DurableSharedPrefixCandidate>
     durable_shared_prefix_candidates(const PreparedPromptData& prompt);
-    [[nodiscard]] bool
-    durable_shared_prefix_matches(const qwen3_6::DurableSharedPrefixCandidate& candidate,
-                                  const SharedPrefixHandle& resident) const;
-    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] runtime::DurableImportAssessment
     inspect_durable_shared_prefix_import(std::uint32_t frontier,
                                          const SharedPrefixHandle* replacement,
                                          const ContinuationHandle* host_private = nullptr,
                                          const SharedPrefixHandle* host_shared  = nullptr) const;
-    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
-    export_shared_prefix(const SharedPrefixHandle& shared, std::string_view model_binding,
-                         const qwen3_6::SharedPrefixPersistenceMetadata& metadata);
 
     void retire_completed_snapshot_sources() { retire_ready_snapshot_sources(); }
 
@@ -787,7 +780,6 @@ private:
 
     [[nodiscard]] qwen3_6::SharedPrefixPublication<Variant>
     adopt_shared_prefix_impl(const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
-                             bool enable_failure_checkpoints,
                              const std::function<void()>& commit_checkpoint = {});
 
     void advance_resource_revision() noexcept {

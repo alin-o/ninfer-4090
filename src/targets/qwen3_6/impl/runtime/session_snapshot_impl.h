@@ -1358,18 +1358,6 @@ ContinuationHandle ProgramImplCore::restore_continuation(std::span<const std::ui
     }
 }
 
-qwen3_6::RetainedSessionSnapshot
-ProgramImplCore::export_shared_prefix(const SharedPrefixHandle& handle,
-                                      std::string_view model_binding,
-                                      const qwen3_6::SharedPrefixPersistenceMetadata& metadata) {
-    qwen3_6::RetainedSessionSnapshot snapshot =
-        begin_export_shared_prefix(handle, model_binding, metadata);
-    if (snapshot.await_transfer) { snapshot.await_transfer(snapshot.bytes); }
-    retire_ready_snapshot_sources();
-    snapshot.await_transfer = {};
-    return snapshot;
-}
-
 std::vector<qwen3_6::DurableSharedPrefixCandidate>
 ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prompt) {
     std::vector<qwen3_6::DurableSharedPrefixCandidate> candidates;
@@ -1415,83 +1403,6 @@ ProgramImplCore::durable_shared_prefix_candidates(const PreparedPromptData& prom
               [](const auto& left, const auto& right) { return left.frontier > right.frontier; });
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
     return candidates;
-}
-
-bool ProgramImplCore::durable_shared_prefix_matches(
-    const qwen3_6::DurableSharedPrefixCandidate& candidate,
-    const SharedPrefixHandle& resident) const {
-    if (!valid_shared_prefix(resident) || candidate.content_digest.size() != 64) { return false; }
-    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(resident)];
-    if (candidate.frontier == 0 || shared.frontier != candidate.frontier || !shared.identity ||
-        shared.identity->ledger().size() != candidate.frontier) {
-        return false;
-    }
-    const auto* identity = shared.identity->prefix_identity();
-    if (identity == nullptr || identity->size() < candidate.frontier ||
-        !identity->vision_items().empty()) {
-        return false;
-    }
-    std::vector<std::uint8_t> identity_bytes;
-    SnapshotWriter writer(identity_bytes);
-    write_span(writer, shared.identity->ledger());
-    write_span(writer,
-               std::span<const std::uint8_t>(identity->token_types()).first(candidate.frontier));
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        write_span(
-            writer,
-            std::span<const std::int32_t>(identity->position_axis(axis)).first(candidate.frontier));
-    }
-    write_vision_items(writer, {});
-    return frontend_internal::sha256_hex(frontend_internal::sha256(identity_bytes)) ==
-           candidate.content_digest;
-}
-
-bool ProgramImplCore::durable_shared_prefix_import_feasible(std::uint32_t frontier) const {
-    if (frontier == 0 || frontier > capacity || speculative_backend == SpeculativeBackend::DFlash ||
-        pending_transaction_ || has_context_transaction() || !host_state_images || !host_kv_arena ||
-        !host_kv_extents || state_store->occupied() == state_store->capacity() ||
-        host_state_images->occupied() == host_state_images->capacity() ||
-        std::none_of(shared_prefix_slots.begin(), shared_prefix_slots.end(),
-                     [](const auto& slot) { return slot.role == SharedPrefixSlotRole::Free; }) ||
-        std::none_of(requests.begin(), requests.begin() + max_concurrency,
-                     [](const auto& request) { return request.lifecycle == Lifecycle::Empty; })) {
-        return false;
-    }
-
-    const std::uint32_t text_pages = kv_pages_for_frontier(frontier);
-    const std::uint32_t backend_frontier =
-        speculative_backend == SpeculativeBackend::Mtp ? frontier - 1U : 0U;
-    const std::uint32_t backend_pages = kv_pages_for_frontier(backend_frontier);
-    const auto address_fits = [](const auto& addresses, const auto& pages, std::uint32_t required) {
-        return addresses && pages && addresses->occupied() < addresses->capacity() &&
-               required <= pages->capacity() - pages->occupied() &&
-               required <= pages->physical_pool().available_pages();
-    };
-    if (!address_fits(text_kv_addresses, text_kv_pages, text_pages) ||
-        (backend_pages != 0 &&
-         !address_fits(backend_kv_addresses, backend_kv_pages, backend_pages))) {
-        return false;
-    }
-    const std::uint32_t required_extents = 1U + (backend_pages != 0 ? 1U : 0U);
-    if (required_extents > host_kv_extents->capacity() - host_kv_extents->occupied()) {
-        return false;
-    }
-    const HostKVPageLayout text_layout =
-        plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
-    std::optional<HostKVPageLayout> backend_layout;
-    std::array<HostKVAllocationRequest, 2> allocations{};
-    allocations[0]               = {.layout = &text_layout, .pages = text_pages};
-    std::size_t allocation_count = 1;
-    if (backend_pages != 0) {
-        backend_layout = plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
-        allocations[allocation_count++] = {.layout = &*backend_layout, .pages = backend_pages};
-    }
-    try {
-        return host_kv_arena
-            ->plan_after_releases(
-                {}, std::span<const HostKVAllocationRequest>(allocations.data(), allocation_count))
-            .has_value();
-    } catch (...) { return false; }
 }
 
 struct DurableSharedImportPhysicalPlan {
@@ -2476,7 +2387,7 @@ bool ProgramImplCore::shared_prefix_matches(
 
 qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported) {
-    return adopt_shared_prefix_impl(imported, true);
+    return adopt_shared_prefix_impl(imported);
 }
 
 void ProgramImplCore::duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle& handle) {
@@ -2793,7 +2704,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     const ContinuationHandle* host_private, const SharedPrefixHandle* host_shared,
     std::shared_ptr<const void> physical_plan) {
     if (replacement == nullptr && host_private == nullptr && host_shared == nullptr) {
-        return adopt_shared_prefix_impl(imported, true, commit_checkpoint);
+        return adopt_shared_prefix_impl(imported, commit_checkpoint);
     }
     const auto plan =
         std::static_pointer_cast<const DurableSharedImportPhysicalPlan>(physical_plan);
@@ -3213,7 +3124,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
         ContractAccess::consume(*replacement);
     }
     try {
-        auto publication = adopt_shared_prefix_impl(imported, true, commit_checkpoint);
+        auto publication = adopt_shared_prefix_impl(imported, commit_checkpoint);
         if (host_private != nullptr) {
             publication.reclaimed_private_summary = continuation_summary(*host_private);
         }
@@ -3459,7 +3370,7 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
 }
 
 qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix_impl(
-    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported, bool enable_failure_checkpoints,
+    const qwen3_6::ValidatedSharedPrefixImport<Variant>& imported,
     const std::function<void()>& commit_checkpoint) {
     if (!imported) { throw std::invalid_argument("shared import plan is empty"); }
     if (pending_transaction_ || has_context_transaction()) {
@@ -3504,10 +3415,8 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix_i
         if (!state) {
             throw std::invalid_argument("shared snapshot does not fit the Host State capacity");
         }
-        if (enable_failure_checkpoints) {
-            runtime::testing::shared_snapshot_import_checkpoint(
-                runtime::testing::SharedSnapshotImportStage::StateAllocated);
-        }
+        runtime::testing::shared_snapshot_import_checkpoint(
+            runtime::testing::SharedSnapshotImportStage::StateAllocated);
 
         if (!host_kv_extents) {
             throw std::invalid_argument("shared snapshot adoption requires Host KV capacity");
@@ -3547,10 +3456,8 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix_i
         text_address =
             build_address(*text_kv_addresses, *text_kv_pages, text_layout,
                           backing->boundary.frontier, backing->data() + backing->text_offset);
-        if (enable_failure_checkpoints) {
-            runtime::testing::shared_snapshot_import_checkpoint(
-                runtime::testing::SharedSnapshotImportStage::MainKvAllocated);
-        }
+        runtime::testing::shared_snapshot_import_checkpoint(
+            runtime::testing::SharedSnapshotImportStage::MainKvAllocated);
         if (backing->boundary.backend_frontier != 0) {
             backend_address = build_address(*backend_kv_addresses, *backend_kv_pages,
                                             *backend_layout, backing->boundary.backend_frontier,

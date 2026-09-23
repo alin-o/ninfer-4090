@@ -4,26 +4,19 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from typing import Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BASELINE_REVISION = "c7dca9acfef663acd10d4ec2817f184bc50547fe"
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(REPO_ROOT))
 
-
-def sha256_file(path: Path) -> str:
-    import hashlib
-
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from tools.bench.tiered_cache_replay import BASELINE_REVISION, sha256_file, write_json
 
 
 def captured(command: Sequence[str], *, cwd: Path) -> str:
@@ -76,20 +69,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "-DBUILD_TESTING=OFF",
         "-DNINFER_BUILD_BENCHMARKS=OFF",
     ]
+    build_command = [
+        "cmake",
+        "--build",
+        str(build),
+        "--parallel",
+        str(args.parallel),
+        "--target",
+        "ninfer-serve",
+    ]
     subprocess.run(configure, cwd=REPO_ROOT, check=True)
-    subprocess.run(
-        [
-            "cmake",
-            "--build",
-            str(build),
-            "--parallel",
-            str(args.parallel),
-            "--target",
-            "ninfer-serve",
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-    )
+    subprocess.run(build_command, cwd=REPO_ROOT, check=True)
     serve = build / "apps/ninfer-serve"
     if not serve.is_file() or not os.access(serve, os.X_OK):
         raise RuntimeError(f"baseline build produced no executable: {serve}")
@@ -101,26 +91,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "source_archive_sha256": archive_sha256,
         "serve_path": str(serve),
         "serve_sha256": sha256_file(serve),
-        "build_command": configure
-        + [
-            "&&",
-            "cmake",
-            "--build",
-            str(build),
-            "--parallel",
-            str(args.parallel),
-            "--target",
-            "ninfer-serve",
-        ],
+        "build_command": [*configure, "&&", *build_command],
         "compiler": {
             "cmake": captured(["cmake", "--version"], cwd=REPO_ROOT).splitlines()[0],
             "nvcc": captured(["nvcc", "--version"], cwd=REPO_ROOT).splitlines()[-1],
         },
     }
     manifest = output / "baseline-build.json"
-    temporary = manifest.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, manifest)
+    write_json(manifest, identity)
     print(manifest)
     return 0
 

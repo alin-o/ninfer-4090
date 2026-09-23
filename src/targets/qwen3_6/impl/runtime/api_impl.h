@@ -652,32 +652,12 @@ Program<Variant>::durable_shared_prefix_candidates(const PreparedPrompt& prompt)
 }
 
 template <>
-bool Program<Variant>::durable_shared_prefix_matches(
-    const DurableSharedPrefixCandidate& candidate,
-    const SharedPrefixHandle<Variant>& resident) const {
-    return impl_->durable_shared_prefix_matches(candidate, resident);
-}
-
-template <>
-bool Program<Variant>::durable_shared_prefix_import_feasible(std::uint32_t frontier) const {
-    return impl_->durable_shared_prefix_import_feasible(frontier);
-}
-
-template <>
 runtime::DurableImportAssessment Program<Variant>::inspect_durable_shared_prefix_import(
     std::uint32_t frontier, const SharedPrefixHandle<Variant>* replacement,
     const ContinuationHandle<Variant>* host_private,
     const SharedPrefixHandle<Variant>* host_shared) const {
     return impl_->inspect_durable_shared_prefix_import(frontier, replacement, host_private,
                                                        host_shared);
-}
-
-template <>
-RetainedSessionSnapshot
-Program<Variant>::export_shared_prefix(const SharedPrefixHandle<Variant>& shared,
-                                       std::string_view model_binding,
-                                       const SharedPrefixPersistenceMetadata& metadata) {
-    return impl_->export_shared_prefix(shared, model_binding, metadata);
 }
 
 template <>

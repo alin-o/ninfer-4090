@@ -40,15 +40,6 @@ std::string media_value(const Json& part, MediaKind kind) {
     return {};
 }
 
-std::string data_media_type(std::string_view value) {
-    if (!value.starts_with("data:")) { return {}; }
-    const std::size_t separator = value.find(';', 5);
-    const std::size_t comma     = value.find(',', 5);
-    const std::size_t end       = separator == std::string_view::npos ? comma : separator;
-    if (end == std::string_view::npos || end == 5) { return {}; }
-    return std::string(value.substr(5, end - 5));
-}
-
 OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_index,
                          std::size_t part_index) {
     std::string value = media_value(part, kind);
@@ -67,7 +58,7 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
         source.kind = media_acquire::SourceKind::Url;
     } else if (value.starts_with("data:")) {
         source.kind = media_acquire::SourceKind::Data;
-        if (media_type.empty()) { media_type = data_media_type(value); }
+        if (media_type.empty()) { media_type = media_acquire::data_uri_media_type(value); }
     } else {
         source.kind = media_acquire::SourceKind::Path;
         if (value.starts_with("file://")) { value.erase(0, 7); }

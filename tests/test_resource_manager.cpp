@@ -1115,11 +1115,6 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
-    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) {
-        inspected_durable_frontiers.push_back(frontier);
-        return frontier <= max_durable_import_frontier;
-    }
-
     [[nodiscard]] DurableImportAssessment
     inspect_durable_shared_prefix_import(std::uint32_t frontier,
                                          const FakeSharedPrefixHandle* replacement,

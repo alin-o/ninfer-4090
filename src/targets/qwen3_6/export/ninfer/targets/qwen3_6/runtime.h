@@ -1164,17 +1164,10 @@ public:
     // Program or its State/KV stores. Engine applies startup policy before calling this.
     [[nodiscard]] static std::vector<DurableSharedPrefixCandidate>
     durable_shared_prefix_candidates(const PreparedPrompt& prompt);
-    [[nodiscard]] bool
-    durable_shared_prefix_matches(const DurableSharedPrefixCandidate& candidate,
-                                  const SharedPrefixHandle<Variant>& resident) const;
-    [[nodiscard]] bool durable_shared_prefix_import_feasible(std::uint32_t frontier) const;
     [[nodiscard]] runtime::DurableImportAssessment inspect_durable_shared_prefix_import(
         std::uint32_t frontier, const SharedPrefixHandle<Variant>* replacement,
         const ContinuationHandle<Variant>* host_private = nullptr,
         const SharedPrefixHandle<Variant>* host_shared  = nullptr) const;
-    [[nodiscard]] RetainedSessionSnapshot
-    export_shared_prefix(const SharedPrefixHandle<Variant>& shared, std::string_view model_binding,
-                         const SharedPrefixPersistenceMetadata& metadata);
     // Engine worker boundary for an asynchronous export whose producer event has settled.
     // Program, never the filesystem worker, mutates State/KV source-pin ownership.
     void retire_completed_snapshot_sources();

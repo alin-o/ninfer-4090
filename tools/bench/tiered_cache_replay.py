@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import statistics
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -16,6 +18,9 @@ EVIDENCE_TYPE = "ninfer_tiered_cache_evidence"
 EVIDENCE_VERSION = 5
 CALIBRATION_TYPE = "ninfer_tiered_cache_predecessor_calibration"
 CALIBRATION_VERSION = 1
+# Source revision of the recorded historical comparison executable.
+BASELINE_REVISION = "c7dca9acfef663acd10d4ec2817f184bc50547fe"
+CACHE_BREAKPOINT_MARKER = "=== CACHE_BREAKPOINT ==="
 
 
 class ReplayError(RuntimeError):
@@ -28,6 +33,24 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def source_identity(repo: Path) -> tuple[str, bool]:
+    """Return the checked-out commit and whether the worktree has uncommitted changes."""
+
+    def git(*command: str) -> str:
+        return subprocess.run(
+            ["git", *command], cwd=repo, text=True, capture_output=True, check=True
+        ).stdout
+
+    return git("rev-parse", "HEAD").strip(), bool(git("status", "--porcelain"))
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -124,7 +147,7 @@ def expanded_fixture(manifest: dict[str, Any], suffix: str) -> dict[str, Any]:
     # Grow the stable side of the structural boundary.  Appending the corpus after the marker
     # would benchmark a private continuation whose reusable frontier happens to resemble the
     # intended shared prefix, while leaving the actual SSD-eligible checkpoint tiny.
-    marker = "=== CACHE_BREAKPOINT ==="
+    marker = CACHE_BREAKPOINT_MARKER
     marker_offset = selected["stable"].find(marker)
     if marker_offset < 0:
         raise ReplayError("measurement fixture has no structural cache boundary")

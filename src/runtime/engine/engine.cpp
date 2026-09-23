@@ -53,9 +53,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     if (options.auto_save_queue_jobs == 0) { options.auto_save_queue_jobs = 2; }
     if (options.auto_save_queue_bytes == 0) { options.auto_save_queue_bytes = 1ULL << 30U; }
-    if (options.auto_save_queue_bytes == 0) {
-        throw std::invalid_argument("auto-save queue byte capacity must be nonzero");
-    }
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
@@ -178,8 +175,6 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
-        [[nodiscard]] virtual std::vector<CheckpointLifecycleFact>
-        take_failure_checkpoint_lifecycle() noexcept = 0;
     };
 
     template <class Submission>
@@ -189,23 +184,12 @@ public:
             : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
-            try {
-                return submission_.wait(sink, cancellation);
-            } catch (runtime::SettledGenerationFailure& failure) {
-                failure_checkpoint_lifecycle_ = failure.take_checkpoint_lifecycle();
-                failure.rethrow_cause();
-            }
-        }
-
-        [[nodiscard]] std::vector<CheckpointLifecycleFact>
-        take_failure_checkpoint_lifecycle() noexcept override {
-            return std::move(failure_checkpoint_lifecycle_);
+            return submission_.wait(sink, cancellation);
         }
 
     private:
         std::shared_ptr<void> keep_alive_;
         Submission submission_;
-        std::vector<CheckpointLifecycleFact> failure_checkpoint_lifecycle_;
     };
 
     template <class Submission>
@@ -216,11 +200,6 @@ public:
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
-    }
-
-    [[nodiscard]] std::vector<CheckpointLifecycleFact>
-    take_failure_checkpoint_lifecycle() noexcept {
-        return state_->take_failure_checkpoint_lifecycle();
     }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
@@ -251,9 +230,9 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     std::unique_ptr<Impl> impl = std::move(impl_);
     try {
         return impl->wait(sink, cancellation);
-    } catch (...) {
-        failure_checkpoint_lifecycle_ = impl->take_failure_checkpoint_lifecycle();
-        throw;
+    } catch (runtime::SettledGenerationFailure& failure) {
+        failure_checkpoint_lifecycle_ = failure.take_checkpoint_lifecycle();
+        failure.rethrow_cause();
     }
 }
 
@@ -918,7 +897,9 @@ runtime::DurableSharedSnapshotAccess::ImportResult runtime::DurableSharedSnapsho
     const std::string binding = slot_model_binding(engine.impl_->load);
     ImportResult imported     = std::visit(
         [&](auto& core) -> ImportResult {
-            if constexpr (requires { core->shared_prefix_slot_summary(std::uint32_t{}); }) {
+            if constexpr (requires {
+                              core->import_shared_prefix(std::span<const std::uint8_t>{}, binding);
+                          }) {
                 std::uint64_t validation_nanoseconds = 0;
                 std::uint64_t adoption_nanoseconds   = 0;
                 bool validation_completed            = false;
@@ -932,18 +913,8 @@ runtime::DurableSharedSnapshotAccess::ImportResult runtime::DurableSharedSnapsho
                     };
                     auto result = core->import_shared_prefix(
                         std::span<const std::uint8_t>(*bytes), binding, cancellation_flag,
-                        &validation_nanoseconds, &adoption_nanoseconds,
-                        [&] {
-                            if (cancellation.requested()) {
-                                throw RequestError(RequestErrorKind::Cancelled,
-                                                       "shared snapshot import was cancelled");
-                            }
-                            if (std::chrono::steady_clock::now() >= deadline) {
-                                throw RequestError(RequestErrorKind::QueueTimeout,
-                                                       "shared snapshot import exceeded its deadline");
-                            }
-                        },
-                        bytes, true, candidate, &validation_completed, reservation_id, deadline);
+                        &validation_nanoseconds, &adoption_nanoseconds, bytes, true, candidate,
+                        &validation_completed, reservation_id, deadline);
                     if (!result.summary || !result.checkpoint) {
                         throw std::logic_error(
                             "durable shared import has no locked publication identity");
@@ -997,18 +968,6 @@ void runtime::DurableSharedSnapshotAccess::wake_recovery(Engine& engine) noexcep
             if constexpr (requires { core->wake_durable_shared_prefix_recovery(); }) {
                 core->wake_durable_shared_prefix_recovery();
             }
-        },
-        engine.impl_->core);
-}
-
-bool runtime::DurableSharedSnapshotAccess::resident(Engine& engine, const Candidate& candidate) {
-    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](auto& core) {
-            if constexpr (requires { core->durable_shared_prefix_resident(candidate); }) {
-                return core->durable_shared_prefix_resident(candidate);
-            }
-            return false;
         },
         engine.impl_->core);
 }
@@ -1141,10 +1100,7 @@ runtime::testing::SharedSnapshotTestAccess::import(Engine& engine,
     const std::string binding = slot_model_binding(engine.impl_->load);
     return std::visit(
         [&](auto& core) -> SharedSnapshotImportObservation {
-            if constexpr (requires {
-                              core->import_shared_prefix(bytes, binding);
-                              core->shared_prefix_slot_summary(std::uint32_t{});
-                          }) {
+            if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
                 auto result = core->import_shared_prefix(bytes, binding);
                 if (!result.summary) {
                     throw std::logic_error("shared import result has no locked summary");
@@ -1155,30 +1111,6 @@ runtime::testing::SharedSnapshotTestAccess::import(Engine& engine,
                         .main_frontier    = result.summary->checkpoint.required_kv.main_frontier,
                         .backend_frontier = result.summary->checkpoint.required_kv.backend_frontier,
                         .state_residency  = result.summary->checkpoint.state_residency};
-            } else {
-                throw std::logic_error("shared snapshots require a generation Engine");
-            }
-        },
-        engine.impl_->core);
-}
-
-std::uint32_t
-runtime::testing::SharedSnapshotTestAccess::import_cancelled(Engine& engine,
-                                                             std::span<const std::uint8_t> bytes) {
-    if (!engine.impl_) { throw std::logic_error("Engine is moved from"); }
-    const std::string binding = slot_model_binding(engine.impl_->load);
-    std::atomic<bool> cancelled{true};
-    return std::visit(
-        [&](auto& core) -> std::uint32_t {
-            if constexpr (requires { core->import_shared_prefix(bytes, binding); }) {
-                try {
-                    const auto result = core->import_shared_prefix(
-                        bytes, binding, runtime::CancellationFlagView{.flag = &cancelled});
-                    return static_cast<std::uint32_t>(result.disposition);
-                } catch (const RequestError& error) {
-                    if (error.kind() == RequestErrorKind::Cancelled) { return 2U; }
-                    throw;
-                }
             } else {
                 throw std::logic_error("shared snapshots require a generation Engine");
             }

@@ -45,8 +45,6 @@ struct SharedSnapshotTestAccess {
                                                                                std::uint32_t slot);
     [[nodiscard]] static SharedSnapshotImportObservation
     import(Engine& engine, std::span<const std::uint8_t> bytes);
-    [[nodiscard]] static std::uint32_t import_cancelled(Engine& engine,
-                                                        std::span<const std::uint8_t> bytes);
     [[nodiscard]] static SealedSharedSnapshotTestImport parse(Engine& engine,
                                                               std::span<const std::uint8_t> bytes);
     static void import_validated(Engine& engine, const SealedSharedSnapshotTestImport& imported);

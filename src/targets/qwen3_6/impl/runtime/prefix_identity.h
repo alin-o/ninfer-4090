@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -18,7 +19,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(ResidentPrefixIdentity& other) noexcept;
-    void append_generated(std::size_t count, std::int32_t rope_delta);
+    void append_generated(std::size_t count, std::int32_t rope_delta,
+                          std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
@@ -39,7 +41,6 @@ public:
     [[nodiscard]] const std::vector<VisionItem>& vision_items() const noexcept {
         return vision_items_;
     }
-
     void restore(std::vector<std::uint8_t> token_types,
                  std::array<std::vector<std::int32_t>, 3> positions,
                  std::vector<VisionItem> vision_items);
@@ -59,7 +60,8 @@ public:
     void clear() noexcept;
     void assign(const PreparedPromptData& prompt);
     void swap(PrefixShortlistDigests& other) noexcept;
-    void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta);
+    void append_generated(std::span<const TokenId> tokens, std::int32_t rope_delta,
+                          std::optional<std::uint32_t> execution_split_after = std::nullopt);
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept {

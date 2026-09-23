@@ -115,10 +115,12 @@ public:
     // unconsumed handle cancels its request; wait() owns result consumption and may run
     // independently from GPU execution. Streaming mode requires a non-null sink in wait() and
     // publishes one exact GenerationStart before output deltas; Aggregate mode requires a null
-    // sink.
+    // sink. Observation options request protocol-neutral publication facts without changing the
+    // execution request.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
            OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,
+           GenerationObservationOptions observation               = {},
            std::chrono::steady_clock::time_point pending_deadline = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
@@ -135,6 +137,8 @@ public:
 
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    [[nodiscard]] bool is_available() const;
+
     void reset_memory_peaks() noexcept;
 
     // Session persistence for one retained-session slot: a private continuation-catalog cell
@@ -158,6 +162,7 @@ private:
     [[nodiscard]] GenerationHandle
     submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
                          OutputConsumerMode consumer_mode,
+                         GenerationObservationOptions observation,
                          std::chrono::steady_clock::time_point pending_deadline,
                          std::shared_ptr<runtime::DeferredDurableRecovery> recovery);
 

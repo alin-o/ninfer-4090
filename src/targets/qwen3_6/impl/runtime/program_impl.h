@@ -4,7 +4,6 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
-#include "runtime/engine/context_transfer_test_gate.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -46,8 +45,8 @@ using Clock = std::chrono::steady_clock;
 // the same hash over the prefix its frontier covers (session_snapshot_impl.h calls through
 // here for the full ledger).
 std::string ledger_prefix_digest(std::span<const TokenId> ledger) {
-    std::uint64_t hash      = 1469598103934665603ULL;
-    const auto* bytes       = reinterpret_cast<const unsigned char*>(ledger.data());
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto* bytes  = reinterpret_cast<const unsigned char*>(ledger.data());
     const std::size_t count = ledger.size() * sizeof(TokenId);
     for (std::size_t index = 0; index < count; ++index) {
         hash = (hash ^ bytes[index]) * 1099511628211ULL;
@@ -751,10 +750,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), kv_packed_v(plan.kv_packed_v),
-      kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v), kv_packed_k(plan.kv_packed_k),
-      kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
+      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -763,8 +759,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                   : 0),
       gdn_state_bytes(plan.persistent.state_images.linear.payload_bytes()),
       dflash_kv_bytes(plan.persistent.dflash ? plan.persistent.dflash->kv_payload_bytes() : 0),
-      replay_records_bytes(
-          plan.persistent.replay_records ? plan.persistent.replay_records->payload_bytes() : 0),
+      replay_records_bytes(plan.persistent.replay_records
+                               ? plan.persistent.replay_records->payload_bytes()
+                               : 0),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -783,7 +780,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::MtpDecodeIngress) +
                                                           sizeof(qwen3_6::MtpDecodeEgress))
                    : std::nullopt),
-      dflash_host(plan.speculative_backend == SpeculativeBackend::DFlash
+      dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
@@ -795,7 +792,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
-        model.dflash.has_value() != plan.features.dflash() ||
+        model.dflash.has_value() != plan.features.masked_draft() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.vision) {
         throw std::invalid_argument(
@@ -803,9 +800,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
-    }
-    if (model.dflash.has_value() && model.vision.has_value()) {
-        throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     if (workspace_plan.general_capacity == 0 ||
         workspace_plan.vision.has_value() != vision_enabled ||
@@ -896,7 +890,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    if (dflash.has_value() != plan.features.dflash()) {
+    if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
@@ -956,10 +950,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.ordinary.has_value() != (speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
-    if (io.dflash_prefill.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
+    if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {
         throw std::logic_error("DFlash prefill scratch does not match the sequence plan");
     }
-    if (io.dflash_decode.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
+    if (io.dflash_decode.has_value() != is_masked_draft_backend(speculative_backend)) {
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
@@ -1095,7 +1089,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
-        text_kv_addresses->materialize_to_tokens(*address, predictor_count, device.stream);
+        text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -1342,10 +1336,7 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                 state_store->checkpoint_references(*protection.state) !=
                 protection.consumed_state_references;
 
-            if (admission.reuse == ReusePath::PrivateEndpoint ||
-                is_rewrite_checkpoint_restore(admission.reuse)) {
-                // Either consuming path retains optional checkpoint references. Pressure can
-                // transfer an aliased image into this lineage by evicting its external owners.
+            if (is_rewrite_checkpoint_restore(admission.reuse)) {
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
                         std::any_of(
@@ -2381,22 +2372,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             });
         }
         const bool evicted = owner.decision != nullptr && owner.decision->evicts_continuation;
-        const bool consumed =
-            candidate.has_source &&
-            candidate.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
-            owner.sequence == &continuation_states[candidate.source_index];
         for (CheckpointProjection& checkpoint : checkpoints) {
-            // Consumption transfers compatible sparse checkpoints into the active lineage,
-            // but executing the suffix advances the endpoint. Price that lost recovery point
-            // for identity and pressure plans alike; retaining/forking a source preserves it.
-            const bool retained_by_active =
-                checkpoint.checkpoint.ref.kind == runtime::CheckpointKind::LongAnchor
-                    ? checkpoint.checkpoint.ref.frontier <= candidate.reuse_base
-                    : checkpoint.checkpoint.ref.kind != runtime::CheckpointKind::SessionEndpoint &&
-                          candidate.rewrite_disposition ==
-                              RewriteCheckpointDisposition::RetainExisting;
             checkpoint.survives =
-                !evicted && (!consumed || retained_by_active) &&
+                !evicted &&
                 !(owner.decision != nullptr &&
                   std::find(owner.decision->dropped_checkpoints.begin(),
                             owner.decision->dropped_checkpoints.end(), checkpoint.checkpoint.ref) !=
@@ -2890,8 +2868,8 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
     if (speculative_backend == SpeculativeBackend::Mtp) {
         sequence.mtp_kv_valid    = retained->backend_frontier;
         sequence.mtp_draft_count = 0;
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        sequence.dflash_context_frontier = retained->backend_frontier;
+    } else if (is_masked_draft_backend(speculative_backend)) {
+        sequence.dflash_context_frontier = retained->main_frontier;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(sequence);
@@ -2901,7 +2879,7 @@ qwen3_6::detail::PressureDecision
 ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
     qwen3_6::detail::PressureDecision option;
     option.id                                  = std::numeric_limits<std::uint64_t>::max();
-    option.effect.removed                      = resident_resources(sequence);
+    option.effect.removed                      = owner_exclusive_resources(sequence);
     const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
     if (!sequence.kv || summary.long_anchors.size() != sequence.long_anchors.size()) {
         throw std::logic_error("eviction owner checkpoint inventory is incomplete");
@@ -2916,7 +2894,7 @@ qwen3_6::detail::PressureDecision
 ProgramImplCore::inspect_shared_eviction_option(const SharedPrefixState& shared) const {
     qwen3_6::detail::PressureDecision option;
     option.id                  = std::numeric_limits<std::uint64_t>::max() - 1U;
-    option.effect.removed      = resident_resources(shared);
+    option.effect.removed      = owner_exclusive_resources(shared);
     option.checkpoint_drops    = 1;
     option.evicts_continuation = true;
     option.shared_owner        = true;
@@ -3443,7 +3421,7 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
         const SequenceState& sequence = continuation_states[index];
         if ((private_owner_state[index] & kOwnerEvicted) != 0) {
             append_state(sequence.state.write);
-            if (!sequence.state_source_retained || sequence.state.read == sequence.state.write) {
+            if (!sequence.state.borrows_read() || sequence.state.read == sequence.state.write) {
                 append_state(sequence.state.read);
             }
             if (sequence.rewrite_state) { append_state(*sequence.rewrite_state); }
@@ -3809,13 +3787,6 @@ bool ProgramImplCore::compose_pressure_candidate(
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
-    details.unique_reclamation               = runtime::UniquePhysicalReclamation{
-                      .device_state_slots      = removed.device.state_slots,
-                      .device_main_kv_pages    = removed.device.main_kv_pages,
-                      .device_backend_kv_pages = removed.device.backend_kv_pages,
-                      .host_state_slots        = removed.host.state_slots,
-                      .host_kv_bytes           = removed.host.kv_bytes,
-    };
 
     if (projection->source_state_fork_required &&
         details.state_fork_required != *projection->source_state_fork_required) {
@@ -3846,7 +3817,7 @@ bool ProgramImplCore::compose_pressure_candidate(
             }
             ++details.demand.reservation_credit.device.state_slots;
 
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (is_masked_draft_backend(speculative_backend)) {
                 const auto copy = std::find_if(
                     details.transfer_requirements.begin(), details.transfer_requirements.end(),
                     [](const runtime::ContextTransferRequirement& requirement) {
@@ -4551,7 +4522,6 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
-        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -4654,7 +4624,7 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
         throw std::logic_error("consumed materialization source is incomplete");
     }
 
-    const detail::PhysicalResources before = resident_resources(source);
+    const detail::PhysicalResources before = owner_exclusive_resources(source);
     const auto retained_state              = [&](StateImageHandle handle) {
         if (source.endpoint_valid && source.state.read == handle) { return true; }
         if (source.rewrite_state && *source.rewrite_state == handle) { return true; }
@@ -4777,18 +4747,18 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     source.text_kv_valid = details.reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (is_masked_draft_backend(speculative_backend)) {
         source.dflash_context_frontier = details.reuse_base;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
 
-    const detail::PhysicalResources after   = resident_resources(source);
+    const detail::PhysicalResources after   = owner_exclusive_resources(source);
     const detail::PhysicalResources removed = checked_resource_difference(before, after);
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
-void ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
+bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
         !requests[transaction.destination.value].prefill || !transaction.source_prepared) {
@@ -4809,7 +4779,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
          continuation_slots[transaction.source_index].role != ContinuationSlotRole::Catalogued ||
          continuation_slots[transaction.source_index].generation !=
              transaction.source_generation)) {
-        throw std::logic_error("materialization source changed during capacity preparation");
+        return false;
     }
     if (transaction.has_shared_source &&
         (transaction.shared_source_index >= shared_prefix_capacity ||
@@ -4817,16 +4787,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
              SharedPrefixSlotRole::Catalogued ||
          shared_prefix_slots[transaction.shared_source_index].generation !=
              transaction.shared_source_generation)) {
-        throw std::logic_error("materialization shared source changed during capacity preparation");
+        return false;
     }
     SequenceState* source_state =
         transaction.has_source ? &continuation_states[transaction.source_index] : nullptr;
     SharedPrefixState* shared_state = transaction.has_shared_source
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
-    if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
-        resident_resources(*source_state).host.state_slots == 0) {
-        throw std::logic_error("materialization source has no resident state");
+    // Residency of the *selected* checkpoint is what preparation is about to use, so that is what
+    // must be validated. resident_resources() is the wrong question here: it filters through
+    // state_exclusive_to_sequence, which answers "may this sequence release the image", not "is the
+    // image readable". A checkpoint that a published shared prefix also references is not exclusive
+    // and is therefore counted as zero, even though it is fully resident and is exactly the image
+    // the response-replay path is about to restore from.
+    if (source_state != nullptr) {
+        const std::optional<StateImageHandle> selected =
+            try_selected_state(*source_state, details.reuse, details.selected_checkpoint);
+        if (!selected || state_store->residency(*selected) == StateReplicaResidency::None) {
+            return false;
+        }
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;
@@ -4837,11 +4816,18 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             source_state != nullptr
                 ? selected_state(*source_state, details.reuse, details.selected_checkpoint)
                 : shared_state->state;
+        const StateReplicaResidency residency = state_store->residency(state);
+        // Source existence is a StateImageStore fact. Owner-exclusive resources may be zero for a
+        // valid allocation aliased by private and shared checkpoints.
+        if (state_store->role(state) != StateImageRole::CheckpointImmutable ||
+            residency == StateReplicaResidency::None) {
+            throw std::logic_error("materialization source has no published StateImage replica");
+        }
         const bool consuming_fork =
             source_state != nullptr &&
             details.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
             details.state_fork_required;
-        if (state_store->residency(state) == StateReplicaResidency::HostOnly) {
+        if (residency == StateReplicaResidency::HostOnly) {
             host_state_restore = state;
             if (state_count == 0) {
                 throw std::logic_error("Host StateImage restore has no Device reservation");
@@ -4867,7 +4853,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             if (!transaction.state_fork_destination) { throw std::bad_alloc(); }
         } else if (source_state != nullptr &&
                    details.source_mode == runtime::PrivateSourceMode::Retain &&
-                   state_store->residency(state) == StateReplicaResidency::Both) {
+                   residency == StateReplicaResidency::Both) {
             if (state_count == 0) {
                 throw std::logic_error("Both StateImage split has no active destination");
             }
@@ -5048,6 +5034,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     transaction.prepared = true;
     requests[lane].prefill->elapsed_seconds +=
         std::chrono::duration<double>(Clock::now() - prepare_started).count();
+    return true;
 }
 
 void ProgramImplCore::prepare_prefix_forks(MaterializationTransaction& transaction) {
@@ -5477,29 +5464,7 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
     work.state_changes.clear();
     work.main_kv_changes.clear();
     work.backend_kv_changes.clear();
-    work.pending_kv_offloads.clear();
     if (work.option.evicts_continuation) { return; }
-
-    const auto count_demotions = [](const auto& actions) {
-        return static_cast<std::size_t>(
-            std::count_if(actions.begin(), actions.end(), [](const auto& action) {
-                return action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
-            }));
-    };
-    work.pending_kv_offloads.reserve(count_demotions(work.option.main_kv_changes) +
-                                     count_demotions(work.option.backend_kv_changes));
-    const auto record_demotions = [&](const auto& actions, runtime::ContextResourceClass resource) {
-        for (const qwen3_6::detail::PressureKVDecision& action : actions) {
-            if (action.kind != qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) { continue; }
-            work.pending_kv_offloads.push_back(runtime::CommittedKvOffloadRange{
-                .resource   = resource,
-                .begin_page = action.begin_page,
-                .page_count = action.page_count,
-            });
-        }
-    };
-    record_demotions(work.option.main_kv_changes, runtime::ContextResourceClass::MainKV);
-    record_demotions(work.option.backend_kv_changes, runtime::ContextResourceClass::BackendKV);
 
     work.state_changes.resize(work.option.state_changes.size());
 
@@ -5918,7 +5883,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
         throw std::logic_error("materialization victim is not strictly releasable");
     }
 
-    out.delta.removed = resident_resources(continuation_states[index]);
+    out.delta.removed = owner_exclusive_resources(continuation_states[index]);
     release_continuation_slot_strict(index);
     if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
         continuation_slots[index].role      = ContinuationSlotRole::ReservedMaterialization;
@@ -5937,14 +5902,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     if (transaction_ptr == nullptr || transaction_ptr->terminal) {
         throw std::logic_error("Program has no progressable context transaction");
     }
-    MaterializationTransaction& transaction  = *transaction_ptr;
-    PressureTransition& pressure_transition  = transaction.pressure_transition;
-    const auto observe_committed_reclamation = [&](auto&& operation) {
-        const detail::PhysicalResources before = physical_occupancy();
-        operation();
-        observe_physical_reclamation(before, transaction.committed_reclamation);
-    };
-    const auto collect_pressure_operations = [&](MaterializationTransaction::PressureWork& work) {
+    MaterializationTransaction& transaction = *transaction_ptr;
+    PressureTransition& pressure_transition = transaction.pressure_transition;
+    const auto collect_pressure_operations  = [&](MaterializationTransaction::PressureWork& work) {
         if (work.spill_pages > std::numeric_limits<std::uint64_t>::max() -
                                    transaction.operations.pressure_spill_pages) {
             transaction.operations.pressure_spill_pages = std::numeric_limits<std::uint64_t>::max();
@@ -6050,7 +6010,6 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         release_materialization_staging(transaction);
         transaction.terminal      = true;
         out.status                = runtime::ContextTransactionStatus::Aborted;
-        out.committed_reclamation = transaction.committed_reclamation;
         out.transfer_observations = std::move(transaction.transfer_observations);
         out.operations            = transaction.operations;
         complete_source_acknowledgement(false);
@@ -6059,32 +6018,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_shared_victim_acknowledgement();
     };
 
-    if (cancellation.requested()) {
-        transaction.cancel_pending = true;
-        if (!transaction.submitted_snapshot_cancellation_observed &&
-            !snapshot_source_retirements_.empty() &&
-            runtime::testing::snapshot_transfer_gate() != nullptr) {
-            runtime::testing::note_materialization_submitted_cancellation();
-            transaction.submitted_snapshot_cancellation_observed = true;
-        }
-    }
+    if (cancellation.requested()) { transaction.cancel_pending = true; }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        // An eviction auto-save may still be reading an otherwise releasable victim on the
-        // transfer stream.  Keep the transaction sealed until the worker can retire those
-        // source pins; unrelated admitted lanes remain runnable between progress boundaries.
-        // Preflight already proved every selected victim releasable before the observer ran, so
-        // retry only while this bounded handoff is outstanding and preserve the strict check
-        // below for every other topology change.
-        if (!snapshot_source_retirements_.empty()) {
-            for (std::size_t position = 0; position < transaction.victim_count; ++position) {
-                if (transaction.pressure[position].option.evicts_continuation &&
-                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
-                    out.status = runtime::ContextTransactionStatus::InProgress;
-                    return out;
-                }
-            }
-        }
         if (transaction.cancel_pending) {
             abort_transaction();
             return out;
@@ -6100,20 +6036,17 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     shared_prefix_states[index].active_references != 0) {
                     throw std::logic_error("shared pressure victim changed before release");
                 }
-                const detail::PhysicalResources resident =
-                    resident_resources(shared_prefix_states[index]);
+                const detail::PhysicalResources exclusive =
+                    owner_exclusive_resources(shared_prefix_states[index]);
                 if (work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("shared pressure eviction changed after reservation");
                 }
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
                     throw std::logic_error("shared pressure victim is not strictly releasable");
                 }
-                detail::PhysicalResources released;
-                observe_committed_reclamation([&] {
-                    released =
-                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
-                });
-                if (released != resident) {
+                const detail::PhysicalResources released =
+                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                if (released != exclusive) {
                     throw std::logic_error("shared pressure eviction acknowledgement is invalid");
                 }
                 work.committed_delta    = detail::PhysicalDelta{.removed = released};
@@ -6126,15 +6059,14 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 };
                 transaction.shared_victim_released[position] = true;
             } else {
-                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
+                publish_pressure_host_releases(work);
             }
         }
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
-                PhysicalReleaseResult released;
-                observe_committed_reclamation(
-                    [&] { released = release_materialization_victim(transaction, position); });
+                const PhysicalReleaseResult released =
+                    release_materialization_victim(transaction, position);
                 if (released.status != runtime::ConsumeStatus::Consumed ||
                     released.delta.added != detail::PhysicalResources{} ||
                     work.option.effect.added != detail::PhysicalResources{}) {
@@ -6145,7 +6077,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 work.mutation_published = true;
                 evict_private_result(transaction.pressure_results[position]);
             } else {
-                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
+                publish_pressure_host_releases(work);
                 if (work.completed) {
                     SequenceState& victim = continuation_states[work.continuation_index];
                     retain_private_result(transaction.pressure_results[position], victim);
@@ -6296,15 +6228,14 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.completed) { continue; }
-            observe_committed_reclamation([&] { publish_pressure_work(work); });
+            publish_pressure_work(work);
             collect_pressure_operations(work);
             const std::uint32_t index = transaction.shared_victim_indices[position];
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
-                .owner                 = transaction.shared_pressure_results[position].owner,
-                .disposition           = runtime::VictimDisposition::Retained,
-                .pressure_committed    = true,
-                .final_summary         = shared_prefix_summary(shared_prefix_states[index]),
-                .committed_kv_offloads = std::move(work.pending_kv_offloads),
+                .owner              = transaction.shared_pressure_results[position].owner,
+                .disposition        = runtime::VictimDisposition::Retained,
+                .pressure_committed = true,
+                .final_summary      = shared_prefix_summary(shared_prefix_states[index]),
             };
             complete_pressure_delta(work);
             transaction.shared_victim_released[position] = true;
@@ -6314,13 +6245,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.completed) { continue; }
-            observe_committed_reclamation([&] { publish_pressure_work(work); });
+            publish_pressure_work(work);
             collect_pressure_operations(work);
             retain_private_result(transaction.pressure_results[position],
                                   continuation_states[work.continuation_index]);
             transaction.pressure_results[position].pressure_committed = true;
-            transaction.pressure_results[position].committed_kv_offloads =
-                std::move(work.pending_kv_offloads);
             complete_pressure_delta(work);
             transaction.victim_released[position] = true;
         }
@@ -6383,7 +6312,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     }
 
     if (!transaction.prepared) {
-        prepare_materialization(transaction);
+        // A stale plan is a planning-order fact, not physical corruption: preparation validates
+        // its source before mutating anything, so the transaction unwinds through the ordinary
+        // abort path and only this request is cancelled.
+        if (!prepare_materialization(transaction)) {
+            abort_transaction();
+            return out;
+        }
         enqueue_materialization_transfers(transaction);
         if (transaction.transfer_submitted) {
             out.status = runtime::ContextTransactionStatus::InProgress;
@@ -6402,13 +6337,28 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
+    } catch (const std::logic_error& invariant) {
+        // A per-request planning/state invariant (stale epoch, unmoved endpoint, entitlement
+        // mismatch, ...): the lane is already unwound by start_request, so abort this one
+        // request instead of tearing down the whole engine.
+        //
+        // The abort acknowledgements assert catalog state that start_request may already have
+        // consumed. If one of them throws, keep the original invariant visible instead of
+        // replacing it with the acknowledgement's message, so the failure can be diagnosed.
+        try {
+            abort_transaction();
+        } catch (const std::logic_error& acknowledgement) {
+            throw std::logic_error(std::string(invariant.what()) +
+                                   " (abort acknowledgement failed: " + acknowledgement.what() +
+                                   ")");
+        }
+        return out;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
     }
     transaction.terminal      = true;
     out.status                = runtime::ContextTransactionStatus::Published;
-    out.committed_reclamation = transaction.committed_reclamation;
     out.transfer_observations = std::move(transaction.transfer_observations);
     out.operations            = transaction.operations;
     complete_source_acknowledgement(true);
@@ -6420,12 +6370,6 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
-    // Source pins are Program capabilities.  The Host writer may wait for and consume its
-    // private image, but only this worker boundary mutates State/KV ownership.
-    retire_ready_snapshot_sources();
-    // After this point pressure work is allowed to mutate/release selected victims.  A snapshot
-    // may only be sealed in the reservation window above.
-    snapshot_save_window_ = false;
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress<Variant> {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {
@@ -6659,7 +6603,7 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
     };
 
     if (sequence.endpoint_valid) {
-        if (!validate_state(sequence.state.read, !sequence.state_source_retained ||
+        if (!validate_state(sequence.state.read, !sequence.state.read_has_external_owner() ||
                                                      sequence.state.read == sequence.state.write)) {
             return false;
         }
@@ -6668,7 +6612,7 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
             return false;
         }
     } else if (state_store->valid(sequence.state.read) ||
-               state_store->valid(sequence.state.write) || sequence.state_source_retained) {
+               state_store->valid(sequence.state.write) || sequence.state.borrows_read()) {
         return false;
     }
     if (sequence.rewrite_state && *sequence.rewrite_state != sequence.state.read &&
@@ -6744,74 +6688,88 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
     if (++slot.generation == 0) { ++slot.generation; }
 }
 
-detail::PhysicalResources ProgramImplCore::resident_resources(const SequenceState& sequence) const {
-    if (!state_store || !text_kv_addresses || !text_kv_pages) {
-        throw std::logic_error("resident sequence resources have no physical stores");
+detail::PhysicalResources
+ProgramImplCore::sequence_exclusive_state_resources(const SequenceState& sequence) const {
+    if (!state_store) {
+        throw std::logic_error("sequence StateImage resources have no physical store");
     }
     detail::PhysicalResources out;
-    {
-        std::array<StateImageHandle, 4> states{};
-        std::uint32_t state_count = 0;
-        const auto add_state      = [&](StateImageHandle handle) {
-            if (!state_store->valid(handle)) {
-                throw std::logic_error("resident sequence has a stale StateImage");
-            }
-            if (!state_exclusive_to_sequence(sequence, handle)) { return; }
-            for (std::uint32_t index = 0; index < state_count; ++index) {
-                if (states[index] == handle) { return; }
-            }
-            states[state_count++]                 = handle;
-            const StateReplicaResidency residency = state_store->residency(handle);
-            if (residency == StateReplicaResidency::DeviceOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++out.device.state_slots;
-            }
-            if (residency == StateReplicaResidency::HostOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++out.host.state_slots;
-            }
-        };
-        const bool has_read_state  = sequence.state.read.valid();
-        const bool has_write_state = sequence.state.write.valid();
-        if (has_read_state != has_write_state) {
-            throw std::logic_error("resident sequence has a partial primary StateImage pair");
+    std::array<StateImageHandle, 4> states{};
+    std::uint32_t state_count = 0;
+    const auto add_state      = [&](StateImageHandle handle) {
+        if (!state_store->valid(handle)) {
+            throw std::logic_error("sequence owner has a stale StateImage");
         }
-        if (has_read_state) {
-            if (!sequence.state_source_retained || sequence.state.read == sequence.state.write) {
-                add_state(sequence.state.read);
-            }
-            add_state(sequence.state.write);
+        if (!state_exclusive_to_sequence(sequence, handle)) { return; }
+        for (std::uint32_t index = 0; index < state_count; ++index) {
+            if (states[index] == handle) { return; }
         }
-        if (sequence.rewrite_state) { add_state(*sequence.rewrite_state); }
-        if (sequence.reserved_state) { add_state(*sequence.reserved_state); }
-        for (std::size_t anchor_index = 0; anchor_index < sequence.long_anchors.size();
-             ++anchor_index) {
-            const StateImageHandle handle = sequence.long_anchors[anchor_index].state;
-            if (!state_store->valid(handle)) {
-                throw std::logic_error("resident sequence has a stale long-anchor StateImage");
-            }
-            if (!state_exclusive_to_sequence(sequence, handle)) { continue; }
-            bool seen = false;
-            for (std::uint32_t index = 0;
-                 index < std::min<std::uint32_t>(state_count, states.size()); ++index) {
-                if (states[index] == handle) { seen = true; }
-            }
-            for (std::size_t prior = 0; !seen && prior < anchor_index; ++prior) {
-                if (sequence.long_anchors[prior].state == handle) { seen = true; }
-            }
-            if (seen) { continue; }
-            const StateReplicaResidency residency = state_store->residency(handle);
-            if (residency == StateReplicaResidency::DeviceOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++out.device.state_slots;
-            }
-            if (residency == StateReplicaResidency::HostOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++out.host.state_slots;
-            }
+        states[state_count++]                 = handle;
+        const StateReplicaResidency residency = state_store->residency(handle);
+        if (residency == StateReplicaResidency::DeviceOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++out.device.state_slots;
         }
+        if (residency == StateReplicaResidency::HostOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++out.host.state_slots;
+        }
+    };
+    const bool has_read_state  = sequence.state.read.valid();
+    const bool has_write_state = sequence.state.write.valid();
+    if (has_read_state != has_write_state) {
+        throw std::logic_error("sequence owner has a partial primary StateImage pair");
+    }
+    if (sequence.state.borrows_read() &&
+        (!sequence.state.fork_pending || sequence.state.read == sequence.state.write)) {
+        throw std::logic_error("sequence has an invalid borrowed StateImage source");
+    }
+    if (has_read_state) {
+        if (!sequence.state.borrows_read() || sequence.state.read == sequence.state.write) {
+            add_state(sequence.state.read);
+        }
+        add_state(sequence.state.write);
+    }
+    if (sequence.rewrite_state) { add_state(*sequence.rewrite_state); }
+    if (sequence.reserved_state) { add_state(*sequence.reserved_state); }
+    for (std::size_t anchor_index = 0; anchor_index < sequence.long_anchors.size();
+         ++anchor_index) {
+        const StateImageHandle handle = sequence.long_anchors[anchor_index].state;
+        if (!state_store->valid(handle)) {
+            throw std::logic_error("sequence owner has a stale long-anchor StateImage");
+        }
+        if (!state_exclusive_to_sequence(sequence, handle)) { continue; }
+        bool seen = false;
+        for (std::uint32_t index = 0; index < std::min<std::uint32_t>(state_count, states.size());
+             ++index) {
+            if (states[index] == handle) { seen = true; }
+        }
+        for (std::size_t prior = 0; !seen && prior < anchor_index; ++prior) {
+            if (sequence.long_anchors[prior].state == handle) { seen = true; }
+        }
+        if (seen) { continue; }
+        const StateReplicaResidency residency = state_store->residency(handle);
+        if (residency == StateReplicaResidency::DeviceOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++out.device.state_slots;
+        }
+        if (residency == StateReplicaResidency::HostOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++out.host.state_slots;
+        }
+    }
+    return out;
+}
 
-        if (!sequence.kv) { throw std::logic_error("resident sequence has no KV address bundle"); }
+detail::PhysicalResources
+ProgramImplCore::owner_exclusive_resources(const SequenceState& sequence) const {
+    if (!state_store || !text_kv_addresses || !text_kv_pages) {
+        throw std::logic_error("sequence owner resources have no physical stores");
+    }
+    detail::PhysicalResources out = sequence_exclusive_state_resources(sequence);
+
+    {
+        if (!sequence.kv) { throw std::logic_error("sequence owner has no KV address bundle"); }
         const auto add_kv = [&](const KVAddressSpaceStore& addresses,
                                 const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
                                 std::uint32_t& device_pages) {
@@ -6842,7 +6800,7 @@ detail::PhysicalResources ProgramImplCore::resident_resources(const SequenceStat
                 if (entitlement < mapped ||
                     entitlement - mapped >
                         std::numeric_limits<std::uint32_t>::max() - device_pages) {
-                    throw std::logic_error("resident active KV entitlement is inconsistent");
+                    throw std::logic_error("owner active KV entitlement is inconsistent");
                 }
                 device_pages += entitlement - mapped;
             }
@@ -6860,9 +6818,9 @@ detail::PhysicalResources ProgramImplCore::resident_resources(const SequenceStat
 }
 
 detail::PhysicalResources
-ProgramImplCore::resident_resources(const SharedPrefixState& shared) const {
+ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) const {
     if (!state_store || !text_kv_addresses || !text_kv_pages) {
-        throw std::logic_error("shared resident resources have no physical stores");
+        throw std::logic_error("shared owner resources have no physical stores");
     }
     detail::PhysicalResources out;
     {
@@ -6938,38 +6896,6 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
     return out;
 }
 
-void ProgramImplCore::observe_physical_reclamation(
-    detail::PhysicalResources before, runtime::UniquePhysicalReclamation& total) const noexcept {
-    const detail::PhysicalResources after = physical_occupancy();
-    const auto add_u32 = [](std::uint32_t& destination, std::uint32_t value) noexcept {
-        destination = value > std::numeric_limits<std::uint32_t>::max() - destination
-                          ? std::numeric_limits<std::uint32_t>::max()
-                          : destination + value;
-    };
-    const auto add_size = [](std::size_t& destination, std::size_t value) noexcept {
-        destination = value > std::numeric_limits<std::size_t>::max() - destination
-                          ? std::numeric_limits<std::size_t>::max()
-                          : destination + value;
-    };
-    add_u32(total.device_state_slots, before.device.state_slots > after.device.state_slots
-                                          ? before.device.state_slots - after.device.state_slots
-                                          : 0U);
-    add_u32(total.device_main_kv_pages,
-            before.device.main_kv_pages > after.device.main_kv_pages
-                ? before.device.main_kv_pages - after.device.main_kv_pages
-                : 0U);
-    add_u32(total.device_backend_kv_pages,
-            before.device.backend_kv_pages > after.device.backend_kv_pages
-                ? before.device.backend_kv_pages - after.device.backend_kv_pages
-                : 0U);
-    add_u32(total.host_state_slots, before.host.state_slots > after.host.state_slots
-                                        ? before.host.state_slots - after.host.state_slots
-                                        : 0U);
-    add_size(total.host_kv_bytes, before.host.kv_bytes > after.host.kv_bytes
-                                      ? before.host.kv_bytes - after.host.kv_bytes
-                                      : 0U);
-}
-
 detail::PhysicalResources
 ProgramImplCore::materialization_deficit(const ResourceCandidateState& admission) const {
     // Pressure is relative to this candidate's real peak. Treating every dimension as scarce
@@ -7014,12 +6940,15 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
 }
 
-StateImageHandle
-ProgramImplCore::selected_state(const SequenceState& sequence, ReusePath reuse,
-                                std::optional<runtime::CheckpointRef> checkpoint) const {
+// Every way this resolution fails is a stale plan rather than a broken Program, so preparation
+// consults it directly and aborts its transaction. selected_state keeps throwing for the callers
+// that have already established the path is live.
+std::optional<StateImageHandle>
+ProgramImplCore::try_selected_state(const SequenceState& sequence, ReusePath reuse,
+                                    std::optional<runtime::CheckpointRef> checkpoint) const {
     if (reuse == ReusePath::PrivateEndpoint) {
         if (!sequence.endpoint_valid || !state_store->valid(sequence.state.read)) {
-            throw std::logic_error("private endpoint StateImage is stale");
+            return std::nullopt;
         }
         return sequence.state.read;
     }
@@ -7029,7 +6958,7 @@ ProgramImplCore::selected_state(const SequenceState& sequence, ReusePath reuse,
     }
     if (reuse == ReusePath::PrivateLongAnchor) {
         if (!checkpoint || checkpoint->kind != runtime::CheckpointKind::LongAnchor) {
-            throw std::logic_error("long-anchor materialization has no selected checkpoint");
+            return std::nullopt;
         }
         const auto anchor = std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
                                          [&](const LongAnchorCheckpoint& candidate) {
@@ -7040,7 +6969,16 @@ ProgramImplCore::selected_state(const SequenceState& sequence, ReusePath reuse,
             return anchor->state;
         }
     }
-    throw std::logic_error("materialization path has no selected StateImage");
+    return std::nullopt;
+}
+
+StateImageHandle
+ProgramImplCore::selected_state(const SequenceState& sequence, ReusePath reuse,
+                                std::optional<runtime::CheckpointRef> checkpoint) const {
+    const std::optional<StateImageHandle> selected =
+        try_selected_state(sequence, reuse, std::move(checkpoint));
+    if (!selected) { throw std::logic_error("materialization path has no selected StateImage"); }
+    return *selected;
 }
 
 std::uint32_t ProgramImplCore::selected_state_consumed_references(
@@ -7318,22 +7256,21 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         sequence.lane                          = lane;
         transaction.root_continuation_index.reset();
         start_sequence(lane, sequence, transaction);
-        detail::PhysicalResources actual         = resident_resources(sequence);
+        detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            const auto describe = [](const detail::PhysicalResources& resources) {
-                return "lanes=" + std::to_string(resources.device.active_lanes) +
-                       ",device_state=" + std::to_string(resources.device.state_slots) +
-                       ",main_pages=" + std::to_string(resources.device.main_kv_pages) +
-                       ",backend_pages=" + std::to_string(resources.device.backend_kv_pages) +
-                       ",host_state=" + std::to_string(resources.host.state_slots) +
-                       ",host_kv_bytes=" + std::to_string(resources.host.kv_bytes);
+            const auto describe = [](const detail::PhysicalResources& r) {
+                return "lanes " + std::to_string(r.device.active_lanes) + " state_slots " +
+                       std::to_string(r.device.state_slots) + " main_kv_pages " +
+                       std::to_string(r.device.main_kv_pages) + " backend_kv_pages " +
+                       std::to_string(r.device.backend_kv_pages) + " host_state_slots " +
+                       std::to_string(r.host.state_slots) + " host_kv_bytes " +
+                       std::to_string(r.host.kv_bytes);
             };
-            throw std::logic_error(
-                "materialized sequence does not match its active entitlement: actual{" +
-                describe(actual) + "} expected{" + describe(expected) + "} frontier=" +
-                std::to_string(details.reuse_base));
+            throw std::logic_error("materialized sequence does not match its active entitlement"
+                                   " (actual: " + describe(actual) + "; expected: " +
+                                   describe(expected) + ")");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -7392,7 +7329,7 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
                                                             : 0U;
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
-                                       (static_cast<std::uint32_t>(kv_dtype) << 16U);
+                                       (static_cast<std::uint32_t>(kv_storage) << 16U);
     return qwen3_6::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,
@@ -7580,12 +7517,8 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
                                 exact_shared == nullptr && shared_prefix_capacity != 0;
 
     CaptureAssessment assessment;
-    assessment.shortlist_key        = group.identity->shortlist_key;
-    assessment.shared_evidence      = group.shared_evidence;
-    assessment.structural_origins   = group.structural_origins;
-    assessment.structural_role      = static_cast<std::uint8_t>(group.structural_role);
-    assessment.ssd_eligible         = group.ssd_eligible;
-    assessment.first_volatile_token = group.first_volatile_token;
+    assessment.shortlist_key   = group.identity->shortlist_key;
+    assessment.shared_evidence = group.shared_evidence;
     assessment.protected_rebuild_work =
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;
@@ -7693,7 +7626,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     detail::PhysicalResources replaced_shared;
     if (publish_shared && replacement != nullptr) {
         replaced_shared =
-            resident_resources(shared_prefix_states[ContractAccess::index(*replacement)]);
+            owner_exclusive_resources(shared_prefix_states[ContractAccess::index(*replacement)]);
     }
     if (replaced_shared.device.state_slots > state_store->device_occupied()) {
         throw std::logic_error("shared capture replacement exceeds Device State occupancy");
@@ -7748,7 +7681,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     if (assessment.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (is_masked_draft_backend(speculative_backend)) {
         assessment.transfer_requirements.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
     }
@@ -7775,7 +7708,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         if (assessment.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
-        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+        } else if (is_masked_draft_backend(speculative_backend)) {
             recovery.push_back(state_transfer_requirement(
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice,
                 true));
@@ -7962,17 +7895,8 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || !valid_capture_offer(offer)) {
+    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
-    }
-    // A retained-prefix activation can leave its asynchronous StateImage fork pending until the
-    // next Program boundary. Reaching an optional capture frontier in that interval is ordinary
-    // scheduling, not an invariant failure: the capture cannot own the same physical StateImage
-    // transaction, so consume this offer and continue the request. A later frontier may still be
-    // captured after the fork settles.
-    if (has_unsettled_state_fork()) {
-        skip_capture(std::move(offer));
-        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));
@@ -8110,7 +8034,6 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         transaction.transfer_enqueue_pending = assessment.needs_transfer;
         advance_resource_revision();
         context_transaction_.emplace<ActiveCaptureTransaction>(std::move(transaction));
-        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -8234,10 +8157,8 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
                                                  SharedPrefixSlotRole::ReservedReplacement)) {
                 throw std::logic_error("shared capture replacement is not strictly releasable");
             }
-            const detail::PhysicalResources before  = physical_occupancy();
             const detail::PhysicalResources removed = release_shared_prefix_state_strict(
                 *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement);
-            observe_physical_reclamation(before, transaction.committed_reclamation);
             if (removed != transaction.capacity_preparation_removed) {
                 throw std::logic_error("shared capture preparation release changed");
             }
@@ -8330,7 +8251,7 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (is_masked_draft_backend(speculative_backend)) {
         const StateImageSelectors state_fork =
             state_store->selectors(transaction.source_state, transaction.destination_state);
         start_context_transfer_timer(runtime::ContextResourceClass::State);
@@ -8361,14 +8282,6 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::BackendKV);
         ++transaction.operations.partial_tail_cow_pages;
-    }
-    if (const auto* gate = runtime::testing::active_capture_transfer_gate(); gate != nullptr) {
-        if (gate->enqueue == nullptr) {
-            throw std::logic_error("active capture transfer test gate has no enqueue hook");
-        }
-        cuda_check(gate->enqueue(gate->context, device.transfer_stream),
-                   "enqueue active capture transfer test delay", __FILE__, __LINE__);
-        runtime::testing::note_active_capture_transfer_gate_wait();
     }
     context_completion_.record(device.transfer_stream);
     transaction.transfer_enqueue_pending = false;
@@ -8496,7 +8409,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
                                                         : prefill.initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
                                                                 : 0U;
-        materialize_sequence_kv(sequence, prefill.prompt_tokens, backend_materialized);
+        ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
     }
 
     detail::PhysicalResources removed = transaction.capacity_preparation_removed;
@@ -8504,7 +8417,6 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         state_store->retain_checkpoint_reference(transaction.source_state);
     }
     if (transaction.publish_private) {
-        const detail::PhysicalResources before = physical_occupancy();
         if (transaction.recycles_private_state) {
             if (!sequence.rewrite_state ||
                 *sequence.rewrite_state != transaction.destination_state ||
@@ -8519,7 +8431,6 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
                                              transaction.private_replacement));
-        observe_physical_reclamation(before, transaction.committed_reclamation);
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {
@@ -8555,7 +8466,6 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     ActiveCaptureResult out;
     out.status                         = runtime::ContextTransactionStatus::Published;
     out.capacity_preparation_committed = transaction.replacement_removed;
-    out.committed_reclamation          = transaction.committed_reclamation;
     if (transaction.publish_private) {
         populate_continuation_summary(sequence, transaction.active_summary);
         out.active_summary = std::move(transaction.active_summary);
@@ -8611,26 +8521,10 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction_ptr == nullptr) {
         throw std::logic_error("Program has no active capture transaction");
     }
-    ActiveCaptureTransaction& transaction    = *transaction_ptr;
-    PressureTransition& pressure_transition  = transaction.pressure_transition;
-    const auto observe_committed_reclamation = [&](auto&& operation) {
-        const detail::PhysicalResources before = physical_occupancy();
-        operation();
-        observe_physical_reclamation(before, transaction.committed_reclamation);
-    };
+    ActiveCaptureTransaction& transaction   = *transaction_ptr;
+    PressureTransition& pressure_transition = transaction.pressure_transition;
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
-    }
-    if (cancellation.requested() && !transaction.cancel_pending) {
-        // The lifecycle regression observes cancellation only after the real State transfer has
-        // been submitted and its capability still owns the pinned source/destination. This is
-        // deliberately earlier than settlement and publication, which remain event-gated below.
-        if (transaction.transfer_submitted && transaction.state_snapshot &&
-            transaction.state_snapshot->valid() &&
-            runtime::testing::active_capture_transfer_gate() != nullptr) {
-            runtime::testing::note_active_capture_submitted_cancellation();
-        }
-        transaction.cancel_pending = true;
     }
     const auto abort = [&]() -> ActiveCaptureResult {
         abort_active_capture(transaction);
@@ -8647,7 +8541,6 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         ActiveCaptureResult out;
         out.status                         = runtime::ContextTransactionStatus::Aborted;
         out.capacity_preparation_committed = transaction.replacement_removed;
-        out.committed_reclamation          = transaction.committed_reclamation;
         out.victims                        = std::move(transaction.pressure_results);
         out.shared_victims                 = std::move(transaction.shared_pressure_results);
         out.transfer_observations          = std::move(transaction.transfer_observations);
@@ -8675,24 +8568,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        // The Engine may have sealed an eviction snapshot after this capture topology was
-        // reserved.  Its immutable sources remain pinned until the transfer event settles.  Do
-        // not mistake that bounded handoff for a topology violation: retain the transaction and
-        // let independent admitted lanes execute between progress boundaries.  Preflight proved
-        // each victim releasable before the observer ran; strict validation below still catches
-        // every unrelated ownership change.
-        if (!snapshot_source_retirements_.empty()) {
-            for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
-                const auto& work = transaction.pressure[position];
-                if (work.option.evicts_continuation &&
-                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
-                    ActiveCaptureResult out;
-                    out.status = runtime::ContextTransactionStatus::InProgress;
-                    return out;
-                }
-            }
-        }
-        if (transaction.cancel_pending) { return abort(); }
+        if (cancellation.requested()) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -8704,18 +8580,15 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     shared_prefix_states[index].active_references != 0) {
                     throw std::logic_error("capture shared pressure victim changed before release");
                 }
-                const detail::PhysicalResources resident =
-                    resident_resources(shared_prefix_states[index]);
+                const detail::PhysicalResources exclusive =
+                    owner_exclusive_resources(shared_prefix_states[index]);
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
                     throw std::logic_error(
                         "capture shared pressure victim is not strictly releasable");
                 }
-                detail::PhysicalResources released;
-                observe_committed_reclamation([&] {
-                    released =
-                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
-                });
-                if (released != resident ||
+                const detail::PhysicalResources released =
+                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                if (released != exclusive ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("capture shared pressure eviction changed");
                 }
@@ -8728,7 +8601,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                 };
             } else {
-                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
+                publish_pressure_host_releases(work);
                 if (work.completed) {
                     transaction.shared_pressure_results[position] =
                         MaterializationSharedVictimResult{
@@ -8755,19 +8628,19 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 if (!can_release_continuation_slot_strict(index)) {
                     throw std::logic_error("capture private victim is not strictly releasable");
                 }
-                const detail::PhysicalResources resident =
-                    resident_resources(continuation_states[index]);
-                observe_committed_reclamation([&] { release_continuation_slot_strict(index); });
-                work.committed_delta                   = detail::PhysicalDelta{.removed = resident};
-                work.completed                         = true;
-                work.mutation_published                = true;
+                const detail::PhysicalResources exclusive =
+                    owner_exclusive_resources(continuation_states[index]);
+                release_continuation_slot_strict(index);
+                work.committed_delta    = detail::PhysicalDelta{.removed = exclusive};
+                work.completed          = true;
+                work.mutation_published = true;
                 transaction.pressure_results[position] = MaterializationVictimResult{
                     .owner              = transaction.pressure_results[position].owner,
                     .disposition        = runtime::VictimDisposition::Evicted,
                     .pressure_committed = true,
                 };
             } else {
-                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
+                publish_pressure_host_releases(work);
                 if (work.completed) {
                     transaction.pressure_results[position] = MaterializationVictimResult{
                         .owner              = transaction.pressure_results[position].owner,
@@ -8874,7 +8747,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work = transaction.shared_pressure[position];
             if (!work.completed) {
-                observe_committed_reclamation([&] { publish_pressure_work(work); });
+                publish_pressure_work(work);
                 collect_spill(work);
                 transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
                     .owner              = transaction.shared_pressure_results[position].owner,
@@ -8882,14 +8755,13 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = shared_prefix_summary(
                         shared_prefix_states[transaction.shared_victim_indices[position]]),
-                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             auto& work = transaction.pressure[position];
             if (!work.completed) {
-                observe_committed_reclamation([&] { publish_pressure_work(work); });
+                publish_pressure_work(work);
                 collect_spill(work);
                 transaction.pressure_results[position] = MaterializationVictimResult{
                     .owner              = transaction.pressure_results[position].owner,
@@ -8897,7 +8769,6 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = continuation_summary(
                         continuation_states[transaction.victim_indices[position]]),
-                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
@@ -8920,11 +8791,9 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (has_pressure() && pressure_transition.phase != PressureTransitionPhase::Committed) {
         throw std::logic_error("capture pressure transition did not reach a stable phase");
     }
-    // A prepared capture may already own transfer-stream work. Cancellation is adopted below,
-    // after context_completion_ is ready, so abort_active_capture cannot release a live State
-    // destination, KV snapshot reservation, or source pin.
+    if (cancellation.requested()) { return abort(); }
     if (!transaction.prepared) {
-        if (transaction.cancel_pending) { return abort(); }
+        if (cancellation.requested()) { return abort(); }
         try {
             prepare_active_capture(transaction);
         } catch (...) {
@@ -8934,7 +8803,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
     }
     if (transaction.transfer_enqueue_pending) {
-        if (transaction.cancel_pending) { return abort(); }
+        if (cancellation.requested()) { return abort(); }
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
@@ -8990,7 +8859,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
         transaction.transfer_submitted = false;
     }
-    if (transaction.cancel_pending) { return abort(); }
+    if (cancellation.requested()) { return abort(); }
     return publish_active_capture(transaction);
 }
 
@@ -9030,12 +8899,50 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
 }
 
+// Begin and ordinary rounds may already have provisional identity through the accepted extent;
+// speculative and forced spans arrive with identity at their base. Both are Program-owned pending
+// states, and this is their single accepted-prefix identity commit.
+void ProgramImplCore::commit_generated_prefix_identity(
+    SequenceState& sequence, std::uint32_t base_ledger_frontier,
+    std::span<const TokenId> accepted_tokens,
+    std::optional<std::uint32_t> prefix_execution_split_after) {
+    if (base_ledger_frontier > sequence.ledger.size() ||
+        accepted_tokens.size() > sequence.ledger.size() - base_ledger_frontier ||
+        sequence.ledger.size() != base_ledger_frontier + accepted_tokens.size() ||
+        !std::equal(accepted_tokens.begin(), accepted_tokens.end(),
+                    sequence.ledger.begin() + static_cast<std::ptrdiff_t>(base_ledger_frontier)) ||
+        (prefix_execution_split_after &&
+         (*prefix_execution_split_after == 0 ||
+          *prefix_execution_split_after > accepted_tokens.size()))) {
+        throw std::logic_error("committed generated-prefix identity has an invalid span");
+    }
+    const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
+                                  sequence.prefix_digests.size() == sequence.ledger.size();
+    const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
+                               sequence.prefix_digests.size() == base_ledger_frontier;
+    if (!already_appended && !awaits_append) {
+        throw std::logic_error("generated-prefix identity is not at its base or committed extent");
+    }
+    if (already_appended && !prefix_execution_split_after) { return; }
+    sequence.prefix_identity.truncate(base_ledger_frontier);
+    sequence.prefix_digests.truncate(base_ledger_frontier);
+    sequence.prefix_identity.append_generated(accepted_tokens.size(), sequence.rope_delta,
+                                              prefix_execution_split_after);
+    sequence.prefix_digests.append_generated(accepted_tokens, sequence.rope_delta,
+                                             prefix_execution_split_after);
+    if (sequence.prefix_identity.size() != sequence.ledger.size() ||
+        sequence.prefix_digests.size() != sequence.ledger.size()) {
+        throw std::logic_error("committed generated-prefix identity changed the ledger shape");
+    }
+}
+
 runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
     std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
-    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
+    std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
+    runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
-        row_stride == 0 ||
+        row_stride == 0 || prefix_execution_splits.size() != members.size() ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
         throw std::invalid_argument("forced-token membership is invalid");
     }
@@ -9060,12 +8967,16 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             sequence.text_kv_valid != sequence.execution_frontier ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
-            (speculative_backend == SpeculativeBackend::DFlash &&
+            (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier > sequence.execution_frontier) ||
             static_cast<std::uint64_t>(sequence.execution_frontier) + row_stride > capacity) {
             throw std::logic_error("forced-token sequence frontier is invalid");
         }
         validate_licensed_tokens(row_major_tokens.subspan(row * row_stride, row_stride));
+        if (prefix_execution_splits[row] &&
+            (*prefix_execution_splits[row] == 0 || *prefix_execution_splits[row] > row_stride)) {
+            throw std::logic_error("forced-token execution split is outside its row");
+        }
         lanes[row] = lane;
     }
 
@@ -9099,11 +9010,12 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             RequestControl& request  = requests[lane];
             const std::span<const TokenId> forced =
                 row_major_tokens.subspan(row * row_stride, row_stride);
-            const std::uint32_t base = sequence.execution_frontier;
-            const std::uint32_t end  = base + row_stride;
-            const auto started       = Clock::now();
+            const std::uint32_t base_ledger_frontier = sequence.ledger_frontier;
+            const std::uint32_t base                 = sequence.execution_frontier;
+            const std::uint32_t end                  = base + row_stride;
+            const auto started                       = Clock::now();
 
-            if (speculative_backend == SpeculativeBackend::DFlash &&
+            if (is_masked_draft_backend(speculative_backend) &&
                 sequence.dflash_context_frontier < base) {
                 const std::array<std::uint32_t, 1> append_lanes{lane};
                 const std::array<std::uint32_t, 1> append_starts{sequence.dflash_context_frontier};
@@ -9114,23 +9026,21 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 device.synchronize();
                 timing.end_wait();
                 sequence.dflash_context_frontier = base;
-                commit_sequence_kv(sequence, sequence.text_kv_valid,
-                                   sequence.dflash_context_frontier);
+                commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
                 work.reset();
                 timing.resume_submit();
             }
 
-            bind_sequence_kv(sequence);
-            materialize_sequence_kv(sequence, end,
-                                    speculative_backend == SpeculativeBackend::None ? 0U : end);
+            ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
                 throw std::logic_error("forced-token continuation ledger has an invalid shape");
             }
 
-            if (speculative_backend == SpeculativeBackend::DFlash) {
-                if (!dflash || !io.dflash_decode || !sequence.kv || !sequence.kv->backend) {
+            if (is_masked_draft_backend(speculative_backend)) {
+                if (!dflash || !io.dflash_decode || !sequence.kv ||
+                    (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
                 *dflash_host_ingress                            = {};
@@ -9139,7 +9049,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 dflash_host_ingress->state_source_slots[0]      = selectors.source;
                 dflash_host_ingress->state_destination_slots[0] = selectors.destination;
                 dflash_host_ingress->dflash_kv_table_rows[0] =
-                    backend_kv_addresses->bound_row(*sequence.kv->backend);
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0;
                 CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
                                            sizeof(qwen3_6::DFlashDecodeIngress),
                                            cudaMemcpyHostToDevice, device.stream));
@@ -9168,7 +9079,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (is_masked_draft_backend(speculative_backend)) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
@@ -9181,7 +9092,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 sequence.text_kv_valid = cursor;
                 if (speculative_backend == SpeculativeBackend::Mtp) {
                     sequence.mtp_kv_valid = cursor;
-                } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                } else if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -9195,8 +9106,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             timing.end_wait();
             work.reset();
 
-            sequence.prefix_identity.append_generated(row_stride, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(forced, sequence.rope_delta);
+            commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
+                                             prefix_execution_splits[row]);
             advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
@@ -9263,6 +9174,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
         for (std::size_t row = 0; row < row_count; ++row) {
             const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
             lanes[row]                              = lane;
@@ -9276,12 +9188,16 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!decision.cancelled &&
                  (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
-                  (!decision.terminal && decision.accepted_tokens != candidate.produced)))) {
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
+                (decision.prefix_execution_split_after &&
+                 (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
+                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
                 throw std::logic_error("pending transaction decision is invalid");
             }
-            accepted[row]  = decision.accepted_tokens;
-            terminal[row]  = decision.terminal ? 1U : 0U;
-            cancelled[row] = decision.cancelled ? 1U : 0U;
+            accepted[row]                = decision.accepted_tokens;
+            terminal[row]                = decision.terminal ? 1U : 0U;
+            cancelled[row]               = decision.cancelled ? 1U : 0U;
+            prefix_execution_splits[row] = decision.prefix_execution_split_after;
             if (decision.cancelled) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
@@ -9289,11 +9205,14 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         }
 
         timing.pause();
-        timing.include(resolve_pending_raw(
-            std::span<const std::uint32_t>(lanes.data(), row_count),
-            std::span<const std::uint32_t>(accepted.data(), row_count),
-            std::span<const std::uint8_t>(terminal.data(), row_count),
-            std::span<const std::uint8_t>(cancelled.data(), row_count), failed_timing));
+        timing.include(
+            resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
+                                std::span<const std::uint32_t>(accepted.data(), row_count),
+                                std::span<const std::uint8_t>(terminal.data(), row_count),
+                                std::span<const std::uint8_t>(cancelled.data(), row_count),
+                                std::span<const std::optional<std::uint32_t>>(
+                                    prefix_execution_splits.data(), row_count),
+                                failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
 
@@ -9396,12 +9315,12 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
+    // Every valid terminal execution path settles a borrowed materialization Fork first. A
+    // borrowed source cannot become this continuation's direct endpoint; fall back to terminal
+    // discard if that publication invariant was not established.
+    if (state.state.fork_pending && state.state.borrows_read()) { return out; }
     try {
         out.summary.long_anchors.reserve(state.long_anchors.size());
-        // ResourceManager publishes at most endpoint + rewrite + every long anchor after the
-        // physical freeze. Reserve before mutation so observability cannot introduce a
-        // post-commit allocation failure at terminal retention.
-        out.lifecycle.reserve(state.long_anchors.size() + 2U);
     } catch (...) { return out; }
     try {
         if (state.state.fork_pending) {
@@ -9409,6 +9328,9 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
             const StateImageHandle destination = state.state.write;
             state_store->abort_fork(source, destination);
             if (!state_store->release(destination)) { return out; }
+            // An active-capture source is still this sequence's primary lifetime. Publishing it
+            // as the endpoint retains that direct ownership; surviving checkpoint references
+            // still prevent exclusive attribution and release.
             state.state = ActiveStateBinding{.read = source, .write = source};
         }
         if (state.reserved_state) {
@@ -9484,9 +9406,6 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     const bool valid               = !has_context_transaction() && !pending_transaction_ &&
                        valid_continuation(continuation) && !materialization_pins(index, generation);
     if (!valid) { return out; }
-    // Direct destructive callers have no open context transaction through which to revisit an
-    // asynchronous eviction spill.  Settle that bounded handoff here; materialization pressure
-    // instead defers at progress boundaries so unrelated admitted lanes remain runnable.
     if (wait_for_exports && !snapshot_source_retirements_.empty()) { settle_snapshot_sources(); }
     try {
         if (!can_release_continuation_slot_strict(index)) { return out; }
@@ -9524,7 +9443,7 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
         if (!can_release_shared_prefix_state(index, expected_role)) { std::terminate(); }
         SharedPrefixState& shared               = shared_prefix_states[index];
         SharedPrefixSlot& slot                  = shared_prefix_slots[index];
-        const detail::PhysicalResources removed = resident_resources(shared);
+        const detail::PhysicalResources removed = owner_exclusive_resources(shared);
         const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
         if (shared.kv->backend && !backend_kv_addresses->release(*shared.kv->backend)) {
             std::terminate();
@@ -9565,7 +9484,6 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 
 void ProgramImplCore::fail_all_cleanup() noexcept {
     pending_transaction_.reset();
-    settle_snapshot_sources();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
@@ -9674,18 +9592,13 @@ bool ProgramImplCore::persistent_backfill_safe(
 
 qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
-    const std::uint32_t reserved_state    = state_store ? state_store->reserved() : 0U;
     return qwen3_6::PhysicalUsageSnapshot{
-        .resource_revision            = resource_revision_,
-        .logical_state_capacity_slots = state_store ? state_store->capacity() : 0U,
-        .logical_state_used_slots     = state_store ? state_store->occupied() - reserved_state : 0U,
-        .logical_state_reserved_slots = reserved_state,
-        .logical_state_inflight_slots = state_store ? state_store->in_flight() : 0U,
-        .device_state_slots           = usage.device.state_slots,
-        .host_state_slots             = usage.host.state_slots,
-        .device_main_kv_pages         = usage.device.main_kv_pages,
-        .device_backend_kv_pages      = usage.device.backend_kv_pages,
-        .host_kv_bytes                = usage.host.kv_bytes,
+        .resource_revision       = resource_revision_,
+        .device_state_slots      = usage.device.state_slots,
+        .host_state_slots        = usage.host.state_slots,
+        .device_main_kv_pages    = usage.device.main_kv_pages,
+        .device_backend_kv_pages = usage.device.backend_kv_pages,
+        .host_kv_bytes           = usage.host.kv_bytes,
     };
 }
 
@@ -9780,13 +9693,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 sequence.state = ActiveStateBinding{.read = current, .write = current};
             } else {
                 const StateImageSelectors selectors = state_store->begin_fork(selected, current);
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (is_masked_draft_backend(speculative_backend)) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
                 }
-                sequence.state =
-                    ActiveStateBinding{.read = selected, .write = current, .fork_pending = true};
-                sequence.state_source_retained = true;
+                sequence.state = ActiveStateBinding{
+                    .read           = selected,
+                    .write          = current,
+                    .fork_pending   = true,
+                    .read_ownership = StateReadOwnership::ExternalOwner,
+                };
             }
             transaction.reserved_states[0]   = {};
             transaction.split_state_identity = false;
@@ -9961,15 +9877,27 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 }
                 sequence.state = ActiveStateBinding{.read = destination, .write = destination};
             } else {
+                const std::uint32_t references = state_store->checkpoint_references(selected);
+                const std::uint32_t lineage_references =
+                    owned_checkpoint_references(sequence, selected);
+                if (lineage_references > references) {
+                    throw std::logic_error("consumed StateImage Fork ownership is inconsistent");
+                }
+                const StateReadOwnership read_ownership =
+                    lineage_references == references ? StateReadOwnership::LineageCheckpoint
+                                                     : StateReadOwnership::ExternalOwner;
                 const StateImageSelectors selectors =
                     state_store->begin_fork(selected, destination);
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (is_masked_draft_backend(speculative_backend)) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
                 }
                 sequence.state = ActiveStateBinding{
-                    .read = selected, .write = destination, .fork_pending = true};
-                sequence.state_source_retained = true;
+                    .read           = selected,
+                    .write          = destination,
+                    .fork_pending   = true,
+                    .read_ownership = read_ownership,
+                };
             }
             transaction.state_fork_destination.reset();
         };
@@ -10002,10 +9930,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     throw std::logic_error("retained prefix has incomplete MTP KV");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            } else if (is_masked_draft_backend(speculative_backend)) {
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->dflash_context_frontier
-                                                         : shared_source->backend_frontier;
+                                                         : shared_source->frontier;
                 if (source_backend < base) {
                     throw std::logic_error("retained prefix has incomplete DFlash KV");
                 }
@@ -10054,7 +9982,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (speculative_backend == SpeculativeBackend::DFlash &&
+            } else if (is_masked_draft_backend(speculative_backend) &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
@@ -10100,8 +10028,9 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
-            } else if (speculative_backend == SpeculativeBackend::DFlash) {
-                if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
+            } else if (is_masked_draft_backend(speculative_backend)) {
+                if (!dflash || (backend_kv_cache() && !sequence.kv->backend) ||
+                    sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 sequence.dflash_context_frontier = base;
@@ -10128,7 +10057,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -10144,6 +10073,21 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
+        if (is_masked_draft_backend(speculative_backend)) {
+            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
+                throw std::logic_error("DFlash prefill state is incomplete");
+            }
+            *dflash_host_ingress                       = {};
+            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
+            const StateImageSelectors selectors        = state_selectors(sequence);
+            dflash_host_ingress->state_source_slots[0] = selectors.source;
+            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+            dflash_host_ingress->dflash_kv_table_rows[0] =
+                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
@@ -10170,16 +10114,18 @@ ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal,
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
     return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
-                                           failed_timing);
+                                           std::nullopt, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+    std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
-        terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
+        terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
+        prefix_execution_splits.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
 
@@ -10198,9 +10144,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             }
         } else {
             timing.pause();
-            timing.include(resolve_non_speculative_pending(active_sequence(lane), requests[lane],
-                                                           accepted_tokens.front(),
-                                                           terminal.front() != 0, failed_timing));
+            timing.include(resolve_non_speculative_pending(
+                active_sequence(lane), requests[lane], accepted_tokens.front(),
+                terminal.front() != 0, prefix_execution_splits.front(), failed_timing));
             timing.resume_post();
         }
         return timing.finish();
@@ -10219,9 +10165,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 }
             } else {
                 timing.pause();
-                timing.include(resolve_non_speculative_pending(active_sequence(lane),
-                                                               requests[lane], accepted_tokens[row],
-                                                               terminal[row] != 0, failed_timing));
+                timing.include(resolve_non_speculative_pending(
+                    active_sequence(lane), requests[lane], accepted_tokens[row], terminal[row] != 0,
+                    prefix_execution_splits[row], failed_timing));
                 timing.resume_post();
             }
         }
@@ -10251,7 +10197,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             sequence.text_kv_valid != pending.base_E ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != pending.base_E) ||
-            (speculative_backend == SpeculativeBackend::DFlash &&
+            (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier != pending.base_E)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
@@ -10279,6 +10225,23 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
+        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
+        if (speculative_backend == SpeculativeBackend::DFlash2) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
+                    continue;
+                }
+                const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
+                Tensor ids =
+                    io.dflash_decode->licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
+                        .slice(0, 0, count)
+                        .view({count});
+                Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
+                                    .view({TextConfig::token_domain});
+                ops::increment_token_counts(ids, counts, device.stream);
+            }
+        }
+
         if (needs_hidden_correction) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
             Tensor selector_tensor;
@@ -10291,7 +10254,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
-            } else if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
+            } else if (is_masked_draft_backend(speculative_backend) && io.dflash_decode) {
                 qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
@@ -10309,7 +10272,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                          device.stream);
         }
 
-        if (speculative_backend == SpeculativeBackend::DFlash) {
+        if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
@@ -10364,9 +10327,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
-            sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(
-                std::span<const TokenId>(token_base, committed), sequence.rope_delta);
+            commit_generated_prefix_identity(sequence, pending.base_S,
+                                             std::span<const TokenId>(token_base, committed),
+                                             prefix_execution_splits[row]);
             advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
@@ -10439,24 +10402,29 @@ bool ProgramImplCore::can_clear_lane_strict(const SequenceState& sequence) const
 
     if (!state_store->valid(sequence.state.read) || !state_store->valid(sequence.state.write) ||
         (sequence.state.fork_pending &&
-         (!sequence.state_source_retained ||
+         (!sequence.state.borrows_read() ||
           !state_store->can_abort_fork(sequence.state.read, sequence.state.write)))) {
         return false;
     }
+    enum class ForkEndpoint : std::uint8_t { None, Source, Destination };
     const auto validate_state = [&](StateImageHandle handle, bool release_object,
-                                    bool fork_destination = false) {
+                                    ForkEndpoint fork_endpoint = ForkEndpoint::None) {
         if (!state_store->valid(handle)) { return false; }
         const std::uint32_t owned = owned_checkpoint_references(sequence, handle);
         const std::uint32_t total = state_store->checkpoint_references(handle);
         if (owned > total ||
             (owned != 0 && state_store->role(handle) != StateImageRole::CheckpointImmutable &&
-             !fork_destination)) {
+             fork_endpoint != ForkEndpoint::Destination)) {
             return false;
         }
         if (!release_object || total != owned) { return true; }
-        if (fork_destination) {
-            return state_store->can_release_after_fork_abort(sequence.state.read,
-                                                             sequence.state.write, owned);
+        if (fork_endpoint == ForkEndpoint::Source) {
+            return state_store->can_release_source_after_fork_abort(sequence.state.read,
+                                                                    sequence.state.write, owned);
+        }
+        if (fork_endpoint == ForkEndpoint::Destination) {
+            return state_store->can_release_destination_after_fork_abort(
+                sequence.state.read, sequence.state.write, owned);
         }
         return state_store->can_release_after_checkpoint_references(handle, owned);
     };
@@ -10464,12 +10432,16 @@ bool ProgramImplCore::can_clear_lane_strict(const SequenceState& sequence) const
         return handle == sequence.state.read || handle == sequence.state.write;
     };
 
-    if (!validate_state(sequence.state.read, !sequence.state_source_retained ||
-                                                 sequence.state.read == sequence.state.write)) {
+    if (!validate_state(sequence.state.read,
+                        !sequence.state.read_has_external_owner() ||
+                            sequence.state.read == sequence.state.write,
+                        sequence.state.fork_pending ? ForkEndpoint::Source : ForkEndpoint::None)) {
         return false;
     }
     if (sequence.state.write != sequence.state.read &&
-        !validate_state(sequence.state.write, true, sequence.state.fork_pending)) {
+        !validate_state(sequence.state.write, true,
+                        sequence.state.fork_pending ? ForkEndpoint::Destination
+                                                    : ForkEndpoint::None)) {
         return false;
     }
     if (sequence.rewrite_state && !duplicates_binding(*sequence.rewrite_state) &&
@@ -10564,49 +10536,6 @@ StateImageSelectors ProgramImplCore::state_selectors(const SequenceState& sequen
     return state_store->selectors(sequence.state.read, sequence.state.write);
 }
 
-std::uint32_t
-ProgramImplCore::owned_device_state_slots(const SequenceState& sequence) const noexcept {
-    if (!state_store) { return 0; }
-    std::array<StateImageHandle, 4> unique{};
-    std::uint32_t count = 0;
-    const auto add      = [&](StateImageHandle handle) {
-        if (!state_exclusive_to_sequence(sequence, handle)) { return; }
-        const StateReplicaResidency residency = state_store->residency(handle);
-        if (residency != StateReplicaResidency::DeviceOnly &&
-            residency != StateReplicaResidency::Both) {
-            return;
-        }
-        for (std::uint32_t index = 0; index < count; ++index) {
-            if (unique[index] == handle) { return; }
-        }
-        unique[count++] = handle;
-    };
-    add(sequence.state.read);
-    add(sequence.state.write);
-    if (sequence.rewrite_state) { add(*sequence.rewrite_state); }
-    if (sequence.reserved_state) { add(*sequence.reserved_state); }
-    for (std::size_t anchor_index = 0; anchor_index < sequence.long_anchors.size();
-         ++anchor_index) {
-        const StateImageHandle handle = sequence.long_anchors[anchor_index].state;
-        if (!state_exclusive_to_sequence(sequence, handle)) { continue; }
-        const StateReplicaResidency residency = state_store->residency(handle);
-        if (residency != StateReplicaResidency::DeviceOnly &&
-            residency != StateReplicaResidency::Both) {
-            continue;
-        }
-        bool seen = false;
-        for (std::uint32_t index = 0; index < std::min<std::uint32_t>(count, unique.size());
-             ++index) {
-            if (unique[index] == handle) { seen = true; }
-        }
-        for (std::size_t prior = 0; !seen && prior < anchor_index; ++prior) {
-            if (sequence.long_anchors[prior].state == handle) { seen = true; }
-        }
-        if (!seen) { ++count; }
-    }
-    return count;
-}
-
 std::uint32_t ProgramImplCore::owned_checkpoint_references(const SequenceState& sequence,
                                                            StateImageHandle state) const noexcept {
     std::uint32_t references = 0;
@@ -10643,18 +10572,18 @@ void ProgramImplCore::refresh_state_views(SequenceState& sequence) {
 }
 
 void ProgramImplCore::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
-    const std::uint32_t footprint = owned_device_state_slots(sequence);
-    if (slots == 0 || footprint > slots) {
+    const std::uint32_t owned = sequence_exclusive_state_resources(sequence).device.state_slots;
+    if (slots == 0 || owned > slots) {
         throw std::logic_error("sequence StateImage entitlement is inconsistent");
     }
-    if (footprint == slots) { return; }
-    if (slots - footprint != 1 || sequence.reserved_state) {
+    if (owned == slots) { return; }
+    if (slots - owned != 1 || sequence.reserved_state) {
         throw std::logic_error("sequence StateImage reservation is not a single destination");
     }
     std::optional<StateImageHandle> reserved = state_store->reserve_destination();
     if (!reserved) { throw std::bad_alloc(); }
     sequence.reserved_state = *reserved;
-    if (owned_device_state_slots(sequence) != slots) {
+    if (sequence_exclusive_state_resources(sequence).device.state_slots != slots) {
         throw std::logic_error("sequence StateImage entitlement did not materialize exactly");
     }
 }
@@ -10666,15 +10595,13 @@ void ProgramImplCore::settle_state_fork(SequenceState& sequence) {
     }
     const StateImageHandle source      = sequence.state.read;
     const StateImageHandle destination = sequence.state.write;
+    const bool external_source         = sequence.state.read_has_external_owner();
     state_store->commit_fork(source, destination);
-    sequence.state.read         = destination;
-    sequence.state.write        = destination;
-    sequence.state.fork_pending = false;
-    if (!sequence.state_source_retained && state_store->checkpoint_references(source) == 0 &&
+    sequence.state = ActiveStateBinding{.read = destination, .write = destination};
+    if (!external_source && state_store->checkpoint_references(source) == 0 &&
         !state_store->release(source)) {
         throw std::logic_error("unreferenced StateImage fork source could not be released");
     }
-    sequence.state_source_retained = false;
     refresh_state_views(sequence);
 }
 
@@ -10695,7 +10622,6 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
     try {
         if (sequence.state.fork_pending) {
             state_store->abort_fork(sequence.state.read, sequence.state.write);
-            sequence.state.fork_pending = false;
         }
         if (sequence.rewrite_state) {
             state_store->release_checkpoint_reference(*sequence.rewrite_state);
@@ -10717,7 +10643,7 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
 
         release_if_unreferenced(sequence.state.write, true);
         if (sequence.state.read != sequence.state.write) {
-            release_if_unreferenced(sequence.state.read, !sequence.state_source_retained);
+            release_if_unreferenced(sequence.state.read, !sequence.state.read_has_external_owner());
         }
         if (sequence.rewrite_state) {
             release_if_unreferenced(*sequence.rewrite_state,
@@ -10750,7 +10676,6 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
-    sequence.state_source_retained     = false;
 }
 
 void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noexcept {
@@ -10787,7 +10712,8 @@ void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noe
         if (sequence.endpoint_valid) {
             release_if_unreferenced(sequence.state.write, true);
             if (sequence.state.read != sequence.state.write) {
-                release_if_unreferenced(sequence.state.read, !sequence.state_source_retained);
+                release_if_unreferenced(sequence.state.read,
+                                        !sequence.state.read_has_external_owner());
             }
         }
         if (sequence.rewrite_state) {
@@ -10820,7 +10746,6 @@ void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noe
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
-    sequence.state_source_retained     = false;
 }
 
 void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
@@ -10847,7 +10772,7 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
 
     const auto releasable = [&](StateImageHandle handle) { return state_store->valid(handle); };
     if (releasable(sequence.state.write)) { (void)state_store->release(sequence.state.write); }
-    if (!sequence.state_source_retained && sequence.state.read != sequence.state.write &&
+    if (!sequence.state.read_has_external_owner() && sequence.state.read != sequence.state.write &&
         releasable(sequence.state.read)) {
         (void)state_store->release(sequence.state.read);
     }
@@ -10855,14 +10780,15 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
         const StateImageHandle handle = *sequence.rewrite_state;
         const bool duplicates_binding =
             handle == sequence.state.write ||
-            (!sequence.state_source_retained && handle == sequence.state.read);
+            (!sequence.state.read_has_external_owner() && handle == sequence.state.read);
         if (!duplicates_binding && releasable(handle)) { (void)state_store->release(handle); }
     }
     for (std::size_t index = 0; index < sequence.long_anchors.size(); ++index) {
         const StateImageHandle handle = sequence.long_anchors[index].state;
-        bool duplicate                = handle == sequence.state.write ||
-                         (!sequence.state_source_retained && handle == sequence.state.read) ||
-                         (sequence.rewrite_state && handle == *sequence.rewrite_state);
+        bool duplicate =
+            handle == sequence.state.write ||
+            (!sequence.state.read_has_external_owner() && handle == sequence.state.read) ||
+            (sequence.rewrite_state && handle == *sequence.rewrite_state);
         for (std::size_t previous = 0; !duplicate && previous < index; ++previous) {
             duplicate = sequence.long_anchors[previous].state == handle;
         }
@@ -10870,9 +10796,10 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
     }
     if (sequence.reserved_state) {
         const StateImageHandle handle = *sequence.reserved_state;
-        bool duplicate                = handle == sequence.state.write ||
-                         (!sequence.state_source_retained && handle == sequence.state.read) ||
-                         (sequence.rewrite_state && handle == *sequence.rewrite_state);
+        bool duplicate =
+            handle == sequence.state.write ||
+            (!sequence.state.read_has_external_owner() && handle == sequence.state.read) ||
+            (sequence.rewrite_state && handle == *sequence.rewrite_state);
         for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
             duplicate = duplicate || anchor.state == handle;
         }
@@ -10885,7 +10812,6 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
-    sequence.state_source_retained     = false;
 }
 
 void ProgramImplCore::release_active_shared_references(SequenceState& sequence) noexcept {
@@ -10902,13 +10828,13 @@ void ProgramImplCore::release_active_shared_references(SequenceState& sequence) 
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
@@ -10945,11 +10871,13 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     try {
         if (!text_active) {
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row,
+                    device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
@@ -10983,18 +10911,18 @@ void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     } catch (...) {}
 }
 
-void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
-                                              std::uint32_t backend_tokens) {
+void ProgramImplCore::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
+                                                std::uint32_t backend_tokens) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    text_kv_addresses->materialize_to_tokens(sequence.kv->text, main_tokens, device.stream);
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
-        backend_kv_addresses->materialize_to_tokens(*sequence.kv->backend, backend_tokens,
-                                                    device.stream);
+        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
+                                                      device.stream);
     }
 }
 
@@ -11153,7 +11081,7 @@ void ProgramImplCore::prepare_graphs() {
                 addresses.create_active(1, static_cast<std::int32_t>(row));
             if (!allocation) { throw std::bad_alloc(); }
             allocations.push_back(*allocation);
-            addresses.materialize_to_tokens(*allocation, 1, device.stream);
+            addresses.ensure_mapped_to_tokens(*allocation, 1, device.stream);
 
             // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
             // page across its temporary table keeps every dummy read/write address valid without
@@ -11168,8 +11096,8 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
                              "MTP KV cache");
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, *backend_kv_addresses, dflash_capture_allocations,
+    } else if (dflash && dflash->full) {
+        reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
                              "DFlash Full KV cache");
     }
     device.synchronize();
@@ -11214,8 +11142,8 @@ void ProgramImplCore::prepare_graphs() {
             zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
         }
-        if (dflash) {
-            zero_capture_pages(dflash->full, *backend_kv_addresses, dflash_capture_allocations,
+        if (dflash && dflash->full) {
+            zero_capture_pages(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
                                batch_size);
         }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
@@ -11236,15 +11164,22 @@ void ProgramImplCore::prepare_graphs() {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            const std::uint32_t width  = draft_window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
+                dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
+                for (std::uint32_t column = 0; column < width; ++column) {
+                    dflash_host_ingress->target_rope_positions[row * width + column] =
+                        checked_i32(frontier + std::min(column, extent),
+                                    "graph representative DFlash target RoPE position");
+                }
                 dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
                 dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
@@ -11380,7 +11315,7 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
     }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (is_masked_draft_backend(speculative_backend)) {
         const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
         validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
         schedule::DFlashBatchContext dflash_state{execution_core(),
@@ -11434,7 +11369,7 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
     }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (is_masked_draft_backend(speculative_backend)) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
     }
 
@@ -11518,7 +11453,7 @@ void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
 void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                     std::span<const std::uint32_t> starts,
                                                     std::span<const std::uint32_t> counts) {
-    if (speculative_backend != SpeculativeBackend::DFlash || !dflash || !io.dflash_decode ||
+    if (!is_masked_draft_backend(speculative_backend) || !dflash || !io.dflash_decode ||
         lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
         counts.size() != lanes.size()) {
         throw std::logic_error("DFlash context append has invalid membership");
@@ -11538,9 +11473,10 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || !sequence.kv->backend ||
-            text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 || end64 > capacity) {
+        if (!sequence.kv || text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
+            (backend_kv_cache() && (!sequence.kv->backend ||
+                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
+            end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
@@ -11548,12 +11484,18 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
         dflash_host_ingress->dflash_kv_table_rows[row] =
-            backend_kv_addresses->bound_row(*sequence.kv->backend);
+            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
         dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(lane);
         const StateImageSelectors selectors               = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
         dflash_host_ingress->state_destination_slots[row] = selectors.destination;
-        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
+        // Context append writes only the draft caches. Target execution owns Main KV
+        // coverage, including any uncommitted suffix that survives until the round is settled.
+        // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
+        if (sequence.kv->backend) {
+            backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
+                                                          device.stream);
+        }
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
     }
@@ -11629,25 +11571,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 .timing  = timing.finish(),
             };
         }
-        // The previous unit may belong to another admitted request. These scalar rows
-        // are shared execution controls, so bind the selected sequence at every chunk.
-        bind_sequence_kv(sequence);
-        if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
-                throw std::logic_error("DFlash prefill state is incomplete");
-            }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                backend_kv_addresses->bound_row(*sequence.kv->backend);
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
-        }
-
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
@@ -11706,7 +11629,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (is_masked_draft_backend(speculative_backend)) {
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             std::uint32_t remaining          = nominal;
@@ -11732,12 +11655,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto execution_split                  = std::upper_bound(
+                const auto rewrite_split                    = std::upper_bound(
                     staged.prompt.prefill_execution_frontiers.begin(),
                     staged.prompt.prefill_execution_frontiers.end(), staged.cursor);
-                if (execution_split != staged.prompt.prefill_execution_frontiers.end() &&
-                    (!split_frontier || *execution_split < *split_frontier)) {
-                    split_frontier = *execution_split;
+                if (rewrite_split != staged.prompt.prefill_execution_frontiers.end() &&
+                    (!split_frontier || *rewrite_split < *split_frontier)) {
+                    split_frontier = *rewrite_split;
                 }
                 schedule::PrefillChunkResult result;
                 timing.pause();
@@ -11766,7 +11689,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -11871,7 +11794,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
-        } else if (speculative_backend == SpeculativeBackend::DFlash &&
+        } else if (is_masked_draft_backend(speculative_backend) &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
@@ -11977,7 +11900,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + 1, 0);
+            ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12136,8 +12059,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1,
-                                    std::min(capacity, frontier + extent + draft_window));
+            ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
+                                      std::min(capacity, frontier + extent + draft_window));
         }
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12234,7 +12157,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
+    if (!is_masked_draft_backend(speculative_backend) || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
@@ -12254,9 +12177,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
             text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
+            (backend_kv_cache() && (!sequence.kv->backend ||
+                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -12312,18 +12236,25 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
+            dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+            for (std::uint32_t column = 0; column < width; ++column) {
+                const std::uint32_t position = frontier + std::min(column, extent);
+                dflash_host_ingress->target_rope_positions[row * width + column] =
+                    checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
+            }
             dflash_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             dflash_host_ingress->dflash_kv_table_rows[row] =
-                backend_kv_addresses->bound_row(*sequence.kv->backend);
+                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
             dflash_host_ingress->active_lanes[row]       = static_cast<std::int32_t>(sequence.lane);
             const StateImageSelectors selectors          = state_selectors(sequence);
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
+            ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
+                                      backend_kv_cache() ? frontier : 0U);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
@@ -12426,10 +12357,10 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets, failed_timing);
 }
 
-runtime::ExecutionTiming
-ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
-                                                 std::uint32_t accepted_tokens, bool terminal,
-                                                 runtime::ExecutionTiming* failed_timing) {
+runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(
+    SequenceState& sequence, RequestControl& request, std::uint32_t accepted_tokens, bool terminal,
+    std::optional<std::uint32_t> prefix_execution_split_after,
+    runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
@@ -12439,6 +12370,14 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
         request.pending.produced != 1 || accepted_tokens != 1) {
         throw std::logic_error("non-speculative pending round must commit its single token");
     }
+
+    const std::uint32_t base_ledger_frontier = request.pending.kind == PendingKind::Begin
+                                                   ? request.pending.prompt_tokens
+                                                   : request.pending.base_S;
+    commit_generated_prefix_identity(
+        sequence, base_ledger_frontier,
+        std::span<const TokenId>(sequence.ledger).subspan(base_ledger_frontier, accepted_tokens),
+        prefix_execution_split_after);
 
     switch (request.pending.kind) {
     case PendingKind::Begin:
@@ -12485,30 +12424,10 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
     MemorySummary out;
-    out.device      = device.device;
-    out.max_context = capacity;
-    out.kv_capacity = kv_capacity;
-    switch (kv_dtype) {
-    case DType::BF16:
-        out.kv_cache = KvCacheStorage::BFloat16;
-        break;
-    case DType::I8:
-        // This fork's packed/rotated/E8 modes all report through the I8 storage family.
-        out.kv_cache =
-            kv_e8_root ? KvCacheStorage::RK2V4E8
-                       : (kv_e8_lattice
-                              ? KvCacheStorage::RK4V4E8
-                              : (kv_packed_k
-                                     ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
-                                     : (kv_rotate_v ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
-                                                    : KvCacheStorage::Int8Group64)));
-        break;
-    case DType::FP8_E4M3FN:
-        out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
-        break;
-    default:
-        std::terminate();
-    }
+    out.device           = device.device;
+    out.max_context      = capacity;
+    out.kv_capacity      = kv_capacity;
+    out.kv_cache         = kv_storage;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
@@ -12547,40 +12466,12 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.text_kv_bytes                = text_kv_bytes;
     out.mtp_kv_bytes                 = mtp_kv_bytes;
     out.gdn_state_bytes              = gdn_state_bytes;
-    out.checkpoint_state_image_bytes = state_images ? state_images->host_layout().image_bytes : 0;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
-    const auto device_page_bytes     = [](const DeviceKVPagePool& pool) {
-        std::size_t bytes = 0;
-        for (std::size_t index = 0; index < pool.plane_count(); ++index) {
-            bytes += pool.plane(index).bytes() / pool.capacity_pages();
-        }
-        return bytes;
-    };
-    if (text_kv_pages) {
-        const DeviceKVPagePool& pool      = text_kv_pages->physical_pool();
-        out.device_main_kv_capacity_pages = pool.capacity_pages();
-        out.device_main_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
-        out.device_main_kv_page_bytes     = device_page_bytes(pool);
-    }
-    if (backend_kv_pages) {
-        const DeviceKVPagePool& pool         = backend_kv_pages->physical_pool();
-        out.device_backend_kv_capacity_pages = pool.capacity_pages();
-        out.device_backend_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
-        out.device_backend_kv_page_bytes     = device_page_bytes(pool);
-    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
     }
-    if (state_store) {
-        out.logical_state_capacity_slots = state_store->capacity();
-        out.logical_state_reserved_slots = state_store->reserved();
-        out.logical_state_used_slots = state_store->occupied() - out.logical_state_reserved_slots;
-        out.logical_state_inflight_slots = state_store->in_flight();
-    }
-    out.host_main_kv_page_bytes    = text_host_kv_page_stride;
-    out.host_backend_kv_page_bytes = backend_host_kv_page_stride;
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();

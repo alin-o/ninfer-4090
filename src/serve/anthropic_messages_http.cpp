@@ -19,7 +19,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     res.set_header("request-id", request_id);
     try {
         const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req), anthropic_thinking_signer_);
+            parse_anthropic_count_tokens_request(parse_json_body(req));
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -52,7 +52,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             reasoning_override = req.get_header_value("x-ninfer-reasoning");
         }
         request = parse_anthropic_messages_request(parse_json_body(req), limits,
-                                                   anthropic_thinking_signer_, reasoning_override);
+                                                   reasoning_override);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -79,7 +79,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepared = service_->prepare(request.generation,
                                      request.stream ? GenerationConsumerMode::Streaming
                                                     : GenerationConsumerMode::Aggregate,
-                                     [&req] { return client_disconnected(req); });
+                                     {}, [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -123,11 +123,16 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         lifecycle->done(outcome);
+        if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+            // The client disconnected: stop_presentation() deliberately refuses to
+            // serialize cancelled outcomes, and there is nobody left to answer.
+            lifecycle->response_failure(
+                make_client_disconnected_failure(RequestFailurePhase::Transport));
+            return;
+        }
         try {
-            set_owned_json_content(
-                res,
-                make_anthropic_messages_response(identity, outcome, anthropic_thinking_signer_),
-                prepared.lifetime);
+            set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
+                                   prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->response_failure(
@@ -146,8 +151,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
-                                                                 anthropic_thinking_signer_);
+        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
@@ -224,6 +228,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 lifecycle->done(outcome);
+                if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+                    // The client disconnected mid-stream: terminal events have no
+                    // recipient and stop_presentation() rejects cancelled outcomes
+                    // (it would surface as a misleading response-render 500).
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);

@@ -1601,8 +1601,6 @@ void exercise_protocol_content_capture(const char* artifact) {
     const CapturedGeneration responses_capture = capture_generation(
         service, writer, std::move(responses.generation), "openai_responses", 3, false);
 
-    AnthropicThinkingSigner::Key signing_key{};
-    AnthropicThinkingSigner signer(signing_key);
     GenerationRequest anthropic =
         parse_anthropic_messages_request(
             Json{{"model", "qwen3.8"},
@@ -1616,7 +1614,7 @@ void exercise_protocol_content_capture(const char* artifact) {
                                                          {"media_type", "image/x-portable-pixmap"},
                                                          {"data", media_payload}}}}})}}})},
                  {"max_tokens", 4}},
-            RequestLimits{}, signer)
+            RequestLimits{})
             .generation;
     const CapturedGeneration anthropic_capture =
         capture_generation(service, writer, std::move(anthropic), "anthropic_messages", 4, false);

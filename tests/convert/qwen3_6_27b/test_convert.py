@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
+import pytest
 import torch
 
 from tools.artifact.container import (
@@ -12,6 +17,19 @@ from tools.artifact.container import (
 )
 from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
 from tools.convert.qwen3_6_27b import convert, inventory, recipe
+
+
+def test_official_config_uses_only_nested_mtp_field():
+    model = os.environ.get("NINFER_QWEN3_6_27B_MODEL")
+    if not model:
+        pytest.skip("NINFER_QWEN3_6_27B_MODEL is not set")
+    config = json.loads((Path(model) / "config.json").read_text())
+
+    assert "mtp_num_hidden_layers" not in config
+    summary = convert.validate_config(config)
+    assert summary["mtp_num_hidden_layers"] == 1
+    assert summary["text"]["mtp_num_hidden_layers"] == 1
+    assert convert.RECIPE_ID == "qwen3_6_27b-v2"
 
 
 def test_complete_inventory_has_one_preplanned_object_directory():

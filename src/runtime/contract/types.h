@@ -179,6 +179,10 @@ struct OutputDecision {
     std::uint32_t accepted_tokens   = 0;
     FinishReason finish_reason      = FinishReason::None;
     ContinuationAction continuation = ContinuationAction::Decode;
+    // Empty or one token-aligned frontier within the accepted span where model-history
+    // reconstruction gains an execution split. Frontend owns detection; Engine only transports
+    // this relative position.
+    std::optional<std::uint32_t> prefix_execution_split_after;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
@@ -212,6 +216,9 @@ struct CommitDecision {
     std::uint32_t accepted_tokens = 0;
     bool terminal                 = false;
     bool cancelled                = false;
+    // Copied unchanged from the corresponding OutputDecision; still relative to this row's
+    // accepted span.
+    std::optional<std::uint32_t> prefix_execution_split_after;
 };
 
 // Exact features for the startup-selected static prefill cost model. They describe only the
@@ -572,6 +579,19 @@ struct PressurePhysicalGuidance {
     std::uint32_t unsatisfied_constraints   = 0;
     std::uint32_t estimated_remaining_steps = 0;
     std::uint64_t normalized_residual_q20   = 0;
+    // Aggregate byte relief cannot resolve an extent/ordered-stage geometry question.
+    bool requires_exact_feedback = false;
+};
+
+struct PressureOwnerRecoveryGuidance {
+    PlanningOwnerId owner;
+    CoalescedTransferWork additional_restore;
+};
+
+struct PressureConstructionOptionId {
+    std::uint32_t cursor_generation = 0;
+    std::uint32_t scan_generation   = 0;
+    std::uint32_t index             = 0;
 };
 
 // Program-projected unique physical objects removed by a complete pressure target. Aliases,
@@ -639,6 +659,18 @@ struct PressureTargetGuidance {
     std::uint32_t stable_target_ordinal = 0;
     std::uint32_t degradation_units     = 0;
     std::uint32_t dropped_checkpoints   = 0;
+    PrivateSourceMode source_mode       = PrivateSourceMode::ConsumeToActive;
+    std::span<const PressureCheckpointOutcome> checkpoint_changes;
+    std::span<const PressureOwnerRecoveryGuidance> recovery_estimates;
+    bool recovery_estimate_complete = false;
+};
+
+// One resumable scan operation: one owner's successor generation or one option summary.
+// Guidance spans expire at the next session call; the ID remains valid until choose/reset.
+struct PressureConstructionStep {
+    std::optional<PressureTargetGuidance> guidance;
+    PressureConstructionOptionId option;
+    bool exhausted = false;
 };
 
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only

@@ -140,29 +140,6 @@ dropped_checkpoint_count(const qwen3_6::detail::PressureDecision& decision) noex
     return decision.checkpoint_drops;
 }
 
-inline runtime::DeviceStateVictimClass
-device_state_victim_class(const qwen3_6::detail::PressureDecision& decision) noexcept {
-    if (decision.effect.removed.device.state_slots == 0) {
-        return runtime::DeviceStateVictimClass::None;
-    }
-    if (decision.shared_owner) { return runtime::DeviceStateVictimClass::Intermediate; }
-    if (decision.evicts_continuation ||
-        std::any_of(
-            decision.state_changes.begin(), decision.state_changes.end(),
-            [](qwen3_6::detail::PressureStateDecision change) {
-                return change ==
-                           qwen3_6::detail::PressureStateDecision::DropEndpointDeviceDuplicate ||
-                       change == qwen3_6::detail::PressureStateDecision::DemoteEndpointToHost;
-            }) ||
-        std::any_of(decision.dropped_checkpoints.begin(), decision.dropped_checkpoints.end(),
-                    [](runtime::CheckpointRef ref) {
-                        return ref.kind == runtime::CheckpointKind::SessionEndpoint;
-                    })) {
-        return runtime::DeviceStateVictimClass::PrivateEndpoint;
-    }
-    return runtime::DeviceStateVictimClass::Intermediate;
-}
-
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -264,6 +241,11 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
     target_hash_table.assign(hash_capacity, std::numeric_limits<std::uint32_t>::max());
     expansion_scratch.reserve(maximum_scratch_targets);
     committed_children.reserve(maximum_scratch_targets);
+    for (auto& cursor : construction_slots) {
+        cursor.choices.reserve(owners.size());
+        cursor.options.reserve(maximum_scratch_targets + owners.size());
+    }
+    guidance_recovery.reserve(owners.size());
     selected_private_owners.reserve(private_owners.size());
     selected_private_owner_ids.reserve(private_owners.size());
     selected_private_decisions.reserve(private_owners.size());
@@ -279,6 +261,8 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
     projected_owner_decisions.assign(owners.size(), nullptr);
     assessment_outcomes.reserve(owners.size());
     guidance_outcomes.reserve(owners.size());
+    guidance_checkpoint_changes.reserve(
+        owners.size() * (2U + owner.context_cache.max_long_anchors_per_continuation.value_or(0)));
     const std::size_t private_checkpoint_capacity =
         2U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (private_checkpoint_capacity > std::numeric_limits<std::size_t>::max() - 3U ||
@@ -632,212 +616,189 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
     return handle;
 }
 
-inline std::optional<qwen3_6::PressureTargetHandle>
-PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
-    runtime::PlanningCandidateId admission,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::span<const runtime::PlanningOwnerId> conversation_head_ids) {
-    if (scratch_live) {
-        throw std::logic_error("guided pressure closure conflicts with expansion scratch");
+inline qwen3_6::PressureTargetHandle
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::maximal_target(
+    runtime::PlanningCandidateId id) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    choice_scratch.clear();
+    for (const auto& victim : candidate_options[selected].victims) {
+        choice_scratch.push_back(victim.eviction_choice);
     }
-    const std::uint32_t selected_candidate = candidate_index(admission);
-    populate_options(selected_candidate);
-    CandidateOptions& options       = candidate_options[selected_candidate];
-    const CandidateState& candidate = *candidates[selected_candidate].state;
-    const std::optional<typename Core::MaterializationSourceProtection> protection =
-        program->materialization_source_protection(candidate);
-    if (!protection) { return std::nullopt; }
+    const auto index = intern_target(selected, choice_scratch);
+    qwen3_6::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = index;
+    return result;
+}
 
-    std::vector<std::size_t> victim_order;
-    victim_order.reserve(options.victims.size());
-    const auto append_victim = [&](std::size_t victim_index) {
-        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
-            victim_order.end()) {
-            victim_order.push_back(victim_index);
-        }
-    };
-    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
-        const auto found =
-            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
-                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
-            });
-        if (found != options.victims.end()) {
-            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
+inline auto PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::construction_slot(
+    const qwen3_6::PressureConstructionCursor& cursor) -> ConstructionSlot& {
+    if (cursor.session_ != this || cursor.slot_ >= construction_slots.size() || scratch_live ||
+        resource_revision != program->resource_revision()) {
+        throw std::logic_error("pressure construction cursor is stale");
+    }
+    auto& slot = construction_slots[cursor.slot_];
+    if (!slot.leased || slot.generation != cursor.generation_) {
+        throw std::logic_error("pressure construction lease is stale");
+    }
+    return slot;
+}
+
+inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::release_construction(
+    const void* owner, std::uint32_t index, std::uint32_t lease) noexcept {
+    auto& session = *const_cast<PressurePlanningSessionImpl*>(
+        static_cast<const PressurePlanningSessionImpl*>(owner));
+    if (index < session.construction_slots.size()) {
+        auto& slot = session.construction_slots[index];
+        if (slot.generation == lease) {
+            slot.leased = false;
+            slot.options.clear();
         }
     }
-    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+}
 
-    // Session bindings are logical policy owned by ResourceManager. Physical endpoint State
-    // alone does not distinguish the current rollback point from superseded cached history.
-    std::vector<bool> conversation_heads(options.victims.size(), false);
-    for (std::size_t index = 0; index < options.victims.size(); ++index) {
-        const auto owner = owners[options.victims[index].owner_index].id;
-        conversation_heads[index] =
-            std::find(conversation_head_ids.begin(), conversation_head_ids.end(), owner) !=
-            conversation_head_ids.end();
+inline detail::PhysicalResources
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::construction_residual(
+    std::uint32_t index, std::span<const std::uint16_t> choices) const {
+    detail::PhysicalDelta pressure;
+    const auto& options = candidate_options[index];
+    for (std::size_t owner = 0; owner < choices.size(); ++owner) {
+        if (choices[owner] == 0) { continue; }
+        const auto& decision = options.victims[owner].decisions[choices[owner] - 1];
+        pressure.added =
+            NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(pressure.added, decision.effect.added);
+        pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(pressure.removed,
+                                                                           decision.effect.removed);
     }
+    auto result = program->guided_materialization_deficit(*candidates[index].state, pressure);
+    result.host.kv_bytes =
+        std::max(result.host.kv_bytes, candidates[index].state->blocked_host_allocation_bytes);
+    return result;
+}
 
-    const auto projected_residual = [&](std::span<const std::uint16_t> target_choices,
-                                        std::optional<std::size_t> override_owner,
-                                        const PressureDecision* override_decision) {
-        detail::PhysicalDelta pressure;
-        for (std::size_t index = 0; index < options.victims.size(); ++index) {
-            const PressureDecision* decision = nullptr;
-            if (override_owner && *override_owner == index) {
-                decision = override_decision;
-            } else {
-                const std::uint16_t choice = target_choices[index];
-                if (choice != 0) {
-                    if (choice > options.victims[index].decisions.size()) {
-                        throw std::logic_error("guided pressure choice is invalid");
-                    }
-                    decision = &options.victims[index].decisions[choice - 1U];
-                }
-            }
-            if (decision == nullptr) { continue; }
-            pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-                pressure.added, decision->effect.added);
-            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-                pressure.removed, decision->effect.removed);
+inline qwen3_6::PressureConstructionCursor
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::begin_construction(
+    qwen3_6::PressureTargetHandle target, bool restore) {
+    if (!valid(target) || scratch_live) { throw std::logic_error("invalid construction parent"); }
+    const auto& node = targets[target.index_];
+    populate_options(node.candidate_index);
+    for (std::uint32_t index = 0; index < construction_slots.size(); ++index) {
+        auto& slot = construction_slots[index];
+        if (slot.leased) { continue; }
+        const auto choices = victim_choices(node);
+        slot.choices.assign(choices.begin(), choices.end());
+        slot.options.clear();
+        slot.next_owner = slot.next_option = 0;
+        slot.candidate_index               = node.candidate_index;
+        slot.residual =
+            node.assessed_residual.value_or(construction_residual(node.candidate_index, choices));
+        slot.restore = restore;
+        slot.leased  = true;
+        if (++construction_generation == 0) { ++construction_generation; }
+        slot.generation      = construction_generation;
+        slot.scan_generation = 1;
+        return qwen3_6::PressureConstructionCursor(this, index, slot.generation,
+                                                   &release_construction);
+    }
+    throw std::length_error("all pressure construction cursors are leased");
+}
+
+inline runtime::PressureConstructionStep
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::next_construction_option(
+    qwen3_6::PressureConstructionCursor& cursor) {
+    auto& slot    = construction_slot(cursor);
+    auto& options = candidate_options[slot.candidate_index];
+    if (slot.next_option < slot.options.size()) {
+        const auto index   = static_cast<std::uint32_t>(slot.next_option++);
+        const auto& option = slot.options[index];
+        return {.guidance = guidance_choices(slot.candidate_index, slot.choices, 0, option.victim,
+                                             option.identity ? nullptr : &option.decision),
+                .option   = {.cursor_generation = slot.generation,
+                             .scan_generation   = slot.scan_generation,
+                             .index             = index}};
+    }
+    if (slot.next_owner == options.victims.size()) { return {.exhausted = true}; }
+    const auto owner_index          = slot.next_owner++;
+    const auto& victim              = options.victims[owner_index];
+    const auto choice               = slot.choices[owner_index];
+    const PressureDecision* current = choice == 0 ? nullptr : &victim.decisions[choice - 1];
+    const auto protection =
+        program->materialization_source_protection(*candidates[slot.candidate_index].state);
+    if (!protection) { throw std::logic_error("construction source protection is stale"); }
+    const auto append = [&](PressureDecision decision, bool identity = false) {
+        if (slot.options.size() == slot.options.capacity()) {
+            throw std::length_error("construction option capacity exceeded");
         }
-        detail::PhysicalResources residual =
-            program->guided_materialization_deficit(candidate, pressure);
-        residual.host.kv_bytes =
-            std::max(residual.host.kv_bytes, candidate.blocked_host_allocation_bytes);
-        return residual;
+        slot.options.push_back(
+            {.victim = owner_index, .decision = std::move(decision), .identity = identity});
     };
-    const detail::PhysicalResources capacity = program->admission_capacity();
-    constexpr std::uint64_t kResidualOne     = 1ULL << 20U;
-    const auto normalized                    = [](std::uint64_t value, std::uint64_t limit) {
-        if (value == 0) { return std::uint64_t{0}; }
-        if (limit == 0 || value >= limit) { return kResidualOne; }
-        if (value > std::numeric_limits<std::uint64_t>::max() / kResidualOne) {
-            return kResidualOne;
-        }
-        const std::uint64_t scaled = value * kResidualOne;
-        return std::max<std::uint64_t>(1, scaled / limit + (scaled % limit != 0 ? 1U : 0U));
-    };
-    const auto residual_key = [&](const detail::PhysicalResources& residual) {
-        std::uint32_t constraints = 0;
-        std::uint64_t total       = 0;
-        const auto append         = [&](std::uint64_t value, std::uint64_t limit) {
-            if (value == 0) { return; }
-            ++constraints;
-            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(total, normalized(value, limit));
-        };
-        append(residual.device.active_lanes, capacity.device.active_lanes);
-        append(residual.device.state_slots, capacity.device.state_slots);
-        append(residual.device.main_kv_pages, capacity.device.main_kv_pages);
-        append(residual.device.backend_kv_pages, capacity.device.backend_kv_pages);
-        append(residual.host.state_slots, capacity.host.state_slots);
-        append(residual.host.kv_bytes, capacity.host.kv_bytes);
-        return std::tuple{constraints, total};
-    };
-    const auto transfer_bytes = [](const PressureDecision& decision) {
-        std::uint64_t bytes = 0;
-        for (const runtime::ContextTransferRequirement& requirement :
-             decision.transfer_requirements) {
-            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(bytes,
-                                                              requirement.work.payload_bytes);
-        }
-        return bytes;
-    };
-
-    choice_scratch.assign(options.victims.size(), 0);
-
-    struct Selection {
-        std::size_t victim_index = 0;
-        std::size_t victim_rank  = 0;
-        PressureDecision decision;
-        detail::PhysicalResources residual;
-        bool adds_destruction = false;
-    };
-
-    const std::size_t maximum_steps = 16U * std::max<std::size_t>(1, options.victims.size()) + 16U;
-    for (std::size_t step = 0; step < maximum_steps; ++step) {
-        const detail::PhysicalResources residual =
-            projected_residual(choice_scratch, std::nullopt, nullptr);
-        if (residual == detail::PhysicalResources{}) {
-            TargetNode* existing = find_target(selected_candidate, choice_scratch);
-            const std::size_t maximum =
-                candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
-            if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
-            const std::uint32_t target_index =
-                existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
-                                    : intern_target(selected_candidate, choice_scratch);
-            qwen3_6::PressureTargetHandle handle;
-            handle.session_    = this;
-            handle.generation_ = generation;
-            handle.index_      = target_index;
-            return handle;
-        }
-
-        std::optional<Selection> selected;
-        const auto selection_key = [&](const Selection& value) {
-            runtime::DeviceStateVictimClass victim_class =
-                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(value.decision);
-            if (victim_class == runtime::DeviceStateVictimClass::PrivateEndpoint &&
-                !conversation_heads[value.victim_index]) {
-                victim_class = runtime::DeviceStateVictimClass::Intermediate;
-            }
-            const bool head = victim_class == runtime::DeviceStateVictimClass::PrivateEndpoint;
-            return std::tuple{
-                static_cast<std::uint8_t>(victim_class),
-                head ? value.victim_rank : static_cast<std::size_t>(value.adds_destruction),
-                head ? static_cast<std::size_t>(value.adds_destruction) : value.victim_rank,
-                residual_key(value.residual),
-                NINFER_QWEN36_RUNTIME_NS::degradation_units(value.decision),
-                transfer_bytes(value.decision),
-                value.decision.id,
-            };
-        };
-        for (std::size_t victim_rank = 0; victim_rank < victim_order.size(); ++victim_rank) {
-            const std::size_t victim_index     = victim_order[victim_rank];
-            const std::uint16_t current_choice = choice_scratch[victim_index];
-            const PressureDecision* current =
-                current_choice == 0 ? nullptr
-                                    : &options.victims[victim_index].decisions[current_choice - 1U];
-            if (current != nullptr && current->evicts_continuation) { continue; }
-            std::vector<PressureDecision> successors =
-                pressure_successors(options.victims[victim_index], residual, *protection, current);
-            for (PressureDecision& successor : successors) {
-                const std::uint32_t prior_drops =
-                    current == nullptr ? 0 : current->checkpoint_drops;
-                const bool adds_destruction =
-                    successor.evicts_continuation || successor.checkpoint_drops > prior_drops;
-                const detail::PhysicalResources child_residual =
-                    projected_residual(choice_scratch, victim_index, &successor);
-                if (child_residual == residual) { continue; }
-                Selection candidate{
-                    .victim_index     = victim_index,
-                    .victim_rank      = victim_rank,
-                    .decision         = std::move(successor),
-                    .residual         = child_residual,
-                    .adds_destruction = adds_destruction,
-                };
-                if (!selected || selection_key(candidate) < selection_key(*selected)) {
-                    selected = std::move(candidate);
+    if (slot.restore) {
+        if (current != nullptr) {
+            append({}, true);
+            // Rebuild ordinary alternatives from the immutable candidate requirement, not from a
+            // rewritten post-state. Complete assessment validates every less-destructive neighbor.
+            for (auto& decision : pressure_successors(
+                     victim, candidates[slot.candidate_index].state->identity_pressure_deficit,
+                     *protection, nullptr)) {
+                if (decision != *current && !decision.evicts_continuation) {
+                    append(std::move(decision));
                 }
             }
         }
-        if (!selected) { return std::nullopt; }
+    } else if (current == nullptr || !current->evicts_continuation) {
+        for (auto& decision : pressure_successors(victim, slot.residual, *protection, current)) {
+            if (current == nullptr || decision != *current) { append(std::move(decision)); }
+        }
+    }
+    return {}; // one owner's successor generation is a separately metered operation
+}
 
-        std::vector<PressureDecision>& decisions =
-            options.victims[selected->victim_index].decisions;
-        const auto existing  = std::find(decisions.begin(), decisions.end(), selected->decision);
-        std::uint16_t choice = 0;
-        if (existing != decisions.end()) {
-            choice = static_cast<std::uint16_t>(1U + (existing - decisions.begin()));
+inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::choose_construction(
+    qwen3_6::PressureConstructionCursor& cursor, runtime::PressureConstructionOptionId id) {
+    auto& slot = construction_slot(cursor);
+    if (id.cursor_generation != slot.generation || id.scan_generation != slot.scan_generation ||
+        id.index >= slot.options.size()) {
+        throw std::logic_error("stale construction option");
+    }
+    auto& option         = slot.options[id.index];
+    auto& decisions      = candidate_options[slot.candidate_index].victims[option.victim].decisions;
+    std::uint16_t choice = 0;
+    if (!option.identity) {
+        const auto found = std::find(decisions.begin(), decisions.end(), option.decision);
+        if (found != decisions.end()) {
+            choice = static_cast<std::uint16_t>(1 + found - decisions.begin());
         } else {
-            if (decisions.size() >= std::numeric_limits<std::uint16_t>::max()) {
-                return std::nullopt;
+            if (decisions.size() == std::numeric_limits<std::uint16_t>::max()) {
+                throw std::length_error("construction owner decision capacity exceeded");
             }
-            decisions.push_back(std::move(selected->decision));
+            decisions.push_back(std::move(option.decision));
             choice = static_cast<std::uint16_t>(decisions.size());
         }
-        choice_scratch[selected->victim_index] = choice;
     }
-    return std::nullopt;
+    slot.choices[option.victim] = choice;
+    slot.residual               = construction_residual(slot.candidate_index, slot.choices);
+    slot.next_owner = slot.next_option = 0;
+    slot.options.clear();
+    if (++slot.scan_generation == 0) { ++slot.scan_generation; }
+}
+
+inline std::optional<qwen3_6::PressureTargetHandle>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::construction_target(
+    const qwen3_6::PressureConstructionCursor& cursor) {
+    auto& slot = construction_slot(cursor);
+    if (!find_target(slot.candidate_index, slot.choices) &&
+        targets.size() >= candidates.size() + 1U + planning_detail::kOptionalTargetCapacity) {
+        return std::nullopt;
+    }
+    const auto index = intern_target(slot.candidate_index, slot.choices);
+    qwen3_6::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = index;
+    return result;
 }
 
 inline runtime::PressureTargetGuidance
@@ -846,15 +807,30 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
         throw std::logic_error("pressure target guidance is stale or conflicts with expansion");
     }
     TargetNode& node = targets[target.index_];
-    populate_options(node.candidate_index);
-    const CandidateState& candidate              = *candidates[node.candidate_index].state;
-    const CandidateOptions& options              = candidate_options[node.candidate_index];
-    const std::span<const std::uint16_t> choices = victim_choices(node);
+    auto result = guidance_choices(node.candidate_index, victim_choices(node), node.stable_ordinal);
+    if (node.assessed_residual &&
+        *node.assessed_residual !=
+            construction_residual(node.candidate_index, victim_choices(node))) {
+        result.physical.requires_exact_feedback = true;
+    }
+    return result;
+}
+
+inline runtime::PressureTargetGuidance
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance_choices(
+    std::uint32_t candidate_index, std::span<const std::uint16_t> choices, std::uint32_t ordinal,
+    std::optional<std::size_t> override_owner, const PressureDecision* override_decision) {
+    populate_options(candidate_index);
+    const CandidateState& candidate = *candidates[candidate_index].state;
+    const CandidateOptions& options = candidate_options[candidate_index];
     if (choices.size() != options.victims.size()) {
         throw std::logic_error("pressure target victim domain changed");
     }
 
     guidance_outcomes.clear();
+    guidance_checkpoint_changes.clear();
+    guidance_recovery.clear();
+    bool recovery_complete = true;
     NINFER_QWEN36_RUNTIME_NS::PlanningTransferAccumulator estimated_pressure;
     detail::PhysicalDelta approximate_pressure;
     std::uint32_t total_degradation = 0;
@@ -866,10 +842,32 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
             choice > victim_options.decisions.size()) {
             throw std::logic_error("pressure target guidance owner choice is invalid");
         }
-        if (choice == 0) { continue; }
+        const PressureDecision* selected =
+            override_owner && *override_owner == index
+                ? override_decision
+                : (choice == 0 ? nullptr : &victim_options.decisions[choice - 1U]);
+        if (selected == nullptr) { continue; }
         const Owner& victim_owner        = owners[victim_options.owner_index];
-        const PressureDecision& decision = victim_options.decisions[choice - 1U];
-        approximate_pressure.added       = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+        const PressureDecision& decision = *selected;
+        for (const auto checkpoint : decision.dropped_checkpoints) {
+            guidance_checkpoint_changes.push_back(
+                {.owner = victim_owner.id, .checkpoint = checkpoint, .survives = false});
+        }
+        NINFER_QWEN36_RUNTIME_NS::PlanningTransferAccumulator recovery;
+        for (auto transfer : decision.transfer_requirements) {
+            if (transfer.direction == runtime::ContextTransferDirection::DeviceToHost) {
+                transfer.direction = runtime::ContextTransferDirection::HostToDevice;
+                recovery.append(std::span<const runtime::ContextTransferRequirement>(&transfer, 1));
+            }
+        }
+        guidance_recovery.push_back(
+            {.owner = victim_owner.id, .additional_restore = recovery.work});
+        if (!decision.evicts_continuation && decision.transfer_requirements.empty() &&
+            (!decision.state_changes.empty() || !decision.main_kv_changes.empty() ||
+             !decision.backend_kv_changes.empty())) {
+            recovery_complete = false;
+        }
+        approximate_pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
             approximate_pressure.added, decision.effect.added);
         approximate_pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
             approximate_pressure.removed, decision.effect.removed);
@@ -885,8 +883,6 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
                                                               : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = decision.checkpoint_drops,
-            .device_state_victim_class =
-                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(decision),
         });
     }
     detail::PhysicalResources residual =
@@ -983,14 +979,19 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
                 .unsatisfied_constraints   = constraints,
                 .estimated_remaining_steps = remaining_steps,
                 .normalized_residual_q20   = residual_q20,
+                .requires_exact_feedback   = candidate.blocked_host_allocation_bytes != 0,
             },
         .estimated_machine_work =
             NINFER_QWEN36_RUNTIME_NS::materialization_machine_work(candidate, estimated_pressure),
-        .owner_outcomes        = guidance_outcomes,
-        .candidate             = candidate_ids[node.candidate_index],
-        .stable_target_ordinal = node.stable_ordinal,
-        .degradation_units     = total_degradation,
-        .dropped_checkpoints   = total_dropped,
+        .owner_outcomes             = guidance_outcomes,
+        .candidate                  = candidate_ids[candidate_index],
+        .stable_target_ordinal      = ordinal,
+        .degradation_units          = total_degradation,
+        .dropped_checkpoints        = total_dropped,
+        .source_mode                = candidate.source_mode,
+        .checkpoint_changes         = guidance_checkpoint_changes,
+        .recovery_estimates         = guidance_recovery,
+        .recovery_estimate_complete = recovery_complete,
     };
 }
 
@@ -1063,22 +1064,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                                                                : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = dropped,
-            .device_state_victim_class =
-                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(*decision),
         });
         ++projection_work;
     }
     for (std::size_t index = 0; index < owners.size(); ++index) {
         const Owner& owner               = owners[index];
         const PressureDecision* decision = projected_owner_decisions[index];
-        // With no pressure actions, only the consumed source changes recovery. Keep all other
-        // owners at their cached baseline instead of walking every unaffected KV prefix again.
-        if (identity_target &&
-            (!candidate.has_source || owner.shared ||
-             RuntimeContractAccess<NINFER_QWEN36_VARIANT>::index(*owner.private_handle) !=
-                 candidate.source_index)) {
-            continue;
-        }
         if (owner.shared) {
             recovery_shared_owners.push_back(owner.shared_handle);
             recovery_shared_decisions.push_back(decision);
@@ -1091,9 +1082,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     }
 
     bool recovery_projection_valid = true;
-    if (!identity_target ||
-        (candidate.has_source &&
-         candidate.source_mode == runtime::PrivateSourceMode::ConsumeToActive)) {
+    if (!identity_target) {
         recovery_projection_valid = program->pressure_checkpoint_recovery_impacts(
             candidate, recovery_private_owners, recovery_private_decisions,
             recovery_private_owner_ids, recovery_shared_owners, recovery_shared_decisions,
@@ -1189,7 +1178,6 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         .physical_status       = status,
         .source_mode           = projected->source_mode,
         .machine_work          = machine_work,
-        .unique_reclamation    = projected->unique_reclamation,
         .owner_outcomes        = assessment_outcomes,
         .checkpoint_impacts    = {},
         .candidate             = candidate_ids[node.candidate_index],
@@ -1257,8 +1245,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
 
 inline qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>
 PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::prepare_expansion(
-    qwen3_6::PressureTargetHandle parent) {
-    if (!valid(parent) || scratch_live) {
+    qwen3_6::PressureTargetHandle parent, std::uint32_t maximum_owners) {
+    if (!valid(parent) || scratch_live || maximum_owners == 0) {
         throw std::logic_error("pressure expansion parent is stale or scratch is busy");
     }
     const TargetNode& node = targets[parent.index_];
@@ -1353,8 +1341,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::prepare_expansion(
         return choice;
     };
 
+    prepared_owner_end = static_cast<std::uint32_t>(std::min<std::size_t>(
+        options.victims.size(),
+        static_cast<std::size_t>(node.next_expansion_owner) + maximum_owners));
     try {
-        for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+        for (std::size_t victim_index = node.next_expansion_owner;
+             victim_index < prepared_owner_end; ++victim_index) {
             CandidateVictimOptions& victim_options   = options.victims[victim_index];
             const std::uint16_t current_choice       = parent_choices[victim_index];
             std::vector<PressureDecision>& decisions = victim_options.decisions;
@@ -1453,9 +1445,13 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::commit_expansion(
     }
     target_choice_arena.resize(choice_write);
     const std::uint32_t new_count = prepared_new_count;
-    prepared.session_             = nullptr;
-    prepared.session_generation_  = 0;
-    prepared.scratch_generation_  = 0;
+    auto& parent                  = targets[prepared.parent_index_];
+    parent.next_expansion_owner   = prepared_owner_end;
+    const bool complete =
+        prepared_owner_end == candidate_options[parent.candidate_index].victims.size();
+    prepared.session_            = nullptr;
+    prepared.session_generation_ = 0;
+    prepared.scratch_generation_ = 0;
     expansion_scratch.clear();
     prepared_owner_decisions.clear();
     prepared_new_count  = 0;
@@ -1464,6 +1460,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::commit_expansion(
     return qwen3_6::PressureExpansionView{
         .children            = committed_children,
         .new_canonical_count = new_count,
+        .complete            = complete,
     };
 }
 
@@ -1511,12 +1508,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::seal(
     std::optional<AdmissionCandidate> sealed = std::move(assessed.executable_);
     assessed.reset();
     program->select_shared_captures(*sealed, prompt, intent.shared_capture_frontiers);
-    if (sealed->impl_->blocked_host_allocation_bytes != 0) { return std::nullopt; }
-    const auto status = program->revalidate_materialization(*sealed, prompt);
-    if (status == runtime::PreflightStatus::InvariantFailure) {
-        throw std::logic_error("pressure materialization assessment is internally invalid");
-    }
-    if (status != runtime::PreflightStatus::Ready) {
+    if (sealed->impl_->blocked_host_allocation_bytes != 0 ||
+        program->revalidate_materialization(*sealed, prompt) != runtime::PreflightStatus::Ready) {
         return std::nullopt;
     }
     return sealed;

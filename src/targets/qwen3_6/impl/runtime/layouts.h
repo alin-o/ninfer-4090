@@ -23,12 +23,14 @@ using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct DFlashPersistentLayout {
-    qwen3_6::PagedKVCacheLayout full;
+    std::optional<qwen3_6::PagedKVCacheLayout> full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
 
-    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept { return full.payload_bytes(); }
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return full ? full->payload_bytes() : 0;
+    }
 };
 
 struct PersistentLayout {
@@ -75,14 +77,7 @@ struct SequencePlanningInputs {
     std::uint32_t draft_window             = 0;
     std::uint32_t turn_checkpoint_ring     = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    DType kv_dtype                         = DType::BF16;
-    std::int32_t kv_quant_group            = 0;
-    bool kv_packed_v                       = false;
-    bool kv_rotate_k                       = false;
-    bool kv_rotate_v                       = false;
-    bool kv_packed_k                       = false;
-    bool kv_e8_lattice                     = false;
-    bool kv_e8_root                        = false;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -106,14 +101,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t draft_window             = 0;
     std::uint32_t turn_checkpoint_ring     = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    DType kv_dtype                         = DType::BF16;
-    std::int32_t kv_quant_group            = 0;
-    bool kv_packed_v                       = false;
-    bool kv_rotate_k                       = false;
-    bool kv_rotate_v                       = false;
-    bool kv_packed_k                       = false;
-    bool kv_e8_lattice                     = false;
-    bool kv_e8_root                        = false;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

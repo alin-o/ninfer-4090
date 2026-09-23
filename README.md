@@ -301,10 +301,12 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   `llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`,
   `llamacpp:requests_processing`, `llamacpp:requests_deferred`), so existing scrapers read this
   server without changes. Prompt tokens count only computed prefill; prefix-cache hits are
-  excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
-  hits, MTP draft/acceptance totals, and bounded auto-save queued, active-writer, reserved and
-  rejected work. Reserved jobs/bytes remain visible until Program-side source-pin retirement,
-  even when both the pending queue and active writer are empty.
+  excluded, as in llama.cpp. Processing/deferred occupancy is reserved before prompt preparation
+  or engine submission and held through response release, so accepted work cannot disappear from
+  metrics while queued. Additional `ninfer:` series report request totals, prefix-cache hits, MTP
+  draft/acceptance totals, and bounded auto-save queued, active-writer, reserved and rejected work.
+  Reserved jobs/bytes remain visible until Program-side source-pin retirement, even when both the
+  pending queue and active writer are empty.
 - **Durable shared anchors.** `--shared-prefix-cache-dir DIR` keeps complete, Frontend-classified
   stable harness/project prefixes across server restarts. Records are content-addressed, bounded by
   record/byte/staging/job limits, written with file and directory sync before an atomic manifest
@@ -413,12 +415,19 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 ## Artifact
 
-| Model | Artifact | Size |
-|---|---|---:|
-| Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB |
+| Model | Artifact | Revision | Size | SHA-256 |
+|---|---|---|---:|---|
+| Qwen3.8-27B | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `3526913004b1` (2026-08-14, container v2) | 16.96 GiB | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| Qwen3.8-27B + DFlash2 weights | same repository | `dc370fb6295a` (2026-09-06, container v2) | 19.03 GiB | `0634abb07024221de141456cf04a42ab74b18bc38e1b781c6eb2e062a467eec3` |
 
-The artifact is architecture-independent; the model card's RTX 5090 requirement describes the
-upstream engine, not the file. Verify the download against the SHA-256 published on the card.
+The download scripts fetch the pinned `3526913004b1` revision, which is the artifact this fork is
+validated with. The artifact is architecture-independent; the model card's RTX 5090 requirement
+describes the upstream engine, not the file. The `dc370fb6295a` revision adds the DFlash2 draft
+weights and loads on the same engine (`--spec dflash2 --draft-tokens 3` to use them).
+
+**Do not download the `main` revision.** Since 2026-09-15 it is a container-v3 artifact with a
+maintained jinja chat template. This fork reads container v2 only and rejects v3 with
+`artifact magic is not NInfer v2`; v3 support arrives with the next upstream catch-up.
 
 ## Reasoning effort
 
@@ -460,6 +469,16 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
+
+## Support
+
+NInfer is a personal project that I develop out of interest. If you find it useful and would like
+to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
+
+Support is entirely voluntary. It is not a purchase or investment and does not come with financial
+returns, promised services or features, or a role in project decisions. The project's direction,
+priorities, technical choices, and release schedule remain independently determined by the
+maintainer.
 
 ## License
 

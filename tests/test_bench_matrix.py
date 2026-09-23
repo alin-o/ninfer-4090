@@ -6,12 +6,12 @@ from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 from tools.bench.run_tiered_cache_replay import build_regression_matrix
 
 
-def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v14_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 13,
+                "schema_version": 14,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -41,7 +41,8 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "max_context": 4096,
                     "prefill_chunk": 1024,
                     "kv_cache": "int8-group64",
-                    "mtp_draft_tokens": 5,
+                    "speculative_backend": "mtp",
+                    "draft_tokens": 5,
                     "proposal_head": "optimized",
                     "decode_path": "cuda-graph",
                     "decode_graph_prime": {"primed": True, "output_tokens": 13},
@@ -99,6 +100,7 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         "cuda-graph",
         True,
     )
+    assert (row["speculative_backend"], row["draft_tokens"]) == ("mtp", 5)
     assert row["decode_graph_prime_output_tokens"] == 13
     assert row["kv_capacity"] == 8192
     assert row["host_to_device_bytes"] == 17_400_000_000

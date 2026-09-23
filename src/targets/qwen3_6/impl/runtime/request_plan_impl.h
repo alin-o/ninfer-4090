@@ -131,9 +131,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
-                                   DType dtype) noexcept {
+                                   KvCacheStorage storage) noexcept {
     return static_cast<std::uint32_t>(backend) | (static_cast<std::uint32_t>(proposal) << 8U) |
-           (static_cast<std::uint32_t>(dtype) << 16U);
+           (static_cast<std::uint32_t>(storage) << 16U);
 }
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
@@ -331,7 +331,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
-            capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
+            capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -579,12 +579,13 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     if ((is_rewrite_checkpoint_restore(plan->reuse) ||
          plan->reuse == ReusePath::PrivateLongAnchor ||
          plan->reuse == ReusePath::SharedStablePrefix) &&
-        speculative_backend == SpeculativeBackend::DFlash &&
+        is_masked_draft_backend(speculative_backend) &&
         (!dflash ||
-         (source != nullptr && (!source->kv || !source->kv->backend ||
+         (source != nullptr && (!source->kv || (backend_kv_cache() && !source->kv->backend) ||
                                 source->dflash_context_frontier < plan->reuse_base)) ||
-         (shared_source != nullptr && (!shared_source->kv || !shared_source->kv->backend ||
-                                       shared_source->backend_frontier < plan->reuse_base)))) {
+         (shared_source != nullptr &&
+          (!shared_source->kv || (backend_kv_cache() && !shared_source->kv->backend) ||
+           shared_source->frontier < plan->reuse_base)))) {
         throw std::logic_error("published DFlash checkpoint is not materializable");
     }
 
@@ -635,6 +636,13 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 unique.push_back(state);
                 // Aliased checkpoint state remains shared occupancy until the complete
                 // pressure target removes its last external owner.
+                // A checkpoint another owner also references is not this sequence's to release, so
+                // it is not part of its exclusive entitlement; the actual-side accounting in
+                // sequence_exclusive_state_resources applies the same filter, and the rewrite
+                // restore branch below already does this. Without it a host-demoted long anchor
+                // shared with a published prefix is counted as one host StateImage the sequence
+                // does not own, start_request rejects the entitlement, and the engine latches
+                // (sergiuszm/ninfer-4090#9).
                 if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
@@ -834,7 +842,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         return out;
     };
     const detail::PhysicalResources source_resources =
-        source != nullptr ? resident_resources(*source) : detail::PhysicalResources{};
+        source != nullptr ? owner_exclusive_resources(*source) : detail::PhysicalResources{};
     plan->source_resources = source_resources;
     if (source != nullptr || shared_source != nullptr) {
         const StateImageHandle selected =
@@ -851,7 +859,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             (plan->source_mode == runtime::PrivateSourceMode::Retain && !splits_private_both) ||
             (plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
              plan->state_fork_required);
-        if (speculative_backend == SpeculativeBackend::DFlash && forks_device_state &&
+        if (is_masked_draft_backend(speculative_backend) && forks_device_state &&
             selected_state_residency != StateReplicaResidency::HostOnly) {
             // DFlash has lane-local recurrent state which is copied eagerly when a retained
             // checkpoint forks. The copy completes on the compute stream in the publication

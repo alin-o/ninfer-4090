@@ -234,7 +234,7 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, queued_requests);
+        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
@@ -272,11 +272,6 @@ void HttpServer::record_request_start(RequestLogContext& context) {
         context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
     }
     request_jsonl_.write_request_start(context);
-    // Upstream dropped RequestLogContext::prompt_tokens, which this fork declared and read
-    // here but never assigned anywhere - so this argument has always been 0 and the
-    // Prometheus per-request prompt-token value has always been 0 with it. Passing 0
-    // explicitly keeps behaviour identical; fixing the metric is a separate change.
-    metrics_.begin_request(context.id, 0);
     operational_log_.request_start(context);
 }
 
@@ -297,7 +292,6 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 void HttpServer::record_request_done(RequestLogContext& context, const GenerationOutcome& outcome) {
     context.kv_snapshot = make_kv_capacity_snapshot(service_->memory_summary());
     request_jsonl_.write_request_done(context, outcome);
-    metrics_.end_request(context.id);
     metrics_.record(outcome);
     operational_log_.request_done(context, outcome);
 }
@@ -310,7 +304,6 @@ void HttpServer::record_request_failure(RequestLogContext& context, const Reques
     request_jsonl_.write_request_error(context, failure.machine_message,
                                        failure.checkpoint_lifecycle);
     operational_log_.request_failure(context, failure);
-    metrics_.end_request(context.id);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
@@ -362,7 +355,9 @@ void HttpServer::run_monitor() {
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
-    if (report_has_activity(tail)) { record_throughput(tail); }
+    // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
+    // fixed-cadence operational record and deliberately has no irregular shutdown tail.
+    if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }
 }
 
 void HttpServer::stop_monitor() {
@@ -472,15 +467,17 @@ void HttpServer::register_routes() {
     // Before a service is attached the server is still binding ahead of model load, which
     // is healthy by design.
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
-        const bool healthy = service_ == nullptr || service_->healthy();
-        if (!healthy) { res.status = 503; }
-        res.set_content(nlohmann::json{{"status", healthy ? "ok" : "error"}}.dump(),
+        const bool available =
+            service_ != nullptr && service_->is_available() && service_->healthy();
+        res.status = available ? 200 : 503;
+        res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(metrics_.render(options_.max_concurrency, service_ != nullptr
-                                                                      ? service_->runtime_stats()
-                                                                      : ninfer::RuntimeStats{}),
+        res.set_content(metrics_.render(options_.max_concurrency,
+                                        service_ != nullptr ? service_->runtime_stats()
+                                                            : ninfer::RuntimeStats{},
+                                        service_ != nullptr ? service_->active_request_count() : 0),
                         "text/plain; version=0.0.4");
     });
     // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per

@@ -55,7 +55,13 @@ struct W8RowSplitMmaGemmSchedule {
     static_assert(STAGES == 2, "W8G32 MMA uses a two-stage cp.async pipeline");
     static_assert(ACTIVATION_STAGES == 1 || ACTIVATION_STAGES == STAGES,
                   "W8G32 MMA activation staging is single-buffered or follows the pipeline");
-    static_assert(SMEM_BYTES <= 48 * 1024);
+#if defined(NINFER_SM86)
+    // sm_86/sm_89 cap statically allocated shared memory at 48 KB (sm_120a accepts up to the
+    // 99 KB per-CTA limit). An instantiation over the cap fails here instead of in nvlink.
+    static_assert(SMEM_BYTES <= 48 * 1024, "sm_86/sm_89 static shared memory limit");
+#else
+    static_assert(SMEM_BYTES <= 99 * 1024, "sm_120a per-CTA shared memory limit");
+#endif
 };
 
 __device__ __forceinline__ int w8g32_swz64(int row, int col) {
@@ -325,6 +331,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         } else {
             static_assert(Cfg::WARPS_M == 2);
+            static_assert(BM <= Cfg::ACTIVATION_STAGES * BK,
+                          "FP32 up tile must fit in the activation staging storage");
             auto* up_shared = reinterpret_cast<float*>(Bs);
             __syncthreads();
             if (wm == 1) {
@@ -391,7 +399,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         }
     } else if constexpr (Epilogue == W8Epilogue::Residual) {
-        static_assert(BM <= Cfg::STAGES * BK && (BM % 8) == 0,
+        static_assert(BM <= Cfg::ACTIVATION_STAGES * BK && (BM % 8) == 0,
                       "W8 residual epilogue reuses the x pipeline as a BF16 output tile");
         __syncthreads();
         __nv_bfloat16* projected_shared = Bs[0];

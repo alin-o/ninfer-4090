@@ -155,7 +155,8 @@ void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     vision_items_.swap(other.vision_items_);
 }
 
-void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta) {
+void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta,
+                                              std::optional<std::uint32_t> /*execution_split_after*/) {
     const std::size_t begin = size();
     if (count > std::numeric_limits<std::size_t>::max() - begin) {
         throw std::overflow_error("generated prefix identity length overflows size_t");
@@ -319,7 +320,8 @@ void PrefixShortlistDigests::swap(PrefixShortlistDigests& other) noexcept {
 }
 
 void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,
-                                              std::int32_t rope_delta) {
+                                              std::int32_t rope_delta,
+                                              std::optional<std::uint32_t> /*execution_split_after*/) {
     if (digests_.empty()) {
         throw std::logic_error("generated shortlist append has no resident prefix");
     }

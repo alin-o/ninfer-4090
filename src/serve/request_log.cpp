@@ -1,6 +1,7 @@
 #include "serve/request_log.h"
 #include "ninfer/build_identity.h"
 #include "product/logging/logging.h"
+#include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
@@ -112,6 +113,15 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
     return "unknown";
 }
 
+Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
+    return Json{{"marker_seen", diagnostics.marker_seen},
+                {"structured_call_count", diagnostics.structured_call_count},
+                {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
+                {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
+                {"fallback_reason",
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+}
+
 std::string tool_choice_name(const ToolChoice& choice) {
     switch (choice.mode) {
     case ToolChoiceMode::Auto:
@@ -161,6 +171,10 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "rk4v4-e8";
     case ninfer::KvCacheStorage::RK2V4E8:
         return "rk2v4-e8";
+    case ninfer::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
     }
     return "unknown";
 }
@@ -469,6 +483,19 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
         {"best_reuse_prompt_tokens", diagnostics.best_reuse_prompt_tokens},
+        {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
+        {"first_improvement_ns", diagnostics.first_improvement_ns
+                                     ? Json(*diagnostics.first_improvement_ns)
+                                     : Json(nullptr)},
+        {"incumbent_improvements", diagnostics.incumbent_improvements},
+        {"search_work", diagnostics.search_work},
+        {"search_granted_ns", diagnostics.search_granted_ns},
+        {"search_renewals", diagnostics.search_renewals},
+        {"search_discovery_used", diagnostics.search_discovery_used},
+        {"search_overshoot_ns", diagnostics.search_overshoot_ns},
+        {"search_stop_phase",
+         ninfer::materialization_search_phase_name(diagnostics.search_stop_phase)},
+        {"search_boundary_limited", diagnostics.search_boundary_limited},
     };
 }
 
@@ -749,7 +776,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
          {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
          {"thinking_control_tokens", outcome.thinking.injected_tokens},
          {"thinking_control_applied", outcome.thinking.applied},
-         {"tool_call_count", outcome.tool_calls.size()}};
+         {"tool_call_count", outcome.tool_calls.size()},
+         {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     const ninfer::RequestCheckpointSummary checkpoints =
         summarize_checkpoint_lifecycle(outcome.checkpoint_lifecycle);
     record["checkpoint_summary"] = Json{{"reuse_loaded", checkpoints.reuse_loaded},
@@ -1445,8 +1473,8 @@ void JsonlRequestLog::append(std::string record) {
         }
     }
     if (report_failure && logger_ != nullptr) {
-        logger_->error("request_log status=failed phase=write path={}",
-                       product::quote_log_value(path_));
+        logger_->error("request log disabled | write failed | {}",
+                       product::format_pretty_text(path_));
     }
 }
 

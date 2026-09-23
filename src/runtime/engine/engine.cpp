@@ -13,6 +13,7 @@
 #include "targets/registry.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -77,7 +78,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(concurrency);
+    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
+        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
 
     if (*cache.max_private_continuations < concurrency) {
@@ -475,14 +477,16 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
+                                GenerationObservationOptions observation,
                                 std::chrono::steady_clock::time_point pending_deadline) {
     return submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
-                                pending_deadline, {});
+                                observation, pending_deadline, {});
 }
 
 GenerationHandle
 Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
                              OutputConsumerMode consumer_mode,
+                             GenerationObservationOptions observation,
                              std::chrono::steady_clock::time_point pending_deadline,
                              std::shared_ptr<runtime::DeferredDurableRecovery> recovery) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -490,6 +494,11 @@ Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
         throw std::logic_error("submit requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    if (observation.live_timings) { observation.phase_timings = true; }
+    if (consumer_mode != OutputConsumerMode::Streaming &&
+        (observation.live_timings || observation.prompt_progress)) {
+        throw std::invalid_argument("live generation observations require a Streaming consumer");
+    }
 
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
@@ -549,8 +558,8 @@ Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), consumer_mode, pending_deadline,
-                                 std::move(recovery));
+                                 std::move(resolved_options), consumer_mode, observation,
+                                 pending_deadline, std::move(recovery));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -560,6 +569,7 @@ Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
 
 GenerationHandle runtime::DurableSharedSnapshotAccess::submit(
     Engine& engine, PreparedPrompt prompt, RequestOptions options, OutputConsumerMode consumer_mode,
+    GenerationObservationOptions observation,
     std::chrono::steady_clock::time_point pending_deadline,
     std::shared_ptr<DeferredDurableRecovery> recovery) {
     if (recovery) {
@@ -567,14 +577,15 @@ GenerationHandle runtime::DurableSharedSnapshotAccess::submit(
         recovery->model_binding = slot_model_binding(engine.impl_->load);
     }
     return engine.submit_with_recovery(std::move(prompt), std::move(options), consumer_mode,
-                                       pending_deadline, std::move(recovery));
+                                       observation, pending_deadline, std::move(recovery));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
     const OutputConsumerMode consumer_mode =
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
-    return submit(std::move(prompt), std::move(options), consumer_mode).wait(sink, cancellation);
+    return submit(std::move(prompt), std::move(options), consumer_mode, {})
+        .wait(sink, cancellation);
 }
 
 const EngineOptions& Engine::options() const {
@@ -769,6 +780,20 @@ std::vector<SlotState> Engine::slot_states() const {
                 return core->slot_states();
             } else {
                 throw std::logic_error("session persistence requires a generation Engine");
+            }
+        },
+        impl_->core);
+}
+
+bool Engine::is_available() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else {
+                return core != nullptr && core->is_available();
             }
         },
         impl_->core);

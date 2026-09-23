@@ -216,6 +216,8 @@ struct ResourceCandidateState {
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
     detail::PhysicalDemand demand;
+    // Resources released by consuming this private owner alone. Shared aliases are intentionally
+    // absent; complete pressure targets settle their joint reference graph separately.
     detail::PhysicalResources source_resources;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::Root;
     std::uint32_t reuse_base                  = 0;
@@ -429,7 +431,6 @@ struct SequenceState {
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
-    bool state_source_retained    = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
@@ -598,6 +599,7 @@ public:
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
+                         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                          runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
@@ -636,14 +638,7 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
-    const DType kv_dtype;
-    const std::int32_t kv_quant_group;
-    const bool kv_packed_v;
-    const bool kv_rotate_k;
-    const bool kv_rotate_v;
-    const bool kv_packed_k;
-    const bool kv_e8_lattice;
-    const bool kv_e8_root;
+    const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;
@@ -1077,7 +1072,9 @@ private:
                  const SequenceState* source, const SharedPrefixState* shared_source,
                  std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
-    void prepare_materialization(MaterializationTransaction& transaction);
+    // False when the plan went stale between planning and preparation. The caller aborts the
+    // transaction instead of failing the Engine: nothing has been mutated at that point.
+    [[nodiscard]] bool prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);
     void record_materialization_transfer_observations(MaterializationTransaction& transaction);
     void publish_materialization_transfers(MaterializationTransaction& transaction);
@@ -1116,6 +1113,7 @@ private:
     [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
         std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+        std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
@@ -1125,13 +1123,17 @@ private:
                                             std::uint64_t generation) const noexcept;
     [[nodiscard]] bool has_unsettled_state_fork() const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
-    [[nodiscard]] detail::PhysicalResources resident_resources(const SequenceState& sequence) const;
+    // Per-owner resources are intentionally distinct from global physical occupancy: an aliased
+    // allocation contributes only when removing this owner would release it.
     [[nodiscard]] detail::PhysicalResources
-    resident_resources(const SharedPrefixState& shared) const;
+    owner_exclusive_resources(const SequenceState& sequence) const;
+    [[nodiscard]] detail::PhysicalResources
+    owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
-    void observe_physical_reclamation(detail::PhysicalResources before,
-                                      runtime::UniquePhysicalReclamation& total) const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+    [[nodiscard]] std::optional<StateImageHandle>
+    try_selected_state(const SequenceState& sequence, ReusePath reuse,
+                       std::optional<runtime::CheckpointRef> checkpoint) const;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
@@ -1259,8 +1261,8 @@ private:
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
-    [[nodiscard]] std::uint32_t
-    owned_device_state_slots(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] detail::PhysicalResources
+    sequence_exclusive_state_resources(const SequenceState& sequence) const;
     [[nodiscard]] std::uint32_t owned_checkpoint_references(const SequenceState& sequence,
                                                             StateImageHandle state) const noexcept;
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
@@ -1309,9 +1311,14 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void
+    commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
+                                     std::span<const TokenId> accepted_tokens,
+                                     std::optional<std::uint32_t> prefix_execution_split_after);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                     std::uint32_t accepted_tokens, bool terminal,
+                                    std::optional<std::uint32_t> prefix_execution_split_after,
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
@@ -1337,8 +1344,8 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
-    void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
-                                 std::uint32_t backend_tokens = 0);
+    void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
+                                   std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
@@ -1388,8 +1395,9 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         std::uint32_t victim_choice_offset = 0;
         std::uint32_t victim_choice_count  = 0;
         std::optional<detail::PhysicalResources> assessed_residual;
-        std::uint32_t stable_ordinal = 0;
-        bool root_maximal            = false;
+        std::uint32_t next_expansion_owner = 0;
+        std::uint32_t stable_ordinal       = 0;
+        bool root_maximal                  = false;
     };
 
     struct CandidateVictimOptions {
@@ -1418,6 +1426,25 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         bool leased              = false;
     };
 
+    struct ConstructionOption {
+        std::size_t victim = 0;
+        PressureDecision decision;
+        bool identity = false;
+    };
+
+    struct ConstructionSlot {
+        std::vector<std::uint16_t> choices;
+        std::vector<ConstructionOption> options;
+        std::size_t next_owner        = 0;
+        std::size_t next_option       = 0;
+        std::uint32_t candidate_index = 0;
+        std::uint32_t generation      = 0;
+        std::uint32_t scan_generation = 1;
+        detail::PhysicalResources residual;
+        bool restore = false;
+        bool leased  = false;
+    };
+
     PressurePlanningSessionImpl(
         Core& owner, std::span<const PhysicalCandidateBinding> physical_candidates,
         std::span<const runtime::PlanningCandidateId> admission_candidate_ids,
@@ -1431,15 +1458,33 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_6::PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    [[nodiscard]] qwen3_6::PressureTargetHandle
+    maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] qwen3_6::PressureConstructionCursor
+    begin_construction(qwen3_6::PressureTargetHandle target, bool restore = false);
+    [[nodiscard]] runtime::PressureConstructionStep
+    next_construction_option(qwen3_6::PressureConstructionCursor& cursor);
+    void choose_construction(qwen3_6::PressureConstructionCursor& cursor,
+                             runtime::PressureConstructionOptionId option);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
-    guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-                          std::span<const runtime::PlanningOwnerId> conversation_head_ids);
+    construction_target(const qwen3_6::PressureConstructionCursor& cursor);
+    [[nodiscard]] ConstructionSlot&
+    construction_slot(const qwen3_6::PressureConstructionCursor& cursor);
+    static void release_construction(const void*, std::uint32_t, std::uint32_t) noexcept;
+    [[nodiscard]] runtime::PressureTargetGuidance
+    guidance_choices(std::uint32_t candidate_index, std::span<const std::uint16_t> choices,
+                     std::uint32_t ordinal,
+                     std::optional<std::size_t> override_owner = std::nullopt,
+                     const PressureDecision* override_decision = nullptr);
+    [[nodiscard]] detail::PhysicalResources
+    construction_residual(std::uint32_t candidate_index,
+                           std::span<const std::uint16_t> choices) const;
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>
-    prepare_expansion(qwen3_6::PressureTargetHandle parent);
+    prepare_expansion(qwen3_6::PressureTargetHandle parent,
+                      std::uint32_t maximum_owners = std::numeric_limits<std::uint32_t>::max());
     [[nodiscard]] qwen3_6::PressureExpansionView
     commit_expansion(qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>&& prepared);
     void discard_expansion(
@@ -1510,8 +1555,13 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     std::vector<runtime::CheckpointRecoveryAlternativeWork> assessment_recovery_alternatives;
     typename Core::PressureRecoveryScratch recovery_scratch;
     std::vector<runtime::PressureOwnerOutcome> guidance_outcomes;
+    std::vector<runtime::PressureCheckpointOutcome> guidance_checkpoint_changes;
+    std::vector<runtime::PressureOwnerRecoveryGuidance> guidance_recovery;
+    std::array<ConstructionSlot, 4> construction_slots;
+    std::uint32_t construction_generation = 0;
     std::array<AssessmentSlot, 2> assessment_slots;
     std::uint32_t prepared_new_count = 0;
+    std::uint32_t prepared_owner_end = 0;
     std::size_t scratch_choice_mark  = 0;
     bool scratch_live                = false;
 };

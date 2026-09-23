@@ -786,7 +786,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered.append_template("<think>\n");
             add_rewrite_execution_boundary();
             rendered.append(reasoning);
-            rendered.append_template("\n</think>\n\n");
+            rendered.append_template(kCanonicalReasoningCloseSerialization);
             add_rewrite_execution_boundary();
         }
         rendered.append(body);
@@ -827,7 +827,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         } else {
             rendered.append_template("<think>\n");
             add_rewrite_execution_boundary();
-            rendered.append_template("\n</think>\n\n");
+            rendered.append_template(kCanonicalReasoningCloseSerialization);
             add_rewrite_execution_boundary();
         }
     }

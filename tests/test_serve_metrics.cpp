@@ -49,7 +49,7 @@ int main() {
     ServeMetrics metrics;
     // The four llamacpp counters flow straight from the Engine's live totals.
     ninfer::RuntimeStats live;
-    const auto empty = parse(metrics.render(1, live));
+    const auto empty = parse(metrics.render(1, live, 0));
     failures += check(empty.at("llamacpp:prompt_tokens_total") == 0.0, "starts at zero");
     const auto never = metrics.last_completed();
     failures += check(never.prompt_tokens == 0 && never.cached_tokens == 0,
@@ -65,20 +65,12 @@ int main() {
     failures +=
         check(empty.at("ninfer:auto_save_in_flight_jobs") == 0.0, "auto-save writer starts idle");
 
-    // Two in-flight requests against one execution lane: FIFO order says the
-    // older one processes and the newer one is deferred.
-    metrics.begin_request(7, 500);
-    metrics.begin_request(8, 900);
-    const auto busy = parse(metrics.render(1, live));
+    // Admission reserves request lifetimes before preparation/submission. Metrics use that
+    // authoritative count directly, including work not yet visible in an engine slot.
+    const auto busy = parse(metrics.render(1, live, 2));
     failures += check(busy.at("llamacpp:requests_processing") == 1.0, "one processing");
     failures += check(busy.at("llamacpp:requests_deferred") == 1.0, "one deferred");
-    const auto active = metrics.active_snapshot();
-    failures += check(active.size() == 2 && active[0].first == 7 && active[0].second == 500,
-                      "snapshot FIFO order");
-    metrics.end_request(7);
-    metrics.end_request(7); // idempotent
-    metrics.end_request(8);
-    const auto drained = parse(metrics.render(1, live));
+    const auto drained = parse(metrics.render(1, live, 0));
     failures += check(drained.at("llamacpp:requests_processing") == 0.0, "drained processing");
     failures += check(drained.at("llamacpp:requests_deferred") == 0.0, "drained deferred");
 
@@ -124,7 +116,7 @@ int main() {
         ninfer::ContextCacheMetricRole::ConversationHead,
         ninfer::ContextCacheMetricPlacement::Device, ninfer::ContextCacheMetricPin::Unpinned,
         ninfer::ContextCacheMetricIdentity::InitialPrefix)] = 1;
-    const auto values                                       = parse(metrics.render(1, live));
+    const auto values                                       = parse(metrics.render(1, live, 0));
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "live prefill tokens");
     failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "live prefill seconds");
     failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "live decode tokens");

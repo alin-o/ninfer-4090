@@ -907,10 +907,12 @@ State/KV stores, temporary Device page capacity, address spaces, and an executio
 the import.
 
 An inactive, unpinned shared owner can provide the logical import slot even without an SSD copy.
-Program must prove physical releasability and seal an exact in-memory rollback snapshot before
-replacing it. The rollback retains the original identity and copies State/KV directly; it does not
-require the victim's provenance to qualify for SSD export. Failed or cancelled import restores the
-victim; active references and export pins remain protected. Successful eviction reports destination
+Program must prove physical releasability before replacing it. When physical capacity permits,
+Program retains the victim's State/KV while staging the incoming owner, then releases the victim
+only after adoption succeeds. If adoption needs that storage first, Program seals an exact
+in-memory rollback snapshot retaining the original identity and State/KV; this does not require
+the victim's provenance to qualify for SSD export. Failed or cancelled import preserves or restores
+the victim; active references and export pins remain protected. Successful eviction reports destination
 `Ssd` only for a durably backed owner, and `None` otherwise.
 
 When SSD wins, Engine reserves the sealed source/victim plan and signals Gateway to load the chosen

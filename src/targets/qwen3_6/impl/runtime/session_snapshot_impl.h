@@ -2151,7 +2151,12 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_shared_prefix_snapshot(
     };
     snapshot.settle_transfer = [pending] { pending->settle(); };
     snapshot_source_retirements_.push_back(SnapshotSourceRetirement{
-        .ready  = [pending] { return !pending->submitted || pending->completion->ready(); },
+        .ready =
+            [pending] {
+                runtime::testing::shared_snapshot_export_checkpoint(
+                    runtime::testing::SharedSnapshotExportStage::BeforeReadinessQuery);
+                return !pending->submitted || pending->completion->ready();
+            },
         .retire = [pending] { pending->retire(); },
     });
     return snapshot;
@@ -2198,7 +2203,8 @@ qwen3_6::ValidatedSharedPrefixImport<Variant> ProgramImplCore::parse_shared_pref
     const auto actual_checksum = frontend_internal::sha256(
         snapshot.subspan(kSharedEnvelopeHeaderBytes), cancellation_checkpoint);
     if (actual_checksum != expected_checksum) {
-        throw std::invalid_argument("shared snapshot payload checksum does not match");
+        throw runtime::DurableImportError(runtime::DurableImportErrorKind::ChecksumMismatch,
+                                          "shared snapshot payload checksum does not match");
     }
 
     SnapshotReader reader(snapshot.subspan(kSharedEnvelopeHeaderBytes));
@@ -2717,7 +2723,55 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
         !same_optional_handle(plan->replacement, replacement) ||
         !same_optional_handle(plan->host_private, host_private) ||
         !same_optional_handle(plan->host_shared, host_shared)) {
-        throw std::invalid_argument("durable shared import physical plan is stale");
+        throw runtime::DurableImportError(runtime::DurableImportErrorKind::StalePlan,
+                                          "durable shared import physical plan is stale");
+    }
+
+    // A logical replacement need not reclaim physical storage before adoption. Keep the old
+    // owner intact while staging the import whenever the current pools have enough room.
+    // Only the publication cell is borrowed; failure restores it without a snapshot or D2H wait.
+    if (replacement != nullptr && host_private == nullptr && host_shared == nullptr) {
+        const std::uint32_t victim_index       = ContractAccess::index(*replacement);
+        const SharedPrefixSlot original_slot   = shared_prefix_slots[victim_index];
+        SharedPrefixState original             = std::move(shared_prefix_states[victim_index]);
+        shared_prefix_slots[victim_index].role = SharedPrefixSlotRole::Free;
+        if (++shared_prefix_slots[victim_index].generation == 0) {
+            ++shared_prefix_slots[victim_index].generation;
+        }
+        try {
+            const auto without_reclamation = inspect_durable_shared_prefix_import(
+                imported.summary().checkpoint.ref.frontier, nullptr, nullptr, nullptr);
+            if (without_reclamation.feasibility == runtime::DurableImportFeasibility::Feasible) {
+                if (cancellation.requested()) {
+                    throw RequestError(RequestErrorKind::Cancelled,
+                                       "shared snapshot replacement was cancelled before commit");
+                }
+                auto publication = adopt_shared_prefix_impl(imported, commit_checkpoint);
+                const std::uint32_t published_index = ContractAccess::index(publication.handle);
+                if (published_index == victim_index) {
+                    SharedPrefixState published = std::move(shared_prefix_states[victim_index]);
+                    shared_prefix_states[victim_index] = std::move(original);
+                    shared_prefix_slots[victim_index]  = original_slot;
+                    (void)release_shared_prefix_state_strict(victim_index,
+                                                             SharedPrefixSlotRole::Catalogued);
+                    shared_prefix_states[victim_index]     = std::move(published);
+                    shared_prefix_slots[victim_index].role = SharedPrefixSlotRole::Catalogued;
+                } else {
+                    shared_prefix_states[victim_index] = std::move(original);
+                    shared_prefix_slots[victim_index]  = original_slot;
+                    (void)release_shared_prefix_state_strict(victim_index,
+                                                             SharedPrefixSlotRole::Catalogued);
+                }
+                ContractAccess::consume(*replacement);
+                return publication;
+            }
+        } catch (...) {
+            shared_prefix_states[victim_index] = std::move(original);
+            shared_prefix_slots[victim_index]  = original_slot;
+            throw;
+        }
+        shared_prefix_states[victim_index] = std::move(original);
+        shared_prefix_slots[victim_index]  = original_slot;
     }
 
     const std::vector<StateImageHandle>& duplicate_host_states = plan->duplicate_host_states;
@@ -2916,11 +2970,14 @@ qwen3_6::SharedPrefixPublication<Variant> ProgramImplCore::adopt_shared_prefix(
     for (const StateImageHandle state : duplicate_host_states) {
         if (state_store->residency(state) != StateReplicaResidency::Both ||
             state_store->source_pins(state) != 0) {
-            throw std::invalid_argument("durable shared import Host State release plan is stale");
+            throw runtime::DurableImportError(
+                runtime::DurableImportErrorKind::StalePlan,
+                "durable shared import Host State release plan is stale");
         }
     }
     if (!host_kv_extents->can_release_page_replicas(plan->duplicate_host_releases)) {
-        throw std::invalid_argument("durable shared import Host KV release plan is stale");
+        throw runtime::DurableImportError(runtime::DurableImportErrorKind::StalePlan,
+                                          "durable shared import Host KV release plan is stale");
     }
     if (commit_checkpoint) { commit_checkpoint(); }
 

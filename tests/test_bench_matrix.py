@@ -160,3 +160,35 @@ def test_tiered_cache_matrix_requires_complete_private_host_materialization() ->
             },
         }
     )["status"] == "FAIL"
+
+
+def test_existing_replay_matches_response_ids_unless_historical(tmp_path, monkeypatch) -> None:
+    from argparse import Namespace
+    from contextlib import nullcontext
+    from tools.bench import run_tiered_cache_replay as replay
+
+    monkeypatch.setattr(replay, "RunningServe", lambda *args: nullcontext())
+    monkeypatch.setattr(replay, "server_command", lambda *args: [])
+    monkeypatch.setattr(replay, "gpu_memory_snapshot", lambda: {})
+    monkeypatch.setattr(replay, "wait_for_idle_catalog", lambda *args: {})
+    monkeypatch.setattr(replay, "run_exchange", lambda *args: ({}, None, "resp-measured"))
+    monkeypatch.setattr(replay, "request_measurement", lambda *args, **kwargs: {})
+    for historical in (False, True):
+        schema = replay.BASELINE_REQUEST_LOG_SCHEMA if historical else replay.REQUEST_LOG_SCHEMA
+        monkeypatch.setattr(replay, "load_events", lambda *args, **kwargs: [
+            {"event": "server_start", "schema_version": schema}
+        ])
+        correlations = []
+
+        def done(*args, expected_response_id, allowed_schemas):
+            correlations.append((expected_response_id, allowed_schemas))
+            return {}, len(correlations)
+
+        monkeypatch.setattr(replay, "latest_done", done)
+        args = Namespace(historical_baseline=historical, baseline_serve="serve", serve="serve",
+                         weights="model.ninfer", port=9000, startup_timeout_seconds=1,
+                         request_timeout_seconds=1)
+        fixture = {"payload_sha256": "fixture"}
+        replay.run_profile("existing", [fixture], args, tmp_path, seed=fixture)
+        expected = None if historical else "resp-measured"
+        assert correlations == [(expected, (schema,)), (expected, (schema,))]

@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
 
@@ -586,6 +587,20 @@ struct UniquePhysicalReclamation {
     [[nodiscard]] friend constexpr bool
     operator==(const UniquePhysicalReclamation&,
                const UniquePhysicalReclamation&) noexcept = default;
+};
+
+// Machine-readable recoverable failures across the Program/Engine import boundary.
+enum class DurableImportErrorKind : std::uint8_t { StalePlan, ChecksumMismatch };
+
+class DurableImportError : public std::invalid_argument {
+public:
+    DurableImportError(DurableImportErrorKind kind, const char* message)
+        : std::invalid_argument(message), kind_(kind) {}
+
+    [[nodiscard]] DurableImportErrorKind kind() const noexcept { return kind_; }
+
+private:
+    DurableImportErrorKind kind_;
 };
 
 // Program-owned diagnosis for one complete durable Host import projection.  ResourceManager may

@@ -94,6 +94,13 @@ against isolated execution; the CPU checks cover fairness, protected owners, and
 The memory-only victim case checks replacement of a non-durable user-content checkpoint, including
 restoration after allocation failure and cancellation. SSD export eligibility remains enforced.
 
+`ninfer_qwen3_8_shared_recovery_zero_output_test` verifies reservation cancellation and an
+Aborted lifecycle fact for zero-output SSD recovery. `ninfer_qwen3_8_shared_import_errors_test`
+checks typed checksum/stale/adoption failures, snapshot-query pin cleanup, and transactional
+replacement without a rollback snapshot when physical capacity is available. Both use
+`NINFER_QWEN3_8_27B_WEIGHTS`. Transfer fault hooks and their atomic counters are enabled only
+with `BUILD_TESTING=ON`; application-only builds compile these call sites to no-ops.
+
 Enable uniform floating-point error records when establishing or reviewing an Op criterion:
 
 ```bash

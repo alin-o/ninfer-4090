@@ -418,6 +418,16 @@ public:
         return {tokens, std::move(digest)};
     }
 
+    void settle_unused_recovery(const std::shared_ptr<DeferredDurableRecovery>& recovery) {
+        {
+            std::scoped_lock lock(execution_mutex_);
+            settle_unresolved_recovery(recovery, "ssd-warm-or-root-selected",
+                                       CheckpointLifecycleStatus::Aborted);
+            request_admission_check();
+        }
+        queue_cv_.notify_one();
+    }
+
     // Stable Engine boundary for the durable shared catalog. Filesystem workers own bytes only;
     // these calls select logical owners under the execution lock and leave all codec/State/KV
     // work in Program. They intentionally do not address or evict private session slots.
@@ -604,7 +614,8 @@ private:
                                        "shared snapshot import was cancelled");
                 }
                 if (result.disposition == ResourceManagement::SharedImportDisposition::Stale) {
-                    throw std::invalid_argument("durable shared recovery plan is stale");
+                    throw DurableImportError(DurableImportErrorKind::StalePlan,
+                                             "durable shared recovery plan is stale");
                 }
                 {
                     const auto view = resources_.shared_catalog_slot(result.slot);
@@ -1526,10 +1537,10 @@ private:
         });
     }
 
-    void settle_unresolved_recovery(const std::shared_ptr<Request>& request, std::string reason,
-                                    CheckpointLifecycleStatus status) {
-        if (!request->durable_recovery) { return; }
-        DeferredDurableRecovery& recovery = *request->durable_recovery;
+    void settle_unresolved_recovery(const std::shared_ptr<DeferredDurableRecovery>& deferred,
+                                    std::string reason, CheckpointLifecycleStatus status) {
+        if (!deferred) { return; }
+        DeferredDurableRecovery& recovery = *deferred;
         std::unique_lock lock(recovery.mutex);
         if (recovery.completed) { return; }
         const std::uint64_t reservation_id = std::exchange(recovery.reservation_id, 0);
@@ -1544,7 +1555,7 @@ private:
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
-        settle_unresolved_recovery(request, "ssd-admission-failure",
+        settle_unresolved_recovery(request->durable_recovery, "ssd-admission-failure",
                                    CheckpointLifecycleStatus::Failed);
         release_planning_state(request);
         request->prompt      = {};
@@ -1566,10 +1577,10 @@ private:
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
         if (reason == FinishReason::Cancelled) {
-            settle_unresolved_recovery(request, "ssd-cancelled",
+            settle_unresolved_recovery(request->durable_recovery, "ssd-cancelled",
                                        CheckpointLifecycleStatus::Aborted);
         } else {
-            settle_unresolved_recovery(request, "ssd-warm-or-root-selected",
+            settle_unresolved_recovery(request->durable_recovery, "ssd-warm-or-root-selected",
                                        CheckpointLifecycleStatus::Aborted);
         }
         release_planning_state(request);
@@ -1778,7 +1789,7 @@ private:
         try {
             for (const auto& request : cancelled) { complete_detached_cancelled(request); }
             for (const auto& request : expired) {
-                settle_unresolved_recovery(request, "ssd-deadline",
+                settle_unresolved_recovery(request->durable_recovery, "ssd-deadline",
                                            CheckpointLifecycleStatus::Aborted);
                 complete_error(request,
                                std::make_exception_ptr(RequestError(
@@ -2219,12 +2230,13 @@ private:
         if (request->cancelled.load(std::memory_order_acquire) ||
             deferred_gateway_cancel_requested(&recovery)) {
             request->cancelled.store(true, std::memory_order_release);
-            settle_unresolved_recovery(request, "ssd-cancelled",
+            settle_unresolved_recovery(request->durable_recovery, "ssd-cancelled",
                                        CheckpointLifecycleStatus::Aborted);
             return true;
         }
         if (Clock::now() >= request->deadline) {
-            settle_unresolved_recovery(request, "ssd-deadline", CheckpointLifecycleStatus::Aborted);
+            settle_unresolved_recovery(request->durable_recovery, "ssd-deadline",
+                                       CheckpointLifecycleStatus::Aborted);
             return true;
         }
         if (materializing_ || instance_.program->has_context_transaction()) { return false; }
@@ -2417,9 +2429,12 @@ private:
                 return true;
             } catch (const std::invalid_argument& error) {
                 resources_.cancel_durable_recovery(reservation_id);
-                const std::string_view message(error.what());
-                if (validation_completed && message.find("stale") != std::string_view::npos &&
-                    attempt == 0) {
+                const auto* import_error = dynamic_cast<const DurableImportError*>(&error);
+                const bool stale =
+                    import_error && import_error->kind() == DurableImportErrorKind::StalePlan;
+                const bool checksum = import_error && import_error->kind() ==
+                                                          DurableImportErrorKind::ChecksumMismatch;
+                if (validation_completed && stale && attempt == 0) {
                     std::lock_guard lock(recovery.mutex);
                     recovery.reservation_id = 0;
                     request_admission_check();
@@ -2430,11 +2445,8 @@ private:
                 recovery.invalidate_record = !validation_completed;
                 recovery.fallback_reason =
                     validation_completed
-                        ? (message.find("stale") != std::string_view::npos ? "ssd-stale-replanned"
-                                                                           : "ssd-adoption-failure")
-                        : (message.find("checksum") != std::string_view::npos
-                               ? "ssd-checksum-failure"
-                               : "ssd-validation-failure");
+                        ? (stale ? "ssd-stale-replanned" : "ssd-adoption-failure")
+                        : (checksum ? "ssd-checksum-failure" : "ssd-validation-failure");
                 append_deferred_recovery_fact(recovery, CheckpointLifecycleStatus::Failed,
                                               bytes->size());
                 recovery.completed = true;
@@ -2699,7 +2711,7 @@ private:
                 continue;
             }
             if (Clock::now() >= head->deadline) {
-                settle_unresolved_recovery(head, "ssd-deadline",
+                settle_unresolved_recovery(head->durable_recovery, "ssd-deadline",
                                            CheckpointLifecycleStatus::Aborted);
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -2735,7 +2747,7 @@ private:
                 continue;
             }
             if (Clock::now() >= head->deadline) {
-                settle_unresolved_recovery(head, "ssd-deadline",
+                settle_unresolved_recovery(head->durable_recovery, "ssd-deadline",
                                            CheckpointLifecycleStatus::Aborted);
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -2814,7 +2826,7 @@ private:
                     continue;
                 }
                 if (Clock::now() >= candidate->deadline) {
-                    settle_unresolved_recovery(candidate, "ssd-deadline",
+                    settle_unresolved_recovery(candidate->durable_recovery, "ssd-deadline",
                                                CheckpointLifecycleStatus::Aborted);
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(

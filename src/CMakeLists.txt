@@ -33,9 +33,12 @@ add_library(ninfer_core STATIC
   runtime/engine/admission_policy.cpp
   runtime/engine/context_cost.cpp
   runtime/engine/context_cost_defaults.cpp
-  runtime/engine/context_transfer_test_gate.cpp
   runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp)
+if(BUILD_TESTING)
+  target_sources(ninfer_core PRIVATE runtime/engine/context_transfer_test_gate.cpp)
+  target_compile_definitions(ninfer_core PUBLIC NINFER_TEST_HOOKS=1)
+endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)

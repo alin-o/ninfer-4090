@@ -6470,9 +6470,16 @@ void ProgramImplCore::finalize_context_transaction() noexcept {
 void ProgramImplCore::retire_ready_snapshot_sources() {
     auto retirement = snapshot_source_retirements_.begin();
     while (retirement != snapshot_source_retirements_.end()) {
-        if (!retirement->ready()) {
-            ++retirement;
-            continue;
+        try {
+            if (!retirement->ready()) {
+                ++retirement;
+                continue;
+            }
+        } catch (...) {
+            // Event queries may surface asynchronous transfer failures. Settle every source
+            // before propagating the failure; Host consumers can still own the backing image.
+            settle_snapshot_sources();
+            throw;
         }
         retirement->retire();
         retirement = snapshot_source_retirements_.erase(retirement);

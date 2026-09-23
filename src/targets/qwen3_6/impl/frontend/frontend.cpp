@@ -941,9 +941,11 @@ PreparedContextCache prepare_context_cache(
     // descendant as the project anchor.
     has_project_frontier =
         has_project_frontier ||
-        std::any_of(
-            structural_boundaries.begin(), structural_boundaries.end(),
-            [](const auto& source) { return (source.origins & SharedPrefixProjectContext) != 0; });
+        std::any_of(structural_boundaries.begin(), structural_boundaries.end(),
+                    [](const auto& source) {
+                        return source.frontier && *source.frontier == 0 &&
+                               (source.origins & SharedPrefixProjectContext) != 0;
+                    });
     // Port the bounded upstream selection: only the deepest stable anchor on each side of a
     // project boundary is retained. Without a project, select the deepest stable harness
     // (preferring a cache-marker anchor when present).

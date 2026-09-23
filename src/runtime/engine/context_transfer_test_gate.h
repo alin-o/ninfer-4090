@@ -51,31 +51,30 @@ struct SharedSnapshotImportTestGate {
     void (*checkpoint)(void* context, SharedSnapshotImportStage stage) = nullptr;
 };
 
-void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* gate) noexcept;
-void clear_shared_snapshot_import_gate() noexcept;
-void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage);
-
 enum class SharedSnapshotExportStage : std::uint8_t {
     StatePinnedBeforeRegistration,
     KvPinnedBeforeRegistration,
+    BeforeReadinessQuery,
 };
 
-// Deterministic source-registration checkpoints for real-Program export rollback regressions.
-// The callback runs after the physical source is pinned but before the pin is appended to the
-// transfer settlement's cleanup vector, so an injected bad_alloc exercises the actual ownership
-// gap that the guarded registration must close.
+// Deterministic export checkpoints for real-Program ownership regressions. Registration stages
+// run after pinning but before appending to the cleanup vector. BeforeReadinessQuery exercises
+// failure while Program polls a transfer whose Host consumer can still retain its backing image.
 struct SharedSnapshotExportTestGate {
     void* context                                                      = nullptr;
     void (*checkpoint)(void* context, SharedSnapshotExportStage stage) = nullptr;
 };
 
+#ifdef NINFER_TEST_HOOKS
+void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* gate) noexcept;
+void clear_shared_snapshot_import_gate() noexcept;
+void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage);
 void install_shared_snapshot_export_gate(const SharedSnapshotExportTestGate* gate) noexcept;
 void clear_shared_snapshot_export_gate() noexcept;
 void shared_snapshot_export_checkpoint(SharedSnapshotExportStage stage);
 void note_shared_snapshot_export_pin_acquired() noexcept;
 void note_shared_snapshot_export_pin_released() noexcept;
 [[nodiscard]] std::uint64_t shared_snapshot_export_pinned_sources() noexcept;
-
 void install_snapshot_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_snapshot_transfer_gate() noexcept;
 [[nodiscard]] const ContextTransferTestGate* snapshot_transfer_gate() noexcept;
@@ -94,7 +93,6 @@ void note_materialization_submitted_cancellation() noexcept;
 [[nodiscard]] std::uint64_t materialization_submitted_cancellations() noexcept;
 void note_snapshot_shutdown_cleanup(SnapshotShutdownCleanup cleanup) noexcept;
 [[nodiscard]] SnapshotShutdownCleanup snapshot_shutdown_cleanup() noexcept;
-
 void install_active_capture_transfer_gate(const ContextTransferTestGate* gate) noexcept;
 void clear_active_capture_transfer_gate() noexcept;
 [[nodiscard]] const ContextTransferTestGate* active_capture_transfer_gate() noexcept;
@@ -102,5 +100,75 @@ void note_active_capture_transfer_gate_wait() noexcept;
 [[nodiscard]] std::uint64_t active_capture_transfer_gate_waits() noexcept;
 void note_active_capture_submitted_cancellation() noexcept;
 [[nodiscard]] std::uint64_t active_capture_submitted_cancellations() noexcept;
+#else
+// No hook storage, atomic accounting, or injectable callbacks in application-only builds.
+inline void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate*) noexcept {}
+
+inline void clear_shared_snapshot_import_gate() noexcept {}
+
+inline void shared_snapshot_import_checkpoint(SharedSnapshotImportStage) {}
+
+inline void install_shared_snapshot_export_gate(const SharedSnapshotExportTestGate*) noexcept {}
+
+inline void clear_shared_snapshot_export_gate() noexcept {}
+
+inline void shared_snapshot_export_checkpoint(SharedSnapshotExportStage) {}
+
+inline void note_shared_snapshot_export_pin_acquired() noexcept {}
+
+inline void note_shared_snapshot_export_pin_released() noexcept {}
+
+[[nodiscard]] inline std::uint64_t shared_snapshot_export_pinned_sources() noexcept { return {}; }
+
+inline void install_snapshot_transfer_gate(const ContextTransferTestGate*) noexcept {}
+
+inline void clear_snapshot_transfer_gate() noexcept {}
+
+[[nodiscard]] inline const ContextTransferTestGate* snapshot_transfer_gate() noexcept { return {}; }
+
+inline void note_snapshot_transfer_gate_wait() noexcept {}
+
+[[nodiscard]] inline std::uint64_t snapshot_transfer_gate_waits() noexcept { return {}; }
+
+inline void note_snapshot_transfer_ownership_acquired(std::size_t, std::size_t) noexcept {}
+
+inline void note_snapshot_transfer_pins_released(std::size_t) noexcept {}
+
+inline void note_snapshot_transfer_backing_released(std::size_t) noexcept {}
+
+[[nodiscard]] inline std::uint64_t snapshot_transfer_live_settlements() noexcept { return {}; }
+
+[[nodiscard]] inline std::uint64_t snapshot_transfer_live_backing_bytes() noexcept { return {}; }
+
+[[nodiscard]] inline std::uint64_t snapshot_transfer_pinned_sources() noexcept { return {}; }
+
+inline void note_snapshot_host_accounting(SnapshotHostAccounting) noexcept {}
+
+[[nodiscard]] inline SnapshotHostAccounting snapshot_host_accounting() noexcept { return {}; }
+
+inline void note_materialization_submitted_cancellation() noexcept {}
+
+[[nodiscard]] inline std::uint64_t materialization_submitted_cancellations() noexcept { return {}; }
+
+inline void note_snapshot_shutdown_cleanup(SnapshotShutdownCleanup) noexcept {}
+
+[[nodiscard]] inline SnapshotShutdownCleanup snapshot_shutdown_cleanup() noexcept { return {}; }
+
+inline void install_active_capture_transfer_gate(const ContextTransferTestGate*) noexcept {}
+
+inline void clear_active_capture_transfer_gate() noexcept {}
+
+[[nodiscard]] inline const ContextTransferTestGate* active_capture_transfer_gate() noexcept {
+    return {};
+}
+
+inline void note_active_capture_transfer_gate_wait() noexcept {}
+
+[[nodiscard]] inline std::uint64_t active_capture_transfer_gate_waits() noexcept { return {}; }
+
+inline void note_active_capture_submitted_cancellation() noexcept {}
+
+[[nodiscard]] inline std::uint64_t active_capture_submitted_cancellations() noexcept { return {}; }
+#endif
 
 } // namespace ninfer::runtime::testing

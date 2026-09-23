@@ -431,8 +431,9 @@ public:
                 for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                     const SharedCatalogEntry& entry = shared_catalog_[slot];
                     // SSD recovery competes for inactive shared cache capacity just like root
-                    // admission. Program seals an exact rollback image before replacement, so
-                    // an unused victim does not itself need SSD backing. Active/pinned owners
+                    // admission. Program preserves the victim until adoption can commit, using
+                    // a rollback image when physical reclamation is required. An unused victim
+                    // does not itself need SSD backing. Active/pinned owners
                     // remain ineligible, and the portfolio loss ranks the feasible victims.
                     if (entry.state != SharedCatalogState::Catalogued || !entry.handle) {
                         continue;

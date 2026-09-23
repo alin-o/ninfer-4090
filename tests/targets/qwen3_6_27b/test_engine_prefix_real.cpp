@@ -2188,7 +2188,7 @@ private:
 
 class SharedSnapshotImportGate {
 public:
-    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay, AllocationFailure };
+    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay, AllocationFailure, StalePlan };
 
     SharedSnapshotImportGate(ninfer::runtime::testing::SharedSnapshotImportStage stage,
                              Action action, std::atomic<bool>* cancellation = nullptr)
@@ -2214,10 +2214,10 @@ private:
                            ninfer::runtime::testing::SharedSnapshotImportStage stage) {
         auto& gate = *static_cast<SharedSnapshotImportGate*>(context);
         if (stage != gate.stage_) { return; }
-        gate.triggered_.store(true, std::memory_order_release);
+        const bool already_triggered = gate.triggered_.exchange(true, std::memory_order_acq_rel);
         switch (gate.action_) {
         case Action::Reject:
-            throw std::invalid_argument("injected recoverable shared import rejection");
+            throw std::invalid_argument("injected rejection with misleading stale/checksum text");
         case Action::Fail:
             throw std::logic_error("injected fatal shared import invariant failure");
         case Action::Cancel:
@@ -2231,6 +2231,10 @@ private:
             return;
         case Action::AllocationFailure:
             throw std::bad_alloc();
+        case Action::StalePlan:
+            if (already_triggered) { return; }
+            throw ninfer::runtime::DurableImportError(
+                ninfer::runtime::DurableImportErrorKind::StalePlan, "projection changed");
         }
     }
 
@@ -2261,15 +2265,23 @@ public:
     SharedSnapshotExportAllocationGate&
     operator=(const SharedSnapshotExportAllocationGate&) = delete;
 
+    [[nodiscard]] bool triggered() const noexcept {
+        return triggered_.load(std::memory_order_acquire);
+    }
+
 private:
     static void checkpoint(void* context,
                            ninfer::runtime::testing::SharedSnapshotExportStage stage) {
         auto& gate = *static_cast<SharedSnapshotExportAllocationGate*>(context);
-        if (stage == gate.stage_) { throw std::bad_alloc(); }
+        if (stage == gate.stage_) {
+            gate.triggered_.store(true, std::memory_order_release);
+            throw std::bad_alloc();
+        }
     }
 
     ninfer::runtime::testing::SharedSnapshotExportTestGate registration_;
     ninfer::runtime::testing::SharedSnapshotExportStage stage_;
+    std::atomic<bool> triggered_{false};
 };
 
 class CountingOutputSink final : public ninfer::OutputSink {
@@ -4529,8 +4541,163 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
     return 0;
 }
 
+int exercise_durable_import_errors(const char* artifact, const std::vector<std::uint8_t>& bytes,
+                                   const std::string& digest, std::uint32_t frontier,
+                                   const std::vector<ninfer::TokenId>& expected_tokens) {
+    using Access = ninfer::runtime::DurableSharedSnapshotAccess;
+    for (int mode = 0; mode != 3; ++mode) {
+        ninfer::Engine engine(shared_snapshot_engine_options(artifact));
+        auto prompt = engine.prepare(shared_snapshot_prompt());
+        const std::array candidates{
+            Access::Candidate{.content_digest = digest, .frontier = frontier}};
+        const auto selected = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+        if (selected.reservation_id == 0) {
+            std::cerr << "import error fixture could not reserve SSD recovery\n";
+            return 1;
+        }
+        auto recovery       = std::make_shared<ninfer::runtime::DeferredDurableRecovery>();
+        recovery->candidate = {.content_digest = digest, .frontier = frontier};
+        recovery->available_candidates.push_back(recovery->candidate);
+        recovery->reservation_id = selected.reservation_id;
+        auto payload             = std::make_shared<std::vector<std::uint8_t>>(bytes);
+        if (mode == 0) { payload->back() ^= 1U; }
+        recovery->bytes          = payload;
+        recovery->load_completed = true;
+        SharedSnapshotImportGate gate(
+            ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+            mode == 2 ? SharedSnapshotImportGate::Action::StalePlan
+                      : SharedSnapshotImportGate::Action::Reject);
+        auto handle          = Access::submit(engine, std::move(prompt), fixed_output(3),
+                                              ninfer::OutputConsumerMode::Aggregate,
+                                              std::chrono::steady_clock::time_point::max(), recovery);
+        const auto generated = handle.wait(nullptr, {});
+        const std::string expected_reason = mode == 0   ? "ssd-checksum-failure"
+                                            : mode == 1 ? "ssd-adoption-failure"
+                                                        : "ssd-successful-restore";
+        if (!recovery->completed || recovery->reservation_id != 0 || recovery->bytes ||
+            recovery->fallback_reason != expected_reason ||
+            recovery->invalidate_record != (mode == 0) ||
+            recovery->loaded_from_ssd != (mode == 2) || !engine.healthy() ||
+            generated.generated_token_ids != expected_tokens) {
+            std::cerr << "typed import failure classification failed: " << recovery->fallback_reason
+                      << '\n';
+            return 1;
+        }
+    }
+    // Fill the logical catalog while leaving enough physical capacity for staged adoption.
+    // Export failure injection proves this path never needs a rollback D2H snapshot.
+    auto options                              = shared_snapshot_engine_options(artifact);
+    options.context_cache.max_shared_prefixes = 1;
+    ninfer::Engine engine(std::move(options));
+    auto resident                                   = shared_snapshot_prompt();
+    resident.messages.front().parts.front().text[0] = 'X';
+    (void)engine.generate(engine.prepare(resident), fixed_output(3));
+    // Delivery can finish before the worker publishes its final ownership statistics.
+    ninfer::runtime::testing::SharedSnapshotTestAccess::with_execution_lock(engine, [] {});
+    const auto before = engine.runtime_stats();
+    const std::array candidates{Access::Candidate{.content_digest = digest, .frontier = frontier}};
+    const auto payload = std::make_shared<const std::vector<std::uint8_t>>(bytes);
+    for (bool reject : {true, false}) {
+        auto prompt         = engine.prepare(shared_snapshot_prompt());
+        const auto selected = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+        if (!selected.replacement || selected.reservation_id == 0) {
+            std::cerr << "staged replacement fixture did not select its resident victim\n";
+            return 1;
+        }
+        SharedSnapshotExportAllocationGate no_snapshot(
+            ninfer::runtime::testing::SharedSnapshotExportStage::StatePinnedBeforeRegistration);
+        if (reject) {
+            bool rejected = false;
+            SharedSnapshotImportGate gate(
+                ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                SharedSnapshotImportGate::Action::Reject);
+            try {
+                (void)Access::import(engine, candidates.front(), payload, {},
+                                     selected.reservation_id);
+            } catch (const std::invalid_argument&) { rejected = gate.triggered(); }
+            const auto after = engine.runtime_stats();
+            if (!rejected || !engine.healthy() ||
+                before.context_cache_owners != after.context_cache_owners ||
+                before.device_state_occupied_slots != after.device_state_occupied_slots ||
+                before.host_state_occupied_slots != after.host_state_occupied_slots ||
+                before.device_main_kv_occupied_pages != after.device_main_kv_occupied_pages ||
+                before.device_backend_kv_occupied_pages != after.device_backend_kv_occupied_pages ||
+                before.host_kv_occupied_bytes != after.host_kv_occupied_bytes) {
+                std::cerr << "staged adoption failure changed its retained victim: rejected="
+                          << rejected << " healthy=" << engine.healthy() << " owners="
+                          << (before.context_cache_owners == after.context_cache_owners)
+                          << " state=" << before.device_state_occupied_slots << '/'
+                          << after.device_state_occupied_slots
+                          << " host=" << before.host_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots
+                          << " main=" << before.device_main_kv_occupied_pages << '/'
+                          << after.device_main_kv_occupied_pages
+                          << " backend=" << before.device_backend_kv_occupied_pages << '/'
+                          << after.device_backend_kv_occupied_pages
+                          << " hostkv=" << before.host_kv_occupied_bytes << '/'
+                          << after.host_kv_occupied_bytes << '\n';
+                return 1;
+            }
+        } else {
+            const auto imported =
+                Access::import(engine, candidates.front(), payload, {}, selected.reservation_id);
+            if (!imported.displaced_checkpoint || imported.frontier != frontier) {
+                std::cerr << "staged adoption did not publish the replacement\n";
+                return 1;
+            }
+        }
+    }
+    auto [slot, exported] =
+        ninfer::runtime::testing::SharedSnapshotTestAccess::export_first_durable(engine);
+    (void)slot;
+    exported.await_transfer(exported.bytes);
+    if (exported.bytes != bytes) {
+        std::cerr << "staged replacement changed imported State/KV bytes\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_zero_output_durable_recovery(const char* artifact) {
+    using Access = ninfer::runtime::DurableSharedSnapshotAccess;
+    ninfer::Engine engine(shared_snapshot_engine_options(artifact));
+    auto prompt            = engine.prepare(shared_snapshot_prompt());
+    const auto candidates  = Access::candidates(engine, prompt);
+    const auto reservation = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+    if (reservation.reservation_id == 0) {
+        std::cerr << "zero-output recovery fixture could not reserve its SSD plan\n";
+        return 1;
+    }
+    auto recovery            = std::make_shared<ninfer::runtime::DeferredDurableRecovery>();
+    recovery->candidate      = {.content_digest = reservation.candidate.content_digest,
+                                .frontier       = reservation.candidate.frontier};
+    recovery->reservation_id = reservation.reservation_id;
+    recovery->bytes          = std::make_shared<const std::vector<std::uint8_t>>(3, 0);
+    auto handle              = Access::submit(engine, std::move(prompt), fixed_output(0),
+                                              ninfer::OutputConsumerMode::Aggregate,
+                                              std::chrono::steady_clock::time_point::max(), recovery);
+    const auto result        = handle.wait(nullptr, {});
+    if (!result.generated_token_ids.empty() ||
+        result.finish_reason != ninfer::FinishReason::OutputLimit || !recovery->completed ||
+        recovery->reservation_id != 0 || recovery->bytes || recovery->lifecycle.size() != 1 ||
+        recovery->lifecycle.front().status != ninfer::CheckpointLifecycleStatus::Aborted ||
+        recovery->lifecycle.front().serialized_bytes != 3) {
+        std::cerr << "zero-output request did not abort and release durable recovery\n";
+        return 1;
+    }
+    auto next_prompt = engine.prepare(shared_snapshot_prompt());
+    const auto next  = Access::decide_recovery(engine, next_prompt, fixed_output(3), candidates);
+    Access::cancel_recovery(engine, next.reservation_id);
+    if (next.reservation_id == 0 || next.reservation_id == reservation.reservation_id) {
+        std::cerr << "zero-output request retained its durable reservation\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_rollback_only = false,
-                                        bool durable_lifecycle_only = false) {
+                                        bool durable_lifecycle_only = false,
+                                        bool import_errors_only     = false) {
     using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
 
     std::vector<std::uint8_t> bytes;
@@ -4644,6 +4811,27 @@ int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_ro
                                     source_memory.host_backend_kv_page_bytes;
         snapshot.release_storage();
         source_validated = Access::parse(source, bytes);
+        if (import_errors_only) {
+            (void)ninfer::runtime::DurableSharedSnapshotAccess::settle_export(source, slot, 0,
+                                                                              false);
+            SharedSnapshotExportAllocationGate gate(
+                ninfer::runtime::testing::SharedSnapshotExportStage::BeforeReadinessQuery);
+            auto [held_slot, held] = Access::export_first_durable(source);
+            held.await_transfer(held.bytes);
+            try {
+                (void)ninfer::runtime::DurableSharedSnapshotAccess::settle_export(source, held_slot,
+                                                                                  0, false);
+            } catch (const std::bad_alloc&) {}
+            if (!gate.triggered() ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() != 0) {
+                std::cerr << "snapshot query failure retained pins while consumer held the image\n";
+                return 1;
+            }
+        }
+    }
+    if (import_errors_only) {
+        return exercise_durable_import_errors(artifact, bytes, durable_digest, durable_frontier,
+                                              expected_tokens);
     }
 
     if (!durable_lifecycle_only) {
@@ -7342,6 +7530,19 @@ int main() {
             return 77;
         }
         const int result = exercise_responses_host_continuation(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-import-errors") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        const int result =
+            exercise_shared_snapshot_round_trip(qwen38_groupwise, false, false, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-recovery-zero-output") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        const int result = exercise_zero_output_durable_recovery(qwen38_groupwise);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

@@ -504,13 +504,13 @@ Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
         if (recovery) {
-            {
-                std::lock_guard lock(recovery->mutex);
-                recovery->fallback_reason = "ssd-warm-or-root-selected";
-                recovery->completed       = true;
-                recovery->bytes.reset();
-            }
-            recovery->cv.notify_all();
+            std::visit(
+                [&](auto& core) {
+                    if constexpr (requires { core->settle_unused_recovery(recovery); }) {
+                        core->settle_unused_recovery(recovery);
+                    }
+                },
+                impl_->core);
         }
 
         struct ImmediateSubmission {

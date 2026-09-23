@@ -1096,8 +1096,8 @@ void exercise_ssd_replaces_memory_only_checkpoint(const char* artifact) {
     require(candidate != candidates.end(), "memory-only rollback lost its incoming SSD identity");
     RequestOptions request_options;
     request_options.execution.requested_output_tokens = 8;
-    // Both seams run after the victim has been physically released. Rollback must reconstruct
-    // the non-durable owner, including its original residency, before failure escapes.
+    // Both seams run after imported allocations begin. The non-durable owner and its original
+    // residency must be preserved or restored before failure escapes.
     for (const bool cancel : {false, true}) {
         const auto decision = Access::decide_recovery(engine, incoming_prompt, request_options,
                                                       std::span(&*candidate, 1));

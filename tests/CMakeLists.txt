@@ -9,6 +9,8 @@ add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
+  # Engine's core dependency is private; its test-hook definition does not reach consumers.
+  target_compile_definitions(${name} PRIVATE NINFER_TEST_HOOKS=1)
   target_include_directories(${name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/include
@@ -154,6 +156,14 @@ add_test(NAME ninfer_qwen3_8_shared_snapshot_lifecycle_test
   COMMAND ${CMAKE_COMMAND} -E env NINFER_PREFIX_REAL_SCENARIO=shared-snapshot-lifecycle
           $<TARGET_FILE:ninfer_qwen3_6_27b_prefix_real_test>)
 set_tests_properties(ninfer_qwen3_8_shared_snapshot_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_8_shared_recovery_zero_output_test
+  COMMAND ${CMAKE_COMMAND} -E env NINFER_PREFIX_REAL_SCENARIO=shared-recovery-zero-output
+          $<TARGET_FILE:ninfer_qwen3_6_27b_prefix_real_test>)
+set_tests_properties(ninfer_qwen3_8_shared_recovery_zero_output_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_8_shared_import_errors_test
+  COMMAND ${CMAKE_COMMAND} -E env NINFER_PREFIX_REAL_SCENARIO=shared-import-errors
+          $<TARGET_FILE:ninfer_qwen3_6_27b_prefix_real_test>)
+set_tests_properties(ninfer_qwen3_8_shared_import_errors_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_openai_cache_real_test
   SOURCES test_openai_cache_real.cpp
   LIBRARIES ninfer_serve spdlog::spdlog CUDA::cudart)

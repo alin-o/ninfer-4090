@@ -1281,7 +1281,7 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
             if (selected->structural_role != qwen3_6::SharedPrefixRole::Transient) {
                 existing->structural_role = selected->structural_role;
             }
-            existing->ssd_eligible         = selected->ssd_eligible;
+            existing->ssd_eligible |= selected->ssd_eligible;
             existing->first_volatile_token = selected->first_volatile_token;
         }
     }

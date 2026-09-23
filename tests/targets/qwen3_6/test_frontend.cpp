@@ -2221,6 +2221,14 @@ int test_structural_boundary_inside_token_mapping_skip() {
                           cache.structural_boundaries_accepted >= 1 &&
                           cache.structural_boundaries_noncapturable == 0,
                       "prepared structural diagnostics did not report the mapping skip separately");
+    const auto unmapped_project = FrontendFactory::structural_diagnostics({
+        {1, ninfer::targets::qwen3_6::SharedPrefixInstructionsEnd},
+        {std::nullopt, ninfer::targets::qwen3_6::SharedPrefixProjectContext},
+    });
+    failures += check(unmapped_project.structural_checkpoints.size() == 1 &&
+                          unmapped_project.structural_checkpoints.front().role ==
+                              ninfer::targets::qwen3_6::SharedPrefixRole::Harness,
+                      "unmapped project delimiter reclassified a harness as project context");
     return failures;
 }
 

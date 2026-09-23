@@ -628,7 +628,7 @@ def run_profile(
                     request_log,
                     done_count,
                     args.request_timeout_seconds,
-                    expected_response_id=None if baseline_profile else response_id,
+                    expected_response_id=None if historical_baseline else response_id,
                     allowed_schemas=allowed_schemas,
                 )
                 measurements.append(

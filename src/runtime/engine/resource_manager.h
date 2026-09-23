@@ -2196,10 +2196,10 @@ public:
     // any physical state is destroyed. An aborted transaction leaves the session alive, so a
     // spurious observation costs one redundant (still valid) spill file.
     using EvictionObserver = std::function<void(std::uint32_t, const ContinuationHandle&)>;
-    // Fork-local: fires whenever a catalog cell stops holding the session it held, by any
-    // route - eviction, consumption, release, abort, cancel or cleanup. Session state the
-    // Engine keys by cell (the slot file binding) must die here, or it outlives its session
-    // and gets applied to whichever session lands in the cell next.
+    // Fork-local: fires whenever a catalog cell stops holding a session without an identified
+    // same-session continuation taking its place. Session state the Engine keys by cell (the slot
+    // file binding) must die here, or it outlives its session and gets applied to whichever session
+    // lands in the cell next.
     using SlotReleaseObserver = std::function<void(std::uint32_t)>;
 
     void set_eviction_observer(EvictionObserver observer) {
@@ -4397,6 +4397,14 @@ private:
                 source.state            = CatalogState::Catalogued;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
+                // The first inferred chat head may be anonymous even though the continuation
+                // request carries the session key established by the next turn. Since this source
+                // is the selected continuation, treat that one-way transition as the same
+                // logical session so an explicit save binding follows the head.
+                const bool same_session =
+                    (source.session && record->session && *source.session == *record->session) ||
+                    (!source.session && record->session);
+                if (!same_session) { notify_slot_released(source); }
                 erase_session_if_owner(source.id);
                 source.handle.reset();
                 source.summary.endpoint.reset();
@@ -4404,6 +4412,9 @@ private:
                 source.summary.long_anchors.clear();
                 source.observations.clear();
                 source.session.reset();
+                source.ssd_backed        = false;
+                source.superseded        = false;
+                source.authoritative_epoch = 0;
             }
         }
 

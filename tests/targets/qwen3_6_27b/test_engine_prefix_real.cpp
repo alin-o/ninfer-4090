@@ -1,7 +1,6 @@
 #include "ninfer/engine.h"
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -2247,7 +2246,7 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         return 1;
     }
 
-    for (std::uint32_t index = 0; index < 6; ++index) {
+    for (std::uint32_t index = 0; index < 7; ++index) {
         const std::string suffix              = std::to_string(index);
         const ninfer::GenerationResult filler = engine.generate(
             engine.prepare(session_turn("publication-filler-" + suffix,

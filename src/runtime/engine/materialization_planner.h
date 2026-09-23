@@ -267,11 +267,25 @@ public:
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
+            // When all identities are blocked, seed the fallback with the cheapest offered
+            // identity rather than unconditionally using the root. A reusable shared/private
+            // source can then win immediately after evicting a replaceable owner, without
+            // waiting for optional construction search to discover its maximal target.
+            std::uint32_t fallback_candidate = root_candidate_index;
+            for (std::uint32_t candidate = 0; candidate < candidates.size(); ++candidate) {
+                if (identity_costs_[candidate].lower_bound_ns <
+                    identity_costs_[fallback_candidate].lower_bound_ns) {
+                    fallback_candidate = candidate;
+                }
+            }
+            const auto fallback_target = fallback_candidate == root_candidate_index
+                                             ? session.root_maximal_target(
+                                                   candidates[fallback_candidate].id)
+                                             : session.maximal_target(
+                                                   candidates[fallback_candidate].id);
+            AssessedPressureTarget assessed            = session.assess(fallback_target);
             const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
+            if (assessment.candidate != candidates[fallback_candidate].id) {
                 throw std::logic_error("maximal pressure target changed admission candidate");
             }
             ++targets_evaluated;
@@ -281,13 +295,37 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            if (!goal && fallback_candidate != root_candidate_index) {
+                // The root remains the hard fallback if the cheapest reusable source cannot
+                // produce a legal publication target after maximal pressure.
+                AssessedPressureTarget root_assessed =
+                    session.assess(session.root_maximal_target(candidates[root_candidate_index].id));
+                const PressureTargetAssessment& root_assessment = root_assessed.assessment();
+                if (root_assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(root_assessment.candidate, root_assessment.source_mode,
+                                        root_assessment.owner_outcomes);
+                }
+                if (goal) {
+                    const FoldedCost cost = fold_assessment(
+                        candidates[root_candidate_index], root_assessment, pressure.owner_policy,
+                        pressure.checkpoint_policy, machine_cost);
+                    incumbent = make_incumbent(
+                        session.root_maximal_target(candidates[root_candidate_index].id),
+                        root_candidate_index, root_assessment, std::move(root_assessed), cost, *goal);
+                    ++targets_evaluated;
+                    planning_saturating_add(projection_work, root_assessment.projection_work);
+                    mark_target(root_assessment.stable_target_ordinal,
+                                kTargetDiscovered | kTargetAssessed);
+                }
+            } else if (goal) {
+                const FoldedCost cost = fold_assessment(
+                    candidates[fallback_candidate], assessment, pressure.owner_policy,
+                    pressure.checkpoint_policy, machine_cost);
+                incumbent = make_incumbent(fallback_target, fallback_candidate, assessment,
+                                           std::move(assessed), cost, *goal);
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            }
             if (!goal) { return std::nullopt; }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
         if (!identity_best) { search_started = Clock::now(); }
@@ -503,10 +541,97 @@ public:
             path.visited.push_back(path.parent.stable_target_ordinal);
             path.cursor.emplace(session.begin_construction(target, restore));
         };
+
+        const auto lru_target = [&](std::uint32_t candidate)
+            -> std::optional<PressureTargetHandle> {
+            std::optional<PressureTargetHandle> current;
+            for (std::size_t depth = 0; depth < pressure.owner_policy.size(); ++depth) {
+                const PressureTargetHandle parent =
+                    current.value_or(session.identity_target(candidates[candidate].id));
+                auto cursor = session.begin_construction(parent);
+                std::optional<GuidanceCost> best;
+                PressureConstructionOptionId best_option;
+                for (;;) {
+                    const auto step = session.next_construction_option(cursor);
+                    if (step.guidance) {
+                        const bool evicts = std::any_of(
+                            step.guidance->owner_outcomes.begin(),
+                            step.guidance->owner_outcomes.end(), [](const auto& outcome) {
+                                return outcome.disposition == VictimDisposition::Evicted;
+                            });
+                        const GuidanceCost cost = rank_guidance(candidate, *step.guidance);
+                        if (evicts &&
+                            (!best || std::tuple{cost.newest_affected_hit_epoch,
+                                                 cost.affected_selected_hits,
+                                                 cost.retention_weight, cost.key()} <
+                                                 std::tuple{best->newest_affected_hit_epoch,
+                                                            best->affected_selected_hits,
+                                                            best->retention_weight, best->key()})) {
+                            best        = cost;
+                            best_option = step.option;
+                        }
+                    }
+                    if (step.exhausted) { break; }
+                }
+                if (!best) { break; }
+                session.choose_construction(cursor, best_option);
+                current = session.construction_target(cursor);
+                if (!current) { break; }
+                const auto guide = session.guidance(*current);
+                if (guide.physical.unsatisfied_constraints == 0) { break; }
+            }
+            return current;
+        };
+
+        // If every identity target is blocked, the mandatory root fallback is not enough to
+        // compare reusable sources: it only explores the root candidate's pressure lattice.
+        // Seed the best offered alternative with its maximal target as well. The maximal target
+        // evicts every eligible non-source owner, so it is a conservative but exact feasible
+        // fallback whenever the candidate itself can fit; construction search can still refine it
+        // afterwards. In particular, a shared source must be allowed to retain itself while an old
+        // private owner supplies the publication cell.
+        const auto seed_promising_maximal = [&]() {
+            const auto promising =
+                std::find_if(order.begin(), order.end(), [&](auto candidate) {
+                    return !candidate_seeded[candidate] &&
+                           identity_costs_[candidate].lower_bound_ns < incumbent.cost.total_ns;
+                });
+            if (promising == order.end() || optional_targets >= kTargetBudget) { return false; }
+            const auto candidate = *promising;
+            if (const auto target = lru_target(candidate)) {
+                const auto guide = session.guidance(*target);
+                if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
+                    if (!target_marked(guide.stable_target_ordinal, kTargetDiscovered)) {
+                        ++optional_targets;
+                        mark_target(guide.stable_target_ordinal, kTargetDiscovered);
+                    }
+                    (void)assess_target(*target, candidate, guide.stable_target_ordinal);
+                    ++search_work;
+                }
+                if (candidate_seeded[candidate]) { return true; }
+            }
+            const auto gain = incumbent.cost.total_ns - identity_costs_[candidate].lower_bound_ns;
+            search_phase      = MaterializationSearchPhase::Assessment;
+            if (!allow_work(assessment_step_ns, assessment_step_ns, gain, false)) { return false; }
+            const auto target = session.maximal_target(candidates[candidate].id);
+            const auto guide  = session.guidance(target);
+            if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
+                if (!target_marked(guide.stable_target_ordinal, kTargetDiscovered)) {
+                    ++optional_targets;
+                    mark_target(guide.stable_target_ordinal, kTargetDiscovered);
+                }
+                const auto started = Clock::now();
+                (void)assess_target(target, candidate, guide.stable_target_ordinal);
+                observe_step(assessment_step_ns, started);
+                ++search_work;
+            }
+            return true;
+        };
         std::size_t next_path  = 0;
         bool search_stopped    = false;
         bool rescue_done       = false;
         bool refinement_seeded = false;
+        rescue_done            = seed_promising_maximal();
         const auto have_paths  = [&] {
             return std::any_of(paths.begin(), paths.end(),
                                 [](const auto& path) { return bool(path.cursor); });

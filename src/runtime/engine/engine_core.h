@@ -936,10 +936,10 @@ private:
             // The session was going to be destroyed either way; losing the spill costs the
             // client one cold prefill, exactly the pre-feature behavior.
         }
-        // Both callers destroy the session immediately after this returns. The release observer
-        // clears the binding too; doing it here as well keeps the spill correct even for a
-        // destroying path that never reaches clear_catalog_entry.
-        clear_slot_session(slot);
+        // The ResourceManager clears the binding when the catalog entry is actually released.
+        // Do not clear it here: a consuming materialization can replace this cell with the next
+        // continuation of the same logical session, in which case the spill target must follow
+        // that session into the replacement entry.
     }
 
     void clear_slot_session(std::uint32_t slot) noexcept {

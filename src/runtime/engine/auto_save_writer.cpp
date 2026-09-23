@@ -89,7 +89,6 @@ void AutoSaveWriter::worker_loop(const std::shared_ptr<State>& state) {
                 state->listener(event);
             } catch (...) {}
         }
-
         // Release the worker's pageable and pinned-buffer owners before publishing idle. A
         // Program retirement may intentionally retain the shared reservation/source pins.
         item.snapshot.release_storage();

@@ -4522,6 +4522,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -6025,6 +6026,14 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             abort_transaction();
             return out;
         }
+        // An involuntary eviction may have started an asynchronous snapshot of one of these
+        // owners during reservation.  The snapshot pins its State/KV sources until the
+        // transfer-stream completion event retires; releasing the owner before that point would
+        // make the planned victim appear non-releasable (and, worse, could race source reuse).
+        // Keep the transaction at HostReleases and let the worker boundary retry after the
+        // completion event becomes ready.
+        retire_ready_snapshot_sources();
+        if (!snapshot_source_retirements_.empty()) { return out; }
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.option.evicts_continuation) {
@@ -6370,6 +6379,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    // Planned eviction observers run after reservation and before this first physical step. Once
+    // progress begins, no new snapshot may race the transaction's source mutations.
+    snapshot_save_window_ = false;
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress<Variant> {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {
@@ -6396,6 +6408,7 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
 }
 
 void ProgramImplCore::finalize_context_transaction() noexcept {
+    snapshot_save_window_ = false;
     const bool terminal = std::visit(
         [](const auto& transaction) {
             using T = std::decay_t<decltype(transaction)>;
@@ -7519,6 +7532,10 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     CaptureAssessment assessment;
     assessment.shortlist_key   = group.identity->shortlist_key;
     assessment.shared_evidence = group.shared_evidence;
+    assessment.structural_origins   = group.structural_origins;
+    assessment.structural_role      = static_cast<std::uint8_t>(group.structural_role);
+    assessment.ssd_eligible         = group.ssd_eligible;
+    assessment.first_volatile_token = group.first_volatile_token;
     assessment.protected_rebuild_work =
         validated_rebuild_work(group.identity->rebuild_work, group.frontier);
     assessment.frontier          = group.frontier;
@@ -8043,6 +8060,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         transaction.transfer_enqueue_pending = assessment.needs_transfer;
         advance_resource_revision();
         context_transaction_.emplace<ActiveCaptureTransaction>(std::move(transaction));
+        snapshot_save_window_ = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -9492,6 +9510,7 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 }
 
 void ProgramImplCore::fail_all_cleanup() noexcept {
+    snapshot_save_window_ = false;
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
@@ -9601,13 +9620,18 @@ bool ProgramImplCore::persistent_backfill_safe(
 
 qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
+    const std::uint32_t reserved_state = state_store ? state_store->reserved() : 0U;
     return qwen3_6::PhysicalUsageSnapshot{
-        .resource_revision       = resource_revision_,
-        .device_state_slots      = usage.device.state_slots,
-        .host_state_slots        = usage.host.state_slots,
-        .device_main_kv_pages    = usage.device.main_kv_pages,
-        .device_backend_kv_pages = usage.device.backend_kv_pages,
-        .host_kv_bytes           = usage.host.kv_bytes,
+        .resource_revision            = resource_revision_,
+        .logical_state_capacity_slots = state_store ? state_store->capacity() : 0U,
+        .logical_state_used_slots     = state_store ? state_store->occupied() - reserved_state : 0U,
+        .logical_state_reserved_slots = reserved_state,
+        .logical_state_inflight_slots = state_store ? state_store->in_flight() : 0U,
+        .device_state_slots           = usage.device.state_slots,
+        .host_state_slots             = usage.host.state_slots,
+        .device_main_kv_pages         = usage.device.main_kv_pages,
+        .device_backend_kv_pages      = usage.device.backend_kv_pages,
+        .host_kv_bytes                = usage.host.kv_bytes,
     };
 }
 
@@ -12475,12 +12499,40 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.text_kv_bytes                = text_kv_bytes;
     out.mtp_kv_bytes                 = mtp_kv_bytes;
     out.gdn_state_bytes              = gdn_state_bytes;
+    out.checkpoint_state_image_bytes = state_images ? state_images->host_layout().image_bytes : 0;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
+    const auto device_page_bytes = [](const DeviceKVPagePool& pool) {
+        std::size_t bytes = 0;
+        for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+            bytes += pool.plane(index).bytes() / pool.capacity_pages();
+        }
+        return bytes;
+    };
+    if (text_kv_pages) {
+        const DeviceKVPagePool& pool      = text_kv_pages->physical_pool();
+        out.device_main_kv_capacity_pages = pool.capacity_pages();
+        out.device_main_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_main_kv_page_bytes     = device_page_bytes(pool);
+    }
+    if (backend_kv_pages) {
+        const DeviceKVPagePool& pool          = backend_kv_pages->physical_pool();
+        out.device_backend_kv_capacity_pages = pool.capacity_pages();
+        out.device_backend_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.device_backend_kv_page_bytes     = device_page_bytes(pool);
+    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
     }
+    if (state_store) {
+        out.logical_state_capacity_slots = state_store->capacity();
+        out.logical_state_reserved_slots = state_store->reserved();
+        out.logical_state_used_slots = state_store->occupied() - out.logical_state_reserved_slots;
+        out.logical_state_inflight_slots = state_store->in_flight();
+    }
+    out.host_main_kv_page_bytes    = text_host_kv_page_stride;
+    out.host_backend_kv_page_bytes = backend_host_kv_page_stride;
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();

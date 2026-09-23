@@ -558,7 +558,8 @@ qwen3_6::RetainedSessionSnapshot ProgramImplCore::begin_save_continuation(
     if (model_binding.size() > 4096) {
         throw std::invalid_argument("session snapshot model binding is too long");
     }
-    if (pending_transaction_ || (has_context_transaction() && !snapshot_save_window_)) {
+    if ((pending_transaction_ && !snapshot_save_window_) ||
+        (has_context_transaction() && !snapshot_save_window_)) {
         throw std::logic_error("cannot snapshot a session during a pending transaction");
     }
     // ResourceManager may start an eviction spill immediately after Program has reserved a

@@ -2210,6 +2210,67 @@ public:
         slot_release_observer_ = std::move(observer);
     }
 
+    [[nodiscard]] GenerationProgressWitness
+    generation_progress_witness(Program& program, SequenceHandle protected_sequence,
+                                std::span<const SequenceHandle> cohort) {
+        return program.generation_progress_witness(protected_sequence, cohort);
+    }
+
+    // Live continuations remain logical active owners. Only their source-cache edges are
+    // detached after Program has copied private backing or established an independent State.
+    bool suspend_generation(Program& program, LaneId lane, SequenceHandle sequence) {
+        if (!program.suspend_generation(sequence)) { return false; }
+        release_active_references(lane);
+        return true;
+    }
+
+    void detach_generation_sources(Program& program, LaneId lane, SequenceHandle sequence) {
+        const auto state = program.generation_reservation_state(sequence);
+        if (!state.can_suspend && !state.suspended) { return; }
+        program.detach_generation_sources(sequence);
+        release_active_references(lane);
+    }
+
+    void reclaim_generation_caches(Program& program, const std::function<bool()>& satisfied = {}) {
+        if (!std::holds_alternative<std::monostate>(transaction_) || durable_recovery_ ||
+            program.has_context_transaction()) {
+            return;
+        }
+        if (satisfied && satisfied()) { return; }
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            auto& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                entry.summary.active_references != 0 || private_has_active_edge(slot)) {
+                continue;
+            }
+            if (!entry.generation_eviction_observed) {
+                entry.generation_eviction_observed = true;
+                if (eviction_observer_) {
+                    try {
+                        eviction_observer_(slot, *entry.handle);
+                    } catch (...) {}
+                }
+            }
+            const auto released = program.release_continuation(std::move(*entry.handle), false);
+            if (released.status != ConsumeStatus::Consumed) { continue; }
+            erase_session_if_owner(entry.id);
+            clear_catalog_entry(entry);
+            if (satisfied && satisfied()) { return; }
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            auto& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
+                continue;
+            }
+            const auto released = program.release_shared_prefix(std::move(*entry.handle));
+            if (released.status == ConsumeStatus::Consumed) {
+                clear_shared_entry(entry);
+                if (satisfied && satisfied()) { return; }
+            }
+        }
+    }
+
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -2249,6 +2310,7 @@ private:
         std::vector<CheckpointObservation> observations;
         RetentionClass retention          = RetentionClass::RecentPrivate;
         std::uint64_t authoritative_epoch = 0;
+        bool generation_eviction_observed = false;
         bool superseded                   = false;
         bool ssd_backed                   = false;
     };
@@ -2807,6 +2869,7 @@ private:
         entry.observations.clear();
         entry.retention           = RetentionClass::RecentPrivate;
         entry.authoritative_epoch = 0;
+        entry.generation_eviction_observed = false;
         entry.superseded          = false;
         entry.ssd_backed          = false;
         advance_revision(entry.revision);

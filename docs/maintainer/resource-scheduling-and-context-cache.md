@@ -31,12 +31,13 @@ replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-c
 
 Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但不改变模型语义、请求顺序或生成结果。
 
-当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8` 和非抢占 active requests。
+当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8`；ordinary generation 可以在稳定边界暂停到有界 Host KV backing。
 由此得到两个基本规则：
 
 1. Scheduler 先确定本次尝试的 request，资源层只优化该 request 的 materialization；
-2. 一个 request 发布为 Active 后，其最大合法执行范围已经获得完整资源保证，inactive cache policy
-   不能再借用这部分容量。
+2. Active publication requires a completion witness. Ordinary generation may hold a smaller
+   current KV entitlement backed by a private Host continuation reservation. Speculative backends
+   and requests without that backing retain full completion reservations.
 
 ---
 
@@ -230,6 +231,12 @@ reserve destination
 
 State restore、KV H2D/D2H、D2D fork、partial-tail COW 和 Host extent replacement 都遵循这一规则。
 最终净占用不能掩盖 copy-before-release 的瞬时峰值。
+
+Admission assessment and final materialization validation share the same transition guard.
+An unsettled active State fork blocks new materialization even when a pressure target fits every
+memory budget. Cache eviction cannot remove that dependency: the active request executes to settle
+its fork, then admission retries. A pressure assessment must not advertise that target as feasible
+and leave sealing to reject it as an Engine-fatal inconsistency.
 
 ### 3.5 Resource revision
 
@@ -433,22 +440,42 @@ backend KV 采用另一种 coverage。Checkpoint 只有在全部 required compon
 
 ### 6.1 Admission reservation
 
-一个 candidate 发布为 Active 前，Program 为它保障：
+Generation keeps its effective output limit separate from its physical reservation horizon. The
+last sampled output token need not enter KV: completion uses
+`prompt + max(effective_output - 1, 0)`, capped to context. Ordinary generation initially reserves
+the complete remaining prompt plus up to `generation_reservation_tokens` output tokens (default
+16,384), rounded to the target's physical pages. Before a decode/control unit, Program checks its
+entire footprint. A preferred extension may shrink to the minimum page-aligned grant that permits
+that unit. Failed growth changes neither the continuation nor allocator accounting. Explicit
+worker-owned slack release precedes suspension; shrinking never removes committed mappings.
+During an outstanding context transaction, execution may use its existing entitlement; units
+requiring growth wait until that transaction settles.
 
-```text
-required Device checkpoint prefix
-+ remaining prompt growth
-+ maximum effective output growth
-+ target-defined provisional/speculative growth
-+ State and partial-tail COW destinations
-+ selected backend requirements
-```
+Partial admission also reserves a private allocation from the existing pinned Host KV arena for
+the request's **complete** effective KV extent. This conservative backing reservation avoids any
+future Host-allocation dependency. It is mandatory live backing, not an evictable cache replica.
+Inactive cache extents and live backing share the same physical arena/accounting. No SSD spill or
+prompt replay is used. If backing cannot be obtained, use full Device reservations; a full-reservation
+arrival waits behind an existing partial cohort. Zero Host capacity remains supported.
 
-这些资源绑定在返回的 `SequenceHandle` 中。物化进度只在 allocation 与 reserved-but-unmapped 之间转换，
-不会把容量交给另一个 request。
+The completion witness is a constructive root restore: the protected request's complete private KV
+extent fits the existing Device pool; every other partial owner has already reserved its Host
+snapshot destination. Suspend that bounded set and reclaim optional cache ownership. If shared
+COW tails still retain capacity, snapshot and privatize the protected address too. Restore dependencies
+are the private Host allocations and the request's retained State bindings. The physical pool counts
+shared pages once and returns them only after their final reference. The witness adds no second
+physical allocation or Scheduler memory counter. An existing full entitlement is itself a witness.
+Program validates the construction at worker boundaries against its resource revision and actual
+Device/Host capacities. Requests unable to fit alone are rejected without reducing their output limit.
 
-Active truncate 或 speculative rollback 可以解除 mappings，但对应容量仍属于该 active reservation。
-只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
+Under pressure, protect the selected request through completion or cancellation and obtain its full
+completion entitlement. Then prefer the oldest admitted request. New arrivals cannot bypass suspended
+or growth-blocked owners. The resident-plus-suspended cohort stays bounded by configured concurrency;
+a suspended request retains its logical lane. Long protected output bounds can delay short requests.
+
+Prefill is never suspended. MTP, DFlash and DFlash2 retain full reservations, including their existing
+provisional/backend requirements; their live speculative suspension is not enabled. Output, reasoning,
+stop and tool-call semantics are unchanged by reservation policy.
 
 Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
 exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
@@ -456,9 +483,38 @@ exclusive optional resources。Fork 期间借用的 immutable StateImage/KV sour
 optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
 Fork 错判为超出 active guarantee。
 
+### Live continuation ownership and transfer
+
+Engine keeps RequestRecord, GenerationBudget, generated IDs, cancellation, publication order and
+OutputSession unchanged. Frontend therefore keeps its decoder, reasoning state, stop matching and
+buffered tool calls. Program retains SequenceState metadata, ledger, sampling/penalty history and
+lane-local device sampling data. No lane is reassigned while suspended.
+
+The current implementation leaves recurrent/GDN StateImages and continuation hidden state on Device
+inside the startup-fixed C+H pool. This uses no extra State allocation during suspend/restore and
+avoids copying fixed State merely to restore it to the same cohort. The witness explicitly includes
+these resident State slots. Only growing Main KV moves to Host. An unresolved read-source State fork
+is copied exactly into its already-reserved private destination before source ownership is detached.
+This is a deliberate fixed-cohort design; releasing State/lane storage for additional admissions would
+require a new continuation contract.
+
+At a committed decode/control boundary Program copies every mapped KV page (including the partial
+tail) into its reserved Host allocation, waits for the bounded transfer to settle, then releases its
+Device address mappings/growth entitlement and cache-source edges. The Host image is private and
+immutable while suspended. Restore first reserves the whole destination, recreates private pages,
+copies exact bytes, validates/publishes the committed frontier and rebinds the existing execution row.
+State, token positions and output budget are not recomputed. A full completion grant releases Host
+backing after publication; otherwise it remains reserved. Copies use the existing transfer stream and
+Host arena, with no separate staging allocation. Submission failures drain queued copies before cleanup.
+Cancellation and shutdown release backing only at a settled worker boundary.
+
+The worker currently settles each live transfer synchronously. Other GPU work does not overlap that
+copy; consumer threads and SSE heartbeat polling remain independent. Capacity shortage is a wait or
+suspension decision, never an output-limit result or an Engine-fatal allocator failure.
+
 ### 6.2 Terminal 与 capture
 
-TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，直到 Program 完成：
+TerminalPending request 继续持有 `SequenceHandle` 和当前 reservation，直到 Program 完成：
 
 - **Finish**：发布一个完整 immutable checkpoint；或
 - **Discard**：释放整个 active continuation。
@@ -468,6 +524,12 @@ inactive owners，但只有严格优于 private-only baseline 的完整终态才
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
 
 ### 6.3 Persistent backfill proof
+
+This proof applies only to full-reservation backfill. Backfill candidates are planned with full
+entitlements and no suspension backing; the proof also charges the blocked head's complete eventual
+KV footprint, even when its initial horizon is partial. Backfill closes while any partial owner is
+resident. Existing full-reservation owners finish before an incremental owner becomes the protected
+epoch; they cannot be chosen as suspension victims.
 
 Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program
 提供的物理证明使用同一 feasibility oracle：
@@ -861,6 +923,13 @@ TTFT 的全局最优性。
 
 ## 9. Resource transition
 
+Live generation growth and suspension are also worker-owned resource transitions. They cannot
+start while a context transaction or pending model batch is open. Growth checks capacity before
+resizing; suspension reserves Host backing before admission and settles its copy before releasing
+source references; restoration reserves Device capacity before publishing runnable state. Each
+committed topology change advances the same Program resource revision. These private continuations
+never enter the reusable checkpoint catalog or session index.
+
 ### 9.1 三个对象
 
 需要 allocation、pressure 或 transfer 的终态通过：
@@ -1124,7 +1193,8 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 5. 每个有序 transition stage 都必须满足容量与 allocator geometry。
 6. Prefix hit 必须具有 exact identity、完整 StateImage 和全部 required typed KV coverage。
 7. Published checkpoint immutable；每条 active continuation 至多一个 mutable writer。
-8. Active completion reservation 在 terminal resource result 采用前不可被借用或回收。
+8. Active continuation retains a completion witness; only an explicit worker-owned growth,
+   slack-release or backed suspension transition may change its current entitlement.
 9. 同一时刻至多一个 global resource transition，且 sealed plan 与 `resource_revision` 绑定。
 10. Start 前 stale rejection 无物理副作用；start 后不能更换 candidate 或 target。
 11. Program commit/abort 都返回完整稳定终态；ResourceManager adoption 已预分配且不能失败。

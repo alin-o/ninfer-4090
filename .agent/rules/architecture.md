@@ -16,6 +16,10 @@ description: Use when changing NInfer engine, CUDA operators, target programs, a
 - C++20/CUDA20 builds use CMake/Ninja. Preserve `.clang-format` (four-space
   indentation, 100-column limit, existing include order). Python tooling lives
   under `tools/`; the evaluation coordinator is under `eval/ninfer_eval`.
+- Ordinary generation uses configurable incremental KV reservations and bounded Host-backed
+  suspension within the startup-fixed cohort. State/sampling storage remains assigned to its
+  lane; speculative backends and requests without sufficient Host backing retain full
+  reservations. The resource-scheduling reference owns this contract.
 - Preserve Gateway → Frontend → Engine → Program ownership, as defined in
   `docs/maintainer/engine-architecture.md`: gateways own protocol/transport,
   Frontend owns prompt/output semantics, Engine owns lifecycle/publication,

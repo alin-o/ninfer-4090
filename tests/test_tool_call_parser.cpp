@@ -445,7 +445,7 @@ int test_empty_declared_non_string_is_omitted() {
         fi::ToolCallOutputDecoder decoder(contract, 128);
         std::string visible = decoder.feed(std::string_view(text).substr(0, split));
         visible += decoder.feed(std::string_view(text).substr(split));
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::StopToken);
         if (visible != "I need one more check." || !terminal.content.empty() ||
             terminal.tool_calls.size() != 1 ||
             terminal.tool_calls.front().arguments_json !=
@@ -461,7 +461,7 @@ int test_empty_declared_non_string_is_omitted() {
     fi::ToolCallOutputDecoder bytewise(contract, 128);
     std::string bytewise_visible;
     for (const char byte : text) { bytewise_visible += bytewise.feed(std::string_view(&byte, 1)); }
-    auto bytewise_terminal = bytewise.finish();
+    auto bytewise_terminal = bytewise.finish(ninfer::FinishReason::StopToken);
     failures +=
         check(bytewise_visible == "I need one more check." && bytewise_terminal.content.empty() &&
                   bytewise_terminal.tool_calls.size() == 1 &&
@@ -648,7 +648,7 @@ int test_incremental_valid_and_boolean() {
     visible += legacy.feed("Calling weather.  \n<tool_");
     visible += legacy.feed("call>\n<function=get_weather>");
     visible += legacy.feed("\n</function>\n</tool_call>");
-    auto legacy_terminal = legacy.finish();
+    auto legacy_terminal = legacy.finish(ninfer::FinishReason::StopToken);
     visible += legacy_terminal.content;
 
     auto bool_contract =
@@ -658,7 +658,7 @@ int test_incremental_valid_and_boolean() {
     boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT");
     boolean_visible += boolean.feed("r");
     boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>");
-    auto boolean_terminal = boolean.finish();
+    auto boolean_terminal = boolean.finish(ninfer::FinishReason::StopToken);
 
     int failures = 0;
     failures += check(visible == "Calling weather." && legacy_terminal.tool_calls.size() == 1,
@@ -680,20 +680,20 @@ int test_incremental_fallback_preserves_bytes() {
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
-    auto malformed_terminal = malformed.finish();
+    auto malformed_terminal = malformed.finish(ninfer::FinishReason::StopToken);
     restored += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
     ordinary_text += ordinary.feed("ordinary text  ");
-    ordinary_text += ordinary.finish().content;
+    ordinary_text += ordinary.finish(ninfer::FinishReason::StopToken).content;
 
     const std::string partial_original = "  <tool_x then <tool_";
     fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string partial_restored;
     partial_restored += partial.feed("  <too");
     partial_restored += partial.feed("l_x then <tool_");
-    partial_restored += partial.finish().content;
+    partial_restored += partial.finish(ninfer::FinishReason::StopToken).content;
 
     int failures = 0;
     failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
@@ -704,6 +704,39 @@ int test_incremental_fallback_preserves_bytes() {
                       "ordinary incremental output lost trailing whitespace");
     failures +=
         check(partial_restored == partial_original, "partial marker mismatch lost raw bytes");
+    return failures;
+}
+
+int test_interrupted_tool_output() {
+    const std::string prefix = "Writing the game.";
+    const std::string markup =
+        "\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\ncat > game.html <<'EOF'\n" +
+        std::string(16000, 'x');
+    int failures = 0;
+    for (const auto reason : {ninfer::FinishReason::OutputLimit,
+                              ninfer::FinishReason::ContextCapacity,
+                              ninfer::FinishReason::Cancelled}) {
+        fi::ToolCallOutputDecoder decoder(std::make_shared<fi::ToolCallOutputContract>(), 64);
+        const std::string original = prefix + markup;
+        std::string visible;
+        for (std::size_t i = 0; i < original.size(); i += 7) {
+            visible += decoder.feed(std::string_view(original).substr(i, 7));
+        }
+        auto terminal = decoder.finish(reason);
+        failures += check(visible == prefix && terminal.content.empty() &&
+                              terminal.tool_calls.empty() && terminal.diagnostics.marker_seen &&
+                              terminal.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::IncompleteGeneration,
+                          "interrupted tool output leaked markup or fabricated a call");
+    }
+    // A fully emitted call is valid even if its closing token exactly exhausts the budget.
+    fi::ToolCallOutputDecoder complete(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    (void)complete.feed(markup + "\n</parameter>\n</function>\n</tool_call>");
+    const auto terminal = complete.finish(ninfer::FinishReason::OutputLimit);
+    failures += check(terminal.content.empty() && terminal.tool_calls.size() == 1 &&
+                          terminal.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "complete tool call at the output boundary was discarded");
     return failures;
 }
 
@@ -719,7 +752,7 @@ int test_incremental_embedded_parameter_markup() {
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
         visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(ninfer::FinishReason::StopToken);
 
     int failures = 0;
     failures +=
@@ -755,6 +788,7 @@ int main() {
     failures += test_all_or_nothing_structural_commit();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
+    failures += test_interrupted_tool_output();
     failures += test_incremental_embedded_parameter_markup();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

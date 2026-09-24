@@ -1231,6 +1231,20 @@ public:
     private_host_reclamation_observation_for_test(
         const ContinuationHandle<Variant>& continuation) const;
 
+    [[nodiscard]] runtime::GenerationProgressWitness
+    generation_progress_witness(SequenceHandle<Variant> protected_sequence,
+                                std::span<const SequenceHandle<Variant>> cohort) const;
+    bool configure_generation_reservation(RequestBasePlan<Variant>& base, std::uint32_t quantum,
+                                          bool incremental);
+    [[nodiscard]] runtime::GenerationReservationState
+    generation_reservation_state(SequenceHandle<Variant> sequence) const;
+    [[nodiscard]] runtime::GenerationGrowthResult
+    grow_generation(SequenceHandle<Variant> sequence, std::uint32_t next_tokens, bool completion);
+    void release_generation_slack(SequenceHandle<Variant> sequence, std::uint32_t next_tokens);
+    [[nodiscard]] bool suspend_generation(SequenceHandle<Variant> sequence);
+    [[nodiscard]] bool resume_generation(SequenceHandle<Variant> sequence, bool completion);
+    void detach_generation_sources(SequenceHandle<Variant> sequence);
+
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

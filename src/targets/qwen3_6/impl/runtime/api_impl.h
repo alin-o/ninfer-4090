@@ -590,6 +590,53 @@ void Program<Variant>::fail_all_cleanup() noexcept {
 }
 
 template <>
+runtime::GenerationProgressWitness Program<Variant>::generation_progress_witness(
+    SequenceHandle<Variant> protected_sequence,
+    std::span<const SequenceHandle<Variant>> cohort) const {
+    return impl_->generation_progress_witness(protected_sequence, cohort);
+}
+
+template <>
+bool Program<Variant>::configure_generation_reservation(RequestBasePlan<Variant>& base,
+                                                        std::uint32_t quantum, bool incremental) {
+    return impl_->configure_generation_reservation(base, quantum, incremental);
+}
+
+template <>
+runtime::GenerationReservationState
+Program<Variant>::generation_reservation_state(SequenceHandle<Variant> sequence) const {
+    return impl_->generation_reservation_state(sequence);
+}
+
+template <>
+runtime::GenerationGrowthResult Program<Variant>::grow_generation(SequenceHandle<Variant> sequence,
+                                                                  std::uint32_t next_tokens,
+                                                                  bool completion) {
+    return impl_->grow_generation(sequence, next_tokens, completion);
+}
+
+template <>
+void Program<Variant>::release_generation_slack(SequenceHandle<Variant> sequence,
+                                                std::uint32_t next_tokens) {
+    impl_->release_generation_slack(sequence, next_tokens);
+}
+
+template <>
+bool Program<Variant>::suspend_generation(SequenceHandle<Variant> sequence) {
+    return impl_->suspend_generation(sequence);
+}
+
+template <>
+bool Program<Variant>::resume_generation(SequenceHandle<Variant> sequence, bool completion) {
+    return impl_->resume_generation(sequence, completion);
+}
+
+template <>
+void Program<Variant>::detach_generation_sources(SequenceHandle<Variant> sequence) {
+    impl_->detach_generation_sources(sequence);
+}
+
+template <>
 bool Program<Variant>::isolated_request_feasible(
     const RequestBasePlan<Variant>& base) const noexcept {
     return impl_->isolated_request_feasible(base);

@@ -6,6 +6,7 @@ namespace ninfer::runtime::testing {
 namespace {
 
 std::atomic<const ContextTransferTestGate*> gate{nullptr};
+std::atomic<const ContextTransferTestGate*> generation_gate{nullptr};
 std::atomic<std::uint64_t> waits{0};
 std::atomic<std::uint64_t> live_settlements{0};
 std::atomic<std::uint64_t> live_backing_bytes{0};
@@ -33,6 +34,18 @@ std::atomic<const SharedSnapshotExportTestGate*> shared_export_gate{nullptr};
 std::atomic<std::uint64_t> shared_export_pin_count{0};
 
 } // namespace
+
+void install_generation_transfer_gate(const ContextTransferTestGate* installed) noexcept {
+    generation_gate.store(installed, std::memory_order_release);
+}
+
+void clear_generation_transfer_gate() noexcept {
+    generation_gate.store(nullptr, std::memory_order_release);
+}
+
+const ContextTransferTestGate* generation_transfer_gate() noexcept {
+    return generation_gate.load(std::memory_order_acquire);
+}
 
 void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* installed) noexcept {
     shared_import_gate.store(installed, std::memory_order_release);

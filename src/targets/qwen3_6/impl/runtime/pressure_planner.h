@@ -1127,6 +1127,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
             }
         }
     }
+    // Physical space alone cannot license admission while another active request still owns
+    // an unsettled State fork. The same guard is used by final materialization validation;
+    // pressure actions cannot remove this dependency. Let that request execute and retry.
+    const bool admission_blocked =
+        binding.admission != nullptr && program->materialization_transition_blocked();
+    if (admission_blocked) { status = runtime::MaterializationPhysicalStatus::Infeasible; }
     const bool composed_valid = composed.has_value() || composed_capture.has_value();
     if (identity_target || composed_valid) {
         node.assessed_residual                = program->materialization_deficit(*projected);
@@ -1140,7 +1146,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                         : NINFER_QWEN36_RUNTIME_NS::materialization_machine_work(
                               *projected, selected_private_decisions, selected_shared_decisions);
 
-    bool expandable = identity_target || (recovery_projection_valid && composed_valid);
+    bool expandable =
+        !admission_blocked && (identity_target || (recovery_projection_valid && composed_valid));
     if (expandable) {
         expandable = false;
         for (std::size_t index = 0; index < options.victims.size(); ++index) {

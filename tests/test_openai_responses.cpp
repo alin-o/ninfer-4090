@@ -490,27 +490,73 @@ int test_assistant_item_boundaries_and_errors() {
                 Json{{"model", "m"}, {"input", std::move(input)}}, limits());
         });
     };
-    const ApiError reasoning_after_content = rejected(Json::array({first, reasoning}));
-    failures +=
-        check(reasoning_after_content.status == 400 &&
-                  reasoning_after_content.type == "invalid_request_error" &&
-                  reasoning_after_content.code == "invalid_assistant_history" &&
-                  reasoning_after_content.param == "input" &&
-                  reasoning_after_content.message.find(
-                      "reasoning cannot follow assistant message content") != std::string::npos,
-              "reasoning after assistant content did not fail precisely");
+    for (const Json& prior : {first, reasoning}) {
+        const Json history = Json::array({prior, reasoning, second, call,
+            Json{{"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "done"}}});
+        const auto continued = parse_openai_responses_create_request(
+            Json{{"model", "m"}, {"input", history}}, limits());
+        failures += check(continued.prompt.input_turns.size() == 3 &&
+                              continued.prompt.input_turns[0].role == ninfer::ChatRole::Assistant &&
+                              continued.prompt.input_turns[1].reasoning_content == "thought" &&
+                              continued.prompt.input_turns[1].content[0].text == "second" &&
+                              continued.prompt.input_turns[1].tool_calls.size() == 1 &&
+                              continued.prompt.input_turns[2].role == ninfer::ChatRole::Tool,
+                          "assistant continuation did not preserve ordered segments and tool results");
+        const auto& previous = continued.prompt.input_turns[0];
+        failures += check(prior == first ? previous.content[0].text == "first " &&
+                                              previous.reasoning_content.empty()
+                                        : previous.reasoning_content == "thought" &&
+                                              previous.content.empty(),
+                          "assistant continuation reordered or overwrote preceding content");
+    }
     const ApiError content_after_call = rejected(Json::array({call, first}));
     failures += check(content_after_call.code == "invalid_assistant_history" &&
                           content_after_call.message.find(
                               "assistant message content cannot follow function_call Items") !=
                               std::string::npos,
                       "assistant content after calls was silently reordered");
-    const ApiError duplicate_reasoning = rejected(Json::array({reasoning, reasoning}));
-    failures +=
-        check(duplicate_reasoning.code == "invalid_assistant_history" &&
-                  duplicate_reasoning.message.find(
-                      "reasoning cannot follow another reasoning Item") != std::string::npos,
-              "duplicate reasoning Items were silently overwritten");
+    const ApiError reasoning_after_call = rejected(Json::array({call, reasoning}));
+    failures += check(reasoning_after_call.code == "invalid_assistant_history",
+                      "new reasoning bypassed a pending function call without a result");
+    return failures;
+}
+
+int test_incomplete_response_continuation() {
+    const auto request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "write a game"}, {"max_output_tokens", 64}}, limits());
+    int failures = 0;
+    for (const auto reason : {ninfer::FinishReason::OutputLimit,
+                              ninfer::FinishReason::ContextCapacity}) {
+        GenerationOutcome outcome;
+        outcome.reasoning = "Plan the game";
+        outcome.text = "Writing the file.";
+        outcome.finish_reason = reason;
+        outcome.completion_tokens = 64;
+        outcome.tool_call_parse = {.marker_seen = true,
+            .fallback_reason = ninfer::ToolCallParseFallbackReason::IncompleteGeneration};
+        OpenAIResponsesEventStream stream("resp_partial", 1, request, {});
+        (void)stream.start();
+        (void)stream.reasoning_delta(outcome.reasoning);
+        (void)stream.content_delta(outcome.text);
+        const auto finished = stream.finish(outcome);
+        const auto& response = finished.response.body;
+        failures += check(response.at("status") == "incomplete" &&
+                              response.at("incomplete_details").at("reason") == "max_output_tokens" &&
+                              response.at("output").size() == 2 &&
+                              response.at("output")[1].at("status") == "incomplete" &&
+                              response.at("usage").at("output_tokens") == 64,
+                          "interrupted tool response lost its budget, status, or safe output");
+        Json history = response.at("output");
+        history.push_back(Json{{"type", "reasoning"},
+            {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "Retry in smaller writes"}}})}});
+        history.push_back(Json{{"type", "message"}, {"role", "assistant"}, {"content", "Retrying."}});
+        const auto continued = parse_openai_responses_create_request(
+            Json{{"model", "m"}, {"input", history}}, limits());
+        failures += check(continued.prompt.input_turns.size() == 2 &&
+                              continued.prompt.input_turns[0].content[0].text == outcome.text &&
+                              continued.prompt.input_turns[1].reasoning_content == "Retry in smaller writes",
+                          "replaying an incomplete response poisoned the next assistant continuation");
+    }
     return failures;
 }
 
@@ -1227,6 +1273,7 @@ int main() {
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();
     failures += test_assistant_item_boundaries_and_errors();
+    failures += test_incomplete_response_continuation();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
     failures += test_custom_tools();

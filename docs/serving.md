@@ -298,7 +298,14 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+unambiguously; either causes the tool-call region to fall back to ordinary content at a natural stop.
+
+If generation reaches an output/context limit or is cancelled while a tool-call region cannot be
+parsed, the frontend withholds that region instead of converting it into ordinary answer text.
+It publishes no fabricated or partial executable call; earlier prose and reasoning remain visible,
+and token usage still includes the withheld generation. Complete calls at a limit remain structured.
+Malformed markup after a natural stop retains the existing verbatim text fallback. Request logs
+report `incomplete_generation` for withheld regions.
 
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
@@ -618,6 +625,11 @@ When `max_output_tokens` is omitted, the default output budget is 32,768 tokens,
 Set `--default-max-tokens` to change that server default, or supply an explicit request limit.
 The Engine clamps generation to the remaining context capacity. Reaching either limit produces
 `response.incomplete`; a long reasoning response can exhaust its budget before final answer text.
+The server never extends an explicit or default output limit to finish a tool call. Increase the
+request's output budget (or the server default when the request omits it), limit thinking with
+`--default-thinking-budget`, or generate large files through smaller tool calls. A continuation is
+another request with its own budget, not an automatic byte-for-byte continuation of an unfinished
+file argument.
 
 ### Input Item contract
 
@@ -637,12 +649,14 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `custom_tool_call` | completed custom-tool call with optional `id` and namespace, plus required `call_id`, `name`, and string `input` |
 | `custom_tool_call_output` | completed custom-tool result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
-Contiguous assistant-owned Items form one assistant history turn in the representable order
-`reasoning` -> assistant message content -> `function_call`. Multiple message Items append their
-content parts, multiple calls retain declaration order, and a reasoning-only turn is retained. A
-user, system, developer, or `function_call_output` Item ends the group; an order that would require
-rearranging assistant content fails with `invalid_assistant_history`. Results are validated by
-`call_id` and reordered to call declaration order before prompt rendering; unknown, duplicate, or
+Assistant-owned Items form history segments in the order `reasoning` -> assistant message content
+-> `function_call`. A new reasoning Item after earlier reasoning or message content starts another
+assistant segment, even without an intervening user Item. This preserves client order when Codex
+continues an incomplete response; earlier content is neither reordered nor overwritten. Multiple
+message Items append their content parts, multiple calls retain declaration order, and reasoning-only
+segments are retained. A user, system, developer, or tool-result Item ends the group. Reasoning or
+message content after unresolved function calls still fails with `invalid_assistant_history`.
+Results are validated by `call_id` and reordered to call declaration order before prompt rendering; unknown, duplicate, or
 unrepresentable partial result sets fail with `invalid_tool_history`. Canonical input Items retain
 client order. Input Item IDs are preserved when supplied and generated otherwise; duplicate IDs
 fail.
@@ -970,6 +984,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--generation-reservation-tokens N` | preferred ordinary-generation KV growth quantum, `1..2147483647` tokens, rounded to physical pages | `16384` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1049,6 +1064,13 @@ complete fields and full precision. Operational records never contain prompts, g
 request bodies, credentials, or arbitrary client error messages.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
+
+The metrics endpoint exposes `ninfer:generation_extension_attempts`, `generation_extension_grants`,
+`generation_extension_waits`, `generation_suspensions`, `generation_resumes`, `generation_transfer_bytes`
+and `generation_suspended_seconds`. Gauges `generation_mapped_tokens`, `generation_reserved_tokens`
+(the total current entitlement), `generation_host_backing_bytes`, `generation_host_backing_used_bytes`
+and `generation_protected_request` distinguish current mappings, private backing and the protected epoch.
+All names carry the `ninfer:` prefix. No prompt or tool payload is logged for these transitions.
 
 ## Structured request log
 
@@ -1172,9 +1194,10 @@ the template has no tiered default. A preparation rejection always leaves the re
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
+preserved for consumer validation, and a stable parse-fallback reason. Fallback reasons are `none`,
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+`trailing_content`, plus `incomplete_generation` for interrupted regions withheld from content.
+These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -1186,7 +1209,9 @@ When Vision is enabled, `vision_workspace` reports the aggregate prompt and maxi
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
 
-`request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
+`request_done.engine_timing` reports `queue_wait_seconds` from Engine submission through committed
+materialization, including admission planning, deferred SSD recovery and required cache transfers.
+It also separates blocking
 `device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
 `host_exposed_seconds`: `engine_boundary`, `program_submit`, `program_post`,
 `engine_commit_output`, and `engine_maintenance`. `total` is exactly their sum and excludes Device
@@ -1287,19 +1312,34 @@ pool used by active requests and retained prefixes. `auto` accounts for the comp
 and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
 
-Admission reserves the full prompt-plus-effective-output page entitlement through request
-completion. A request remains queued until a legal resource plan can satisfy that entitlement.
-Consequently, a fully cached request can still wait for capacity. Raising `--default-max-tokens`
-increases this reservation for requests that omit an output limit, reducing the room for concurrent
-requests; it does not increase the startup allocation. An explicit request limit overrides the
-default. Use an output allowance appropriate to the expected response length.
+Ordinary generation can reserve the complete prompt plus one output chunk, then extend before
+execution reaches that horizon. `--generation-reservation-tokens 64` is useful for testing frequent
+boundaries; the default is 16,384. This option changes reservation policy, not output or context
+limits. Grants are page-aligned and may be smaller under pressure. MTP/DFlash backends retain full
+completion reservations.
+
+Each partial request reserves mandatory private backing in the existing Host KV budget before it
+starts. Under pressure, selected requests pause while one protected request completes. They resume
+inside the same request and response stream, preserving text, reasoning and buffered tool calls.
+There is no retry, synthetic stop, usage reset or additional admission timeout. Device State and
+sampling storage stay assigned to the bounded cohort; only growing KV is transferred. With zero or
+insufficient Host capacity the Engine uses full reservations and may queue more requests. Disabling
+the context cache also disables its Host budgets and therefore selects that fallback.
+
+A request can still queue even with a cached prompt. Its complete effective footprint must fit the
+Device pool when running alone. Raising `--default-max-tokens` increases the required completion and
+Host-backing bounds; it does not enlarge the startup pools. Explicit request limits and existing
+output defaults are unchanged. Finite completion epochs provide eventual service, but a long
+protected request can cause a long pause for another stream. Existing five-second SSE heartbeat
+comments continue during these pauses; proxy/client idle timeouts must permit those heartbeats.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
 to pinned Host memory, or evict it. The planner compares incoming-request work with the later
-recovery cost imposed on retained checkpoints. Active requests retain their state and completion
-reservations, and placement choices preserve model semantics. The full policy and invariants are
-defined in [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
+recovery cost imposed on retained checkpoints. Active requests retain their continuation and
+completion witness; ordinary-generation KV residency may change at a stable boundary without changing
+model semantics. The full policy and invariants are defined in
+[Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
 
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
 `--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE

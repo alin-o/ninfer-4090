@@ -24,7 +24,7 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
 - 一个有界 FIFO 等待队列；
-- 不抢占已经激活的请求；
+- ordinary generation 可在 committed boundary 暂停到有界 Host KV backing；prefill 不暂停；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
 Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
@@ -231,6 +231,7 @@ Waiting
   -> Materializing
   -> Prefill
   -> DecodeReady | ControlReady
+  -> GrowthBlocked -> Suspending -> Suspended -> Resuming -> DecodeReady | ControlReady
   -> TerminalPending
   -> Finished
 ```
@@ -240,6 +241,8 @@ Waiting
 - **Prefill**：请求已经 Active，正在消费 prompt suffix。
 - **DecodeReady**：可加入下一次紧凑 decode round。
 - **ControlReady**：Frontend 要求提交规范的 forced-control suffix。
+- **GrowthBlocked / Suspended**：仍是同一个 admitted request；保留预算、Frontend、输出流和 logical lane。
+  Program 在稳定边界复制 KV，完成 transfer 后归还 Device mappings；resume 不重新执行 prompt。
 - **TerminalPending**：模型执行已经终止，但 active resources 尚未完成 retain 或 release。
 - **Finished**：资源与输出均已提交，response 可以完成。
 
@@ -326,7 +329,7 @@ Session key 只是查找提示，不拥有 continuation。每个请求进入 Eng
 2. 推进已经开始的 resource transition；
 3. 完成可以结算的 TerminalPending 请求；
 4. 冻结 active cancellation snapshot；
-5. 在公平门允许时尝试一次 admission；
+5. 先处理 generation growth / suspend / resume，再在公平门允许时尝试一次 admission；
 6. 选择 staged prefill、forced control 或紧凑 decode；
 7. 运行至多一个模型 execution unit；
 8. 提交模型、预算和 Frontend 输出状态；
@@ -350,7 +353,20 @@ FIFO admission owner 后，ResourceManager 才同时比较 warm 与 SSD 路径�
 admitted 的请求可以继续使用各自既有 reservation。stale revision 必须释放旧 reservation 并重新比较
 完整 warm/SSD 集合。
 
-FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
+Incremental admission uses a bounded completion witness: every partial owner has a private Host
+allocation covering its complete effective Main KV extent; its complete isolated extent fits the
+Device pool. Program owns this physical proof and its resource revision. Under pressure the
+Scheduler keeps its protected owner through completion/cancellation, suspends the backed victim
+set, and obtains the protected owner's full completion entitlement. ResourceManager releases
+eligible optional caches before active suspension. Prefill finishes using its admitted entitlement.
+Suspended requests retain their logical lanes, so resident plus suspended requests never exceed C.
+After the epoch, the oldest admitted request is selected before new arrivals. There is no time slicing.
+
+Partial-reservation requests enter only as FIFO head. Persistent backfill is restricted to full
+reservations and is disabled while an incremental cohort is resident; its original completion proof
+charges the blocked head's full eventual footprint and remains valid on that restricted path.
+
+FIFO head 暂时受 full-reservation incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
 后续请求只有在 Program 证明以下条件时才能 backfill：
 
 > borrower 持续占用其完整 active reservation 后，既定 donor set 结束仍足以让 head 以
@@ -496,6 +512,8 @@ Cancellation 在 Engine worker 的稳定边界生效：
 | Waiting | 不创建 Program state，直接结束请求 |
 | Materializing | abort resource transition，并采用其完整结果 |
 | Active | 当前 GPU unit 稳定后进入 TerminalPending 并 release |
+| GrowthBlocked / Suspended | release the same request's Device and private Host ownership |
+| Suspending / Resuming | settle the bounded copy before observing cancellation and releasing buffers |
 | PendingBatch | 通过 cancelled row decision 提交或整体 abort |
 | 已 commit、尚未 adopt | 先 adopt 已提交结果，再执行 terminal 路径 |
 
@@ -529,7 +547,8 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 以下约束属于 Engine 架构，但具体实现由 Program 和下层文档定义：
 
 - Program 在启动时建立固定数量的 control/state/table resources；
-- growing KV 由共享 paged pools 支持，active request 持有完整增长 reservation；
+- growing KV 使用同一共享 paged pool；ordinary generation 在完整下一 execution unit 之前扩展 entitlement；
+- protected completion epochs、bounded Host backing 与 full-reservation fallback 保证 progress；
 - 一个 GPU execution unit 内 State/KV mapping 保持稳定；
 - CUDA Graph 按合法 exact-`B` topology 建立，request identity 和 page IDs 是稳定输入数据，不是 graph key；
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
@@ -547,7 +566,7 @@ checkpoint catalog。
 1. 请求顺序只由 Scheduler 决定。
 2. logical cache policy 只由 ResourceManager 决定。
 3. physical occupancy、reservation、feasibility 和 model state 只由 Program 决定。
-4. Active publication 前必须具备完整 continuation 和完成 reservation。
+4. Active publication 前必须具备完整 continuation、prefill entitlement 和可行 completion witness。
 5. 一个 global resource topology transition 在任意时刻至多一个。
 6. 一个 `PendingBatch` 必须由一次 Program commit 或 abort 完整消费。
 7. Program、Frontend 和 budget 均提交后，模型输出才对 consumer 可见。

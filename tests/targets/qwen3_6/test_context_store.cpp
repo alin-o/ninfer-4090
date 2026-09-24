@@ -296,6 +296,65 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
+    // A live continuation returns its address mappings only after an exact Host copy settles.
+    // Rebuild it at different physical page IDs and check every payload byte, including the tail.
+    {
+        const auto live = addresses.create_active(2, 0);
+        addresses.ensure_mapped_to_tokens(*live, 65, device.stream);
+        addresses.commit_frontier(*live, 65);
+        std::array source{addresses.physical_page(*live, 0), addresses.physical_page(*live, 1)};
+        auto host = host_arena.allocate(host_layout, 2);
+        std::vector<std::byte> expected(host_layout.page_stride * 2);
+        for (std::size_t byte = 0; byte < expected.size(); ++byte) {
+            expected[byte] = static_cast<std::byte>((byte * 37 + 11) % 251);
+        }
+        physical_pages.copy_from_host(expected.data(), host_layout, source, device.stream);
+        device.synchronize();
+        physical_pages.copy_to_host(source, host_arena.writable_view(*host),
+                                    device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        addresses.deactivate(*live);
+        addresses.truncate_inactive_prefix(*live, 0);
+        expect(physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
+               "suspension returns mapped and reserved pages after transfer settlement");
+        const auto competitor = addresses.create_active(3, 1);
+        addresses.ensure_mapped_to_tokens(*competitor, 65, device.stream);
+        addresses.activate(*live, 4, 0, device.stream);
+        addresses.ensure_mapped_to_tokens(*live, 65, device.stream);
+        std::array restored{addresses.physical_page(*live, 0), addresses.physical_page(*live, 1)};
+        physical_pages.copy_from_host(host_arena.view(*host), restored, device.stream);
+        addresses.commit_frontier(*live, 65);
+        device.synchronize();
+        std::vector<std::byte> actual(expected.size());
+        physical_pages.copy_to_host(restored, actual.data(), host_layout, device.stream);
+        device.synchronize();
+        expect(actual == expected, "live KV restore preserves exact bytes at different page IDs");
+        addresses.resize_entitlement(*live, 2);
+        expect(addresses.entitlement(*live) == 2, "explicit unused growth release");
+        addresses.resize_entitlement(*competitor, 4);
+        auto blocker = physical_pages.reserve(2);
+        expect(blocker.has_value(), "growth pressure fixture fills the remaining pool");
+        const auto allocated_before = physical_pages.allocated_pages();
+        const auto reserved_before  = physical_pages.reserved_pages();
+        bool growth_rejected        = false;
+        try {
+            addresses.resize_entitlement(*live, 4);
+        } catch (const std::exception&) { growth_rejected = true; }
+        expect(growth_rejected && addresses.entitlement(*live) == 2 &&
+                   addresses.committed_frontier(*live) == 65 &&
+                   physical_pages.allocated_pages() == allocated_before &&
+                   physical_pages.reserved_pages() == reserved_before,
+               "failed growth leaves committed state and physical accounting unchanged");
+        blocker->release();
+        addresses.resize_entitlement(*live, 4);
+        expect(addresses.entitlement(*live) == 4 && addresses.committed_frontier(*live) == 65,
+               "growth preserves the committed partial tail");
+        addresses.deactivate(*live);
+        addresses.deactivate(*competitor);
+        expect(addresses.release(*live) && addresses.release(*competitor),
+               "live continuation/competitor cleanup");
+    }
+
     const auto address = addresses.create_active(3, 0);
     expect(address.has_value(), "active KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 65, device.stream);

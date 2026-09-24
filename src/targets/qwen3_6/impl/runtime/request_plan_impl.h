@@ -4,6 +4,8 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "runtime/generation/reservation_horizon.h"
+
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -268,6 +270,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    base->completion_pages         = base->text_kv_page_entitlement;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
@@ -476,6 +479,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
+    plan->generation_backing          = base.generation_backing;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;

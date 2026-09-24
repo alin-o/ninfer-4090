@@ -51,6 +51,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    if (options.generation_reservation_tokens == 0 ||
+        options.generation_reservation_tokens >
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("generation_reservation_tokens must be in [1,2147483647]");
+    }
     if (options.auto_save_queue_jobs == 0) { options.auto_save_queue_jobs = 2; }
     if (options.auto_save_queue_bytes == 0) { options.auto_save_queue_bytes = 1ULL << 30U; }
 

@@ -42,6 +42,7 @@ struct ServeOptions {
     std::uint32_t max_pending_requests              = 16;
     std::uint32_t pending_timeout_ms                = 30000;
     std::uint32_t prefill_chunk                     = 1024;
+    std::uint32_t generation_reservation_tokens      = 16384;
     // Retired with the upstream merge: per-sequence rewrite checkpoints and long anchors
     // supersede the host turn-checkpoint ring. The field is dead everywhere and goes away
     // with the flag one release after the deprecation warning ships.

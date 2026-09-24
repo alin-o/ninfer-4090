@@ -598,20 +598,23 @@ enum class AssistantInputPhase {
 struct AssistantInputRun {
     AssistantInputRun() { reset(); }
 
-    void append_reasoning(std::string reasoning, std::size_t index) {
+    void append_reasoning(std::string reasoning, std::size_t index,
+                          std::vector<ChatTurn>& turns) {
         switch (phase) {
         case AssistantInputPhase::Empty:
-            turn.reasoning_content = std::move(reasoning);
-            phase                  = AssistantInputPhase::Reasoning;
-            return;
+            break;
         case AssistantInputPhase::Reasoning:
-            invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
         case AssistantInputPhase::Content:
-            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
+            // A client can continue an incomplete response without inserting a user Item.
+            // Keep consecutive assistant segments in order instead of moving new reasoning
+            // ahead of earlier content or refusing all subsequent replays of the session.
+            flush(turns);
+            break;
         case AssistantInputPhase::Calls:
             invalid_assistant_history(index, "reasoning cannot follow function_call Items");
         }
-        throw std::logic_error("unreachable assistant input phase");
+        turn.reasoning_content = std::move(reasoning);
+        phase                  = AssistantInputPhase::Reasoning;
     }
 
     void append_message(ChatTurn message, std::size_t index) {
@@ -693,7 +696,7 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                 out.input_turns.push_back(std::move(message.turn));
             }
         } else if (type == "reasoning") {
-            assistant.append_reasoning(parse_reasoning_item(item, canonical), index);
+            assistant.append_reasoning(parse_reasoning_item(item, canonical), index, out.input_turns);
         } else if (type == "function_call") {
             assistant.append_call(parse_function_call_item(item, canonical, identities));
         } else if (type == "function_call_output") {

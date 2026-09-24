@@ -90,6 +90,10 @@ int main() {
     live.prefill_seconds_total                              = 0.6;
     live.committed_decode_tokens                            = 300;
     live.decode_seconds_total                               = 6.0;
+    live.generation_suspensions = 3;
+    live.generation_resumes = 2;
+    live.generation_host_backing_bytes = 8192;
+    live.generation_host_backing_used_bytes = 4096;
     live.auto_save_queued_jobs                              = 2;
     live.auto_save_queued_bytes                             = 4096;
     live.auto_save_in_flight_jobs                           = 1;
@@ -122,6 +126,11 @@ int main() {
     failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "live decode tokens");
     failures +=
         check(values.at("llamacpp:tokens_predicted_seconds_total") == 6.0, "live decode seconds");
+    failures += check(values.at("ninfer:generation_suspensions") == 3.0 &&
+                          values.at("ninfer:generation_resumes") == 2.0 &&
+                          values.at("ninfer:generation_host_backing_bytes") == 8192.0 &&
+                          values.at("ninfer:generation_host_backing_used_bytes") == 4096.0,
+                      "live generation backing and suspension metrics");
     failures += check(values.at("ninfer:requests_total") == 2.0, "request count");
     failures += check(values.at("ninfer:prefix_cache_hit_tokens_total") == 900.0, "cache hits");
     failures += check(values.at("ninfer:draft_tokens_total") == 450.0, "draft tokens");

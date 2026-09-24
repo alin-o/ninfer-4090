@@ -149,6 +149,13 @@ state image (about 147 MiB of host memory on Qwen3.8-27B), so size `--host-state
 for `continuations x (2 + anchors)`. The old `--turn-checkpoints` ring is retired
 and ignored; see [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
 
+Ordinary generation uses incremental KV reservations (`--generation-reservation-tokens`, default
+16,384). With configured Host KV backing, requests can pause and resume under pressure without a
+new API call or an output-limit change. The admitted resident-plus-suspended cohort stays within
+`--max-concurrency`; fixed State and sampling storage remain assigned to those lanes. Speculative
+backends and requests without sufficient Host backing use full reservations. See
+[serving](docs/serving.md) for fallback, fairness and stream-timeout details.
+
 Extra requests beyond the slots wait in the admission queue, and the queue deadline
 defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
 parallel agent clients would fail with `request_queue_timeout`. The
@@ -403,8 +410,9 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
-  untested here, and the published cohort results in the
+- `--max-concurrency 2` is measured on the 4090 (see Quick start). Reservation-pressure correctness
+  is tested at 2, 4 and 8 lanes; this does not establish production throughput at higher lane counts.
+  The published cohort results in the
   [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
 - Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
   starves while any prefill runs: a short request submitted behind a 31k-token cold prefill

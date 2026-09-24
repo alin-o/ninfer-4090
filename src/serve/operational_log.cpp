@@ -306,9 +306,12 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
     }
+    const char* action = reason == ninfer::ToolCallParseFallbackReason::IncompleteGeneration
+                             ? " incomplete tool markup withheld | "
+                             : " tool markup returned as text | ";
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
-        .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
+        .message  = "req#" + std::to_string(context.id) + action +
                    pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
     };
 }

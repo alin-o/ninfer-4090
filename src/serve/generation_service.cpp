@@ -254,6 +254,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_pending_requests = options_.max_pending_requests;
     engine_options.pending_timeout_ms   = options_.pending_timeout_ms;
     engine_options.prefill_chunk        = options_.prefill_chunk;
+    engine_options.generation_reservation_tokens = options_.generation_reservation_tokens;
     engine_options.turn_checkpoint_ring = options_.turn_checkpoint_ring;
     engine_options.auto_save_evicted    = options_.auto_save_evicted;
     if (options_.auto_save_evicted) {

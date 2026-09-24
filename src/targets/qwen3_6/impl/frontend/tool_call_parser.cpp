@@ -673,7 +673,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     return visible;
 }
 
-ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
+ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
@@ -687,6 +687,18 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         return Terminal{.content     = {},
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
+    }
+
+    if (saw_tool_marker_ && (reason == FinishReason::OutputLimit ||
+                            reason == FinishReason::ContextCapacity ||
+                            reason == FinishReason::Cancelled)) {
+        // A cut-off call is not answer text. Publishing it poisons replay history and may
+        // mislead the caller into treating an unexecuted write as completed work.
+        parsed.diagnostics.fallback_reason = FallbackReason::IncompleteGeneration;
+        trailing_whitespace_.clear();
+        tool_region_.clear();
+        marker_prefix_bytes_ = 0;
+        return Terminal{.content = {}, .tool_calls = {}, .diagnostics = parsed.diagnostics};
     }
 
     std::string tail = std::move(trailing_whitespace_);

@@ -1177,7 +1177,8 @@ public:
     std::shared_ptr<const fi::GeneratedHistorySource> generated_history_source;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
-    bool preview_ready = false;
+    FinishReason preview_finish_reason = FinishReason::None;
+    bool preview_ready                 = false;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1305,7 +1306,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
-        impl_->preview_ready = true;
+        impl_->preview_finish_reason = reason;
+        impl_->preview_ready         = true;
         return runtime::OutputDecision{
             .accepted_tokens              = count,
             .finish_reason                = reason,
@@ -1480,6 +1482,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_semantic.control_pending = false;
+    impl_->preview_finish_reason          = reason;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
@@ -1502,7 +1505,8 @@ PublishedOutput OutputSession::commit_preview() {
         }
     }
     if (impl_->state.terminal) {
-        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
+        fi::ToolCallOutputDecoder::Terminal terminal =
+            impl_->tool_call_output.finish(impl_->preview_finish_reason);
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
         if (!terminal.content.empty()) {

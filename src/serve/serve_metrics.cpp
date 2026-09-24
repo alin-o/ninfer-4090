@@ -114,6 +114,19 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency,
     append_counter(out, "llamacpp:requests_processing", processing);
     append_counter(out, "llamacpp:requests_deferred", in_flight - processing);
     append_counter(out, "ninfer:requests_total", requests_total_);
+    append_counter(out, "ninfer:generation_extension_attempts", live.generation_extension_attempts);
+    append_counter(out, "ninfer:generation_extension_grants", live.generation_extension_grants);
+    append_counter(out, "ninfer:generation_extension_waits", live.generation_extension_waits);
+    append_counter(out, "ninfer:generation_suspensions", live.generation_suspensions);
+    append_counter(out, "ninfer:generation_resumes", live.generation_resumes);
+    append_counter(out, "ninfer:generation_transfer_bytes", live.generation_transfer_bytes);
+    append_counter(out, "ninfer:generation_mapped_tokens", live.generation_mapped_tokens);
+    append_counter(out, "ninfer:generation_reserved_tokens", live.generation_reserved_tokens);
+    append_counter(out, "ninfer:generation_host_backing_bytes", live.generation_host_backing_bytes);
+    append_counter(out, "ninfer:generation_host_backing_used_bytes", live.generation_host_backing_used_bytes);
+    append_counter(out, "ninfer:generation_protected_request", live.generation_protected_request);
+    append_counter(out, "ninfer:generation_suspended_seconds", live.generation_suspended_seconds);
+
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);

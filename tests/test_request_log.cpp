@@ -539,6 +539,17 @@ int main() {
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+    fallback_outcome.tool_call_parse.fallback_reason =
+        ninfer::ToolCallParseFallbackReason::IncompleteGeneration;
+    const auto incomplete_warning = render_tool_call_fallback(context, fallback_outcome);
+    const Json incomplete_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
+    failures += check(incomplete_warning &&
+                          incomplete_warning->message ==
+                              "req#7 incomplete tool markup withheld | incomplete generation" &&
+                          incomplete_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                              "incomplete_generation",
+                      "interrupted markup diagnostics incorrectly claim it was returned as text");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

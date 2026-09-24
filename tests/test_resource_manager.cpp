@@ -1164,8 +1164,13 @@ public:
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation,
                          bool /*wait_for_exports*/ = true) noexcept {
+        if (release_pinned) { return {}; }
         released_continuations.push_back(continuation.id);
         advance_revision();
+        return FakeReleaseResult{.status = ConsumeStatus::Consumed};
+    }
+
+    [[nodiscard]] FakeReleaseResult release_shared_prefix(FakeSharedPrefixHandle&&) noexcept {
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
 
@@ -1176,6 +1181,7 @@ public:
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions;
+    bool release_pinned                         = false;
     std::size_t required_pressure_actions       = 0;
     std::size_t eviction_pressure_action_units  = 1;
     std::uint32_t private_pressure_alternatives = 1;
@@ -3319,6 +3325,37 @@ void test_commit_and_discard_terminal_states() {
             "discard did not release cancelled active membership");
 }
 
+void test_generation_eviction_waits_for_export_without_repinning() {
+    FakeManager manager = make_manager();
+    FakeProgram program;
+    unsigned observations = 0;
+    manager.set_eviction_observer([&](std::uint32_t, const FakeContinuationHandle&) {
+        ++observations;
+        program.release_pinned = true;
+    });
+    for (std::uint32_t owner = 1; owner <= 2; ++owner) {
+        manager.adopt_restored(0, FakeContinuationHandle(owner, owner),
+                               FakeContinuationSummary{.endpoint = endpoint(owner, 16)});
+        manager.reclaim_generation_caches(program);
+        require(observations == owner && manager.catalog_slot(0).handle != nullptr,
+                "generation pressure released a pinned export source");
+        program.release_pinned = false;
+        manager.reclaim_generation_caches(program);
+        require(observations == owner && manager.catalog_slot(0).handle == nullptr,
+                "generation pressure repeatedly repinned a completed export");
+    }
+    manager.set_eviction_observer({});
+    for (std::uint32_t slot = 0; slot < 2; ++slot) {
+        manager.adopt_restored(slot, FakeContinuationHandle(10 + slot, 10 + slot),
+                               FakeContinuationSummary{.endpoint = endpoint(10 + slot, 16)});
+    }
+    const auto released = program.released_continuations.size();
+    manager.reclaim_generation_caches(
+        program, [&] { return program.released_continuations.size() > released; });
+    require(manager.catalog_slot(0).handle == nullptr && manager.catalog_slot(1).handle != nullptr,
+            "generation growth discarded caches after capacity was satisfied");
+}
+
 void test_backfill_proof_and_stats_follow_program_revision() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -3584,6 +3621,8 @@ int main() {
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);
     run_test("commit and discard", test_commit_and_discard_terminal_states);
+    run_test("generation eviction and export pins",
+             test_generation_eviction_waits_for_export_without_repinning);
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);

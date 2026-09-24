@@ -82,7 +82,8 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] "
+           "[--generation-reservation-tokens N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8]\n"
            "       [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
@@ -137,6 +138,14 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--generation-reservation-tokens") {
+            options.generation_reservation_tokens =
+                parse_u32(value(arg), "generation-reservation-tokens");
+            if (options.generation_reservation_tokens == 0 ||
+                options.generation_reservation_tokens > 2147483647U) {
+                throw std::invalid_argument(
+                    "--generation-reservation-tokens must be in [1,2147483647]");
+            }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {

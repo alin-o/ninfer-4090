@@ -1885,6 +1885,49 @@ int test_structured_tool_output() {
     return failures;
 }
 
+int test_interrupted_tool_output() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    ninfer::PromptInput input;
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "write the game", .media = {}});
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    const auto tokens = fixture_tokenizer().encode(
+        "Writing.\n<tool_call>\n<function=write>\n<parameter=content>unfinished HTML");
+    int failures = 0;
+    for (const auto reason : {ninfer::FinishReason::OutputLimit,
+                              ninfer::FinishReason::ContextCapacity,
+                              ninfer::FinishReason::Cancelled}) {
+        for (const bool between_rounds : {false, true}) {
+            if (!between_rounds && reason == ninfer::FinishReason::Cancelled) { continue; }
+            auto session = frontend.make_output_session(prompt, {});
+            const auto decision = session.preview_model(
+                tokens, static_cast<std::uint32_t>(tokens.size() + (between_rounds ? 1 : 0)),
+                reason == ninfer::FinishReason::Cancelled ? ninfer::FinishReason::OutputLimit
+                                                          : reason);
+            std::string text = channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            if (between_rounds) {
+                failures += check(!decision.finished(), "tool call terminated before the boundary");
+                (void)session.preview_terminal(reason);
+                text += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            } else {
+                failures += check(decision.finish_reason == reason,
+                                  "tool call changed the generation budget boundary");
+            }
+            failures += check(text == "Writing." && session.take_tool_calls().empty() &&
+                                  session.tool_call_parse_diagnostics().fallback_reason ==
+                                      ninfer::ToolCallParseFallbackReason::IncompleteGeneration,
+                              "frontend published interrupted tool markup or an executable call");
+        }
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2436,6 +2479,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_interrupted_tool_output();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

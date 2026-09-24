@@ -103,6 +103,7 @@ public:
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
+          generation_reservation_tokens_(options.generation_reservation_tokens),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -1225,6 +1226,29 @@ private:
         const MemorySummary memory = collect_memory_summary();
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
+        snapshot.generation_protected_request = generation_protected_request_;
+        {
+            std::lock_guard lock(queue_mutex_);
+            snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            for (const auto& request : pending_) {
+                if (request->base_plan) {
+                    snapshot.generation_host_backing_bytes +=
+                        request->base_plan->summary().generation_host_backing_bytes;
+                }
+            }
+        }
+        if (materializing_) {
+            snapshot.generation_host_backing_bytes +=
+                materializing_->summary.generation_host_backing_bytes;
+        }
+        for (const auto& request : slots_) {
+            if (!request || !request->sequence) { continue; }
+            const auto state = instance_.program->generation_reservation_state(*request->sequence);
+            snapshot.generation_mapped_tokens += state.mapped_tokens;
+            snapshot.generation_reserved_tokens += state.reserved_tokens;
+            snapshot.generation_host_backing_bytes += state.host_backing_bytes;
+            snapshot.generation_host_backing_used_bytes += state.host_backing_used_bytes;
+        }
         {
             // Session save/restore copies run outside the context-cache transactions, so the
             // populated transfer stats cannot see them; add the Program's snapshot counters.
@@ -1242,10 +1266,6 @@ private:
             snapshot.state_h2d_count += traffic.state_h2d_count;
             snapshot.state_d2h_bytes += traffic.state_d2h_bytes;
             snapshot.state_h2d_bytes += traffic.state_h2d_bytes;
-        }
-        {
-            std::lock_guard lock(queue_mutex_);
-            snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
@@ -1586,6 +1606,11 @@ private:
     }
 
     void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
+        if (request->suspended_at) {
+            cumulative_stats_.generation_suspended_seconds +=
+                std::chrono::duration<double>(Clock::now() - *request->suspended_at).count();
+            request->suspended_at.reset();
+        }
         request->base_plan.reset();
     }
 
@@ -2284,11 +2309,13 @@ private:
         scheduler_.on_waiting_removed(request->id);
     }
 
-    void ensure_base_plan(const std::shared_ptr<Request>& request) {
+    void ensure_base_plan(const std::shared_ptr<Request>& request, bool allow_incremental = true) {
         if (!request->base_plan) {
             request->base_plan.emplace(
                 instance_.program->plan_request(request->prompt, request->options.execution));
         }
+        instance_.program->configure_generation_reservation(
+            *request->base_plan, generation_reservation_tokens_, allow_incremental);
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
@@ -2804,6 +2831,12 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
+        for (const auto& request : slots_) {
+            if (request && (request->model_state == EngineRequestState::Suspended ||
+                            request->model_state == EngineRequestState::GrowthBlocked)) {
+                return AdmissionProgress::None;
+            }
+        }
         const auto other_runnable = static_cast<std::uint32_t>(
             std::count_if(slots_.begin(), slots_.end(), [](const auto& request) {
                 return request && !request->capture_pending &&
@@ -2855,6 +2888,16 @@ private:
                 control_progress = true;
                 continue;
             }
+            if (!head->base_plan->summary().incremental_reservation) {
+                for (const auto& resident : slots_) {
+                    if (resident && resident->sequence &&
+                        instance_.program->generation_reservation_state(*resident->sequence)
+                            .incremental) {
+                        return control_progress ? AdmissionProgress::ControlProgress
+                                                : AdmissionProgress::None;
+                    }
+                }
+            }
             if (!resolve_deferred_recovery(head)) {
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
@@ -2898,6 +2941,14 @@ private:
                                              std::move(grant));
             }
 
+            for (const auto& resident : slots_) {
+                if (resident && resident->sequence &&
+                    instance_.program->generation_reservation_state(*resident->sequence)
+                        .incremental) {
+                    return control_progress ? AdmissionProgress::ControlProgress
+                                            : AdmissionProgress::None;
+                }
+            }
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
@@ -2958,7 +3009,8 @@ private:
                     continue;
                 }
                 try {
-                    ensure_base_plan(candidate);
+                    // Backfill retains the full-completion proof and needs no suspension backing.
+                    ensure_base_plan(candidate, false);
                 } catch (...) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;
@@ -3149,6 +3201,209 @@ private:
         publish_runtime_stats();
     }
 
+    void service_generation_reservations() {
+        std::uint32_t mandatory_resident_lanes = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request && request->sequence && !request->is_model_finished() &&
+                !instance_.program->generation_reservation_state(*request->sequence).incremental) {
+                mandatory_resident_lanes |= 1U << lane;
+            }
+        }
+        const auto selected = scheduler_.select_generation_protected_lane(
+            slots_, max_concurrency_, generation_protected_request_, mandatory_resident_lanes);
+        if (!selected) {
+            const bool changed            = generation_protected_request_ != 0;
+            generation_protected_request_ = 0;
+            generation_pressure_          = false;
+            if (changed) { publish_runtime_stats(); }
+            return;
+        }
+        auto& protected_request = slots_[*selected];
+        if (generation_protected_request_ != protected_request->id) {
+            generation_pressure_ =
+                generation_pressure_ &&
+                std::any_of(slots_.begin(), slots_.end(), [](const auto& request) {
+                    return request && (request->model_state == EngineRequestState::Suspended ||
+                                       request->model_state == EngineRequestState::GrowthBlocked);
+                });
+        }
+        generation_protected_request_ = protected_request->id;
+        auto& program                 = *instance_.program;
+        std::array<SequenceHandle, kMaximumConcurrency> cohort{};
+        std::size_t cohort_size = 0;
+        for (const auto& request : slots_) {
+            if (request && request->sequence && !request->is_model_finished()) {
+                cohort[cohort_size++] = *request->sequence;
+            }
+        }
+        GenerationProgressWitness witness;
+        if (protected_request->sequence) {
+            witness = resources_.generation_progress_witness(
+                program, *protected_request->sequence,
+                std::span<const SequenceHandle>(cohort.data(), cohort_size));
+            if (!witness.feasible) {
+                throw std::logic_error("admitted generation cohort lost its completion witness");
+            }
+        }
+        bool changed       = false;
+        const auto suspend = [&](const std::shared_ptr<Request>& request) {
+            if (!request || !request->sequence || request->capture_pending ||
+                request->id == generation_protected_request_) {
+                return false;
+            }
+            const auto before = program.generation_reservation_state(*request->sequence);
+            if (!before.can_suspend) { return false; }
+            if (request->model_state != EngineRequestState::GrowthBlocked) {
+                request->reservation_return_state = request->model_state;
+            }
+            request->model_state = EngineRequestState::Suspending;
+            if (!resources_.suspend_generation(program, *request->lane, *request->sequence)) {
+                request->model_state = request->reservation_return_state;
+                return false;
+            }
+            request->model_state  = EngineRequestState::Suspended;
+            request->suspended_at = Clock::now();
+            ++cumulative_stats_.generation_suspensions;
+            cumulative_stats_.generation_transfer_bytes += before.mapped_bytes;
+            changed = true;
+            return true;
+        };
+        const auto promote = [&] {
+            if (!protected_request->sequence || protected_request->capture_pending ||
+                protected_request->is_prefilling()) {
+                return false;
+            }
+            const auto before = program.generation_reservation_state(*protected_request->sequence);
+            if (before.completion_reserved) {
+                (void)program.grow_generation(*protected_request->sequence, 0, true);
+                return true;
+            }
+            if (before.suspended) {
+                protected_request->model_state = EngineRequestState::Resuming;
+                if (!program.resume_generation(*protected_request->sequence, true)) {
+                    protected_request->model_state = EngineRequestState::Suspended;
+                    return false;
+                }
+                protected_request->model_state = protected_request->reservation_return_state;
+                if (protected_request->suspended_at) {
+                    cumulative_stats_.generation_suspended_seconds +=
+                        std::chrono::duration<double>(Clock::now() -
+                                                      *protected_request->suspended_at)
+                            .count();
+                    protected_request->suspended_at.reset();
+                }
+                ++cumulative_stats_.generation_resumes;
+                cumulative_stats_.generation_transfer_bytes +=
+                    program.generation_reservation_state(*protected_request->sequence).mapped_bytes;
+                changed = true;
+                return true;
+            }
+            ++cumulative_stats_.generation_extension_attempts;
+            if (program.grow_generation(*protected_request->sequence, 0, true) !=
+                GenerationGrowthResult::Ready) {
+                ++cumulative_stats_.generation_extension_waits;
+                return false;
+            }
+            ++cumulative_stats_.generation_extension_grants;
+            if (protected_request->model_state == EngineRequestState::GrowthBlocked) {
+                protected_request->model_state = protected_request->reservation_return_state;
+            }
+            changed = true;
+            return true;
+        };
+        if (generation_pressure_ && !program.has_context_transaction() && !promote() &&
+            protected_request->sequence && !protected_request->is_prefilling() &&
+            !protected_request->capture_pending) {
+            resources_.detach_generation_sources(program, *protected_request->lane,
+                                                 *protected_request->sequence);
+            resources_.reclaim_generation_caches(program, promote);
+            if (!promote()) {
+                // A finite completion epoch: the complete backed victim set yields to the
+                // oldest request. Startup lane/State storage stays assigned to this cohort.
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if ((witness.victim_lanes & (1U << lane)) != 0) { (void)suspend(slots_[lane]); }
+                }
+                resources_.reclaim_generation_caches(program, promote);
+                if (!promote()) {
+                    const auto before =
+                        program.generation_reservation_state(*protected_request->sequence);
+                    if (before.can_suspend &&
+                        resources_.suspend_generation(program, *protected_request->lane,
+                                                      *protected_request->sequence)) {
+                        if (protected_request->model_state != EngineRequestState::GrowthBlocked) {
+                            protected_request->reservation_return_state =
+                                protected_request->model_state;
+                        }
+                        protected_request->model_state  = EngineRequestState::Suspended;
+                        protected_request->suspended_at = Clock::now();
+                        ++cumulative_stats_.generation_suspensions;
+                        cumulative_stats_.generation_transfer_bytes += before.mapped_bytes;
+                        resources_.reclaim_generation_caches(program, promote);
+                        changed = true;
+                        (void)promote();
+                    }
+                }
+            }
+        }
+        for (const auto& request : slots_) {
+            if (!request || !request->sequence || request->capture_pending ||
+                request->is_prefilling() || request->is_model_finished() ||
+                request->model_state == EngineRequestState::Suspended) {
+                continue;
+            }
+            const auto state = program.generation_reservation_state(*request->sequence);
+            if (!state.incremental || state.completion_reserved) { continue; }
+            const auto return_state = request->model_state == EngineRequestState::GrowthBlocked
+                                          ? request->reservation_return_state
+                                          : request->model_state;
+            const auto unit =
+                return_state == EngineRequestState::ControlReady
+                    ? static_cast<std::uint32_t>(request->output.pending_control_tokens().size())
+                    : 1U;
+            auto result = program.grow_generation(*request->sequence, unit, false);
+            if (result == GenerationGrowthResult::CapacityWait) {
+                for (const auto& other : slots_) {
+                    if (!other || other == request || !other->sequence || other->capture_pending ||
+                        (generation_pressure_ && other->id == generation_protected_request_)) {
+                        continue;
+                    }
+                    const auto next = other->is_control_ready()
+                                          ? static_cast<std::uint32_t>(
+                                                other->output.pending_control_tokens().size())
+                                          : 1U;
+                    program.release_generation_slack(*other->sequence, next);
+                }
+                resources_.reclaim_generation_caches(program, [&] {
+                    return program.grow_generation(*request->sequence, unit, false) ==
+                           GenerationGrowthResult::Ready;
+                });
+                result = program.grow_generation(*request->sequence, unit, false);
+            }
+            const auto after = program.generation_reservation_state(*request->sequence);
+            if (result == GenerationGrowthResult::Ready) {
+                if (after.reserved_tokens != state.reserved_tokens) {
+                    ++cumulative_stats_.generation_extension_attempts;
+                    ++cumulative_stats_.generation_extension_grants;
+                    changed = true;
+                }
+                request->model_state = return_state;
+            } else {
+                ++cumulative_stats_.generation_extension_attempts;
+                ++cumulative_stats_.generation_extension_waits;
+                request->reservation_return_state = return_state;
+                request->model_state              = EngineRequestState::GrowthBlocked;
+                // Waiting for an unrelated transfer does not justify a completion epoch
+                // or spilling peers when the next chunk can fit after settlement.
+                if (result == GenerationGrowthResult::CapacityWait) { generation_pressure_ = true; }
+            }
+        }
+        if (changed) {
+            request_admission_check();
+            publish_runtime_stats();
+        }
+    }
+
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
         for (;;) {
@@ -3187,6 +3442,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                service_generation_reservations();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -3257,6 +3513,9 @@ private:
     DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    const std::uint32_t generation_reservation_tokens_;
+    std::uint64_t generation_protected_request_ = 0;
+    bool generation_pressure_                   = false;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool context_cache_enabled_;

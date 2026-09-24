@@ -68,6 +68,72 @@ cmake --build build --parallel --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
 
+For incremental generation reservations and live KV suspension:
+
+```bash
+cmake --build build-agent-verify -j --target ninfer_generation_reservations_test \
+  ninfer_generation_reservations_real_test ninfer_admission_policy_test \
+  ninfer_resource_manager_test ninfer_qwen3_6_context_store_test
+ctest --test-dir build-agent-verify --output-on-failure \
+  -R '^ninfer_(generation_reservations|admission_policy|resource_manager|qwen3_6_context_store)_test$'
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  ctest --test-dir build-agent-verify --output-on-failure -V \
+  -R '^ninfer_generation_reservations_real_test$'
+```
+
+The CPU tests exhaust reservation arithmetic and protected-epoch ordering for two, four and eight
+lanes. The context-store test checks exact KV bytes after restoring into different physical pages,
+partial tails, explicit slack release and unchanged accounting after failed growth. ResourceManager
+tests cover cache reclamation stopping at sufficient capacity and avoiding repeated auto-save pins.
+
+The real Engine fixture uses BF16 KV, a 64-token quantum and 400-token greedy output limits. It exercises
+2/4/8 concurrent requests, eager and CUDA-graph decode, shared prefixes, zero/tight Host budgets,
+protected-owner cancellation and cancellation during a deliberately delayed spill. Surviving token
+IDs must exactly match the unsuspended baseline; streamed text/reasoning must match the aggregate
+result with one stream start, and all live Host backing must be released. A 16,384-token quantum
+provides the full-reservation comparison at the same pool and output limits. The fixture prints
+queue/first-token/completion times, transfer bytes, peak live backing claims and startup pool bytes;
+these are fixture observations, not general performance claims or measured total peak VRAM/RAM.
+
+Speculative suspension is disabled; MTP/DFlash/DFlash2 retain full reservations. Real-model
+multimodal suspension, reasoning-heavy responses, long generated tool calls, non-greedy sampling
+and external proxy idle timeouts are not qualified by this fixture. See the
+[resource contract](../docs/maintainer/resource-scheduling-and-context-cache.md#61-admission-reservation)
+for fixed Device State ownership and synchronous transfer settlement.
+
+Qualification on 2026-09-24 used `/models/qwen3_8_27b.ninfer` (groupwise-int), RTX 4090,
+driver 595.91.07 and a Release sm_89 build with CUDA 13.3.73. All nine real scenarios passed in
+337.62 seconds, alongside 12 focused reservation, resource, option/logging and protocol checks.
+Surviving requests exactly matched their isolated greedy token oracle. The four-request comparison
+used a 512-token shared KV pool, 512 MiB Host KV arena, CUDA graphs and identical output limits:
+
+| Reservation quantum | Cohort completion | Maximum admission wait | Maximum first-token time | Suspensions / resumes | Peak live Host backing claim |
+|---|---|---|---|---|---|
+| 64 tokens | 25.32 s | 0.19 s | 0.23 s | 3 / 3 | 112 MiB |
+| 16,384 tokens (full reservation here) | 31.88 s | 23.90 s | 23.94 s | 0 / 0 | 0 |
+
+The incremental case transferred 48 MiB of KV in total. Both reported the same 18,386,484,224 bytes
+of weights, sequence and workspace pool capacity. These single correctness-fixture observations
+demonstrate admission and suspension behavior; they do not establish production throughput or
+measure total peak VRAM/pinned RAM. No deployment or external proxy smoke test was performed.
+
+For admission while another cached request has an unsettled State fork:
+
+```bash
+cmake --build build-agent-verify -j --target ninfer_materialization_fork_real_test
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  ctest --test-dir build-agent-verify -R '^ninfer_materialization_fork_real_test$' \
+  --output-on-failure
+```
+
+This reproduces the 2026-09-24 `selected pressure target could not be sealed` failure with
+MTP3, `rk4v4-e8` KV, three concurrent sessions, six Device State slots and cached conversation
+rewrites. Before the fix, the second round failed the Engine: pressure assessment accepted a
+memory-feasible plan while final validation rejected an unsettled active State fork. Admission now
+waits for that fork to settle. On RTX 4090 with the Qwen3.8 groupwise artifact, all eight rounds
+(24 requests, 64 output tokens each) completed; the admission-policy and ResourceManager tests also
+passed. This is a liveness regression, not a throughput measurement.
+
 For cached side-request scheduling and SSD recovery, build and run only the affected checks:
 
 ```bash

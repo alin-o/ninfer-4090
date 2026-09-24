@@ -30,6 +30,17 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.generation_reservation_tokens == 16384,
+                      "generation reservation quantum default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--generation-reservation-tokens", "64"})
+                          .generation_reservation_tokens == 64,
+                      "small generation reservation quantum");
+    for (const char* invalid : {"0", "-1", "2147483648", "4294967296"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--generation-reservation-tokens", invalid}); }
+        catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "invalid generation reservation quantum accepted");
+    }
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

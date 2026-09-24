@@ -35,7 +35,9 @@ struct SchedulerRequest {
         }
     };
 
-    enum class State : std::uint8_t { Decode, Control, Prefill };
+    enum class State : std::uint8_t { Decode, Control, Prefill, Suspended, Finished };
+
+    [[nodiscard]] bool is_model_finished() const noexcept { return state == State::Finished; }
 
     [[nodiscard]] bool is_prefilling() const noexcept { return state == State::Prefill; }
 
@@ -132,6 +134,58 @@ int main() {
                                                                        revision(34));
                       }),
                       "unclassified post-protection active request was accepted as a donor");
+
+    // Enumerate the resident/suspended/finished topologies for the supported cohort sizes.
+    // A live protected owner survives topology changes; after it leaves, oldest ownership wins.
+    for (const std::uint32_t count : {2U, 4U, 8U}) {
+        std::uint32_t combinations = 1;
+        for (std::uint32_t i = 0; i < count; ++i) { combinations *= 3; }
+        for (std::uint32_t topology = 0; topology < combinations; ++topology) {
+            std::array<std::shared_ptr<SchedulerRequest>, 8> cohort;
+            auto remaining = topology;
+            std::optional<std::uint32_t> oldest;
+            std::optional<std::uint32_t> protected_lane;
+            std::size_t runnable = 0;
+            for (std::uint32_t lane = 0; lane < count; ++lane) {
+                auto request     = std::make_shared<SchedulerRequest>();
+                request->id      = count - lane;
+                const auto state = remaining % 3;
+                remaining /= 3;
+                request->state               = state == 0   ? SchedulerRequest::State::Decode
+                                               : state == 1 ? SchedulerRequest::State::Suspended
+                                                            : SchedulerRequest::State::Finished;
+                request->budget              = SchedulerRequest::Budget{16};
+                request->output.model_tokens = 16;
+                request->sequence            = request->id;
+                runnable += state == 0;
+                cohort[lane] = request;
+                if (state != 2) {
+                    oldest = lane;
+                    if (request->id == count) { protected_lane = lane; }
+                }
+            }
+            Scheduler generation;
+            std::uint32_t mandatory = 0;
+            std::optional<std::uint32_t> oldest_mandatory;
+            for (std::uint32_t lane = 0; lane < count; ++lane) {
+                if (cohort[lane]->is_decode_ready() && lane % 2 == 0) {
+                    mandatory |= 1U << lane;
+                    oldest_mandatory = lane;
+                }
+            }
+            failures +=
+                check(generation.select_generation_protected_lane(cohort, count, 0, mandatory) ==
+                          (oldest_mandatory ? oldest_mandatory : oldest),
+                      "full-reservation incumbents lost their completion epoch");
+
+            failures +=
+                check(generation.select_generation_protected_lane(cohort, count, count) ==
+                          (protected_lane ? protected_lane : oldest),
+                      "completion epoch replaced a live owner or skipped the oldest survivor");
+            failures += check(generation.build_round_membership(cohort, count).size == runnable,
+                              "suspended/finished request entered compact decode");
+        }
+    }
 
     Scheduler scheduler;
     scheduler.observe_fifo_head(10);

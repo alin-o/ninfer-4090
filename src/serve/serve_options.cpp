@@ -75,7 +75,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
+           "[--prefill-chunk N] [--generation-reservation-tokens N (default 16384)] "
+           "[--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -210,6 +211,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--generation-reservation-tokens") {
+            options.generation_reservation_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--generation-reservation-tokens"),
+                                      "generation-reservation-tokens"));
+            if (options.generation_reservation_tokens == 0) {
+                throw std::invalid_argument("--generation-reservation-tokens must be positive");
+            }
         } else if (arg == "--turn-checkpoints") {
             // Retired, but still accepted: the deployed container line passes it, and an
             // unknown argument is fatal below. The value is validated and dropped; main()

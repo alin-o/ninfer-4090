@@ -145,6 +145,25 @@ public:
     }
 
     template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    select_generation_protected_lane(const Slots& slots, std::uint32_t max_concurrency,
+                                     std::uint64_t protected_request        = 0,
+                                     std::uint32_t mandatory_resident_lanes = 0) const noexcept {
+        std::optional<std::uint32_t> selected;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || request->is_model_finished()) { continue; }
+            if (request->id == protected_request) { return lane; }
+            const auto rank = [&](std::uint32_t candidate) {
+                return std::tuple{(mandatory_resident_lanes & (1U << candidate)) == 0,
+                                  slots[candidate]->id};
+            };
+            if (!selected || rank(lane) < rank(*selected)) { selected = lane; }
+        }
+        return selected;
+    }
+
+    template <class Slots>
     [[nodiscard]] RoundMembership build_round_membership(const Slots& slots,
                                                          std::uint32_t max_concurrency) const {
         RoundMembership membership;

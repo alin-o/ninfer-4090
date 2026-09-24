@@ -181,10 +181,23 @@ struct CaptureAssessmentImpl {
     PhysicalResources capacity_preparation_removed;
 };
 
+// Private live KV backing. Fixed lane-local State/sampling storage stays resident and is
+// included in the startup concurrency envelope; it cannot be reused by another request.
+struct GenerationBacking {
+    HostKVAllocation kv;
+    std::vector<DeviceKVPageHandle> page_handles;
+    std::uint32_t completion_pages = 0;
+    std::uint32_t quantum          = 0;
+    std::uint32_t saved_tokens     = 0;
+    bool suspended                 = false;
+};
+
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     detail::PhysicalDemand root_demand;
+    std::shared_ptr<GenerationBacking> generation_backing;
+    std::uint32_t completion_pages = 0;
     runtime::PrefillWork root_rebuild_work;
     std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_6::PreparedContextCache context_cache;
@@ -250,6 +263,7 @@ struct ResourceCandidateState {
 
 template <>
 struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
+    std::shared_ptr<GenerationBacking> generation_backing;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -466,6 +480,7 @@ struct SharedPrefixSlot {
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
+    std::shared_ptr<detail::GenerationBacking> generation_backing;
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
@@ -527,6 +542,20 @@ public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device, const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
+
+    [[nodiscard]] runtime::GenerationProgressWitness
+    generation_progress_witness(SequenceHandle protected_sequence,
+                                std::span<const SequenceHandle> cohort) const;
+    bool configure_generation_reservation(RequestBasePlan& base, std::uint32_t quantum,
+                                          bool incremental);
+    [[nodiscard]] runtime::GenerationReservationState
+    generation_reservation_state(SequenceHandle sequence) const;
+    [[nodiscard]] runtime::GenerationGrowthResult
+    grow_generation(SequenceHandle sequence, std::uint32_t next_tokens, bool completion);
+    void release_generation_slack(SequenceHandle sequence, std::uint32_t next_tokens);
+    [[nodiscard]] bool suspend_generation(SequenceHandle sequence);
+    [[nodiscard]] bool resume_generation(SequenceHandle sequence, bool completion);
+    void detach_generation_sources(SequenceHandle sequence);
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -1122,6 +1151,7 @@ private:
     [[nodiscard]] bool materialization_pins(std::uint32_t index,
                                             std::uint64_t generation) const noexcept;
     [[nodiscard]] bool has_unsettled_state_fork() const noexcept;
+    [[nodiscard]] bool materialization_transition_blocked() const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
     // Per-owner resources are intentionally distinct from global physical occupancy: an aliased
     // allocation contributes only when removing this owner would release it.

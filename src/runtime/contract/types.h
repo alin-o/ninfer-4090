@@ -467,6 +467,8 @@ struct RequestPlanSummary {
     PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
     std::uint64_t service_work_quanta     = 0;
     bool publish_continuation             = true;
+    bool incremental_reservation              = false;
+    std::size_t generation_host_backing_bytes = 0;
 };
 
 enum class MaterializationPhysicalStatus : std::uint8_t {
@@ -719,6 +721,33 @@ struct PrefillStepResult {
     bool complete                         = false;
     ExecutionTiming timing;
 };
+
+struct GenerationReservationState {
+    std::uint32_t mapped_tokens         = 0;
+    std::uint32_t reserved_tokens       = 0;
+    std::size_t host_backing_bytes      = 0;
+    std::size_t host_backing_used_bytes = 0;
+    std::size_t mapped_bytes            = 0;
+    bool incremental                    = false;
+    bool suspended                      = false;
+    bool can_suspend                    = false;
+    bool completion_reserved            = true;
+};
+
+// A bounded completion construction. Device State and lane-local sampling remain resident;
+// victim KV is privately backed before admission. The protected owner can be reconstructed
+// without aliases after the victim set and optional caches relinquish their KV references.
+struct GenerationProgressWitness {
+    ProgramResourceRevision resource_revision;
+    LaneId protected_lane;
+    std::uint32_t victim_lanes          = 0;
+    std::uint32_t completion_main_pages = 0;
+    std::uint32_t resident_state_slots  = 0;
+    std::size_t host_backing_bytes      = 0;
+    bool feasible                       = false;
+};
+
+enum class GenerationGrowthResult : std::uint8_t { Ready, CapacityWait, TransactionWait };
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;

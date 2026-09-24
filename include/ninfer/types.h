@@ -178,6 +178,7 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t generation_reservation_tokens = 16384;
     // Retained host-side turn checkpoints per lane (0 disables the ring). Each entry snapshots
     // the linear-attention state at a past turn boundary so a prompt that diverges mid-history
     // re-prefills from the nearest checkpoint instead of from zero. Host memory cost per entry
@@ -334,7 +335,7 @@ struct GeneratedToolCall {
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
 // normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// complete marker region to ordinary content. Interrupted unparseable regions are withheld instead.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -342,6 +343,7 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    IncompleteGeneration,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -359,6 +361,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::IncompleteGeneration:
+        return "incomplete_generation";
     }
     return "malformed_structure";
 }
@@ -1166,6 +1170,18 @@ context_cache_owner_metric_index(ContextCacheMetricRole role, ContextCacheMetric
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    std::uint64_t generation_extension_attempts = 0;
+    std::uint64_t generation_extension_grants = 0;
+    std::uint64_t generation_extension_waits = 0;
+    std::uint64_t generation_suspensions = 0;
+    std::uint64_t generation_resumes = 0;
+    std::uint64_t generation_transfer_bytes = 0;
+    std::uint64_t generation_mapped_tokens = 0;
+    std::uint64_t generation_reserved_tokens = 0;
+    std::uint64_t generation_host_backing_bytes = 0;
+    std::uint64_t generation_host_backing_used_bytes = 0;
+    std::uint64_t generation_protected_request = 0;
+    double generation_suspended_seconds = 0.0;
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;

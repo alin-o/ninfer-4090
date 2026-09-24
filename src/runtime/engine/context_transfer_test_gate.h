@@ -66,6 +66,9 @@ struct SharedSnapshotExportTestGate {
 };
 
 #ifdef NINFER_TEST_HOOKS
+void install_generation_transfer_gate(const ContextTransferTestGate* gate) noexcept;
+void clear_generation_transfer_gate() noexcept;
+[[nodiscard]] const ContextTransferTestGate* generation_transfer_gate() noexcept;
 void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate* gate) noexcept;
 void clear_shared_snapshot_import_gate() noexcept;
 void shared_snapshot_import_checkpoint(SharedSnapshotImportStage stage);
@@ -102,6 +105,14 @@ void note_active_capture_submitted_cancellation() noexcept;
 [[nodiscard]] std::uint64_t active_capture_submitted_cancellations() noexcept;
 #else
 // No hook storage, atomic accounting, or injectable callbacks in application-only builds.
+inline void install_generation_transfer_gate(const ContextTransferTestGate*) noexcept {}
+
+inline void clear_generation_transfer_gate() noexcept {}
+
+[[nodiscard]] inline const ContextTransferTestGate* generation_transfer_gate() noexcept {
+    return {};
+}
+
 inline void install_shared_snapshot_import_gate(const SharedSnapshotImportTestGate*) noexcept {}
 
 inline void clear_shared_snapshot_import_gate() noexcept {}

@@ -100,6 +100,10 @@ enum class EngineRequestState : std::uint8_t {
     Prefill,
     DecodeReady,
     ControlReady,
+    GrowthBlocked,
+    Suspending,
+    Suspended,
+    Resuming,
     ModelFinished,
 };
 
@@ -181,6 +185,8 @@ struct RequestRecord {
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
+    EngineRequestState reservation_return_state = EngineRequestState::DecodeReady;
+    std::optional<Clock::time_point> suspended_at;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;

@@ -73,12 +73,12 @@ For incremental generation reservations and live KV suspension:
 ```bash
 cmake --build build-agent-verify -j --target ninfer_generation_reservations_test \
   ninfer_generation_reservations_real_test ninfer_admission_policy_test \
-  ninfer_resource_manager_test ninfer_qwen3_6_context_store_test
+  ninfer_resource_manager_test ninfer_qwen3_6_context_store_test ninfer_kv_cache_test
 ctest --test-dir build-agent-verify --output-on-failure \
-  -R '^ninfer_(generation_reservations|admission_policy|resource_manager|qwen3_6_context_store)_test$'
+  -R '^ninfer_(generation_reservations|admission_policy|resource_manager|kv_cache|qwen3_6_context_store)_test$'
 NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
   ctest --test-dir build-agent-verify --output-on-failure -V \
-  -R '^ninfer_generation_reservations(_mtp)?_real_test$'
+  -R '^ninfer_generation_reservations(_mtp|_mixed|_mixed_mtp)?_real_test$'
 ```
 
 The CPU tests exhaust reservation arithmetic and protected-epoch ordering for two, four and eight
@@ -100,13 +100,30 @@ The MTP variant of the fixture (`--mtp`, registered as
 pressure/cancellation cases, requires simultaneous admission, consistent speculative accounting and
 exact token IDs, and adds three concurrent requests with a one-token quantum, short stopped
 responses with a large output ceiling, and a forced thinking-control suffix. Both KV pools contribute
-to transfer and Host-backing metrics. Tight Host capacity must exercise the full-reservation fallback.
+to transfer and Host-backing metrics. Tight Host capacity exercises backed and unbacked owners
+running together; zero Host backing serializes long owners while preserving chunked reservations.
+The MTP suite also cancels the unbacked protected owner during another owner's spill, cancels with
+Host backing disabled, and queues a four-request cohort when only one complete Host image fits.
+Monitor snapshots must never show more than the prompt/mapped extent plus a chunk and page alignment,
+including after pressure growth and restore. The physical KV test also checks allocation rollback
+and exact transfer bytes across three separated Host regions.
 An output request beyond the context ceiling checks the final-token/context-limit boundary under
 pressure with a one-token quantum.
+
 An ample-pool control also runs without suspension: proposal/acceptance positions can differ from
 the isolated baseline when batch shape changes, so these counters are not a bitwise oracle across
 batch shapes. The fixture also compares three short requests with a 160,000-token output ceiling,
 200,000-token KV/context capacity, a 10 GiB Host arena, and 16,384-token versus full reservations.
+
+The mixed-limit regressions (`--mixed` and `--mtp --mixed`, registered as
+`ninfer_generation_reservations_mixed_real_test` and
+`ninfer_generation_reservations_mixed_mtp_real_test`) submit a 64-token full-reservation request
+after two 400-token incremental requests have started. With a 64-token reservation quantum and
+512-token shared KV pool, all three must coexist and the short request must finish before the
+older long request. The tests check pressure, cancellation of the full owner, subsequent partial
+suspension/resume, exact isolated greedy token IDs, one response start, complete streamed text,
+and release of live Host backing. `--mixed-ample` (optionally after `--mtp`) is the corresponding
+1,536-token KV control without pressure.
 
 DFlash/DFlash2 retain full reservations. Real-model
 multimodal suspension, reasoning-heavy responses, long generated tool calls, non-greedy sampling
@@ -115,40 +132,22 @@ and external proxy idle timeouts are not qualified by this fixture. See the
 for fixed Device State ownership and synchronous transfer settlement.
 
 Qualification on 2026-09-24 used `/models/qwen3_8_27b.ninfer` (groupwise-int), RTX 4090,
-driver 595.91.07 and a Release sm_89 build with CUDA 13.3.73. All nine real scenarios passed in
-337.62 seconds, alongside 12 focused reservation, resource, option/logging and protocol checks.
-Surviving requests exactly matched their isolated greedy token oracle. The four-request comparison
-used a 512-token shared KV pool, 512 MiB Host KV arena, CUDA graphs and identical output limits:
+driver 595.91.07 and a Release sm_89 build with CUDA 13.3.73. The command above passed all four
+registered real-model tests in 642.03 seconds: nine ordinary scenarios, 19 MTP scenarios, and four
+mixed-limit completion/cancellation scenarios. The five focused tests also passed. Both target
+variants and CLI/server built. Surviving requests preserved exact isolated greedy token IDs,
+complete streaming output and their output limits. Reservation bounds held through pressure,
+resume and missing Host backing. Fragmented allocation failure returned all provisional storage,
+and spill/restore across three separated Host regions preserved exact canonical KV bytes.
 
-| Reservation quantum | Cohort completion | Maximum admission wait | Maximum first-token time | Suspensions / resumes | Peak live Host backing claim |
-|---|---|---|---|---|---|
-| 64 tokens | 25.32 s | 0.19 s | 0.23 s | 3 / 3 | 112 MiB |
-| 16,384 tokens (full reservation here) | 31.88 s | 23.90 s | 23.94 s | 0 / 0 | 0 |
-
-The incremental case transferred 48 MiB of KV in total. Both reported the same 18,386,484,224 bytes
-of weights, sequence and workspace pool capacity. These single correctness-fixture observations
-demonstrate admission and suspension behavior; they do not establish production throughput or
-measure total peak VRAM/pinned RAM. No deployment or external proxy smoke test was performed.
-
-MTP qualification on the same date, artifact, hardware and toolchain passed all 16 scenarios above.
-The four focused checks passed, and the nine ordinary-generation scenarios plus the 24-request
-cached-State-fork regression passed in 363.43 seconds. Both target variants and CLI/server built.
-The three-request 160K-ceiling comparison uses a short number-list response stopped by the same
-string in both runs, MTP3, `rk4v4-e8`, CUDA graphs, six total Device State slots (three active plus
-three extra), a 200,000-token context/KV pool and a 10 GiB Host KV arena:
-
-| Reservation policy | Peak concurrent requests | Cohort completion | Maximum admission wait | Maximum first-token time |
-|---|---|---|---|---|
-| 16,384-token chunks | 3 | 1.41 s | 0.15 s | 0.20 s |
-| Full 160K completion reservations | 1 | 2.25 s | 1.50 s | 1.55 s |
-
-Both runs preserved the exact isolated greedy output and streamed each response once. Neither
-needed a spill because these responses stopped early. Incremental admission claimed 8,881,631,232
-bytes of live backing inside the fixed Host arena; both runs reported the same 22,228,553,984 bytes
-of weights, sequence and workspace pool capacity. Separate pressure cases exercised Main/MTP
-spilling and restoring at concurrency 2/4/8, including shared prefixes and cancellation during a
-delayed copy. This comparison establishes the admission behavior for this fixture, not general
-production throughput. Device State-slot limits and mandatory Host-backing requirements still apply.
+With the tight Host budget, a backed owner and an unbacked owner ran together with chunked GPU
+reservations. The four-request MTP fixture admitted two at a time and completed all four. With zero
+Host backing, the two-request fixture serialized while still growing in chunks. The 160K-output-cap
+MTP comparison admitted three short responses with the default 16,384-token quantum versus one
+with full reservations; both preserved the exact baseline output. These correctness fixtures do not
+establish general production throughput. Device State-slot limits still apply independently of KV:
+cached State images can occupy the shared C+H pool even when logical lanes and KV capacity are free.
+No server restart, deployment or external proxy smoke test was performed.
 
 For admission while another cached request has an unsettled State fork:
 

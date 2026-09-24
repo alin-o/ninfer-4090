@@ -751,6 +751,9 @@ struct GenerationObservationOptions {
     bool phase_timings   = false;
     bool live_timings    = false;
     bool prompt_progress = false;
+    // Caller-assigned diagnostic identity (HTTP serving uses its request log ID). Published in
+    // SlotState; absent means use the Engine ID. Does not change internal scheduling identity.
+    std::optional<std::uint64_t> request_id;
 };
 
 class CancellationView {
@@ -1395,6 +1398,7 @@ struct SlotState {
     std::vector<SlotCheckpoint> checkpoints;
     // Detailed memory/reservation fields are populated in ContextSnapshot only.
     ContextMemory memory; // Active request's referenced State/KV, including retained anchors.
+    // Caller-supplied observation ID, or the Engine ID when no override was supplied.
     std::uint64_t request_id              = 0;
     std::uint32_t lane                    = 0;
     std::uint32_t mapped_tokens           = 0;

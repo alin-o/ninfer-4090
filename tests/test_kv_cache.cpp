@@ -362,6 +362,55 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     std::optional<ninfer::HostKVAllocation> reused = host_arena.allocate(host_layout, 1);
     failures += expect(reused.has_value(), label + " released Host subextent was not reusable");
 
+    // Three separated holes together fit five pages, but no individual hole does.
+    ninfer::HostKVArena fragmented_arena(host_layout.page_stride * 7, layouts);
+    std::vector<ninfer::HostKVAllocation> separators;
+    for (unsigned i = 0; i < 7; ++i) {
+        separators.push_back(std::move(*fragmented_arena.allocate(host_layout, 1)));
+    }
+    for (const unsigned i : {0U, 1U, 3U, 4U, 6U}) { separators[i].release(); }
+    failures += expect(!fragmented_arena.allocate(host_layout, 5), label + " fixture not fragmented");
+    failures += expect(!fragmented_arena.allocate_fragmented(host_layout, 6),
+                       label + " oversized fragmented allocation succeeded");
+    failures += expect_size(fragmented_arena.occupied_bytes(), host_layout.page_stride * 2,
+                            label + " fragmented failure leaked backing");
+    auto regions = fragmented_arena.allocate_fragmented(host_layout, 5);
+    failures += expect(regions && regions->size() == 3,
+                       label + " fragmented backing did not cover separated holes");
+    if (regions) {
+        std::size_t offset = 0;
+        for (auto& region : *regions) {
+            const auto count = region.page_count();
+            auto view = fragmented_arena.writable_view(region);
+            std::memset(view.data(), 0, count * host_layout.page_stride);
+            source.copy_to_host(std::span(source_handles).subspan(offset, count), view,
+                                context.stream);
+            offset += count;
+        }
+        context.synchronize();
+        destination.zero_pages(restored_handles, context.stream);
+        offset = 0;
+        for (const auto& region : *regions) {
+            const auto count = region.page_count();
+            failures += expect(std::memcmp(fragmented_arena.view(region).data(),
+                                           expected.data() + offset * host_layout.page_stride,
+                                           count * host_layout.page_stride) == 0,
+                               label + " fragmented spill changed canonical bytes");
+            destination.copy_from_host(fragmented_arena.view(region),
+                                       std::span(restored_handles).subspan(offset, count),
+                                       context.stream);
+            offset += count;
+        }
+        destination.copy_to_host(restored_handles, roundtrip_view, context.stream);
+        context.synchronize();
+        failures += expect(std::memcmp(roundtrip_view.data(), expected.data(), expected.size()) == 0,
+                           label + " fragmented restore changed canonical bytes");
+    }
+    regions.reset();
+    for (auto& separator : separators) { separator.release(); }
+    failures += expect(fragmented_arena.can_allocate(host_layout, 7),
+                       label + " fragmented release did not coalesce arena");
+
     ninfer::HostKVArena recipe_arena(host_layout.page_stride * 8,
                                      std::span<const ninfer::HostKVPageLayout>(layouts));
     auto recipe_left   = recipe_arena.allocate(host_layout, 2);

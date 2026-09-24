@@ -185,17 +185,25 @@ struct CaptureAssessmentImpl {
 // Private live KV backing. Fixed lane-local State/sampling storage stays resident and is
 // included in the startup concurrency envelope; it cannot be reused by another request.
 struct GenerationKVBacking {
-    HostKVAllocation kv;
+    std::vector<HostKVAllocation> regions;
     std::vector<DeviceKVPageHandle> page_handles;
     std::uint32_t completion_pages = 0;
     std::uint32_t saved_tokens     = 0;
+
+    [[nodiscard]] std::uint32_t backed_pages() const noexcept {
+        std::uint32_t pages = 0;
+        for (const auto& region : regions) { pages += region.page_count(); }
+        return pages;
+    }
+
+    [[nodiscard]] bool backed() const noexcept { return backed_pages() == completion_pages; }
 };
 
 struct GenerationBacking {
     GenerationKVBacking main;
     GenerationKVBacking backend;
     runtime::ReservationHorizon horizon{};
-    bool suspended                 = false;
+    bool suspended = false;
 };
 
 template <>
@@ -203,7 +211,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     detail::PhysicalDemand root_demand;
     std::shared_ptr<GenerationBacking> generation_backing;
-    std::uint32_t completion_pages = 0;
+    std::uint32_t completion_pages         = 0;
     std::uint32_t completion_backend_pages = 0;
     runtime::PrefillWork root_rebuild_work;
     std::uint32_t root_rebuild_tail_begin = 0;
@@ -553,18 +561,17 @@ public:
     [[nodiscard]] runtime::GenerationProgressWitness
     generation_progress_witness(SequenceHandle protected_sequence,
                                 std::span<const SequenceHandle> cohort) const;
-    bool configure_generation_reservation(RequestBasePlan& base, std::uint32_t quantum,
-                                          bool incremental);
+    void configure_generation_reservation(RequestBasePlan& base, std::uint32_t quantum);
     [[nodiscard]] runtime::GenerationReservationState
     generation_reservation_state(SequenceHandle sequence) const;
-    [[nodiscard]] runtime::GenerationGrowthResult
-    grow_generation(SequenceHandle sequence, std::uint32_t next_tokens, bool completion);
+    [[nodiscard]] runtime::GenerationGrowthResult grow_generation(SequenceHandle sequence,
+                                                                  std::uint32_t next_tokens);
     [[nodiscard]] detail::PhysicalDeviceResources
     generation_unit_pages(const SequenceState& sequence, const detail::GenerationBacking& backing,
                           std::uint32_t next_tokens) const;
     void release_generation_slack(SequenceHandle sequence, std::uint32_t next_tokens);
     [[nodiscard]] bool suspend_generation(SequenceHandle sequence);
-    [[nodiscard]] bool resume_generation(SequenceHandle sequence, bool completion);
+    [[nodiscard]] bool resume_generation(SequenceHandle sequence, std::uint32_t next_tokens);
     void detach_generation_sources(SequenceHandle sequence);
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -1523,7 +1530,7 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
                      const PressureDecision* override_decision = nullptr);
     [[nodiscard]] detail::PhysicalResources
     construction_residual(std::uint32_t candidate_index,
-                           std::span<const std::uint16_t> choices) const;
+                          std::span<const std::uint16_t> choices) const;
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);

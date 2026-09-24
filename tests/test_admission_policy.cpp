@@ -182,6 +182,24 @@ int main() {
                 check(generation.select_generation_protected_lane(cohort, count, count) ==
                           (protected_lane ? protected_lane : oldest),
                       "completion epoch replaced a live owner or skipped the oldest survivor");
+            for (std::uint32_t owner = 0; owner < count; ++owner) {
+                const bool live = !cohort[owner]->is_model_finished();
+                const auto expected =
+                    live && (!oldest_mandatory || (mandatory & (1U << owner)))
+                        ? std::optional<std::uint32_t>(owner)
+                        : (oldest_mandatory ? oldest_mandatory : oldest);
+                failures += check(generation.select_generation_protected_lane(
+                                      cohort, count, cohort[owner]->id, mandatory) == expected,
+                                  "mixed cohort did not protect a full owner before partial owners");
+            }
+            for (std::uint32_t unbacked = 0; unbacked < count; ++unbacked) {
+                const auto expected = oldest_mandatory ? oldest_mandatory
+                    : !cohort[unbacked]->is_model_finished()
+                        ? std::optional<std::uint32_t>(unbacked) : oldest;
+                failures += check(generation.select_generation_protected_lane(
+                                      cohort, count, 0, mandatory, 1U << unbacked) == expected,
+                                  "unbacked owner lost priority to a backed partial owner");
+            }
             failures += check(generation.build_round_membership(cohort, count).size == runnable,
                               "suspended/finished request entered compact decode");
         }

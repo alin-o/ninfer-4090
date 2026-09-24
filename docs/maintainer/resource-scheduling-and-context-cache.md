@@ -36,8 +36,8 @@ Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但
 
 1. Scheduler 先确定本次尝试的 request，资源层只优化该 request 的 materialization；
 2. Active publication requires a completion witness. Ordinary and MTP generation may hold a smaller
-   current KV entitlement backed by a private Host continuation reservation. DFlash/DFlash2 backends
-   and requests without that backing retain full completion reservations.
+   current KV entitlement, with at most one unbacked partial owner. DFlash/DFlash2 backends retain
+   full completion reservations; an unbacked ordinary/MTP owner remains chunked.
 
 ---
 
@@ -451,28 +451,39 @@ worker-owned slack release precedes suspension; shrinking never removes committe
 During an outstanding context transaction, execution may use its existing entitlement; units
 requiring growth wait until that transaction settles.
 
-Partial admission also reserves a private allocation from the existing pinned Host KV arena for
-the request's **complete** effective Main and enabled MTP backend KV extents. This conservative
-backing reservation avoids any future Host-allocation dependency. It is mandatory live backing,
-not an evictable cache replica.
-Inactive cache extents and live backing share the same physical arena/accounting. No SSD spill or
-prompt replay is used. If backing cannot be obtained, use full Device reservations; a full-reservation
-arrival waits behind an existing partial cohort. Zero Host capacity remains supported.
+Partial admission attempts to reserve private regions from the existing pinned Host KV arena for
+its **complete** effective Main and enabled MTP backend KV extents. Regions can span separate free
+extents, avoiding a contiguous-allocation requirement. Backing is all-or-nothing across both pools
+and avoids future Host-allocation dependencies. It is mandatory live backing, not an evictable cache
+replica. Inactive cache extents and live backing share the physical arena/accounting. No SSD spill or
+prompt replay is used.
+
+If backing is unavailable, ordinary/MTP requests still use chunked Device reservations. At most one
+unbacked partial owner may be resident alongside backed partial owners and naturally full owners.
+With zero Host capacity, further partial owners wait until the resident owner holds its final
+chunk or finishes; no initial full-output Device reservation is required.
+A naturally full FIFO head can join a partial cohort when its actual Device/State reservation fits
+and no pressure epoch is active. The output-limit class alone does not block admission.
 
 The completion witness is a constructive root restore: the protected request's complete private KV
 extents fit their existing Device pools; every other partial owner has already reserved its Host
 snapshot destination. Suspend that bounded set and reclaim optional cache ownership. If shared
-COW tails still retain capacity, snapshot and privatize the protected address too. Restore dependencies
-are the private Host allocations and the request's retained State bindings. The physical pool counts
-shared pages once and returns them only after their final reference. The witness adds no second
+COW tails still retain capacity, a backed protected owner can snapshot and privatize its address too.
+An unbacked protected owner retains its mappings and detaches cache-source references instead.
+Restore dependencies are the private Host regions and the request's retained State bindings.
+The physical pool counts shared pages once and returns them only after their final reference. The witness adds no second
 physical allocation or Scheduler memory counter. An existing full entitlement is itself a witness.
 Program validates the construction at worker boundaries against its resource revision and actual
 Device/Host capacities. Requests unable to fit alone are rejected without reducing their output limit.
 
-Under pressure, protect the selected request through completion or cancellation and obtain its full
-completion entitlement. Then prefer the oldest admitted request. New arrivals cannot bypass suspended
-or growth-blocked owners. The resident-plus-suspended cohort stays bounded by configured concurrency;
-a suspended request retains its logical lane. Long protected output bounds can delay short requests.
+Owners with complete entitlements take completion priority, followed by the sole unbacked partial
+owner, then backed partial owners. Within each class, keep the selected owner through completion or
+cancellation, then prefer the oldest admitted request. Under pressure, reclaim optional caches and
+suspend eligible peers only until the selected owner's next chunk fits. Growth and restore never
+grant the full eventual footprint merely to secure completion. Backing remains held until teardown.
+New arrivals wait throughout the finite pressure epoch so they cannot starve that owner's progress.
+The resident-plus-suspended cohort stays bounded by configured concurrency; a suspended request
+retains its logical lane. Long protected output bounds can delay short requests.
 
 Prefill is never suspended. MTP includes both Main KV and its backend KV in admission, growth,
 Host backing, spill/restore and the completion witness. The backend entitlement includes up to
@@ -506,13 +517,13 @@ This is a deliberate fixed-cohort design; releasing State/lane storage for addit
 require a new continuation contract.
 
 At a committed decode/control boundary Program copies every mapped KV page (including the partial
-tail) into its reserved Host allocation, waits for the bounded transfer to settle, then releases its
+tail) into its reserved Host regions, waits for the bounded transfer to settle, then releases its
 Device address mappings/growth entitlement and cache-source edges. The Host image is private and
-immutable while suspended. Restore first reserves the whole destination, recreates private pages,
+immutable while suspended. Restore first reserves the saved mappings plus the next chunk (or the next unit when space is tight), recreates private pages,
 copies exact bytes (including any mapped provisional MTP tail), validates/publishes each committed
 frontier and rebinds the existing execution row.
-State, token positions and output budget are not recomputed. A full completion grant releases Host
-backing after publication; otherwise it remains reserved. Copies use the existing transfer stream and
+State, token positions and output budget are not recomputed. Host backing remains reserved until
+request teardown. Copies use the existing transfer stream and
 Host arena, with no separate staging allocation. Submission failures drain queued copies before cleanup.
 Cancellation and shutdown release backing only at a settled worker boundary.
 
@@ -533,11 +544,12 @@ inactive owners，但只有严格优于 private-only baseline 的完整终态才
 
 ### 6.3 Persistent backfill proof
 
-This proof applies only to full-reservation backfill. Backfill candidates are planned with full
-entitlements and no suspension backing; the proof also charges the blocked head's complete eventual
+This proof applies only to naturally full-reservation backfill. Partial candidates are skipped,
+without expanding their entitlements; the proof also charges the blocked head's complete eventual
 KV footprint, even when its initial horizon is partial. Backfill closes while any partial owner is
-resident. Existing full-reservation owners finish before an incremental owner becomes the protected
-epoch; they cannot be chosen as suspension victims.
+resident. Full-reservation FIFO arrivals can still enter when their reservations fit. Full owners
+finish before an incremental owner becomes the protected pressure epoch; they cannot be chosen as
+suspension victims.
 
 Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program
 提供的物理证明使用同一 feasibility oracle：

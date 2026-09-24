@@ -153,8 +153,9 @@ Ordinary and MTP generation use incremental KV reservations (`--generation-reser
 16,384). With configured Host KV backing, requests can pause and resume under pressure without a
 new API call or an output-limit change. The admitted resident-plus-suspended cohort stays within
 `--max-concurrency`; fixed State and sampling storage remain assigned to those lanes. DFlash/DFlash2
-backends and requests without sufficient Host backing use full reservations. See
-[serving](docs/serving.md) for fallback, fairness and stream-timeout details.
+backends use full reservations. Without sufficient Host backing, at most one unbacked request
+with a partial Device reservation runs at a time. See
+[serving](docs/serving.md) for admission, fairness and stream-timeout details.
 
 Extra requests beyond the slots wait in the admission queue, and the queue deadline
 defaults to 30 seconds. A deep prefill can hold a slot longer than that, so

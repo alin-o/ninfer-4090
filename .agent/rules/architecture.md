@@ -18,8 +18,8 @@ description: Use when changing NInfer engine, CUDA operators, target programs, a
   under `tools/`; the evaluation coordinator is under `eval/ninfer_eval`.
 - Ordinary and MTP generation use configurable incremental KV reservations and bounded Host-backed
   suspension within the startup-fixed cohort. State/sampling storage remains assigned to its
-  lane; DFlash/DFlash2 backends and requests without sufficient Host backing retain full
-  reservations. The resource-scheduling reference owns this contract.
+  lane. Ordinary/MTP owners remain chunked without Host backing, with at most one unbacked partial
+  owner resident. DFlash/DFlash2 retain full reservations. The resource-scheduling reference owns this contract.
 - Preserve Gateway → Frontend → Engine → Program ownership, as defined in
   `docs/maintainer/engine-architecture.md`: gateways own protocol/transport,
   Frontend owns prompt/output semantics, Engine owns lifecycle/publication,

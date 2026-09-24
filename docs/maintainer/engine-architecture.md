@@ -299,6 +299,10 @@ under the observation mutex, so recording request start or completion cannot wai
 request's decode. Synchronous resource mutations and peak resets also refresh the memory snapshot;
 committed checkpoint lifecycle facts retain their operation-owned accounting.
 
+Gateways may supply a diagnostic request ID through `GenerationObservationOptions`. Engine
+publishes that ID in `SlotState` (or its own ID when absent). HTTP serving supplies the same numeric
+ID used in request logs; Engine scheduling and publication order keep their independent identities.
+
 Execution-boundary locking serves queued callers in arrival order so a worker cannot repeatedly
 reacquire ahead of an export settlement or control call. This serializes physical mutations without
 changing Scheduler request ordering. The worker also polls completed snapshot-source retirements
@@ -353,14 +357,17 @@ FIFO admission owner 后，ResourceManager 才同时比较 warm 与 SSD 路径�
 admitted 的请求可以继续使用各自既有 reservation。stale revision 必须释放旧 reservation 并重新比较
 完整 warm/SSD 集合。
 
-Incremental admission uses a bounded completion witness: every partial owner has a private Host
-allocation covering its complete effective Main and enabled MTP backend KV extents; each complete
-isolated extent fits its Device pool. Program owns this physical proof and its resource revision. Under pressure the
-Scheduler keeps its protected owner through completion/cancellation, suspends the backed victim
-set, and obtains the protected owner's full completion entitlement. ResourceManager releases
-eligible optional caches before active suspension. Prefill finishes using its admitted entitlement.
+Incremental admission uses a bounded completion witness: each request's complete isolated Main/MTP
+KV extent fits its Device pool, and all but at most one partial owner hold full private Host backing.
+Program owns this physical proof and its resource revision. Ordinary/MTP owners always grow in
+chunks, including when Host backing is unavailable. Full-entitlement FIFO arrivals may coexist when
+resources fit. Completion priority is full entitlements, then the sole unbacked partial owner, then
+backed partial owners; the selected owner stays protected within its class through completion or
+cancellation. Under pressure ResourceManager reclaims eligible caches, then Scheduler suspends backed
+peers only until the protected owner's next chunk fits. Restore also grants only the next chunk.
+New admissions wait throughout the pressure epoch. Prefill finishes using its admitted entitlement.
 Suspended requests retain their logical lanes, so resident plus suspended requests never exceed C.
-After the epoch, the oldest admitted request is selected before new arrivals. There is no time slicing.
+There is no time slicing.
 
 Partial-reservation requests enter only as FIFO head. Persistent backfill is restricted to full
 reservations and is disabled while an incremental cohort is resident; its original completion proof
@@ -548,7 +555,7 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 
 - Program 在启动时建立固定数量的 control/state/table resources；
 - growing KV 使用同一共享 paged pool；ordinary/MTP generation 在完整下一 execution unit 之前扩展 entitlement；
-- protected completion epochs、bounded Host backing 与 full-reservation fallback 保证 progress；
+- protected completion epochs、bounded Host backing 与 single unbacked partial owner 保证 progress；
 - 一个 GPU execution unit 内 State/KV mapping 保持稳定；
 - CUDA Graph 按合法 exact-`B` topology 建立，request identity 和 page IDs 是稳定输入数据，不是 graph key；
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；

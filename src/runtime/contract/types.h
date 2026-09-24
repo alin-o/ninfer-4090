@@ -459,14 +459,14 @@ struct Revision {
 };
 
 struct RequestPlanSummary {
-    std::uint32_t prompt_tokens           = 0;
-    std::uint32_t reusable_prompt_tokens  = 0;
-    std::uint32_t requested_output_tokens = 0;
-    std::uint32_t effective_output_tokens = 0;
-    FinishReason effective_limit_reason   = FinishReason::None;
-    PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
-    std::uint64_t service_work_quanta     = 0;
-    bool publish_continuation             = true;
+    std::uint32_t prompt_tokens               = 0;
+    std::uint32_t reusable_prompt_tokens      = 0;
+    std::uint32_t requested_output_tokens     = 0;
+    std::uint32_t effective_output_tokens     = 0;
+    FinishReason effective_limit_reason       = FinishReason::None;
+    PrefixReusePath prefix_reuse_path         = PrefixReusePath::Root;
+    std::uint64_t service_work_quanta         = 0;
+    bool publish_continuation                 = true;
     bool incremental_reservation              = false;
     std::size_t generation_host_backing_bytes = 0;
 };
@@ -730,6 +730,7 @@ struct GenerationReservationState {
     std::size_t mapped_bytes            = 0;
     std::size_t reserved_bytes          = 0;
     bool incremental                    = false;
+    bool suspension_backed              = false;
     bool suspended                      = false;
     bool can_suspend                    = false;
     bool completion_reserved            = true;
@@ -741,12 +742,12 @@ struct GenerationReservationState {
 struct GenerationProgressWitness {
     ProgramResourceRevision resource_revision;
     LaneId protected_lane;
-    std::uint32_t victim_lanes          = 0;
-    std::uint32_t completion_main_pages = 0;
+    std::uint32_t victim_lanes             = 0;
+    std::uint32_t completion_main_pages    = 0;
     std::uint32_t completion_backend_pages = 0;
-    std::uint32_t resident_state_slots  = 0;
-    std::size_t host_backing_bytes      = 0;
-    bool feasible                       = false;
+    std::uint32_t resident_state_slots     = 0;
+    std::size_t host_backing_bytes         = 0;
+    bool feasible                          = false;
 };
 
 enum class GenerationGrowthResult : std::uint8_t { Ready, CapacityWait, TransactionWait };

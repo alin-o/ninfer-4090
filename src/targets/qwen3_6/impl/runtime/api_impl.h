@@ -574,7 +574,7 @@ AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) n
 template <>
 ReleaseResult<Variant>
 Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation,
-                                      bool wait_for_exports) noexcept {
+                                       bool wait_for_exports) noexcept {
     return impl_->release_continuation(std::move(continuation), wait_for_exports);
 }
 
@@ -597,9 +597,9 @@ runtime::GenerationProgressWitness Program<Variant>::generation_progress_witness
 }
 
 template <>
-bool Program<Variant>::configure_generation_reservation(RequestBasePlan<Variant>& base,
-                                                        std::uint32_t quantum, bool incremental) {
-    return impl_->configure_generation_reservation(base, quantum, incremental);
+void Program<Variant>::configure_generation_reservation(RequestBasePlan<Variant>& base,
+                                                        std::uint32_t quantum) {
+    impl_->configure_generation_reservation(base, quantum);
 }
 
 template <>
@@ -610,9 +610,8 @@ Program<Variant>::generation_reservation_state(SequenceHandle<Variant> sequence)
 
 template <>
 runtime::GenerationGrowthResult Program<Variant>::grow_generation(SequenceHandle<Variant> sequence,
-                                                                  std::uint32_t next_tokens,
-                                                                  bool completion) {
-    return impl_->grow_generation(sequence, next_tokens, completion);
+                                                                  std::uint32_t next_tokens) {
+    return impl_->grow_generation(sequence, next_tokens);
 }
 
 template <>
@@ -627,8 +626,9 @@ bool Program<Variant>::suspend_generation(SequenceHandle<Variant> sequence) {
 }
 
 template <>
-bool Program<Variant>::resume_generation(SequenceHandle<Variant> sequence, bool completion) {
-    return impl_->resume_generation(sequence, completion);
+bool Program<Variant>::resume_generation(SequenceHandle<Variant> sequence,
+                                         std::uint32_t next_tokens) {
+    return impl_->resume_generation(sequence, next_tokens);
 }
 
 template <>

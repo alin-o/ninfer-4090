@@ -148,14 +148,20 @@ public:
     [[nodiscard]] std::optional<std::uint32_t>
     select_generation_protected_lane(const Slots& slots, std::uint32_t max_concurrency,
                                      std::uint64_t protected_request        = 0,
-                                     std::uint32_t mandatory_resident_lanes = 0) const noexcept {
+                                     std::uint32_t mandatory_resident_lanes = 0,
+                                     std::uint32_t unbacked_partial_lanes = 0) const noexcept {
         std::optional<std::uint32_t> selected;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
             if (!request || request->is_model_finished()) { continue; }
-            if (request->id == protected_request) { return lane; }
             const auto rank = [&](std::uint32_t candidate) {
-                return std::tuple{(mandatory_resident_lanes & (1U << candidate)) == 0,
+                // Complete entitlements finish first, then the sole unbacked partial
+                // owner, then backed owners. Retain the current owner within its class.
+                const auto bit = 1U << candidate;
+                const auto priority = (mandatory_resident_lanes & bit) ? 0U
+                                    : (unbacked_partial_lanes & bit) ? 1U : 2U;
+                return std::tuple{priority,
+                                  slots[candidate]->id != protected_request,
                                   slots[candidate]->id};
             };
             if (!selected || rank(lane) < rank(*selected)) { selected = lane; }

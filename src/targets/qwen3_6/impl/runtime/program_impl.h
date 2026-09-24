@@ -9586,16 +9586,9 @@ ProgramImplCore::generation_progress_witness(SequenceHandle protected_sequence,
         const auto bit  = 1U << lane;
         if ((observed & bit) != 0) { return proof; }
         observed |= bit;
-        const auto& backing = requests[lane].generation_backing;
-        const auto backed   = [](const detail::GenerationKVBacking& image) {
-            return image.completion_pages == 0 ||
-                   (image.kv.valid() && image.kv.page_count() >= image.completion_pages);
-        };
-        if (!backing || !backed(backing->main) || !backed(backing->backend)) { return proof; }
-        proof.host_backing_bytes +=
-            static_cast<std::size_t>(backing->main.kv.page_count()) * text_host_kv_page_stride +
-            static_cast<std::size_t>(backing->backend.kv.page_count()) *
-                backend_host_kv_page_stride;
+        const auto state = generation_reservation_state(handle);
+        if (lane != proof.protected_lane.value && !state.suspension_backed) { return proof; }
+        proof.host_backing_bytes += state.host_backing_bytes;
         if (lane != proof.protected_lane.value) { proof.victim_lanes |= bit; }
     }
     proof.feasible = (observed & (1U << proof.protected_lane.value)) != 0 &&
@@ -9606,50 +9599,49 @@ ProgramImplCore::generation_progress_witness(SequenceHandle protected_sequence,
     return proof;
 }
 
-bool ProgramImplCore::configure_generation_reservation(RequestBasePlan& plan, std::uint32_t quantum,
-                                                       bool incremental) {
+void ProgramImplCore::configure_generation_reservation(RequestBasePlan& plan,
+                                                       std::uint32_t quantum) {
     auto& base = *plan.impl_;
     const runtime::ReservationHorizon horizon{
         base.summary.prompt_tokens, base.summary.effective_output_tokens, capacity, quantum,
         static_cast<std::uint32_t>(kPagedKVPageSize)};
     horizon.validate();
-    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
-    incremental    = incremental && (speculative_backend == SpeculativeBackend::None || mtp) &&
-                  host_kv_arena && horizon.initial_pages() < base.completion_pages;
+    const bool mtp         = speculative_backend == SpeculativeBackend::Mtp;
+    const bool incremental = (speculative_backend == SpeculativeBackend::None || mtp) &&
+                             horizon.initial_pages() < base.completion_pages;
     if (incremental && !base.generation_backing) {
-        auto backing        = std::make_shared<detail::GenerationBacking>();
-        const auto allocate = [&](detail::GenerationKVBacking& image, LogicalKVPageStore& pages,
-                                  std::uint32_t count) {
-            auto allocation = host_kv_arena->allocate(
-                *host_kv_arena->layout_for(pages.physical_pool().geometry()), count);
-            if (!allocation) { return false; }
-            image.kv = std::move(*allocation);
-            image.page_handles.reserve(count);
-            image.completion_pages = count;
+        auto backing                      = std::make_shared<detail::GenerationBacking>();
+        backing->horizon                  = horizon;
+        backing->main.completion_pages    = base.completion_pages;
+        backing->backend.completion_pages = base.completion_backend_pages;
+        const auto allocate = [&](detail::GenerationKVBacking& image, LogicalKVPageStore& pages) {
+            if (!host_kv_arena) { return false; }
+            auto regions = host_kv_arena->allocate_fragmented(
+                *host_kv_arena->layout_for(pages.physical_pool().geometry()),
+                image.completion_pages);
+            if (!regions) { return false; }
+            image.regions = std::move(*regions);
+            image.page_handles.reserve(image.completion_pages);
             return true;
         };
-        // Both pools must have complete private backing before publishing partial admission.
-        // A failed second allocation releases the first with this local owner.
-        if (!allocate(backing->main, *text_kv_pages, base.completion_pages) ||
-            (mtp &&
-             !allocate(backing->backend, *backend_kv_pages, base.completion_backend_pages))) {
-            incremental = false;
-        } else {
-            backing->horizon        = horizon;
-            base.generation_backing = std::move(backing);
-            advance_resource_revision();
+        // Backing is all-or-nothing across pools. An unbacked owner still grows in chunks;
+        // Engine permits only one such partial owner in the resident cohort.
+        if (!allocate(backing->main, *text_kv_pages) ||
+            (mtp && !allocate(backing->backend, *backend_kv_pages))) {
+            backing->main.regions.clear();
+            backing->backend.regions.clear();
         }
-    }
-    if (!incremental && base.generation_backing) {
-        base.generation_backing.reset();
+        base.generation_backing = std::move(backing);
         advance_resource_revision();
     }
     base.summary.incremental_reservation = incremental;
     base.summary.generation_host_backing_bytes =
-        incremental ? static_cast<std::size_t>(base.completion_pages) * text_host_kv_page_stride +
-                          static_cast<std::size_t>(base.completion_backend_pages) *
-                              backend_host_kv_page_stride
-                    : 0;
+        base.generation_backing
+            ? static_cast<std::size_t>(base.generation_backing->main.backed_pages()) *
+                      text_host_kv_page_stride +
+                  static_cast<std::size_t>(base.generation_backing->backend.backed_pages()) *
+                      backend_host_kv_page_stride
+            : 0;
     const auto main_pages = incremental ? horizon.initial_pages() : base.completion_pages;
     const auto backend_pages =
         incremental && mtp ? horizon.mtp_backend_pages(horizon.initial_tokens(), draft_window)
@@ -9662,7 +9654,6 @@ bool ProgramImplCore::configure_generation_reservation(RequestBasePlan& plan, st
         value->device.main_kv_pages    = main_pages;
         value->device.backend_kv_pages = backend_pages;
     }
-    return incremental;
 }
 
 runtime::GenerationReservationState
@@ -9685,19 +9676,18 @@ ProgramImplCore::generation_reservation_state(SequenceHandle handle) const {
     out.reserved_bytes =
         main_reserved * text_host_kv_page_stride + backend_reserved * backend_host_kv_page_stride;
     if (const auto& backing = request.generation_backing) {
-        out.incremental = true;
-        out.suspended   = backing->suspended;
-        out.can_suspend = backing->main.kv.valid() &&
-                          (!sequence.kv->backend || backing->backend.kv.valid()) &&
-                          !backing->suspended && request.lifecycle == Lifecycle::Active &&
-                          !has_context_transaction() && !pending_transaction_;
+        out.incremental       = true;
+        out.suspended         = backing->suspended;
+        out.suspension_backed = backing->main.backed() && backing->backend.backed();
+        out.can_suspend       = out.suspension_backed && !backing->suspended &&
+                          request.lifecycle == Lifecycle::Active && !has_context_transaction() &&
+                          !pending_transaction_;
         out.completion_reserved = !backing->suspended &&
                                   main_reserved >= backing->main.completion_pages &&
                                   backend_reserved >= backing->backend.completion_pages;
         out.host_backing_bytes =
-            static_cast<std::size_t>(backing->main.kv.page_count()) * text_host_kv_page_stride +
-            static_cast<std::size_t>(backing->backend.kv.page_count()) *
-                backend_host_kv_page_stride;
+            static_cast<std::size_t>(backing->main.backed_pages()) * text_host_kv_page_stride +
+            static_cast<std::size_t>(backing->backend.backed_pages()) * backend_host_kv_page_stride;
         out.host_backing_used_bytes =
             backing->suspended
                 ? backing->main.page_handles.size() * text_host_kv_page_stride +
@@ -9726,8 +9716,7 @@ ProgramImplCore::generation_unit_pages(const SequenceState& sequence,
 }
 
 runtime::GenerationGrowthResult ProgramImplCore::grow_generation(SequenceHandle handle,
-                                                                 std::uint32_t next_tokens,
-                                                                 bool completion) {
+                                                                 std::uint32_t next_tokens) {
     if (!valid_sequence(handle)) { throw std::logic_error("stale generation growth"); }
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
@@ -9738,14 +9727,9 @@ runtime::GenerationGrowthResult ProgramImplCore::grow_generation(SequenceHandle 
     const auto main_current = text_kv_addresses->entitlement(sequence.kv->text);
     const auto backend_current =
         sequence.kv->backend ? backend_kv_addresses->entitlement(*sequence.kv->backend) : 0U;
-    const auto required =
-        completion
-            ? detail::PhysicalDeviceResources{.main_kv_pages    = backing->main.completion_pages,
-                                              .backend_kv_pages = backing->backend.completion_pages}
-            : generation_unit_pages(sequence, *backing, next_tokens);
+    const auto required = generation_unit_pages(sequence, *backing, next_tokens);
     if ((has_context_transaction() || pending_transaction_) &&
-        (completion || required.main_kv_pages > main_current ||
-         required.backend_kv_pages > backend_current)) {
+        (required.main_kv_pages > main_current || required.backend_kv_pages > backend_current)) {
         return runtime::GenerationGrowthResult::TransactionWait;
     }
     const auto choose_grant = [&](std::uint32_t current, std::uint32_t needed, std::uint32_t full,
@@ -9777,11 +9761,6 @@ runtime::GenerationGrowthResult ProgramImplCore::grow_generation(SequenceHandle 
         request.active_resources.device.backend_kv_pages += backend_grant - backend_current;
         advance_resource_revision();
     }
-    if (completion && backing->main.kv.valid()) {
-        backing->main.kv.release();
-        backing->backend.kv.release();
-        advance_resource_revision();
-    }
     return runtime::GenerationGrowthResult::Ready;
 }
 
@@ -9792,7 +9771,10 @@ void ProgramImplCore::release_generation_slack(SequenceHandle handle, std::uint3
     auto& request   = requests[lane];
     auto& sequence  = active_sequence(lane);
     if (!request.generation_backing || request.generation_backing->suspended ||
-        request.lifecycle != Lifecycle::Active) {
+        request.lifecycle != Lifecycle::Active ||
+        generation_reservation_state(handle).completion_reserved) {
+        // Admission may rely on this owner's complete entitlement when allowing a new
+        // unbacked partial owner. Never revoke that completion witness by trimming slack.
         return;
     }
     const auto required = generation_unit_pages(sequence, *request.generation_backing, next_tokens);
@@ -9834,9 +9816,15 @@ bool ProgramImplCore::suspend_generation(SequenceHandle handle) {
             image.page_handles[page] = addresses.physical_page(address, page);
         }
         image.saved_tokens = committed;
-        pages.physical_pool().copy_to_host(image.page_handles,
-                                           host_kv_arena->writable_view(image.kv).subview(0, count),
-                                           device.transfer_stream);
+        std::size_t offset = 0;
+        for (auto& region : image.regions) {
+            const auto size = std::min<std::size_t>(region.page_count(), count - offset);
+            if (size == 0) { break; }
+            pages.physical_pool().copy_to_host(
+                std::span(image.page_handles).subspan(offset, size),
+                host_kv_arena->writable_view(region).subview(0, size), device.transfer_stream);
+            offset += size;
+        }
     };
     // Both source images remain owned until every transfer has settled. State, drafts,
     // hidden state and sampling history stay on the original lane at a committed boundary.
@@ -9863,7 +9851,7 @@ bool ProgramImplCore::suspend_generation(SequenceHandle handle) {
         backend_kv_addresses->truncate_inactive_prefix(*sequence.kv->backend, 0);
     }
     release_active_shared_references_strict(sequence);
-    request.active_resources.device.main_kv_pages = 0;
+    request.active_resources.device.main_kv_pages    = 0;
     request.active_resources.device.backend_kv_pages = 0;
     backing.suspended                                = true;
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
@@ -9871,32 +9859,32 @@ bool ProgramImplCore::suspend_generation(SequenceHandle handle) {
     return true;
 }
 
-bool ProgramImplCore::resume_generation(SequenceHandle handle, bool completion) {
+bool ProgramImplCore::resume_generation(SequenceHandle handle, std::uint32_t next_tokens) {
     if (!valid_sequence(handle)) { throw std::logic_error("stale generation resume"); }
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
     auto& sequence  = active_sequence(lane);
     auto& backing   = *request.generation_backing;
     if (!backing.suspended || has_context_transaction() || pending_transaction_) { return false; }
-    const auto unit  = generation_unit_pages(sequence, backing, 1);
-    const auto grant = [&](const detail::GenerationKVBacking& image, std::uint32_t needed) {
-        return completion
-                   ? image.completion_pages
-                   : static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                         image.completion_pages,
-                         std::max<std::uint64_t>(
-                             needed, image.page_handles.size() +
-                                         (static_cast<std::uint64_t>(backing.horizon.quantum) +
-                                          kPagedKVPageSize - 1) /
-                                             kPagedKVPageSize)));
+    const auto unit  = generation_unit_pages(sequence, backing, next_tokens);
+    const auto grant = [&](const detail::GenerationKVBacking& image, std::uint32_t needed,
+                           std::uint32_t available) {
+        needed = std::max(needed, static_cast<std::uint32_t>(image.page_handles.size()));
+        const auto preferred = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            image.completion_pages,
+            std::max<std::uint64_t>(
+                needed,
+                image.page_handles.size() +
+                    (static_cast<std::uint64_t>(backing.horizon.quantum) + kPagedKVPageSize - 1) /
+                        kPagedKVPageSize)));
+        return preferred <= available ? preferred : needed;
     };
-    const auto main_grant    = grant(backing.main, unit.main_kv_pages);
-    const auto backend_grant = grant(backing.backend, unit.backend_kv_pages);
-    if (main_grant > text_kv_pages->physical_pool().available_pages() ||
-        (sequence.kv->backend &&
-         backend_grant > backend_kv_pages->physical_pool().available_pages())) {
-        return false;
-    }
+    const auto main_available = text_kv_pages->physical_pool().available_pages();
+    const auto backend_available =
+        sequence.kv->backend ? backend_kv_pages->physical_pool().available_pages() : 0U;
+    const auto main_grant    = grant(backing.main, unit.main_kv_pages, main_available);
+    const auto backend_grant = grant(backing.backend, unit.backend_kv_pages, backend_available);
+    if (main_grant > main_available || backend_grant > backend_available) { return false; }
     const auto prepare = [&](detail::GenerationKVBacking& image, KVAddressSpaceStore& addresses,
                              KVAddressSpaceHandle address, std::uint32_t entitlement) {
         addresses.activate(address, entitlement, static_cast<std::int32_t>(lane), device.stream);
@@ -9914,9 +9902,16 @@ bool ProgramImplCore::resume_generation(SequenceHandle handle, bool completion) 
     }
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
     const auto restore = [&](const detail::GenerationKVBacking& image, LogicalKVPageStore& pages) {
-        pages.physical_pool().copy_from_host(
-            host_kv_arena->view(image.kv).subview(0, image.page_handles.size()), image.page_handles,
-            device.transfer_stream);
+        std::size_t offset = 0;
+        for (auto& region : image.regions) {
+            const auto size =
+                std::min<std::size_t>(region.page_count(), image.page_handles.size() - offset);
+            if (size == 0) { break; }
+            pages.physical_pool().copy_from_host(
+                host_kv_arena->view(region).subview(0, size),
+                std::span(image.page_handles).subspan(offset, size), device.transfer_stream);
+            offset += size;
+        }
     };
     try {
         restore(backing.main, *text_kv_pages);
@@ -9935,10 +9930,6 @@ bool ProgramImplCore::resume_generation(SequenceHandle handle, bool completion) 
     request.active_resources.device.backend_kv_pages = backend_grant;
     backing.suspended                                = false;
     bind_sequence_kv(sequence);
-    if (completion) {
-        backing.main.kv.release();
-        backing.backend.kv.release();
-    }
     advance_resource_revision();
     return true;
 }

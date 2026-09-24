@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 #include "runtime/engine/context_transfer_test_gate.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -52,8 +53,12 @@ struct Sink : ninfer::OutputSink {
     unsigned starts = 0;
     std::string content;
     std::string reasoning;
+    std::atomic<bool>* started = nullptr;
 
-    void start(ninfer::GenerationStart) override { ++starts; }
+    void start(ninfer::GenerationStart) override {
+        ++starts;
+        if (started) { *started = true; }
+    }
 
     void progress(ninfer::PromptProgress) override {}
 
@@ -65,6 +70,145 @@ struct Sink : ninfer::OutputSink {
 };
 
 enum class Workload { Numbers, EarlyStop, ThinkingControl, ContextLimit };
+
+void run_mixed(const char* artifact, bool mtp, bool ample = false) {
+    ninfer::EngineOptions options;
+    options.artifact_path      = artifact;
+    options.max_context        = 512;
+    options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(ample ? 1536 : 512);
+    options.max_concurrency    = 3;
+    options.pending_timeout_ms = 120000;
+    options.prefill_chunk      = 128;
+    options.generation_reservation_tokens                   = 64;
+    options.use_cuda_graph                                  = true;
+    options.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    options.context_cache.host_state_slots                  = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    if (mtp) {
+        options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+        options.kv_cache                 = ninfer::KvCacheStorage::RK4V4E8;
+    }
+    ninfer::Engine engine(options);
+    const auto tokens =
+        engine.tokenize_text("Write the numbers from one to one thousand, separated by commas:");
+    ninfer::RequestOptions long_request;
+    long_request.execution.requested_output_tokens  = 400;
+    long_request.execution.sampling.temperature     = 0;
+    long_request.execution.sampling.seed            = 42;
+    long_request.stop.include_model_defaults        = false;
+    long_request.output.raw                         = true;
+    auto short_request                              = long_request;
+    short_request.execution.requested_output_tokens = 64;
+    const auto long_baseline = engine.generate(engine.prepare_tokens(tokens), long_request);
+    require(long_baseline.generated_token_ids.size() == 400, "mixed long baseline output budget");
+    auto short_tokens = tokens;
+    short_tokens.insert(short_tokens.end(), long_baseline.generated_token_ids.begin(),
+                        long_baseline.generated_token_ids.begin() + (160 - tokens.size()));
+    const auto short_baseline = engine.generate(engine.prepare_tokens(short_tokens), short_request);
+    require(long_baseline.generated_token_ids.size() == 400 &&
+                short_baseline.generated_token_ids.size() == 64,
+            "mixed baseline output budgets");
+
+    for (const bool cancel_full : {false, true}) {
+        if (ample && cancel_full) { continue; }
+        const auto before = engine.runtime_stats();
+        std::vector<ninfer::GenerationHandle> handles;
+        handles.push_back(engine.submit(engine.prepare_tokens(tokens), long_request,
+                                        ninfer::OutputConsumerMode::Streaming));
+        handles.push_back(engine.submit(engine.prepare_tokens(tokens), long_request,
+                                        ninfer::OutputConsumerMode::Streaming));
+        // Let the protected partial owner enter its second 64-token page. The full owner
+        // then takes four pages and the two partial owners take two each: all eight fit,
+        // but further growth must wait for the full owner to finish or cancel.
+        const auto deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+        bool partial_resident = false;
+        while (!partial_resident && std::chrono::steady_clock::now() < deadline) {
+            const auto stats = engine.runtime_stats();
+            partial_resident =
+                stats.running_requests == 2 && stats.prefilling_requests == 0 &&
+                stats.generation_host_backing_bytes > 0 &&
+                stats.committed_decode_tokens >= before.committed_decode_tokens + 128;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(partial_resident, "older partial owner never became resident");
+        handles.push_back(engine.submit(engine.prepare_tokens(short_tokens), short_request,
+                                        ninfer::OutputConsumerMode::Streaming));
+        std::atomic<bool> full_started{false};
+        std::atomic<bool> saw_mixed{false};
+        std::atomic<bool> saw_pressure{false};
+        std::vector<Sink> sinks(3);
+        sinks[2].started = &full_started;
+        std::vector<std::future<ninfer::GenerationResult>> results;
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            results.push_back(std::async(std::launch::async, [&, i] {
+                return handles[i].wait(&sinks[i], ninfer::CancellationView([&, i] {
+                    return cancel_full && i == 2 && saw_mixed && saw_pressure;
+                }));
+            }));
+        }
+        std::uint32_t peak_running = 0;
+        while (results[2].wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+            const auto stats = engine.runtime_stats();
+            saw_mixed        = saw_mixed || (stats.running_requests == 3 &&
+                                      stats.generation_host_backing_bytes > 0 && full_started);
+            saw_pressure     = saw_pressure ||
+                           stats.generation_extension_waits > before.generation_extension_waits;
+            peak_running = std::max(peak_running, stats.running_requests);
+            require(std::chrono::steady_clock::now() < deadline, "mixed cohort stalled");
+        }
+        const bool short_finished_first =
+            results[0].wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
+        require(saw_mixed && short_finished_first,
+                "full-reservation arrival waited for the older partial owner to finish");
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            auto result = results[i].get();
+            std::cout << "mixed request=" << i << " mtp=" << mtp
+                      << " queue=" << result.engine_timing.queue_wait_seconds
+                      << " total=" << result.timings.total_seconds
+                      << " output=" << result.generated_token_ids.size() << std::endl;
+            require(sinks[i].starts == 1 && sinks[i].content == result.content &&
+                        sinks[i].reasoning == result.reasoning,
+                    "mixed stream lost or repeated output");
+            if (cancel_full && i == 2) {
+                require(result.finish_reason == ninfer::FinishReason::Cancelled,
+                        "mixed full-owner cancellation did not settle");
+            } else {
+                const auto& baseline = i == 2 ? short_baseline : long_baseline;
+                if (result.generated_token_ids != baseline.generated_token_ids) {
+                    const auto mismatch = std::mismatch(
+                        result.generated_token_ids.begin(), result.generated_token_ids.end(),
+                        baseline.generated_token_ids.begin(), baseline.generated_token_ids.end());
+                    std::cerr << "mixed mismatch mtp=" << mtp << " cancel=" << cancel_full
+                              << " request=" << i
+                              << " position=" << mismatch.first - result.generated_token_ids.begin()
+                              << " peak_running=" << peak_running << " pressure=" << saw_pressure
+                              << std::endl;
+                }
+                require(result.generated_token_ids == baseline.generated_token_ids &&
+                            result.finish_reason == baseline.finish_reason,
+                        "mixed continuation differs from isolated greedy baseline");
+            }
+        }
+        const auto after = engine.runtime_stats();
+        std::cout << "mixed mtp=" << mtp << " cancel_full=" << cancel_full
+                  << " peak_running=" << peak_running
+                  << " short_finished_first=" << short_finished_first
+                  << " pressure_before_full_settled=" << saw_pressure
+                  << " suspensions=" << after.generation_suspensions - before.generation_suspensions
+                  << std::endl;
+        require(peak_running == 3 && (ample || saw_pressure),
+                "mixed fixture missed concurrent memory pressure");
+        require(ample ? after.generation_suspensions == before.generation_suspensions
+                      : (after.generation_suspensions > before.generation_suspensions &&
+                         after.generation_resumes > before.generation_resumes),
+                "partial cohort did not suspend and resume after the full owner settled");
+        require(after.generation_suspensions - before.generation_suspensions ==
+                    after.generation_resumes - before.generation_resumes,
+                "mixed cohort left a surviving partial owner suspended");
+        require(after.generation_host_backing_bytes == 0, "mixed cohort leaked Host backing");
+    }
+}
 
 void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_index = -1,
          bool shared = false, std::uint32_t quantum = 64, bool tight_host = false, bool mtp = false,
@@ -156,8 +300,13 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
     double max_completion           = 0;
     std::uint32_t peak_running      = 0;
     std::vector<ninfer::GenerationHandle> handles;
+    std::vector<std::uint64_t> request_ids;
     for (std::uint32_t i = 0; i < concurrency; ++i) {
-        handles.push_back(engine.submit(prepare(), request, ninfer::OutputConsumerMode::Streaming));
+        // Diagnostic IDs may have gaps and arrive out of order after gateway preparation.
+        // The baseline above also consumed an Engine ID without a gateway request.
+        request_ids.push_back(1000 + (concurrency - i) * 17);
+        handles.push_back(engine.submit(prepare(), request, ninfer::OutputConsumerMode::Streaming,
+                                        {.request_id = request_ids.back()}));
     }
     std::vector<std::future<ninfer::GenerationResult>> results;
     std::vector<Sink> sinks(concurrency);
@@ -168,6 +317,10 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
                     if (!transfer_delay.entered.load()) { return false; }
                     transfer_delay.released = true;
                     return true;
+                }
+                if (!host && static_cast<int>(i) == cancel_index) {
+                    return engine.runtime_stats().committed_decode_tokens >=
+                           before.committed_decode_tokens + 128;
                 }
                 return static_cast<int>(i) == cancel_index &&
                        engine.runtime_stats().generation_suspensions >=
@@ -187,6 +340,13 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
                 if (!slot.suspended) { ++running; }
                 require(slot.request_id != 0 && slot.lane < concurrency,
                         "monitor lost active request identity");
+                require(std::find(request_ids.begin(), request_ids.end(), slot.request_id) !=
+                            request_ids.end(),
+                        "monitor did not publish caller-assigned request ID");
+                const auto occupied_horizon = std::max(slot.prompt_tokens, slot.mapped_tokens);
+                const auto chunk_slack = ((static_cast<std::uint64_t>(quantum) + 63) / 64) * 64;
+                require(slot.reserved_tokens <= occupied_horizon + chunk_slack + 64,
+                        "request expanded beyond the next reservation chunk");
                 require(slot.host_backing_used_bytes <= slot.host_backing_bytes,
                         "monitor RAM data exceeds allocated backing");
                 require(slot.memory.device_kv_bytes <=
@@ -271,8 +431,8 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
             require(after.generation_suspensions > before.generation_suspensions,
                     "no suspension exercised under simultaneous growth");
         } else {
-            require(peak_running < concurrency && peak_host_backing > 0,
-                    "tight Host fixture did not exercise partial-to-full fallback");
+            require(peak_running == std::min(concurrency, 2U) && peak_host_backing > 0,
+                    "backed and unbacked chunked owners did not run together");
         }
         require(after.generation_suspensions >= after.generation_resumes &&
                     after.generation_suspensions - after.generation_resumes <=
@@ -280,6 +440,11 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
                 "not all surviving suspended requests resumed");
     } else {
         require(after.generation_suspensions == 0, "zero Host budget suspended a request");
+    }
+    if (!host) {
+        require(peak_running == 1 && after.generation_extension_grants >
+                                       before.generation_extension_grants,
+                "unbacked owners did not serialize with chunked reservations");
     }
     if (early_stop || ample_pool) {
         require(peak_running == (large_ceiling && quantum >= 160000 ? 1U : concurrency),
@@ -319,9 +484,19 @@ int main(int argc, char** argv) {
     }
     try {
         const bool mtp = argc >= 2 && std::string_view(argv[1]) == "--mtp";
+        if ((argc == 2 && std::string_view(argv[1]) == "--mixed-ample") ||
+            (argc == 3 && mtp && std::string_view(argv[2]) == "--mixed-ample")) {
+            run_mixed(artifact, mtp, true);
+            return 0;
+        }
+        if ((argc == 2 && std::string_view(argv[1]) == "--mixed") ||
+            (argc == 3 && mtp && std::string_view(argv[2]) == "--mixed")) {
+            run_mixed(artifact, mtp);
+            return 0;
+        }
         require(argc == 1 || (mtp && argc <= 3), "expected no arguments or --mtp [case]");
         const int selected = argc == 3 ? std::stoi(argv[2]) : -1;
-        require(selected >= -1 && selected <= 15, "invalid case index");
+        require(selected >= -1 && selected <= 18, "invalid case index");
         int index           = 0;
         const auto scenario = [&](std::uint32_t concurrency, bool host, int cancel = -1,
                                   bool shared = false, std::uint32_t quantum = 64,
@@ -348,6 +523,9 @@ int main(int argc, char** argv) {
             scenario(3, true, -1, false, 16384, false, Workload::EarlyStop, false, true);
             scenario(3, true, -1, false, 2147483647, false, Workload::EarlyStop, false, true);
             scenario(2, true, -1, false, 1, false, Workload::ContextLimit);
+            scenario(2, true, 1, false, 64, true);
+            scenario(2, false, 0);
+            scenario(4, true, -1, false, 64, true);
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -84,7 +84,12 @@ Open `/monitor` on the same `ninfer-serve` address. The self-contained page refr
 seconds and works without external assets. The dark theme marks running requests in green,
 pending requests in blue, and suspended requests in orange. It shows shared GPU Main/backend KV and State pool
 occupancy, GPU growth reservations, Host KV and State pools, parallel request lanes, private
-checkpoint frontiers, and a recent aggregate decode-speed graph. Pause/resume controls stop polling.
+checkpoint frontiers, and a recent aggregate decode-speed graph. Current requests reserves a
+fixed-height card for every configured lane in lane order, with idle placeholders, so arrivals,
+completions, and suspension do not move the content below. The pending indicator also keeps its
+space when the queue is empty. Request numbers match the numeric request IDs in the server logs
+for Chat Completions, Responses, and Anthropic Messages, including after warmup or rejected
+requests. Pause/resume controls stop polling.
 With `--api-key`, enter the key on the page; it is held only in page memory. The static page is
 public so browsers can open it, while `/monitor/data` keeps the normal API authentication.
 `/slots` retains its existing JSON schema.
@@ -1357,13 +1362,22 @@ limits. Grants are page-aligned and may be smaller under pressure. MTP reserves 
 Main and backend KV, including space for provisional draft writes.
 DFlash/DFlash2 retain full completion reservations.
 
-Each partial request reserves mandatory private backing in the existing Host KV budget before it
-starts. Under pressure, selected requests pause while one protected request completes. They resume
-inside the same request and response stream, preserving text, reasoning and buffered tool calls.
-There is no retry, synthetic stop, usage reset or additional admission timeout. Device State and
-sampling storage stay assigned to the bounded cohort; only growing KV is transferred. With zero or
-insufficient Host capacity the Engine uses full reservations and may queue more requests. Disabling
-the context cache also disables its Host budgets and therefore selects that fallback.
+A short request whose entire output fits within one chunk uses a full reservation. It can run
+alongside incremental requests when its reservation and Device State fit. Full-reservation owners
+take completion priority under pressure; new admissions wait throughout the pressure epoch.
+
+Partial requests attempt to reserve private backing in the existing Host KV budget before starting;
+backing can span multiple free regions. Under pressure, backed requests can pause while a protected
+request advances in chunks. Restore also reserves only the next chunk. Requests resume inside the
+same response stream, preserving text, reasoning and buffered tool calls. There is no retry,
+synthetic stop, usage reset or additional admission timeout. Device State and sampling storage stay
+assigned to the bounded cohort; only growing KV is transferred.
+
+With insufficient Host backing, at most one unbacked request with a partial reservation runs
+alongside backed requests and owners with complete reservations. It still reserves KV in chunks.
+Further unbacked long requests wait until that owner's final chunk is reserved or it finishes.
+Disabling the context cache disables its Host budgets too. Cached State images share the fixed
+Device State pool; free lanes and free KV alone do not guarantee admission.
 
 A request can still queue even with a cached prompt. Its complete effective footprint must fit the
 Device pool when running alone. Raising `--default-max-tokens` increases the required completion and

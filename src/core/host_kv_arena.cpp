@@ -308,6 +308,27 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
 
+std::optional<std::vector<HostKVAllocation>>
+HostKVArena::allocate_fragmented(const HostKVPageLayout& layout, std::uint32_t pages) {
+    if (pages == 0 || !find_layout(layout)) { return std::nullopt; }
+    std::vector<HostKVAllocation> allocations;
+    allocations.reserve(std::min<std::size_t>(pages, free_extents_.size()));
+    while (pages != 0) {
+        const auto largest = std::max_element(
+            free_extents_.begin(), free_extents_.end(),
+            [](const FreeExtent& a, const FreeExtent& b) { return a.bytes < b.bytes; });
+        if (largest == free_extents_.end()) { return std::nullopt; }
+        const auto count = static_cast<std::uint32_t>(
+            std::min<std::size_t>(pages, largest->bytes / layout.page_stride));
+        if (count == 0) { return std::nullopt; }
+        auto region = allocate_at(layout, count, largest->offset);
+        if (!region) { return std::nullopt; }
+        allocations.push_back(std::move(*region));
+        pages -= count;
+    }
+    return allocations;
+}
+
 std::size_t HostKVArena::allocation_offset(HostKVAllocationHandle allocation) const {
     if (!valid_handle(allocation)) {
         throw std::invalid_argument("Cannot inspect a stale Host KV allocation");

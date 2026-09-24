@@ -2226,7 +2226,7 @@ public:
 
     void detach_generation_sources(Program& program, LaneId lane, SequenceHandle sequence) {
         const auto state = program.generation_reservation_state(sequence);
-        if (!state.can_suspend && !state.suspended) { return; }
+        if (!state.incremental) { return; }
         program.detach_generation_sources(sequence);
         release_active_references(lane);
     }

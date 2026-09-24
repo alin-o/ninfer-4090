@@ -1219,13 +1219,14 @@ public:
                                              const SharedPrefixHandle<Variant>& resident) const;
     [[nodiscard]] SharedPrefixPublication<Variant>
     adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported);
-    [[nodiscard]] SharedPrefixPublication<Variant> adopt_shared_prefix(
-        const ValidatedSharedPrefixImport<Variant>& imported,
-        SharedPrefixHandle<Variant>* replacement, runtime::CancellationFlagView cancellation = {},
-        const std::function<void()>& commit_checkpoint = {},
-        const ContinuationHandle<Variant>* host_private             = nullptr,
-        const SharedPrefixHandle<Variant>* host_shared              = nullptr,
-        std::shared_ptr<const void> physical_plan                   = {});
+    [[nodiscard]] SharedPrefixPublication<Variant>
+    adopt_shared_prefix(const ValidatedSharedPrefixImport<Variant>& imported,
+                        SharedPrefixHandle<Variant>* replacement,
+                        runtime::CancellationFlagView cancellation      = {},
+                        const std::function<void()>& commit_checkpoint  = {},
+                        const ContinuationHandle<Variant>* host_private = nullptr,
+                        const SharedPrefixHandle<Variant>* host_shared  = nullptr,
+                        std::shared_ptr<const void> physical_plan       = {});
     void duplicate_shared_prefix_to_device_for_test(const SharedPrefixHandle<Variant>& shared);
     void fragment_shared_prefix_host_kv_for_test(const SharedPrefixHandle<Variant>& victim,
                                                  const SharedPrefixHandle<Variant>& separator);
@@ -1237,15 +1238,15 @@ public:
     [[nodiscard]] runtime::GenerationProgressWitness
     generation_progress_witness(SequenceHandle<Variant> protected_sequence,
                                 std::span<const SequenceHandle<Variant>> cohort) const;
-    bool configure_generation_reservation(RequestBasePlan<Variant>& base, std::uint32_t quantum,
-                                          bool incremental);
+    void configure_generation_reservation(RequestBasePlan<Variant>& base, std::uint32_t quantum);
     [[nodiscard]] runtime::GenerationReservationState
     generation_reservation_state(SequenceHandle<Variant> sequence) const;
-    [[nodiscard]] runtime::GenerationGrowthResult
-    grow_generation(SequenceHandle<Variant> sequence, std::uint32_t next_tokens, bool completion);
+    [[nodiscard]] runtime::GenerationGrowthResult grow_generation(SequenceHandle<Variant> sequence,
+                                                                  std::uint32_t next_tokens);
     void release_generation_slack(SequenceHandle<Variant> sequence, std::uint32_t next_tokens);
     [[nodiscard]] bool suspend_generation(SequenceHandle<Variant> sequence);
-    [[nodiscard]] bool resume_generation(SequenceHandle<Variant> sequence, bool completion);
+    [[nodiscard]] bool resume_generation(SequenceHandle<Variant> sequence,
+                                         std::uint32_t next_tokens);
     void detach_generation_sources(SequenceHandle<Variant> sequence);
 
     [[nodiscard]] bool

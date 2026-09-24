@@ -192,6 +192,7 @@
       .requests {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-auto-rows: 28rem;
         gap: 14px;
       }
       .badge {
@@ -206,6 +207,10 @@
         color: var(--suspended);
       }
       .pending {
+        block-size: 4rem;
+        overflow: auto;
+        display: flex;
+        align-items: center;
         color: var(--pending);
         background: #172b48;
         border: 1px solid #365781;
@@ -231,6 +236,19 @@
       }
       .request {
         border-top: 3px solid var(--running);
+        min-height: 0;
+        overflow: auto;
+      }
+      .request.idle-request {
+        border-top-color: var(--line);
+      }
+      .badge.idle-badge {
+        background: var(--line);
+        color: var(--muted);
+      }
+      .idle-message {
+        margin-top: 24px;
+        color: var(--muted);
       }
       .request .numbers {
         display: grid;
@@ -473,9 +491,8 @@
         <span><i class="dot pending-dot"></i>Pending</span>
         <span><i class="dot suspended-dot"></i>Suspended</span>
       </div>
-      <div id="pending" class="pending" hidden></div>
+      <div id="pending" class="pending">Pending · waiting for server…</div>
       <div id="requests" class="requests"></div>
-      <div id="no-requests" class="empty">Waiting for server…</div>
       <p class="note" style="margin-top: 12px">
         Each request’s GPU bar shows mapped and reserved Main KV token capacity
         relative to the shared pool. Memory figures include referenced state and
@@ -675,22 +692,42 @@
           ),
         );
         $("requests").replaceChildren();
-        $("no-requests").hidden = active.length > 0;
-        $("no-requests").textContent = data.ready
-          ? "No requests are running. Retained context is shown below."
-          : "Engine unavailable or loading.";
-        $("request-count").textContent = `${active.length} visible lanes`;
-        $("pending").hidden = g.waiting === 0;
+        $("request-count").textContent =
+          `${active.length} active / ${data.max_concurrency} lanes`;
         $("pending").textContent =
           `Pending · ${number(g.waiting)} ${g.waiting === 1 ? "request" : "requests"} waiting for admission`;
 
-        for (const s of active) {
+        const activeByLane = new Map(active.map((s) => [s.lane, s]));
+        for (let lane = 0; lane < data.max_concurrency; lane++) {
+          const s = activeByLane.get(lane);
+          if (!s) {
+            const idle = node("article", undefined, "request idle-request");
+            idle.dataset.lane = String(lane);
+            const head = node("div", undefined, "spread");
+            head.append(
+              node("h3", `Lane ${lane}`),
+              node("span", "Idle", "badge idle-badge"),
+            );
+            idle.append(
+              head,
+              node(
+                "p",
+                data.ready
+                  ? "Ready for the next request."
+                  : "Engine unavailable or loading.",
+                "idle-message",
+              ),
+            );
+            $("requests").append(idle);
+            continue;
+          }
           const e = node(
               "article",
               undefined,
               s.suspended ? "request suspended-request" : "request",
             ),
             head = node("div", undefined, "spread");
+          e.dataset.lane = String(lane);
           head.append(
             node("h3", `Lane ${s.lane} · request ${s.request_id}`),
             node(

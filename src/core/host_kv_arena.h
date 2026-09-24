@@ -215,6 +215,9 @@ public:
                                     std::uint32_t pages) const noexcept;
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
+    // Exact page coverage across available extents. Failure releases every provisional region.
+    [[nodiscard]] std::optional<std::vector<HostKVAllocation>>
+    allocate_fragmented(const HostKVPageLayout& layout, std::uint32_t pages);
 
     // Transaction rollback path: reclaim the exact range occupied before a fallible replacement.
     // The placement is captured while the source allocation is valid and can only be reused after

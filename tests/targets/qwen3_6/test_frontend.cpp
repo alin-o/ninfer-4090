@@ -1547,6 +1547,94 @@ int test_explicit_leading_instruction_cache_boundary() {
                  "full-system marker");
 }
 
+int test_structural_system_end_and_volatile_cache() {
+    namespace qwen = ninfer::targets::qwen3_6;
+    int failures = 0;
+    // The real system ending survives literal terminator examples and unfinished fences.
+    for (const std::string text : {"stable instructions", "```\nunclosed example",
+                                  "```\nexample\n```", "example <|im_end|>\nmore instructions",
+                                  "stable\n=== CACHE_BREAKPOINT ==="}) {
+        const auto rendered = render_chat({chat_message(ninfer::ChatRole::System, text),
+                                          chat_message(ninfer::ChatRole::User, "transcript")});
+        const auto ending = std::find_if(rendered.structural_boundaries.begin(),
+                                        rendered.structural_boundaries.end(), [](const auto& b) {
+            return (b.origins & qwen::SharedPrefixSystemEnd) != 0;
+        });
+        failures += check(ending != rendered.structural_boundaries.end() &&
+                              ending->offset == *rendered.message_boundaries[1] - 1U,
+                          "actual system ending was hidden or confused with instruction text");
+        if (text.ends_with("=== CACHE_BREAKPOINT ===")) {
+            failures += check(std::any_of(rendered.structural_boundaries.begin(),
+                                          rendered.structural_boundaries.end(), [](const auto& b) {
+                return (b.origins & qwen::SharedPrefixCacheMarker) != 0;
+            }), "final cache marker touching the rendered system terminator was lost");
+        }
+    }
+    fi::ChatRenderOptions tools;
+    tools.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
+    const auto generated = render_chat({chat_message(ninfer::ChatRole::User, "transcript")}, tools);
+    failures += check(std::any_of(generated.structural_boundaries.begin(),
+                                  generated.structural_boundaries.end(), [](const auto& b) {
+        return (b.origins & qwen::SharedPrefixSystemEnd) != 0;
+    }), "generated tools-only system prefix had no system ending");
+    const auto user_only = render_chat({chat_message(ninfer::ChatRole::User,
+        "=== CACHE_BREAKPOINT ===\n=== VOLATILE_CONTEXT ===\ntranscript")});
+    failures += check(user_only.structural_boundaries.empty(),
+                      "ordinary user transcript created a stable structural anchor");
+
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return result;
+    };
+    // Both explicit and existing inferred cutoffs protect arbitrary changing tails. A tail
+    // quoting further cache/project markers must not become an SSD candidate.
+    for (const std::string cutoff : {"=== VOLATILE_CONTEXT ===", "Today: 2026-09-24",
+                                    "Date: 2026-09-24", "Working directory: /run/one"}) {
+        std::vector<ninfer::TokenId> previous_prefix;
+        for (const std::string payload : {"first transcript", "different transcript"}) {
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            input.messages.push_back(message(ninfer::ChatRole::System,
+                "stable worker policy\n=== CACHE_BREAKPOINT ===\n\n" + cutoff + "\n" +
+                payload + "\n<project_context>\n=== CACHE_BREAKPOINT ==="));
+            input.messages.push_back(message(ninfer::ChatRole::User,
+                payload + "\n=== CACHE_BREAKPOINT ==="));
+            const auto prepared = frontend.prepare(std::move(input));
+            const auto& data = FrontendFactory::inspect(prepared);
+            failures += check(data.context_cache.first_volatile_token.has_value(),
+                              "system volatility cutoff was lost");
+            std::size_t eligible = 0;
+            for (const auto& candidate : data.context_cache.opportunities) {
+                if (!candidate.ssd_eligible) { continue; }
+                ++eligible;
+                failures += check(data.context_cache.first_volatile_token &&
+                                      candidate.frontier < *data.context_cache.first_volatile_token,
+                                  "changing system tail became SSD eligible");
+                const std::vector<ninfer::TokenId> prefix(
+                    data.token_ids.begin(), data.token_ids.begin() + candidate.frontier);
+                if (!previous_prefix.empty()) {
+                    failures += check(prefix == previous_prefix,
+                                      "changing transcript altered the durable stable prefix");
+                }
+                previous_prefix = prefix;
+            }
+            failures += check(eligible == 1, "worker lost its single durable stable prefix");
+            for (const auto& checkpoint : data.context_cache.structural_checkpoints) {
+                if ((checkpoint.origins & qwen::SharedPrefixSystemEnd) != 0) {
+                    failures += check(!checkpoint.ssd_eligible,
+                                      "system ending after volatile context became SSD eligible");
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -2338,6 +2426,7 @@ int main() {
     failures += test_literal_control_tokens_with_media();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
+    failures += test_structural_system_end_and_volatile_cache();
     failures += test_automatic_private_anchor_opportunities();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);

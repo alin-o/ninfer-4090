@@ -50,6 +50,12 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
     constexpr std::uint32_t kVolatility = 1U << 4U;
     const std::string_view text = chat.text;
     if (region_end == 0 || region_end > text.size()) { return; }
+    // region_end comes from the renderer, not from literal control-token text in instructions.
+    // Keep the actual terminator out of line/fence parsing: a final marker may touch it after
+    // trimming, and an unclosed Markdown fence must never hide the real system ending.
+    constexpr std::string_view kSystemTerminator = "<|im_end|>\n";
+    if (!text.substr(0, region_end).ends_with(kSystemTerminator)) { return; }
+    const std::size_t content_end = region_end - kSystemTerminator.size();
     // Unlike the line-oriented markers below, this legacy envelope is meaningful only as the
     // first content in the leading rendered system message.  In particular, an example of the
     // envelope in otherwise trusted instructions must not acquire project semantics.
@@ -64,13 +70,12 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
         } else { it->origins |= origins; }
     };
     bool instructions = false, project = false, volatile_found = false;
-    std::optional<std::size_t> system_end_offset;
     char fence_char = 0;
     std::size_t fence_len = 0;
-    for (std::size_t begin = 0; begin < region_end;) {
+    for (std::size_t begin = 0; begin < content_end;) {
         const std::size_t newline = text.find('\n', begin);
         const std::size_t end = std::min(newline == std::string_view::npos ? text.size() : newline,
-                                         region_end);
+                                         content_end);
         std::string_view line = text.substr(begin, end - begin);
         if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
         std::size_t left = 0, right = line.size();
@@ -104,12 +109,15 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
                 }
             }
             constexpr std::string_view kEnd = "<|im_end|>";
-            const std::size_t pos = line.rfind(kEnd);
-            if (pos != std::string_view::npos &&
-                line.substr(pos + kEnd.size()).find_first_not_of(" \t") == std::string_view::npos) {
-                // The upstream contract retains only the final system terminator in the
-                // trusted region. Earlier occurrences can be instruction examples.
-                system_end_offset = begin + pos + kEnd.size();
+            if (trimmed == "=== VOLATILE_CONTEXT ===") {
+                if (!volatile_found) {
+                    add(begin, kVolatility);
+                    chat.first_volatile_offset = begin;
+                    volatile_found = true;
+                }
+                // Per-run data may quote markers or project envelopes. It must never create
+                // another stable/SSD anchor, even when it lives in the system-message tail.
+                break;
             }
             constexpr std::string_view kMarker = "=== CACHE_BREAKPOINT ===";
             constexpr std::string_view kProjectTag = "<project_context>";
@@ -156,10 +164,10 @@ void discover_structural_boundaries(RenderedChat& chat, std::size_t region_end) 
             };
             if (!volatile_found && volatile_line()) { add(begin, kVolatility); chat.first_volatile_offset = begin; volatile_found = true; }
         }
-        if (end >= region_end) { break; }
+        if (end >= content_end) { break; }
         begin = end + 1;
     }
-    if (system_end_offset) { add(*system_end_offset, kSystemEnd); }
+    add(region_end - 1U, kSystemEnd);
 }
 
 // Exact upstream initial-user envelope exceptions.  This is intentionally separate from the
@@ -667,6 +675,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered.append_template("<|im_end|>\n");
     }
 
+    // This includes generated tools/reasoning preambles even without an explicit system input.
+    // Later conversation messages, including later instruction-role turns, are not this prefix.
+    const std::size_t leading_system_end = rendered.size();
     std::vector<std::optional<std::size_t>> message_boundaries(messages.size() + 1U);
     std::vector<std::optional<std::size_t>> cache_boundaries(options.cache_markers.size());
     if (message_begin == 0) {
@@ -866,11 +877,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
                         .message_boundaries           = std::move(message_boundaries),
                         .cache_boundaries             = std::move(cache_boundaries)};
-    // The template folds the leading instruction into the initial system span.  Only that
-    // span is eligible for structural recognition, including harness-only prompts.
-    if (message_begin == 1 && !result.message_boundaries.empty() && result.message_boundaries[1]) {
-        discover_structural_boundaries(result, *result.message_boundaries[1]);
-    }
+    // Recognize only the renderer-owned leading system span; never scan a user transcript
+    // or a later instruction turn as a durable prefix.
+    discover_structural_boundaries(result, leading_system_end);
     if (!messages.empty() && messages.front().role == ChatRole::User && result.message_boundaries[1]) {
         discover_initial_user_envelope(result, *result.message_boundaries[1]);
     }

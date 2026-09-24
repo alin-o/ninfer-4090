@@ -510,6 +510,30 @@ protocol policy after assembling instructions, parent history, and current input
 boundary and latest explicit markers refer to the complete prompt. Explicit-only mode suppresses
 these automatic writes but can still read an existing exact prefix.
 
+For worker prompts, keep reusable instructions in the leading system message and put the
+transcript or other per-run input in user messages. The renderer recognizes the actual leading
+system ending, including generated tool/reasoning preambles. Ordinary conversation messages do
+not become stable SSD anchors.
+
+When a system message itself needs a changing tail, delimit it explicitly:
+
+```text
+Reusable worker instructions
+=== CACHE_BREAKPOINT ===
+
+=== VOLATILE_CONTEXT ===
+Per-run objective state or other changing context
+```
+
+`CACHE_BREAKPOINT` selects a reusable prefix; `VOLATILE_CONTEXT` marks the start of content
+excluded from automatic durable shared-prefix selection. Both are standalone lines outside
+Markdown code fences in the leading system message. The explicit cutoff uses the same policy as
+existing `Today: YYYY-MM-DD`, `Date: YYYY-MM-DD`, `Current working directory:`,
+`Working directory:`, `Conversation started:`, and `Conversation log:` identifiers. The earliest
+cutoff wins. Later markers cannot make a volatile tail SSD-eligible. Transient in-memory reuse
+remains available; this policy does not change explicit session snapshots or remove existing SSD
+entries.
+
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
 Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not

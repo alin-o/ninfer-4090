@@ -1336,7 +1336,11 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
                 state_store->checkpoint_references(*protection.state) !=
                 protection.consumed_state_references;
 
-            if (is_rewrite_checkpoint_restore(admission.reuse)) {
+            // Endpoint consumption retains optional checkpoints just like a rewrite restore.
+            // If pressure removes their last external reference, their existing Device/Host
+            // replicas become exclusive to the active lineage and must enter its entitlement.
+            if (admission.reuse == ReusePath::PrivateEndpoint ||
+                is_rewrite_checkpoint_restore(admission.reuse)) {
                 const auto append_optional_state = [&](StateImageHandle state) {
                     if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
                         std::any_of(

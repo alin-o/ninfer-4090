@@ -433,3 +433,15 @@ NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
 NINFER_PREFIX_REAL_SCENARIO=idle-cache-pressure \
 build-agent-verify/tests/ninfer_qwen3_6_27b_prefix_real_test
 ```
+
+The context monitor checks are `ninfer_context_monitor_test` (loading, parallel/suspended
+request JSON, mixed replicas, and non-additive checkpoint rows) and
+`ninfer_qwen3_6_context_store_test` (physical byte accounting across State/KV replica transitions,
+partial-tail pages, and repeated State identities). Build these targets and run:
+
+```sh
+ctest --test-dir build-agent-verify -R 'ninfer_(context_monitor|qwen3_6_context_store)_test' --output-on-failure
+```
+
+Browser validation of `/monitor` additionally exercises two-second refresh, pause/resume,
+API-key entry, stale-data errors, empty/loading states, and narrow layouts.

@@ -161,6 +161,9 @@ public:
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
+    [[nodiscard]] ninfer::ContextSnapshot context_snapshot() const {
+        return engine_->context_snapshot();
+    }
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] bool healthy() const { return engine_->healthy(); }

@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "targets/qwen3_6/impl/runtime/context_memory.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
@@ -197,6 +198,11 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(host_source.has_value(), "Host state source allocation");
     device.synchronize();
     images.freeze(*host_source);
+    const std::array memory_states{*host_source, *host_source};
+    auto memory = store::resident_state_memory(images, physical, memory_states);
+    // Independent tensor geometry: conv 48 + recurrent 128 + hidden 16 + local K/V 4096.
+    expect(memory.device_state_bytes == 4288 && memory.host_state_bytes == 0,
+           "State memory counts a repeated identity once, excluding Host padding");
     auto d2h = images.begin_device_to_host(*host_source, device.transfer_stream);
     expect(d2h.has_value() &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
@@ -204,13 +210,21 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(images.source_pins(*host_source) == 1 && !images.release(*host_source),
            "in-flight State D2H pins its immutable source until transfer settlement");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    memory = store::resident_state_memory(images, physical, memory_states);
+    expect(memory.host_state_bytes == 0, "in-flight State copy is not resident Host data");
     images.publish_transfer(std::move(*d2h), true);
+    memory = store::resident_state_memory(images, physical, memory_states);
+    expect(memory.device_state_bytes == 4288 && memory.host_state_bytes == 4864,
+           "Both State replicas use their respective physical layouts");
     expect(images.residency(*host_source) == store::StateReplicaResidency::Both,
            "State D2H backup publishes stable Both residency");
 
     const auto moved_device = images.reserve_logical_destination();
     expect(moved_device.has_value(), "State replica split destination allocation");
     images.split_device_replica_identity(*host_source, *moved_device);
+    memory = store::resident_state_memory(images, physical, memory_states);
+    expect(memory.device_state_bytes == 0 && memory.host_state_bytes == 4864,
+           "Host-only checkpoint drops Device bytes after replica split");
     expect(images.residency(*host_source) == store::StateReplicaResidency::HostOnly &&
                images.residency(*moved_device) == store::StateReplicaResidency::DeviceOnly,
            "State replica identity split keeps old Host content and moves Device ownership");
@@ -409,6 +423,15 @@ void test_kv_store(ninfer::DeviceContext& device) {
     auto host_extent = extents.publish(std::move(*host_backup));
     expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
            "KV extent publication attaches every logical Host replica");
+    ninfer::ContextMemory memory;
+    store::add_resident_kv_memory(memory, addresses, pages, &extents, *address, 65);
+    // BF16 8 x 2 x 64 columns per page; the one-token tail still occupies a full page.
+    expect(memory.device_kv_bytes == 4096 && memory.host_kv_bytes == 4096,
+           "KV memory includes both replicas and the full partial-tail page");
+    memory = {};
+    store::add_resident_kv_memory(memory, addresses, pages, &extents, *address, 32);
+    expect(memory.device_kv_bytes == 2048 && memory.host_kv_bytes == 2048,
+           "earlier checkpoint references only its prefix page");
     const std::array first_host_release{logical_pages[0]};
     expect(extents.release_page_replicas(pages, first_host_release),
            "first Host page release transaction");
@@ -476,6 +499,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]) &&
                extents.valid(second_host_extent),
            "selected-prefix restore uploads only its missing page and preserves Host backing");
+    memory = {};
+    store::add_resident_kv_memory(memory, addresses, pages, &extents, *address, 65);
+    expect(memory.device_kv_bytes == 2048 && memory.host_kv_bytes == 4096,
+           "mixed KV residency reports each published physical replica");
     auto remaining_restore_reservation = physical_pages.reserve(1);
     expect(remaining_restore_reservation.has_value(), "remaining KV Host restore reservation");
     const std::array remaining_restore_destination{

@@ -251,6 +251,11 @@ ninfer_add_test(ninfer_openai_schema_test
 ninfer_add_test(ninfer_openai_responses_test
   SOURCES test_openai_responses.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_context_monitor_test
+  SOURCES test_context_monitor.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_context_monitor_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_serve_metrics_test
   SOURCES test_serve_metrics.cpp
   LIBRARIES ninfer_serve)

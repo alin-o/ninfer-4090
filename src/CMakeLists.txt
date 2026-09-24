@@ -398,7 +398,13 @@ add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/serve/context_monitor.html")
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/serve/context_monitor.html" NINFER_CONTEXT_MONITOR_HTML)
+  configure_file(serve/context_monitor_page.h.in
+    "${PROJECT_BINARY_DIR}/generated/context_monitor_page.h" @ONLY)
   add_library(ninfer_serve STATIC
+    serve/context_monitor.cpp
     serve/http_transport.cpp
     serve/request_validation.cpp
     serve/openai_chat_request.cpp

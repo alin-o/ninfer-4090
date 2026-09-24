@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>NInfer · Context monitor</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1118;
+        --panel: #151c27;
+        --line: #293447;
+        --text: #e8eef7;
+        --muted: #9baac0;
+        --vram: #75a7ff;
+        --ram: #54d5b0;
+        --reserve: #536a8d;
+        --warn: #ffc675;
+        --running: #69dc98;
+        --pending: #75a7ff;
+        --suspended: #ffb469;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.55 system-ui,
+          sans-serif;
+      }
+      main {
+        max-width: 1320px;
+        margin: auto;
+        padding: 32px 28px 60px;
+      }
+      header,
+      .section-head,
+      .spread {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      h1 {
+        font-size: 28px;
+        letter-spacing: -0.8px;
+        margin: 5px 0;
+      }
+      h2 {
+        font-size: 18px;
+        margin: 0;
+      }
+      h3 {
+        font-size: 15px;
+        margin: 0;
+      }
+      .eyebrow {
+        font-size: 11px;
+        letter-spacing: 2px;
+        color: var(--vram);
+        font-weight: 700;
+      }
+      .muted,
+      small {
+        color: var(--muted);
+      }
+      p {
+        margin: 6px 0 18px;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      button,
+      input {
+        font: inherit;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 9px 13px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: var(--vram);
+      }
+      button:focus-visible,
+      input:focus-visible,
+      summary:focus-visible {
+        outline: 2px solid var(--vram);
+        outline-offset: 3px;
+      }
+      input {
+        max-width: 240px;
+      }
+      .status {
+        font-size: 12px;
+        color: var(--ram);
+      }
+      .status.error {
+        color: var(--warn);
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+        margin: 24px 0;
+      }
+      .card,
+      .panel,
+      .request {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px;
+      }
+      .card .value {
+        font-size: 29px;
+        letter-spacing: -1px;
+        font-variant-numeric: tabular-nums;
+        margin: 4px 0;
+      }
+      .card .label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .section-head {
+        margin: 28px 0 14px;
+      }
+      .pools {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+      .pool {
+        margin: 16px 0 23px;
+      }
+      .pool:last-child {
+        margin-bottom: 0;
+      }
+      .bar {
+        height: 12px;
+        display: flex;
+        border-radius: 4px;
+        overflow: hidden;
+        background: #273142;
+        margin: 8px 0;
+      }
+      .bar span {
+        display: block;
+        transition: width 0.3s;
+        min-width: 0;
+      }
+      .vram {
+        background: var(--vram);
+      }
+      .ram {
+        background: var(--ram);
+      }
+      .reserved {
+        background: repeating-linear-gradient(
+          120deg,
+          #546887,
+          #546887 4px,
+          #364761 4px,
+          #364761 8px
+        );
+      }
+      .legend {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        margin-right: 6px;
+      }
+      .requests {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+      .badge {
+        font-size: 11px;
+        padding: 4px 9px;
+        border-radius: 6px;
+        background: #173b2a;
+        color: var(--running);
+      }
+      .badge.suspended-badge {
+        background: #442d19;
+        color: var(--suspended);
+      }
+      .pending {
+        color: var(--pending);
+        background: #172b48;
+        border: 1px solid #365781;
+        border-left: 3px solid var(--pending);
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 14px;
+      }
+      .running-dot {
+        background: var(--running);
+      }
+      .pending-dot {
+        background: var(--pending);
+      }
+      .suspended-dot {
+        background: var(--suspended);
+      }
+      .request.suspended-request {
+        border-top-color: var(--suspended);
+      }
+      .request .bar .vram {
+        background: var(--running);
+      }
+      .request {
+        border-top: 3px solid var(--running);
+      }
+      .request .numbers {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+        margin: 15px 0;
+      }
+      .big {
+        font-size: 19px;
+        font-variant-numeric: tabular-nums;
+      }
+      small {
+        font-size: 11px;
+        display: block;
+      }
+      code {
+        font:
+          12px ui-monospace,
+          monospace;
+        color: #bbcee8;
+        overflow-wrap: anywhere;
+      }
+      .empty {
+        padding: 28px;
+        border: 1px dashed var(--line);
+        border-radius: 10px;
+        color: var(--muted);
+        text-align: center;
+      }
+      .table-wrap {
+        overflow: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        white-space: nowrap;
+      }
+      th {
+        text-align: left;
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.7px;
+        font-weight: 600;
+      }
+      td,
+      th {
+        padding: 13px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      td:first-child,
+      th:first-child {
+        padding-left: 0;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      .tier-number {
+        font-size: 16px;
+        font-variant-numeric: tabular-nums;
+      }
+      .detail {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      details {
+        margin: 12px 0;
+      }
+      summary {
+        cursor: pointer;
+        padding: 14px 18px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+      .checkpoint-body {
+        padding: 0 18px 12px;
+        border: 1px solid var(--line);
+        border-top: 0;
+        border-radius: 0 0 8px 8px;
+      }
+      details[open] summary {
+        border-radius: 8px 8px 0 0;
+      }
+      .chart {
+        height: 40px;
+        width: 100%;
+        display: block;
+        margin-top: 8px;
+      }
+      .note {
+        font-size: 12px;
+        color: var(--muted);
+        max-width: 1000px;
+      }
+      .notice {
+        padding: 12px 16px;
+        border: 1px solid #645039;
+        color: var(--warn);
+        border-radius: 8px;
+        margin: 15px 0;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      footer {
+        margin-top: 30px;
+        border-top: 1px solid var(--line);
+        padding-top: 18px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      a {
+        color: var(--vram);
+      }
+      @media (max-width: 800px) {
+        .cards {
+          grid-template-columns: 1fr 1fr;
+        }
+        .pools,
+        .requests {
+          grid-template-columns: 1fr;
+        }
+        main {
+          padding: 20px 16px;
+        }
+        .card,
+        .panel,
+        .request {
+          padding: 16px;
+        }
+        h1 {
+          font-size: 24px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .bar span {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">NINFER / OBSERVABILITY</div>
+          <h1>Context & memory</h1>
+          <div class="muted">
+            Parallel requests, retained checkpoints, and the memory they
+            reference.
+          </div>
+        </div>
+        <div class="controls">
+          <span id="status" class="status" role="status">Connecting…</span
+          ><button id="pause" type="button">Pause updates</button>
+        </div>
+      </header>
+      <form id="auth" hidden class="notice">
+        <label for="key">Server API key </label
+        ><input
+          id="key"
+          type="password"
+          autocomplete="off"
+          placeholder="API key"
+        /><button type="submit">Connect</button
+        ><small
+          >Used only in this page’s memory. Never saved in the URL or browser
+          storage.</small
+        >
+      </form>
+      <div id="notice" class="notice" hidden role="alert"></div>
+      <div class="cards">
+        <div class="card">
+          <div class="label">ACTIVE REQUESTS</div>
+          <div class="value" id="active">—</div>
+          <small id="queued">Waiting for server</small>
+        </div>
+        <div class="card">
+          <div class="label">SHARED GPU KV POOL</div>
+          <div class="value" id="kv-use">—</div>
+          <small id="kv-cap">Resident + reserved capacity</small>
+        </div>
+        <div class="card">
+          <div class="label">HOST KV POOL · RAM</div>
+          <div class="value" id="ram-use">—</div>
+          <small id="ram-cap">Checkpoint replicas + request backing</small>
+        </div>
+        <div class="card">
+          <div class="label">AGGREGATE DECODE SPEED</div>
+          <div class="value" id="speed">—</div>
+          <small>tokens/s of decode execution · last interval</small
+          ><svg
+            id="chart"
+            class="chart"
+            viewBox="0 0 240 40"
+            role="img"
+            aria-label="Recent aggregate decode speed"
+          >
+            <polyline
+              id="line"
+              fill="none"
+              stroke="#75a7ff"
+              stroke-width="2"
+              points=""
+            />
+          </svg>
+        </div>
+      </div>
+      <div class="section-head">
+        <h2>Shared context capacity</h2>
+        <div class="legend">
+          <span><i class="dot vram"></i>Resident VRAM</span
+          ><span><i class="dot reserved"></i>Reserved GPU pages</span
+          ><span><i class="dot ram"></i>RAM</span>
+        </div>
+      </div>
+      <div class="pools">
+        <section class="panel">
+          <h3>GPU · VRAM</h3>
+          <div id="gpu-pools"></div>
+        </section>
+        <section class="panel">
+          <h3>Host · RAM</h3>
+          <div id="host-pools"></div>
+        </section>
+      </div>
+      <p class="note" style="margin-top: 12px">
+        These are NInfer’s configured context pools, not total machine memory.
+        Pool occupancy is counted once, including shared allocations. GPU
+        reservations secure future growth; RAM backing can be allocated before a
+        request is moved there.
+      </p>
+      <div class="section-head">
+        <h2>Current requests</h2>
+        <span class="muted" id="request-count"></span>
+      </div>
+      <div class="legend" style="margin-bottom: 14px">
+        <span><i class="dot running-dot"></i>Running</span>
+        <span><i class="dot pending-dot"></i>Pending</span>
+        <span><i class="dot suspended-dot"></i>Suspended</span>
+      </div>
+      <div id="pending" class="pending" hidden></div>
+      <div id="requests" class="requests"></div>
+      <div id="no-requests" class="empty">Waiting for server…</div>
+      <p class="note" style="margin-top: 12px">
+        Each request’s GPU bar shows mapped and reserved Main KV token capacity
+        relative to the shared pool. Memory figures include referenced state and
+        KV; aliases can appear in multiple rows. RAM backing shows allocated
+        capacity separately from copied data.
+      </p>
+      <div class="section-head">
+        <h2>Retained checkpoints</h2>
+        <span class="muted" id="checkpoint-count"></span>
+      </div>
+      <div id="checkpoints"></div>
+      <div id="no-checkpoints" class="empty">Waiting for server…</div>
+      <p class="note" style="margin-top: 12px">
+        Checkpoint sizes are resident physical State and KV payloads, with full
+        KV pages including partial tails. Shared State and KV are included in
+        every referencing checkpoint: rows must not be added together and do not
+        predict bytes freed by deletion. Both VRAM and RAM can hold a replica.
+        Figures exclude model weights, workspace, CPU metadata, allocator
+        overhead outside the payload, and on-disk snapshots. This list covers
+        the private checkpoints also exposed by /slots; shared-prefix cache
+        occupancy is included in the pool overview.
+      </p>
+      <footer>
+        <span id="transfers">Transfer totals unavailable</span><br />Refreshes
+        every 2 seconds from one Engine publication.
+        <a href="slots">Raw slots</a> · <a href="metrics">Prometheus metrics</a>
+      </footer>
+    </main>
+    <script>
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const number = (n) => Number(n).toLocaleString("en-US");
+      const bytes = (n) => {
+        if (!n) return "0 B";
+        const i = Math.min(4, Math.floor(Math.log(n) / Math.log(1024)));
+        return `${(n / 1024 ** i).toFixed(i ? 2 : 0)} ${["B", "KiB", "MiB", "GiB", "TiB"][i]}`;
+      };
+      const percent = (n, d) =>
+        d ? Math.min(100, Math.max(0, (n / d) * 100)) : 0;
+      function node(tag, text, className) {
+        const e = document.createElement(tag);
+        if (text !== undefined) e.textContent = text;
+        if (className) e.className = className;
+        return e;
+      }
+      function bar(used, total, reserved = 0, host = false) {
+        const e = node("div", undefined, "bar");
+        e.setAttribute("role", "img");
+        e.setAttribute(
+          "aria-label",
+          `${number(used)} used, ${number(reserved)} reserved, ${number(total)} capacity`,
+        );
+        for (const [n, c] of [
+          [used, host ? "ram" : "vram"],
+          [reserved, "reserved"],
+        ]) {
+          const s = node("span", undefined, c);
+          s.style.width = percent(n, total) + "%";
+          e.append(s);
+        }
+        return e;
+      }
+      function pool(
+        name,
+        used,
+        total,
+        reserved = 0,
+        unit = "bytes",
+        host = false,
+      ) {
+        const e = node("div", undefined, "pool");
+        const format = unit === "bytes" ? bytes : number;
+        const head = node("div", undefined, "spread");
+        head.append(
+          node("span", name),
+          node(
+            "span",
+            `${format(used + reserved)} / ${format(total)}${unit === "bytes" ? "" : " " + unit}`,
+            "muted",
+          ),
+        );
+        e.append(head, bar(used, total, reserved, host));
+        e.append(
+          node(
+            "small",
+            unit === "bytes"
+              ? `${number(used)} bytes occupied · ${number(Math.max(0, total - used - reserved))} bytes free`
+              : `${number(used)} used${reserved ? " + " + number(reserved) + " reserved" : ""} · ${number(Math.max(0, total - used - reserved))} free`,
+          ),
+        );
+        return e;
+      }
+      function memoryCell(total, state, kv) {
+        const e = node("td");
+        e.append(
+          node("div", bytes(total), "tier-number"),
+          node("small", `${number(total)} bytes`),
+          node("div", `State ${bytes(state)} · KV ${bytes(kv)}`, "detail"),
+        );
+        e.title = `State: ${number(state)} bytes; KV: ${number(kv)} bytes`;
+        return e;
+      }
+      let previous = null,
+        history = [],
+        paused = false,
+        apiKey = "",
+        timer = null,
+        inFlight = false;
+      function render(data) {
+        const p = data.pools,
+          g = data.generation;
+        const active = data.slots.filter((s) => s.processing);
+        $("active").textContent = `${g.running} / ${data.max_concurrency}`;
+        $("queued").textContent =
+          `${g.waiting} queued · ${g.prefilling} prefilling`;
+        $("kv-use").textContent =
+          percent(p.main_occupied_pages, p.main_capacity_pages).toFixed(1) +
+          "%";
+        $("kv-cap").textContent =
+          `${number(p.main_capacity_tokens)} shared token capacity`;
+        $("ram-use").textContent = bytes(p.host_kv_occupied_bytes);
+        $("ram-cap").textContent =
+          `of ${bytes(p.host_kv_capacity_bytes)} allocated pool`;
+        let speed = null;
+        if (
+          previous &&
+          g.decode_tokens >= previous.decode_tokens &&
+          g.decode_seconds >= previous.decode_seconds
+        ) {
+          const dt = g.decode_seconds - previous.decode_seconds;
+          speed = dt > 0 ? (g.decode_tokens - previous.decode_tokens) / dt : 0;
+        } else history = [];
+        previous = g;
+        $("speed").textContent = speed === null ? "—" : speed.toFixed(1);
+        if (speed !== null) {
+          history.push(speed);
+          history = history.slice(-60);
+        }
+        const max = Math.max(1, ...history);
+        $("line").setAttribute(
+          "points",
+          history
+            .map(
+              (v, i) =>
+                `${(i * 240) / Math.max(1, history.length - 1)},${38 - (v / max) * 34}`,
+            )
+            .join(" "),
+        );
+        $("gpu-pools").replaceChildren(
+          pool(
+            "Main KV",
+            p.main_occupied_pages - p.main_reserved_pages,
+            p.main_capacity_pages,
+            p.main_reserved_pages,
+            "pages",
+          ),
+          pool(
+            "Checkpoint / active state",
+            p.device_state_used,
+            p.device_state_capacity,
+            0,
+            "images",
+          ),
+        );
+        if (p.backend_capacity_pages)
+          $("gpu-pools").append(
+            pool(
+              "Speculative KV · occupied / reserved",
+              p.backend_occupied_pages,
+              p.backend_capacity_pages,
+              0,
+              "pages",
+            ),
+          );
+        $("gpu-pools").append(
+          node(
+            "small",
+            `Main KV capacity ${bytes(p.main_capacity_pages * p.main_page_bytes)} · ${number(p.main_page_bytes)} bytes/page`,
+          ),
+        );
+        $("host-pools").replaceChildren(
+          pool(
+            "KV replicas & request backing",
+            p.host_kv_occupied_bytes,
+            p.host_kv_capacity_bytes,
+            0,
+            "bytes",
+            true,
+          ),
+          pool(
+            "Checkpoint state",
+            p.host_state_used * p.host_state_image_bytes,
+            p.host_state_capacity * p.host_state_image_bytes,
+            0,
+            "bytes",
+            true,
+          ),
+        );
+        $("requests").replaceChildren();
+        $("no-requests").hidden = active.length > 0;
+        $("no-requests").textContent = data.ready
+          ? "No requests are running. Retained context is shown below."
+          : "Engine unavailable or loading.";
+        $("request-count").textContent = `${active.length} visible lanes`;
+        $("pending").hidden = g.waiting === 0;
+        $("pending").textContent =
+          `Pending · ${number(g.waiting)} ${g.waiting === 1 ? "request" : "requests"} waiting for admission`;
+
+        for (const s of active) {
+          const e = node(
+              "article",
+              undefined,
+              s.suspended ? "request suspended-request" : "request",
+            ),
+            head = node("div", undefined, "spread");
+          head.append(
+            node("h3", `Lane ${s.lane} · request ${s.request_id}`),
+            node(
+              "span",
+              s.suspended
+                ? "Suspended · KV in RAM"
+                : s.prefilling
+                  ? "Prefilling"
+                  : "Running",
+              s.suspended ? "badge suspended-badge" : "badge",
+            ),
+          );
+          e.append(
+            head,
+            node(
+              "small",
+              `${number(s.prompt_tokens)} prompt tokens · ${number(s.cached_tokens)} reused`,
+            ),
+          );
+          const nums = node("div", undefined, "numbers");
+          for (const [label, total] of [
+            [
+              "Resident VRAM",
+              s.memory.device_state_bytes + s.memory.device_kv_bytes,
+            ],
+            [
+              "RAM data",
+              s.memory.host_state_bytes +
+                s.memory.host_kv_bytes +
+                s.host_backing_used_bytes,
+            ],
+          ]) {
+            const n = node("div");
+            n.append(
+              node("small", label),
+              node("div", bytes(total), "big"),
+              node("small", `${number(total)} bytes`),
+            );
+            nums.append(n);
+          }
+          e.append(
+            nums,
+            pool(
+              "GPU context share",
+              s.mapped_tokens,
+              p.main_capacity_tokens,
+              Math.max(0, s.reserved_tokens - s.mapped_tokens),
+              "tokens",
+            ),
+            pool(
+              "Private RAM backing · copied / allocated",
+              s.host_backing_used_bytes,
+              s.host_backing_bytes,
+              0,
+              "bytes",
+              true,
+            ),
+          );
+          e.append(
+            node(
+              "small",
+              `GPU State ${bytes(s.memory.device_state_bytes)} · GPU KV ${bytes(s.memory.device_kv_bytes)}`,
+            ),
+          );
+          $("requests").append(e);
+        }
+        const opened = new Set(
+          [...$("checkpoints").querySelectorAll("details[open]")].map(
+            (e) => e.dataset.slot,
+          ),
+        );
+        $("checkpoints").replaceChildren();
+        let count = 0;
+        for (const s of data.slots.filter((s) => s.checkpoints.length)) {
+          count += s.checkpoints.length;
+          const details = node("details");
+          details.dataset.slot = String(s.id);
+          details.open = opened.has(String(s.id)) || !render.initialized;
+          const summary = node("summary");
+          summary.append(
+            node(
+              "strong",
+              `Slot ${s.id} · ${s.checkpoints.length} checkpoints`,
+            ),
+            node("span", `  · ${number(s.prompt_tokens)} tokens  · `, "muted"),
+            node("code", s.session_digest),
+          );
+          details.append(summary);
+          const wrap = node("div", undefined, "checkpoint-body table-wrap"),
+            table = node("table"),
+            thead = node("thead"),
+            tr = node("tr");
+          for (const h of ["Frontier", "Identity", "VRAM", "RAM"])
+            tr.append(node("th", h));
+          thead.append(tr);
+          table.append(thead);
+          const tbody = node("tbody");
+          for (const c of s.checkpoints) {
+            const row = node("tr"),
+              identity = node("td");
+            identity.append(node("code", c.session_digest));
+            row.append(
+              node("td", `${number(c.frontier)} tokens`),
+              identity,
+              memoryCell(
+                c.memory.device_state_bytes + c.memory.device_kv_bytes,
+                c.memory.device_state_bytes,
+                c.memory.device_kv_bytes,
+              ),
+              memoryCell(
+                c.memory.host_state_bytes + c.memory.host_kv_bytes,
+                c.memory.host_state_bytes,
+                c.memory.host_kv_bytes,
+              ),
+            );
+            tbody.append(row);
+          }
+          table.append(tbody);
+          wrap.append(table);
+          details.append(wrap);
+          $("checkpoints").append(details);
+        }
+        render.initialized = true;
+        $("checkpoint-count").textContent = `${count} checkpoints`;
+        $("no-checkpoints").hidden = count > 0;
+        $("no-checkpoints").textContent = data.ready
+          ? "No private checkpoints are retained."
+          : "Engine unavailable or loading.";
+        $("transfers").textContent =
+          `Cache transfers since startup: ${bytes(g.to_ram_bytes)} to RAM · ${bytes(g.to_vram_bytes)} to VRAM. Generation suspension/resume traffic: ${bytes(g.suspension_transfer_bytes)} · ${g.suspensions} suspensions · ${g.resumes} resumes.`;
+      }
+      async function refresh() {
+        if (inFlight || paused) return;
+        inFlight = true;
+        const controller = new AbortController(),
+          timeout = setTimeout(() => controller.abort(), 8000);
+        try {
+          const response = await fetch("monitor/data", {
+            headers: apiKey ? { Authorization: "Bearer " + apiKey } : {},
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (response.status === 401) {
+            $("auth").hidden = false;
+            throw new Error("API key required.");
+          }
+          if (!response.ok)
+            throw new Error(`Server returned HTTP ${response.status}.`);
+          const data = await response.json();
+          render(data);
+          $("auth").hidden = true;
+          $("notice").hidden = data.ready;
+          $("notice").textContent =
+            "Engine unavailable or still loading. Figures are the last published snapshot.";
+          $("status").textContent = paused
+            ? "Paused"
+            : `Updated ${new Date().toLocaleTimeString()}`;
+          $("status").className = "status";
+        } catch (error) {
+          previous = null;
+          $("notice").hidden = false;
+          $("notice").textContent =
+            `${error.name === "AbortError" ? "Refresh timed out." : error.message} Displayed values may be stale; retrying every 2 seconds.`;
+          $("status").textContent = "Disconnected · stale";
+          $("status").className = "status error";
+          $("speed").textContent = "—";
+        } finally {
+          clearTimeout(timeout);
+          inFlight = false;
+          if (!paused) timer = setTimeout(refresh, 2000);
+        }
+      }
+      $("pause").addEventListener("click", () => {
+        paused = !paused;
+        clearTimeout(timer);
+        $("pause").textContent = paused ? "Resume updates" : "Pause updates";
+        $("status").textContent = paused ? "Paused" : "Connecting…";
+        if (!paused) {
+          previous = null;
+          refresh();
+        }
+      });
+      $("auth").addEventListener("submit", (event) => {
+        event.preventDefault();
+        apiKey = $("key").value;
+        $("key").value = "";
+        clearTimeout(timer);
+        previous = null;
+        refresh();
+      });
+      refresh();
+    </script>
+  </body>
+</html>

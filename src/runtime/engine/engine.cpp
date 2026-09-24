@@ -789,6 +789,19 @@ std::vector<SlotState> Engine::slot_states() const {
         impl_->core);
 }
 
+ContextSnapshot Engine::context_snapshot() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> ContextSnapshot {
+            if constexpr (requires { core->context_snapshot(); }) {
+                return core->context_snapshot();
+            } else {
+                throw std::logic_error("context monitoring requires a generation Engine");
+            }
+        },
+        impl_->core);
+}
+
 bool Engine::is_available() const {
     if (impl_ == nullptr) { return false; }
     return std::visit(

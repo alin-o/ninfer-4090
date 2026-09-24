@@ -1,0 +1,5 @@
+#pragma once
+#include <string_view>
+namespace ninfer::serve {
+inline constexpr std::string_view kContextMonitorPage = R"NINFER_HTML(@NINFER_CONTEXT_MONITOR_HTML@)NINFER_HTML";
+}

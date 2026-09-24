@@ -35,7 +35,13 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+namespace testing {
+struct HttpServerTestAccess;
+}
+
 class HttpServer {
+    friend struct testing::HttpServerTestAccess;
+
 public:
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
 

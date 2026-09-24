@@ -65,6 +65,8 @@ omitted at startup.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `GET /monitor` | auto-refreshing context, request, and checkpoint memory dashboard |
+| `GET /monitor/data` | coherent Engine context snapshot for the dashboard; authenticated like `/slots` |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 
@@ -75,6 +77,42 @@ cancellations, and queue timeouts do not trigger it. Run the container with
 `--restart unless-stopped` (without `--rm`) to reload the model automatically after such an exit.
 In-memory Responses and private continuations are lost on restart; durable shared prefixes remain
 available in the configured cache directory.
+
+### Context and memory dashboard
+
+Open `/monitor` on the same `ninfer-serve` address. The self-contained page refreshes every two
+seconds and works without external assets. The dark theme marks running requests in green,
+pending requests in blue, and suspended requests in orange. It shows shared GPU Main/backend KV and State pool
+occupancy, GPU growth reservations, Host KV and State pools, parallel request lanes, private
+checkpoint frontiers, and a recent aggregate decode-speed graph. Pause/resume controls stop polling.
+With `--api-key`, enter the key on the page; it is held only in page memory. The static page is
+public so browsers can open it, while `/monitor/data` keeps the normal API authentication.
+`/slots` retains its existing JSON schema.
+
+The pool overview reports physical occupancy once. Per-request and per-checkpoint figures report
+referenced resident State and KV payload bytes; expand a slot to see checkpoint details. Both
+VRAM and RAM replicas are counted where they exist. Full KV pages, including partial tails, count
+at their physical size. Host State includes its per-image alignment; Device State counts tensor
+payload. Shared State/KV allocations appear in each referencing row: **do not sum those rows** or
+interpret them as bytes reclaimed by deleting a checkpoint. The overview includes shared-prefix
+cache allocations; checkpoint detail covers the private catalog also exposed by `/slots`.
+
+Active request bars compare mapped and reserved Main KV token capacity with the shared pool.
+Suspended requests retain their GPU State, while the private RAM backing panel distinguishes
+allocated backing from copied KV data. Pool capacities are the configured NInfer context budgets,
+not total GPU/OS memory. Weights, workspace, CPU object metadata, allocator overhead outside the
+reported payload, and SSD snapshots are outside these per-checkpoint figures.
+
+Generation speed is the delta of committed decode tokens divided by the delta of decode execution
+seconds, aggregated across parallel lanes. It excludes prefill, queue/idle time, and the first token
+emitted by prefill; it is not per-request wall-clock throughput. The first poll displays no rate;
+idle intervals display zero. Disconnection preserves the last figures with a stale-data warning.
+
+Engine publishes memory, runtime counters, and slot rows together under one snapshot lock.
+Physical per-row accounting runs at most twice per second during active execution, plus idle
+boundaries to publish completion and administrative changes. HTTP readers never wait on model
+execution. Updates become visible at settled Engine execution boundaries, so a long execution
+unit can delay a refresh. Sampling does not change cache residency, reservations, or scheduling.
 
 ### Durable shared-prefix persistence
 

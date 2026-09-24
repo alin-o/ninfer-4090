@@ -676,8 +676,14 @@ Program<Variant>::continuation_digest(const ContinuationHandle<Variant>& continu
 
 template <>
 std::vector<SlotCheckpoint>
-Program<Variant>::continuation_checkpoints(const ContinuationHandle<Variant>& continuation) const {
-    return impl_->continuation_checkpoints(continuation);
+Program<Variant>::continuation_checkpoints(const ContinuationHandle<Variant>& continuation,
+                                           bool memory_only) const {
+    return impl_->continuation_checkpoints(continuation, memory_only);
+}
+
+template <>
+ContextMemory Program<Variant>::sequence_memory(SequenceHandle<Variant> sequence) const {
+    return impl_->sequence_memory(sequence);
 }
 
 template <>

@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "runtime/engine/context_transfer_test_gate.h"
+#include "targets/qwen3_6/impl/runtime/context_memory.h"
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
 #include <algorithm>
@@ -502,8 +503,38 @@ std::string ProgramImplCore::continuation_digest(const ContinuationHandle& conti
     return ledger_digest(sequence.ledger);
 }
 
+ContextMemory ProgramImplCore::resident_memory(const SequenceState& sequence,
+                                               std::uint32_t frontier,
+                                               std::span<const StateImageHandle> states) const {
+    ContextMemory out = detail::resident_state_memory(*state_store, *state_images, states);
+    if (!sequence.kv) { return out; }
+    detail::add_resident_kv_memory(out, *text_kv_addresses, *text_kv_pages, host_kv_extents.get(),
+                                   sequence.kv->text, frontier);
+    if (sequence.kv->backend) {
+        const auto backend_frontier = speculative_backend == SpeculativeBackend::Mtp
+                                          ? (frontier == 0 ? 0 : frontier - 1U)
+                                          : frontier;
+        detail::add_resident_kv_memory(out, *backend_kv_addresses, *backend_kv_pages,
+                                       host_kv_extents.get(), *sequence.kv->backend,
+                                       backend_frontier);
+    }
+    return out;
+}
+
+ContextMemory ProgramImplCore::sequence_memory(SequenceHandle handle) const {
+    if (!valid_sequence(handle)) { return {}; }
+    const auto& sequence = active_sequence(ContractAccess::lane(handle).value);
+    std::vector<StateImageHandle> states{sequence.state.read, sequence.state.write};
+    if (sequence.rewrite_state) { states.push_back(*sequence.rewrite_state); }
+    if (sequence.reserved_state) { states.push_back(*sequence.reserved_state); }
+    for (const auto& anchor : sequence.long_anchors) { states.push_back(anchor.state); }
+    // Active mappings may include provisional decode pages beyond the committed frontier.
+    return resident_memory(sequence, std::numeric_limits<std::uint32_t>::max(), states);
+}
+
 std::vector<SlotCheckpoint>
-ProgramImplCore::continuation_checkpoints(const ContinuationHandle& continuation) const {
+ProgramImplCore::continuation_checkpoints(const ContinuationHandle& continuation,
+                                          bool memory_only) const {
     if (!valid_continuation(continuation)) { return {}; }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
     const std::uint32_t depth     = static_cast<std::uint32_t>(sequence.ledger.size());
@@ -524,8 +555,27 @@ ProgramImplCore::continuation_checkpoints(const ContinuationHandle& continuation
     out.reserve(frontiers.size());
     for (const std::uint32_t frontier : frontiers) {
         if (frontier == 0 || frontier > depth) { continue; }
-        out.push_back(SlotCheckpoint{frontier, ledger_prefix_digest(std::span<const TokenId>(
-                                                   sequence.ledger.data(), frontier))});
+        SlotCheckpoint checkpoint;
+        checkpoint.frontier = frontier;
+        if (!memory_only) {
+            checkpoint.session_digest =
+                ledger_prefix_digest(std::span<const TokenId>(sequence.ledger.data(), frontier));
+            out.push_back(std::move(checkpoint));
+            continue;
+        }
+        std::vector<StateImageHandle> states;
+        for (const auto& anchor : sequence.long_anchors) {
+            if (anchor.frontier == frontier) { states.push_back(anchor.state); }
+        }
+        if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier == frontier &&
+            sequence.rewrite_state) {
+            states.push_back(*sequence.rewrite_state);
+        }
+        if (sequence.endpoint_valid && sequence.ledger_frontier == frontier) {
+            states.push_back(sequence.state.read);
+        }
+        checkpoint.memory = resident_memory(sequence, frontier, states);
+        out.push_back(std::move(checkpoint));
     }
     return out;
 }

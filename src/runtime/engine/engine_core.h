@@ -139,6 +139,7 @@ public:
         resources_.set_slot_release_observer(
             [this](std::uint32_t slot) { clear_slot_session(slot); });
         published_memory_ = collect_memory_summary();
+        published_context_.memory = published_memory_;
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -798,6 +799,11 @@ public:
         return states;
     }
 
+    [[nodiscard]] ContextSnapshot context_snapshot() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_context_;
+    }
+
     // Installs the auto-save sink: the model binding save_continuation needs, and a consumer
     // that receives (path, snapshot) for each spilled session and writes the file off-thread.
     void set_eviction_sink(
@@ -1281,6 +1287,11 @@ private:
         }
         // Per-slot occupancy for /slots-style readers. Digests come from a cache keyed by the
         // catalog entry's (id, revision), so an unchanged session costs no ledger hashing.
+        // Rich physical accounting is bounded to twice a second during execution. Always
+        // publish an idle boundary, so completion/erase cannot leave a stale running request.
+        const auto monitor_now = Clock::now();
+        const bool refresh_monitor =
+            snapshot.running_requests == 0 || monitor_now >= next_context_monitor_publication_;
         std::vector<SlotState> slot_snapshot(resources_.catalog_capacity());
         for (std::uint32_t slot = 0; slot < resources_.catalog_capacity(); ++slot) {
             const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
@@ -1301,7 +1312,17 @@ private:
             state.prompt_tokens  = cache.depth;
             state.cached_tokens  = cache.depth;
             state.session_digest = cache.digest;
-            state.checkpoints    = cache.checkpoints;
+            state.checkpoints =
+                refresh_monitor ? instance_.program->continuation_checkpoints(*view.handle, true)
+                                : cache.checkpoints;
+            for (auto& checkpoint : state.checkpoints) {
+                for (const auto& cached : cache.checkpoints) {
+                    if (cached.frontier == checkpoint.frontier) {
+                        checkpoint.session_digest = cached.session_digest;
+                        break;
+                    }
+                }
+            }
         }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
@@ -1311,6 +1332,19 @@ private:
             SlotState& state    = slot_snapshot[*publication];
             state.processing    = true;
             state.prompt_tokens = slots_[lane]->prompt_summary.prompt_tokens;
+            state.request_id    = slots_[lane]->id;
+            state.lane          = lane;
+            state.prefilling    = slots_[lane]->is_prefilling();
+            if (refresh_monitor && slots_[lane]->sequence) {
+                const auto sequence    = *slots_[lane]->sequence;
+                const auto reservation = instance_.program->generation_reservation_state(sequence);
+                state.memory           = instance_.program->sequence_memory(sequence);
+                state.mapped_tokens    = reservation.mapped_tokens;
+                state.reserved_tokens  = reservation.reserved_tokens;
+                state.host_backing_bytes      = reservation.host_backing_bytes;
+                state.host_backing_used_bytes = reservation.host_backing_used_bytes;
+                state.suspended               = reservation.suspended;
+            }
             if (slots_[lane]->begin) {
                 state.cached_tokens = slots_[lane]->begin->reused_prompt_tokens;
             }
@@ -1324,6 +1358,10 @@ private:
         std::lock_guard lock(stats_mutex_);
         published_memory_ = memory;
         published_stats_ = snapshot;
+        if (refresh_monitor) {
+            published_context_                = {memory, snapshot, slot_snapshot};
+            next_context_monitor_publication_ = monitor_now + std::chrono::milliseconds(500);
+        }
         published_slots_ = std::move(slot_snapshot);
     }
 
@@ -3562,6 +3600,8 @@ private:
     std::vector<SlotDigestCacheEntry> slot_digest_cache_;
     // Guarded by stats_mutex_, republished at every unit boundary.
     std::vector<SlotState> published_slots_;
+    ContextSnapshot published_context_;
+    Clock::time_point next_context_monitor_publication_{};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

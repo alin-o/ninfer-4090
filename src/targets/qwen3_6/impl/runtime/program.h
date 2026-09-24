@@ -742,7 +742,9 @@ public:
     continuation_depth(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
     [[nodiscard]] std::vector<SlotCheckpoint>
-    continuation_checkpoints(const ContinuationHandle& continuation) const;
+    continuation_checkpoints(const ContinuationHandle& continuation,
+                             bool memory_only = false) const;
+    [[nodiscard]] ContextMemory sequence_memory(SequenceHandle sequence) const;
     [[nodiscard]] qwen3_6::ContinuationSummary
     continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
@@ -1153,6 +1155,9 @@ private:
     [[nodiscard]] bool has_unsettled_state_fork() const noexcept;
     [[nodiscard]] bool materialization_transition_blocked() const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
+    [[nodiscard]] ContextMemory resident_memory(const SequenceState& sequence,
+                                                std::uint32_t frontier,
+                                                std::span<const StateImageHandle> states) const;
     // Per-owner resources are intentionally distinct from global physical occupancy: an aliased
     // allocation contributes only when removing this owner would release it.
     [[nodiscard]] detail::PhysicalResources

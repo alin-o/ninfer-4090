@@ -144,6 +144,24 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
         while (results[i].wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
             peak_host_backing =
                 std::max(peak_host_backing, engine.runtime_stats().generation_host_backing_bytes);
+            const auto monitor = engine.context_snapshot();
+            for (const auto& slot : monitor.slots) {
+                if (!slot.processing) { continue; }
+                require(slot.request_id != 0 && slot.lane < concurrency,
+                        "monitor lost active request identity");
+                require(slot.host_backing_used_bytes <= slot.host_backing_bytes,
+                        "monitor RAM data exceeds allocated backing");
+                require(slot.memory.device_kv_bytes <=
+                            monitor.memory.device_main_kv_occupied_pages *
+                                monitor.memory.device_main_kv_page_bytes,
+                        "monitor request KV exceeds the coherent physical pool");
+                if (slot.suspended) {
+                    require(slot.memory.device_kv_bytes == 0 && slot.mapped_tokens == 0 &&
+                                slot.reserved_tokens == 0 && slot.memory.device_state_bytes > 0 &&
+                                slot.host_backing_used_bytes > 0,
+                            "monitor suspended request has incorrect State/KV residency");
+                }
+            }
         }
         auto result     = results[i].get();
         max_queue_wait  = std::max(max_queue_wait, result.engine_timing.queue_wait_seconds);

@@ -157,6 +157,8 @@ public:
 
     // Truthful per-slot occupancy, read from the snapshot published at every unit boundary.
     [[nodiscard]] std::vector<SlotState> slot_states() const;
+    // Coherent monitoring sample (up to 500 ms between active execution boundaries).
+    [[nodiscard]] ContextSnapshot context_snapshot() const;
 
 private:
     [[nodiscard]] GenerationHandle

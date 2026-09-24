@@ -1163,9 +1163,12 @@ public:
     [[nodiscard]] std::string
     continuation_digest(const ContinuationHandle<Variant>& continuation) const;
     // Restorable frontiers of the continuation, ascending, each with the digest of the ledger
-    // prefix it covers (rewrite checkpoint, long anchors, and the endpoint).
+    // prefix it covers (rewrite checkpoint, long anchors, and the endpoint). Passing true
+    // skips ledger hashing so Engine can reuse cached digests while refreshing physical bytes.
     [[nodiscard]] std::vector<SlotCheckpoint>
-    continuation_checkpoints(const ContinuationHandle<Variant>& continuation) const;
+    continuation_checkpoints(const ContinuationHandle<Variant>& continuation,
+                             bool memory_only = false) const;
+    [[nodiscard]] ContextMemory sequence_memory(SequenceHandle<Variant> sequence) const;
     // Session persistence for one catalogued continuation. `model_binding` pins the snapshot to
     // the serving weights identity; restore rejects a mismatched binding or configuration and
     // returns the rebuilt continuation (depth and digest come from the accessors above).

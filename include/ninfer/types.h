@@ -1074,6 +1074,8 @@ struct MemorySummary {
     std::size_t checkpoint_state_image_bytes       = 0;
     std::size_t dflash_kv_bytes                    = 0;
     std::size_t replay_records_bytes               = 0;
+    std::uint32_t device_state_capacity_slots      = 0;
+    std::uint32_t device_main_kv_reserved_pages    = 0;
     std::uint32_t device_main_kv_capacity_pages    = 0;
     std::uint32_t device_main_kv_occupied_pages    = 0;
     std::size_t device_main_kv_page_bytes          = 0;
@@ -1360,12 +1362,23 @@ struct SlotRestoreResult {
     std::string session_digest;
 };
 
+// Resident physical payload referenced by a checkpoint/request. Full KV pages are counted,
+// including a partial tail. Aliases count in every referencing row; rows are not additive.
+// Pool-wide allocator padding, weights, workspace, and CPU metadata are excluded.
+struct ContextMemory {
+    std::uint64_t device_state_bytes = 0;
+    std::uint64_t host_state_bytes   = 0;
+    std::uint64_t device_kv_bytes    = 0;
+    std::uint64_t host_kv_bytes      = 0;
+};
+
 // One retained turn checkpoint of a resident session: the ledger depth it rewinds to and the
 // digest of the ledger prefix up to that frontier (same FNV-1a 64 hex encoding as
 // SlotState::session_digest, computed over the prefix only).
 struct SlotCheckpoint {
     std::uint32_t frontier = 0;
     std::string session_digest;
+    ContextMemory memory;
 };
 
 // One Engine lane's occupancy for /slots-style reporting: an active request's prompt size, or
@@ -1380,6 +1393,23 @@ struct SlotState {
     std::uint32_t cached_tokens = 0;
     std::string session_digest;
     std::vector<SlotCheckpoint> checkpoints;
+    // Detailed memory/reservation fields are populated in ContextSnapshot only.
+    ContextMemory memory; // Active request's referenced State/KV, including retained anchors.
+    std::uint64_t request_id              = 0;
+    std::uint32_t lane                    = 0;
+    std::uint32_t mapped_tokens           = 0;
+    std::uint32_t reserved_tokens         = 0;
+    std::uint64_t host_backing_bytes      = 0;
+    std::uint64_t host_backing_used_bytes = 0;
+    bool suspended                        = false;
+    bool prefilling                       = false;
+};
+
+// One worker publication, copied under a single lock for monitoring.
+struct ContextSnapshot {
+    MemorySummary memory;
+    RuntimeStats runtime;
+    std::vector<SlotState> slots;
 };
 
 // Raised when a slot operation's session precondition (if_digest) does not match the lane's

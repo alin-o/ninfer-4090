@@ -12823,6 +12823,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.mtp_kv_bytes                 = mtp_kv_bytes;
     out.gdn_state_bytes              = gdn_state_bytes;
     out.checkpoint_state_image_bytes = state_images ? state_images->host_layout().image_bytes : 0;
+    out.device_state_capacity_slots  = state_images ? state_images->slot_count() : 0;
     out.dflash_kv_bytes              = dflash_kv_bytes;
     out.replay_records_bytes         = replay_records_bytes;
     const auto device_page_bytes = [](const DeviceKVPagePool& pool) {
@@ -12835,6 +12836,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     if (text_kv_pages) {
         const DeviceKVPagePool& pool      = text_kv_pages->physical_pool();
         out.device_main_kv_capacity_pages = pool.capacity_pages();
+        out.device_main_kv_reserved_pages = pool.reserved_pages();
         out.device_main_kv_occupied_pages = pool.allocated_pages() + pool.reserved_pages();
         out.device_main_kv_page_bytes     = device_page_bytes(pool);
     }

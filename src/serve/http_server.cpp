@@ -4,6 +4,7 @@
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
+#include "serve/context_monitor.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
 #include "serve/slot_files.h"
@@ -390,7 +391,8 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/monitor" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -472,6 +474,19 @@ void HttpServer::register_routes() {
         res.status = available ? 200 : 503;
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
+    });
+    server_.Get("/monitor", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(std::string(context_monitor_page()), "text/html; charset=utf-8");
+    });
+    server_.Get("/monitor/data", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
+        const bool ready = service_ != nullptr && service_->is_available() && service_->healthy();
+        res.set_content(
+            context_monitor_json(service_ ? service_->context_snapshot() : ContextSnapshot{}, ready,
+                                 options_.max_concurrency)
+                .dump(),
+            "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency,

@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "runtime/generation/reservation_horizon.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -183,12 +184,17 @@ struct CaptureAssessmentImpl {
 
 // Private live KV backing. Fixed lane-local State/sampling storage stays resident and is
 // included in the startup concurrency envelope; it cannot be reused by another request.
-struct GenerationBacking {
+struct GenerationKVBacking {
     HostKVAllocation kv;
     std::vector<DeviceKVPageHandle> page_handles;
     std::uint32_t completion_pages = 0;
-    std::uint32_t quantum          = 0;
     std::uint32_t saved_tokens     = 0;
+};
+
+struct GenerationBacking {
+    GenerationKVBacking main;
+    GenerationKVBacking backend;
+    runtime::ReservationHorizon horizon{};
     bool suspended                 = false;
 };
 
@@ -198,6 +204,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     detail::PhysicalDemand root_demand;
     std::shared_ptr<GenerationBacking> generation_backing;
     std::uint32_t completion_pages = 0;
+    std::uint32_t completion_backend_pages = 0;
     runtime::PrefillWork root_rebuild_work;
     std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_6::PreparedContextCache context_cache;
@@ -552,6 +559,9 @@ public:
     generation_reservation_state(SequenceHandle sequence) const;
     [[nodiscard]] runtime::GenerationGrowthResult
     grow_generation(SequenceHandle sequence, std::uint32_t next_tokens, bool completion);
+    [[nodiscard]] detail::PhysicalDeviceResources
+    generation_unit_pages(const SequenceState& sequence, const detail::GenerationBacking& backing,
+                          std::uint32_t next_tokens) const;
     void release_generation_slack(SequenceHandle sequence, std::uint32_t next_tokens);
     [[nodiscard]] bool suspend_generation(SequenceHandle sequence);
     [[nodiscard]] bool resume_generation(SequenceHandle sequence, bool completion);

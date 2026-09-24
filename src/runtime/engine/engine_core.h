@@ -3420,7 +3420,7 @@ private:
             }
             const auto after = program.generation_reservation_state(*request->sequence);
             if (result == GenerationGrowthResult::Ready) {
-                if (after.reserved_tokens != state.reserved_tokens) {
+                if (after.reserved_bytes != state.reserved_bytes) {
                     ++cumulative_stats_.generation_extension_attempts;
                     ++cumulative_stats_.generation_extension_grants;
                     changed = true;

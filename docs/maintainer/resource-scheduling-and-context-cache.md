@@ -31,12 +31,12 @@ replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-c
 
 Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但不改变模型语义、请求顺序或生成结果。
 
-当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8`；ordinary generation 可以在稳定边界暂停到有界 Host KV backing。
+当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8`；ordinary/MTP generation 可以在稳定边界暂停到有界 Host KV backing。
 由此得到两个基本规则：
 
 1. Scheduler 先确定本次尝试的 request，资源层只优化该 request 的 materialization；
-2. Active publication requires a completion witness. Ordinary generation may hold a smaller
-   current KV entitlement backed by a private Host continuation reservation. Speculative backends
+2. Active publication requires a completion witness. Ordinary and MTP generation may hold a smaller
+   current KV entitlement backed by a private Host continuation reservation. DFlash/DFlash2 backends
    and requests without that backing retain full completion reservations.
 
 ---
@@ -442,7 +442,7 @@ backend KV 采用另一种 coverage。Checkpoint 只有在全部 required compon
 
 Generation keeps its effective output limit separate from its physical reservation horizon. The
 last sampled output token need not enter KV: completion uses
-`prompt + max(effective_output - 1, 0)`, capped to context. Ordinary generation initially reserves
+`prompt + max(effective_output - 1, 0)`, capped to context. Ordinary and MTP generation initially reserve
 the complete remaining prompt plus up to `generation_reservation_tokens` output tokens (default
 16,384), rounded to the target's physical pages. Before a decode/control unit, Program checks its
 entire footprint. A preferred extension may shrink to the minimum page-aligned grant that permits
@@ -452,14 +452,15 @@ During an outstanding context transaction, execution may use its existing entitl
 requiring growth wait until that transaction settles.
 
 Partial admission also reserves a private allocation from the existing pinned Host KV arena for
-the request's **complete** effective KV extent. This conservative backing reservation avoids any
-future Host-allocation dependency. It is mandatory live backing, not an evictable cache replica.
+the request's **complete** effective Main and enabled MTP backend KV extents. This conservative
+backing reservation avoids any future Host-allocation dependency. It is mandatory live backing,
+not an evictable cache replica.
 Inactive cache extents and live backing share the same physical arena/accounting. No SSD spill or
 prompt replay is used. If backing cannot be obtained, use full Device reservations; a full-reservation
 arrival waits behind an existing partial cohort. Zero Host capacity remains supported.
 
 The completion witness is a constructive root restore: the protected request's complete private KV
-extent fits the existing Device pool; every other partial owner has already reserved its Host
+extents fit their existing Device pools; every other partial owner has already reserved its Host
 snapshot destination. Suspend that bounded set and reclaim optional cache ownership. If shared
 COW tails still retain capacity, snapshot and privatize the protected address too. Restore dependencies
 are the private Host allocations and the request's retained State bindings. The physical pool counts
@@ -473,9 +474,12 @@ completion entitlement. Then prefer the oldest admitted request. New arrivals ca
 or growth-blocked owners. The resident-plus-suspended cohort stays bounded by configured concurrency;
 a suspended request retains its logical lane. Long protected output bounds can delay short requests.
 
-Prefill is never suspended. MTP, DFlash and DFlash2 retain full reservations, including their existing
-provisional/backend requirements; their live speculative suspension is not enabled. Output, reasoning,
-stop and tool-call semantics are unchanged by reservation policy.
+Prefill is never suspended. MTP includes both Main KV and its backend KV in admission, growth,
+Host backing, spill/restore and the completion witness. The backend entitlement includes up to
+`draft_window - 1` provisional columns beyond the target footprint, capped to context. Growth
+preflights both pools before changing either entitlement; a small quantum never splits a verify
+round or its next-draft writes. DFlash and DFlash2 retain full reservations; their live suspension
+is not enabled. Output, reasoning, stop and tool-call semantics are unchanged by reservation policy.
 
 Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
 exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
@@ -488,13 +492,16 @@ Fork 错判为超出 active guarantee。
 Engine keeps RequestRecord, GenerationBudget, generated IDs, cancellation, publication order and
 OutputSession unchanged. Frontend therefore keeps its decoder, reasoning state, stop matching and
 buffered tool calls. Program retains SequenceState metadata, ledger, sampling/penalty history and
-lane-local device sampling data. No lane is reassigned while suspended.
+lane-local device sampling data. MTP draft IDs/count and continuation hidden state remain owned
+by the same sequence; suspension occurs only after acceptance/replay has committed, with no live
+verification transaction. No lane is reassigned while suspended.
 
 The current implementation leaves recurrent/GDN StateImages and continuation hidden state on Device
 inside the startup-fixed C+H pool. This uses no extra State allocation during suspend/restore and
 avoids copying fixed State merely to restore it to the same cohort. The witness explicitly includes
-these resident State slots. Only growing Main KV moves to Host. An unresolved read-source State fork
-is copied exactly into its already-reserved private destination before source ownership is detached.
+these resident State slots. Growing Main and MTP backend KV move to Host. An unresolved read-source
+State fork is copied exactly into its already-reserved private destination before source ownership
+is detached.
 This is a deliberate fixed-cohort design; releasing State/lane storage for additional admissions would
 require a new continuation contract.
 
@@ -502,7 +509,8 @@ At a committed decode/control boundary Program copies every mapped KV page (incl
 tail) into its reserved Host allocation, waits for the bounded transfer to settle, then releases its
 Device address mappings/growth entitlement and cache-source edges. The Host image is private and
 immutable while suspended. Restore first reserves the whole destination, recreates private pages,
-copies exact bytes, validates/publishes the committed frontier and rebinds the existing execution row.
+copies exact bytes (including any mapped provisional MTP tail), validates/publishes each committed
+frontier and rebinds the existing execution row.
 State, token positions and output budget are not recomputed. A full completion grant releases Host
 backing after publication; otherwise it remains reserved. Copies use the existing transfer stream and
 Host arena, with no separate staging allocation. Submission failures drain queued copies before cleanup.

@@ -33,8 +33,8 @@ registered artifacts. Current identities are `qwen3.6-27b/groupwise-int`, `qwen3
 The implementation targets `sm_120a` and is tuned on NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
-bounded FIFO ingress, bounded Host-backed ordinary-generation suspension, and one compact decode
-batch per round. Speculative backends retain full completion reservations.
+bounded FIFO ingress, bounded Host-backed ordinary/MTP generation suspension, and one compact decode
+batch per round. DFlash/DFlash2 retain full completion reservations.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. Additional models, execution platforms, large-scale/preemptive continuous batching, and

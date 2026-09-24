@@ -78,7 +78,7 @@ ctest --test-dir build-agent-verify --output-on-failure \
   -R '^ninfer_(generation_reservations|admission_policy|resource_manager|qwen3_6_context_store)_test$'
 NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
   ctest --test-dir build-agent-verify --output-on-failure -V \
-  -R '^ninfer_generation_reservations_real_test$'
+  -R '^ninfer_generation_reservations(_mtp)?_real_test$'
 ```
 
 The CPU tests exhaust reservation arithmetic and protected-epoch ordering for two, four and eight
@@ -95,7 +95,20 @@ provides the full-reservation comparison at the same pool and output limits. The
 queue/first-token/completion times, transfer bytes, peak live backing claims and startup pool bytes;
 these are fixture observations, not general performance claims or measured total peak VRAM/RAM.
 
-Speculative suspension is disabled; MTP/DFlash/DFlash2 retain full reservations. Real-model
+The MTP variant of the fixture (`--mtp`, registered as
+`ninfer_generation_reservations_mtp_real_test`) uses MTP3 and `rk4v4-e8` KV. It exercises the same
+pressure/cancellation cases, requires simultaneous admission, consistent speculative accounting and
+exact token IDs, and adds three concurrent requests with a one-token quantum, short stopped
+responses with a large output ceiling, and a forced thinking-control suffix. Both KV pools contribute
+to transfer and Host-backing metrics. Tight Host capacity must exercise the full-reservation fallback.
+An output request beyond the context ceiling checks the final-token/context-limit boundary under
+pressure with a one-token quantum.
+An ample-pool control also runs without suspension: proposal/acceptance positions can differ from
+the isolated baseline when batch shape changes, so these counters are not a bitwise oracle across
+batch shapes. The fixture also compares three short requests with a 160,000-token output ceiling,
+200,000-token KV/context capacity, a 10 GiB Host arena, and 16,384-token versus full reservations.
+
+DFlash/DFlash2 retain full reservations. Real-model
 multimodal suspension, reasoning-heavy responses, long generated tool calls, non-greedy sampling
 and external proxy idle timeouts are not qualified by this fixture. See the
 [resource contract](../docs/maintainer/resource-scheduling-and-context-cache.md#61-admission-reservation)
@@ -116,6 +129,26 @@ The incremental case transferred 48 MiB of KV in total. Both reported the same 1
 of weights, sequence and workspace pool capacity. These single correctness-fixture observations
 demonstrate admission and suspension behavior; they do not establish production throughput or
 measure total peak VRAM/pinned RAM. No deployment or external proxy smoke test was performed.
+
+MTP qualification on the same date, artifact, hardware and toolchain passed all 16 scenarios above.
+The four focused checks passed, and the nine ordinary-generation scenarios plus the 24-request
+cached-State-fork regression passed in 363.43 seconds. Both target variants and CLI/server built.
+The three-request 160K-ceiling comparison uses a short number-list response stopped by the same
+string in both runs, MTP3, `rk4v4-e8`, CUDA graphs, six total Device State slots (three active plus
+three extra), a 200,000-token context/KV pool and a 10 GiB Host KV arena:
+
+| Reservation policy | Peak concurrent requests | Cohort completion | Maximum admission wait | Maximum first-token time |
+|---|---|---|---|---|
+| 16,384-token chunks | 3 | 1.41 s | 0.15 s | 0.20 s |
+| Full 160K completion reservations | 1 | 2.25 s | 1.50 s | 1.55 s |
+
+Both runs preserved the exact isolated greedy output and streamed each response once. Neither
+needed a spill because these responses stopped early. Incremental admission claimed 8,881,631,232
+bytes of live backing inside the fixed Host arena; both runs reported the same 22,228,553,984 bytes
+of weights, sequence and workspace pool capacity. Separate pressure cases exercised Main/MTP
+spilling and restoring at concurrency 2/4/8, including shared prefixes and cancellation during a
+delayed copy. This comparison establishes the admission behavior for this fixture, not general
+production throughput. Device State-slot limits and mandatory Host-backing requirements still apply.
 
 For admission while another cached request has an unsettled State fork:
 

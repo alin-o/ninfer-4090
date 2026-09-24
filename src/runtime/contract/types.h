@@ -728,6 +728,7 @@ struct GenerationReservationState {
     std::size_t host_backing_bytes      = 0;
     std::size_t host_backing_used_bytes = 0;
     std::size_t mapped_bytes            = 0;
+    std::size_t reserved_bytes          = 0;
     bool incremental                    = false;
     bool suspended                      = false;
     bool can_suspend                    = false;
@@ -742,6 +743,7 @@ struct GenerationProgressWitness {
     LaneId protected_lane;
     std::uint32_t victim_lanes          = 0;
     std::uint32_t completion_main_pages = 0;
+    std::uint32_t completion_backend_pages = 0;
     std::uint32_t resident_state_slots  = 0;
     std::size_t host_backing_bytes      = 0;
     bool feasible                       = false;

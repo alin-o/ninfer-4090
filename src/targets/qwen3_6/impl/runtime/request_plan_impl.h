@@ -278,6 +278,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    base->completion_backend_pages = base->backend_kv_page_entitlement;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,

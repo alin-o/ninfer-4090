@@ -149,10 +149,10 @@ state image (about 147 MiB of host memory on Qwen3.8-27B), so size `--host-state
 for `continuations x (2 + anchors)`. The old `--turn-checkpoints` ring is retired
 and ignored; see [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
 
-Ordinary generation uses incremental KV reservations (`--generation-reservation-tokens`, default
+Ordinary and MTP generation use incremental KV reservations (`--generation-reservation-tokens`, default
 16,384). With configured Host KV backing, requests can pause and resume under pressure without a
 new API call or an output-limit change. The admitted resident-plus-suspended cohort stays within
-`--max-concurrency`; fixed State and sampling storage remain assigned to those lanes. Speculative
+`--max-concurrency`; fixed State and sampling storage remain assigned to those lanes. DFlash/DFlash2
 backends and requests without sufficient Host backing use full reservations. See
 [serving](docs/serving.md) for fallback, fairness and stream-timeout details.
 

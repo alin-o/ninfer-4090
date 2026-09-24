@@ -18,11 +18,22 @@ int main() {
                 const auto initial =
                     std::min(512U, prompt + (output == 0 ? 0 : std::min(output, quantum) - 1));
                 if (horizon.completion_tokens() != completion ||
+                    horizon.initial_tokens() != initial ||
                     horizon.initial_pages() != (initial + 127) / 128 ||
                     horizon.initial_pages() < (prompt + 127) / 128 ||
                     horizon.initial_pages() > horizon.pages(completion)) {
                     std::cerr << "reservation lost prompt/final-token/context boundary\n";
                     return 1;
+                }
+                for (const auto drafts : {1U, 3U, 8U}) {
+                    // Independent token-by-token footprint: alignment covers the target
+                    // prefix; the next proposal writes at most drafts - 1 extra columns.
+                    auto backend_end = initial;
+                    for (unsigned d = 1; d < drafts && backend_end < 512; ++d) { ++backend_end; }
+                    if (horizon.mtp_backend_pages(initial, drafts) != (backend_end + 127) / 128) {
+                        std::cerr << "MTP provisional tail escaped its initial reservation\n";
+                        return 1;
+                    }
                 }
             }
         }

@@ -35,9 +35,21 @@ struct ReservationHorizon {
         return tokens == 0 ? 0U : static_cast<std::uint32_t>(1 + (tokens - 1) / page_tokens);
     }
 
-    [[nodiscard]] std::uint32_t initial_pages() const noexcept {
-        return pages(static_cast<std::uint64_t>(prompt_tokens) +
-                     (output_tokens == 0 ? 0ULL : std::min(output_tokens, quantum) - 1ULL));
+    [[nodiscard]] std::uint32_t initial_pages() const noexcept { return pages(initial_tokens()); }
+
+    [[nodiscard]] std::uint32_t initial_tokens() const noexcept {
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            context_tokens,
+            static_cast<std::uint64_t>(prompt_tokens) +
+                (output_tokens == 0 ? 0ULL : std::min(output_tokens, quantum) - 1ULL)));
+    }
+
+    // MTP aligns the accepted target columns, then writes up to draft_window - 1
+    // provisional backend columns for the next round. These pages need entitlement
+    // even though only the accepted frontier is committed.
+    [[nodiscard]] std::uint32_t mtp_backend_pages(std::uint32_t main_tokens,
+                                                  std::uint32_t draft_window) const noexcept {
+        return pages(static_cast<std::uint64_t>(main_tokens) + draft_window - 1ULL);
     }
 };
 

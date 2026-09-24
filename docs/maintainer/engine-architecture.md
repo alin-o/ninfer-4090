@@ -24,7 +24,7 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
 - 一个有界 FIFO 等待队列；
-- ordinary generation 可在 committed boundary 暂停到有界 Host KV backing；prefill 不暂停；
+- ordinary/MTP generation 可在 committed boundary 暂停到有界 Host KV backing；prefill 不暂停；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
 Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
@@ -354,8 +354,8 @@ admitted 的请求可以继续使用各自既有 reservation。stale revision �
 完整 warm/SSD 集合。
 
 Incremental admission uses a bounded completion witness: every partial owner has a private Host
-allocation covering its complete effective Main KV extent; its complete isolated extent fits the
-Device pool. Program owns this physical proof and its resource revision. Under pressure the
+allocation covering its complete effective Main and enabled MTP backend KV extents; each complete
+isolated extent fits its Device pool. Program owns this physical proof and its resource revision. Under pressure the
 Scheduler keeps its protected owner through completion/cancellation, suspends the backed victim
 set, and obtains the protected owner's full completion entitlement. ResourceManager releases
 eligible optional caches before active suspension. Prefill finishes using its admitted entitlement.
@@ -547,7 +547,7 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 以下约束属于 Engine 架构，但具体实现由 Program 和下层文档定义：
 
 - Program 在启动时建立固定数量的 control/state/table resources；
-- growing KV 使用同一共享 paged pool；ordinary generation 在完整下一 execution unit 之前扩展 entitlement；
+- growing KV 使用同一共享 paged pool；ordinary/MTP generation 在完整下一 execution unit 之前扩展 entitlement；
 - protected completion epochs、bounded Host backing 与 full-reservation fallback 保证 progress；
 - 一个 GPU execution unit 内 State/KV mapping 保持稳定；
 - CUDA Graph 按合法 exact-`B` topology 建立，request identity 和 page IDs 是稳定输入数据，不是 graph key；

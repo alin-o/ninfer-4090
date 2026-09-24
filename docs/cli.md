@@ -201,7 +201,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
-| `--generation-reservation-tokens N` | preferred ordinary-generation KV reservation quantum, `1..2147483647`; does not change `--max-new` | `16384` |
+| `--generation-reservation-tokens N` | preferred ordinary/MTP KV reservation quantum, `1..2147483647`; does not change `--max-new` | `16384` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity; `nvfp4` and `k8v4` are upstream sm_120a modes, not available on the RTX 4090 | `bf16` |

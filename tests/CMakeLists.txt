@@ -84,6 +84,10 @@ set_tests_properties(ninfer_materialization_fork_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 180)
 set_tests_properties(ninfer_generation_reservations_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 600)
+add_test(NAME ninfer_generation_reservations_mtp_real_test
+  COMMAND ninfer_generation_reservations_real_test --mtp)
+set_tests_properties(ninfer_generation_reservations_mtp_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 600)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_auto_save_writer_test
   SOURCES test_auto_save_writer.cpp

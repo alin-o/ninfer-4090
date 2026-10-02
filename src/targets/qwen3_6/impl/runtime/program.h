@@ -1395,6 +1395,9 @@ private:
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
+    // Single-sequence kernels read their KV table row from one Program-wide device scalar.
+    // Select this sequence's rows before launching such work.
+    void select_sequence_kv_rows(const SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);

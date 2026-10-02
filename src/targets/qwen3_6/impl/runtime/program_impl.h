@@ -9096,6 +9096,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
 
             std::uint32_t cursor = base;
             while (cursor < end) {
+                select_sequence_kv_rows(sequence);
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
                 const StateImageSelectors selectors = state_selectors(sequence);
                 schedule::PrefillContext schedule_state{
@@ -11359,6 +11360,16 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     }
 }
 
+void ProgramImplCore::select_sequence_kv_rows(const SequenceState& sequence) {
+    if (!sequence.kv || !text_kv_addresses->active(sequence.kv->text)) {
+        throw std::logic_error("sequence has no active KV execution mapping");
+    }
+    set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+    set_device_i32(io.backend_kv_table_row,
+                   sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                        : 0);
+}
+
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {
@@ -12009,6 +12020,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     }
 
     RequestControl::Prefill& staged = *request.prefill;
+    select_sequence_kv_rows(sequence);
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }

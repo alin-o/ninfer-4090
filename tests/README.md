@@ -369,6 +369,36 @@ python3 tools/smoke/serve_thinking_preservation.py \
 The shared messages are in
 [`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
 
+## Cross-lane isolation
+
+Single-sequence kernels, including every prefill chunk, read their KV page-table row from one
+Program-wide device scalar. `ProgramImplCore::select_sequence_kv_rows` selects the sequence's own
+rows before each prefill step; without it, a chunk that runs after another lane was admitted or
+restored attends to that lane's pages or to stale pages left by earlier sessions, and its reply
+answers an unrelated task. Every other real generation test submits one prompt on every lane, so
+none of them can observe this.
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
+  ctest --test-dir build --output-on-failure -R '^ninfer_lane_isolation(_mtp)?_real_test$'
+```
+
+`ninfer_lane_isolation_real_test` (ordinary) and `ninfer_lane_isolation_mtp_real_test` run four
+unrelated prompts solo, which leaves retained sessions behind as a server does, and then start
+pairs of them together in several orders. A reply fails when it is shorter than 20 tokens, lacks
+its own task words, or contains words that belong only to another prompt's task. Equality with
+the solo reply is not required because batch position may flip a near-tied token. Without the row
+selection the ordinary variant fails (vault replies answer the numbers task or the other vault's
+content); with it both variants pass.
+
+`ninfer_host_indexing_stress_test` is CPU-only. Page-layout, transfer-work and cyclic planning
+are checked against hand-computed layouts; Tensor slice/permute/view chains against element
+values read through the logical index; and the MTP draft-tensor contract (dim 0 is the fast axis,
+so one proposal step of a `{batch, drafts}` tensor is a contiguous `{batch}` view). The pinned Host
+KV arena is checked for constructor contracts, views, stale handles and fragmentation, and by
+20,000 randomized operations against an independent shadow model that also verifies data
+integrity. The arena sections need pinned Host memory and report a skip note without it.
+
 ## What belongs here
 
 A permanent test should protect one current risk, such as:

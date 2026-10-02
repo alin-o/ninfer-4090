@@ -75,9 +75,16 @@ ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
+ninfer_add_test(ninfer_host_indexing_stress_test SOURCES test_host_indexing_stress.cpp)
 ninfer_add_test(ninfer_generation_reservations_test SOURCES test_generation_reservations.cpp)
 ninfer_add_test(ninfer_generation_reservations_real_test
   SOURCES test_generation_reservations_real.cpp LIBRARIES ninfer_engine ninfer_core)
+ninfer_add_test(ninfer_lane_isolation_real_test
+  SOURCES test_lane_isolation_real.cpp LIBRARIES ninfer_engine)
+add_test(NAME ninfer_lane_isolation_mtp_real_test
+  COMMAND ninfer_lane_isolation_real_test --mtp)
+set_tests_properties(ninfer_lane_isolation_real_test ninfer_lane_isolation_mtp_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_materialization_fork_real_test
   SOURCES test_materialization_fork_real.cpp LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_materialization_fork_real_test PROPERTIES

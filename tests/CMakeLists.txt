@@ -218,6 +218,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_score_candidates_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_score_candidates_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_score_candidates_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_shared_prefix_tokens_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_shared_prefix_tokens_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_shared_prefix_tokens_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
   LIBRARIES ninfer_engine)
@@ -258,6 +266,12 @@ add_test(NAME ninfer_media_budget_recovery_test COMMAND ninfer_media_budget_reco
 
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_score_request_test
+  SOURCES test_score_request.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_systemone_test
+  SOURCES test_systemone.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_openai_responses_test
   SOURCES test_openai_responses.cpp

@@ -407,6 +407,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.causal_score = finish(causal_score);
     }
 
+    {
+        // ExecutionOptions::score_candidates: one broadcast logits column (a single GEMV against
+        // the stored tail hidden) plus up to kCausalScoreTile candidate ids/logprobs.
+        WorkspaceLayoutBuilder score_next_token;
+        matrix(score_next_token, DType::BF16, TextConfig::output_rows, 1);
+        matrix(score_next_token, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(score_next_token, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        out.score_next_token = finish(score_next_token);
+    }
+
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
@@ -631,7 +641,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.causal_score, out.score_next_token});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         // The workspace only needs to cover this fork's configured vision budget; the

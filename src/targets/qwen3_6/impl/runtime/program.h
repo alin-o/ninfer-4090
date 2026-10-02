@@ -226,6 +226,10 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // Non-empty makes this a next-token scoring request (see
+    // runtime::ResolvedExecutionOptions::score_candidates). Validated distinct, in-vocabulary
+    // candidate IDs, carried into RequestControl at admission.
+    std::vector<TokenId> score_candidates;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -288,6 +292,9 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    // Propagated from RequestBasePlanImpl::score_candidates by inspect_lane(); carried into
+    // RequestControl::Prefill at reserve_materialization().
+    std::vector<TokenId> score_candidates;
     runtime::LaneId destination{};
     std::uint64_t destination_epoch = 0;
     runtime::PrefillWork root_rebuild_work;
@@ -520,7 +527,14 @@ struct RequestControl {
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Copied from RequestBasePlanImpl::score_candidates at admission; consumed once at
+        // prefill finalize (both the chunked-prefill and zero-suffix-reuse paths) to populate
+        // RequestControl::candidate_logprobs.
+        std::vector<TokenId> score_candidates;
     };
+    // Set once at prefill finalize from Prefill::score_candidates, in candidate order; empty for
+    // an ordinary (non-scoring) request.
+    std::vector<float> candidate_logprobs;
 
     std::optional<Prefill> prefill;
 };
@@ -736,6 +750,10 @@ public:
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    // Unconditional (any Generation request on the None or Mtp backend may carry
+    // score_candidates; DFlash/DFlash2 reject it at plan_request()): host readback for
+    // RequestControl::candidate_logprobs, up to kCausalScoreTile entries.
+    PinnedHostBuffer score_next_token_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -758,6 +776,12 @@ public:
     [[nodiscard]] std::uint32_t
     continuation_depth(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
+    // The confirmed-reusable token prefix: the sequence's execution_frontier, which excludes a
+    // just-generated trailing token that has not yet been confirmed by a forward pass (at most
+    // one token shorter than the full ledger). This is the exact prefix a later request can match
+    // against this continuation's endpoint checkpoint.
+    [[nodiscard]] std::vector<TokenId>
+    continuation_tokens(const ContinuationHandle& continuation) const;
     [[nodiscard]] std::vector<SlotCheckpoint>
     continuation_checkpoints(const ContinuationHandle& continuation,
                              bool memory_only = false) const;

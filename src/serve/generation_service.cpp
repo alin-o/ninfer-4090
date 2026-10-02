@@ -676,6 +676,53 @@ GenerationService::cancel_and_settle(PreparedRequest& prepared) const noexcept {
     } catch (...) { return {}; }
 }
 
+ScorePrepared
+GenerationService::prepare_score(std::vector<ninfer::TokenId> prompt_tokens,
+                                 std::vector<ninfer::TokenId> candidates,
+                                 std::function<bool()> is_cancelled,
+                                 std::vector<std::uint32_t> shared_prefix_frontiers) const {
+    ScorePrepared prepared;
+    prepared.lifetime = acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout);
+    try {
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        ninfer::PreparedPrompt prompt = engine_->prepare_tokens(
+            std::move(prompt_tokens), /*allow_prefix_identity=*/true, shared_prefix_frontiers);
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        ninfer::RequestOptions options;
+        options.execution.requested_output_tokens = 1;
+        options.execution.score_candidates        = std::move(candidates);
+        const ninfer::GenerationObservationOptions observation{};
+        prepared.generation = engine_->submit(std::move(prompt), std::move(options),
+                                              ninfer::OutputConsumerMode::Aggregate, observation,
+                                              prepared.lifetime->deadline);
+    } catch (const ninfer::RequestError& exception) {
+        throw_request_error(exception);
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_candidates");
+    } catch (...) {
+        throw;
+    }
+    return prepared;
+}
+
+ScoreResult GenerationService::run_score(ScorePrepared& prepared,
+                                         std::function<bool()> is_cancelled) const {
+    const ninfer::CancellationView cancellation(is_cancelled);
+    ninfer::GenerationResult result;
+    try {
+        result = prepared.generation.wait(nullptr, cancellation);
+    } catch (const ninfer::RequestError& exception) {
+        throw_request_error(exception);
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_candidates");
+    }
+    ScoreResult score;
+    score.prompt_tokens = result.prompt.prompt_tokens;
+    score.cached_tokens = result.reused_prompt_tokens;
+    score.candidate_logprobs = std::move(result.candidate_logprobs);
+    return score;
+}
+
 void GenerationService::set_before_payload_read_for_test(std::function<void()> callback) {
     if (!durable_catalog_) { throw std::logic_error("GenerationService has no durable catalog"); }
     durable_catalog_->set_before_payload_read_for_test(std::move(callback));

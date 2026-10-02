@@ -693,7 +693,17 @@ public:
                     // make cancellation erase the last successful head before a replacement
                     // exists. It is an ordinary unpinned pressure candidate again after the
                     // active edge is released.
-                    const bool retain = entry.session.has_value() || entry.ssd_backed;
+                    //
+                    // A scoring request (ExecutionOptions::score_candidates) is additionally
+                    // forced to retain unconditionally: it must never consume/advance a matched
+                    // private source (named slot or otherwise) in place, so a sibling request
+                    // against the same source later sees it completely unchanged. This is the
+                    // only case in which `!base.summary().publish_continuation` can be true while
+                    // this loop is reachable at all (cache enabled, prompt reusable,
+                    // allow_prefix_reuse requested) -- see request_plan_impl.h.
+                    const bool read_only_source   = !base.summary().publish_continuation;
+                    const bool retain = read_only_source || entry.session.has_value() ||
+                                       entry.ssd_backed;
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -740,14 +750,17 @@ public:
                             throw std::logic_error("Program rejected retained private candidate");
                         }
                         append(std::move(*retained));
-                    } else if (!entry.session && entry.ssd_backed &&
+                    } else if (!read_only_source && !entry.session && entry.ssd_backed &&
                                (candidates.back().plan->identity_assessment().physical_status !=
                                     MaterializationPhysicalStatus::Feasible ||
                                 std::none_of(catalog_.begin(), catalog_.end(), [](const auto& cell) {
                                     return cell.state == CatalogState::Vacant;
                                 }))) {
                         // Keep a saved historical source resident when a fork fits without
-                        // pressure. Physical or descriptor pressure may instead consume it.
+                        // pressure. Physical or descriptor pressure may instead consume it. A
+                        // read-only (scoring) request never takes this fallback: it must not
+                        // offer a ConsumeToActive candidate for its matched source under any
+                        // pressure condition.
                         auto consumed = program.inspect_admission(
                             prompt, base, *destination, &*entry.handle, nullptr, index.checkpoint,
                             false);

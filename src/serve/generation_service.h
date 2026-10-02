@@ -18,6 +18,7 @@ class logger;
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -139,6 +140,26 @@ struct PreparedRequest {
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
+// Result of a next-token scoring request (ExecutionOptions::score_candidates). Used by the
+// /v1/score route and by SystemOne's label-probability questions; both need full-vocabulary
+// log p(candidate|prompt) for a small fixed set of candidate tokens rather than generated text.
+struct ScoreResult {
+    std::uint32_t prompt_tokens{0};
+    // Prefix-cache reuse, in tokens, reported the same way as GenerationOutcome's prefix cache
+    // metric (reused_prompt_tokens on the Engine result).
+    std::uint32_t cached_tokens{0};
+    std::vector<float> candidate_logprobs; // one entry per requested candidate, in order
+};
+
+// Preparation/submission half of a split score request. Kept separate from run_score() so a
+// caller sharing one long prefix across several scoring prompts (SystemOne) can submit the first
+// prompt, wait for it alone (so its KV becomes the reusable prefix), then prepare+submit the
+// remaining prompts concurrently for a prefix-cache hit.
+struct ScorePrepared {
+    ninfer::GenerationHandle generation;
+    std::shared_ptr<RequestLifetime> lifetime;
+};
+
 class GenerationService {
 public:
     // The logger is fork-local: the auto-save-on-eviction listener reports through it, and
@@ -200,6 +221,17 @@ public:
         return engine_->slot_states();
     }
 
+    // Named-checkpoint read: the exact confirmed-reusable token ledger of slot `slot`'s retained
+    // session (Engine::slot_tokens), atomically checked against `expected_digest` when given.
+    // Pure read -- never changes slot occupancy or digest. Propagates
+    // ninfer::SlotSessionMismatch (stale digest), std::invalid_argument (empty/erased slot), and
+    // ninfer::RequestError(Overloaded) (busy lane) unchanged; callers map these the same way the
+    // /slots routes do.
+    [[nodiscard]] std::vector<ninfer::TokenId>
+    slot_tokens(std::uint32_t slot, const std::string& expected_digest = {}) const {
+        return engine_->slot_tokens(slot, expected_digest);
+    }
+
     // The slot id space of /slots operations: one slot per private continuation-catalog cell
     // (resolved at Engine construction; at least max_concurrency).
     [[nodiscard]] std::uint32_t slot_count() const {
@@ -232,6 +264,42 @@ public:
     }
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
+
+    // Artifact-tokenizer raw-text encoding (no chat template, no implicit special tokens). Shared
+    // by /v1/score and SystemOne for tokenizing variable request text; fixed scaffolding pieces
+    // are tokenized once by the caller and cached, not routed through here per request.
+    [[nodiscard]] std::vector<ninfer::TokenId> tokenize_text(std::string_view text) const {
+        return engine_->tokenize_text(text);
+    }
+
+    // Raw-token next-token scoring, split into prepare (admission + submit) and run (wait).
+    // Reuses the same bounded FIFO admission (acquire_request_lifetime) as prepare()/run() so a
+    // scoring request counts against the server's normal concurrency/queue limits. `prompt_tokens`
+    // is submitted via Engine::prepare_tokens (no chat template); `candidates` becomes
+    // ExecutionOptions::score_candidates. Invalid candidates (duplicates, out of vocabulary) are
+    // reported by the Engine as RequestError/invalid_argument and mapped to a 400 ApiException.
+    // `shared_prefix_frontiers` is forwarded verbatim to Engine::prepare_tokens: a non-empty span
+    // declares this prompt as ESTABLISHING those cache-boundary candidates (registered once this
+    // request publishes), letting a later sibling prompt sharing the same leading tokens reuse the
+    // prefix without redeclaring it. Empty (the default, and always when
+    // ServeOptions::score_prefix_cache is disabled) writes nothing -- strict read-only scoring.
+    [[nodiscard]] ScorePrepared
+    prepare_score(std::vector<ninfer::TokenId> prompt_tokens,
+                 std::vector<ninfer::TokenId> candidates,
+                 std::function<bool()> is_cancelled             = {},
+                 std::vector<std::uint32_t> shared_prefix_frontiers = {}) const;
+    [[nodiscard]] ScoreResult run_score(ScorePrepared& prepared,
+                                        std::function<bool()> is_cancelled = {}) const;
+    // Convenience non-split call for a single independent scoring request (/v1/score).
+    [[nodiscard]] ScoreResult score(std::vector<ninfer::TokenId> prompt_tokens,
+                                    std::vector<ninfer::TokenId> candidates,
+                                    std::function<bool()> is_cancelled             = {},
+                                    std::vector<std::uint32_t> shared_prefix_frontiers = {}) const {
+        ScorePrepared prepared =
+            prepare_score(std::move(prompt_tokens), std::move(candidates), is_cancelled,
+                         std::move(shared_prefix_frontiers));
+        return run_score(prepared, is_cancelled);
+    }
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,

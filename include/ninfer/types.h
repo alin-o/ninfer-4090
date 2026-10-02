@@ -287,6 +287,12 @@ struct ExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Non-empty makes this a next-token scoring request: it requires requested_output_tokens == 1
+    // and publishes GenerationResult::candidate_logprobs, the full-vocabulary log-probability of
+    // each (distinct, in-vocabulary) candidate as the token following the prompt. The prompt goes
+    // through the ordinary admission, Scheduler and prefix reuse; the one generated token is
+    // incidental and should be ignored.
+    std::vector<TokenId> score_candidates;
 };
 
 struct OutputOptions {
@@ -1004,6 +1010,8 @@ struct MaterializationDiagnostics {
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    // One entry per ExecutionOptions::score_candidates entry, in order; empty otherwise.
+    std::vector<float> candidate_logprobs;
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;

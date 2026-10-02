@@ -773,6 +773,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
+      score_next_token_host(kCausalScoreTile * sizeof(float)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::OrdinaryDecodeIngress) +
@@ -4504,8 +4505,10 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
             .mtp_bridge         = request_plan.mtp_bridge,
+            .score_candidates   = std::move(request_plan.score_candidates),
         };
         request.prefill.emplace(std::move(prefill));
+        request.candidate_logprobs.clear();
         if (request.prefill->vision_plan) {
             if (!workspace_plan.vision) {
                 throw std::logic_error("Vision prefill has no startup workspace plan");
@@ -7211,6 +7214,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
     out.timing                  = step.timing;
+    out.candidate_logprobs      = std::move(step.candidate_logprobs);
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
         const runtime::BatchedGeneratedRound round{
@@ -12222,6 +12226,41 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             }
         }
 
+        // ExecutionOptions::score_candidates: sequence.tail_hidden is valid on both the
+        // fresh-prefill (copy_tail above) and zero-suffix-reuse (checked above) paths at this
+        // point, so one broadcast GEMV + target_logprobs here covers both. No extra work when the
+        // request did not ask for candidates.
+        //
+        // This also covers the Mtp backend unchanged: staged.prepare_mtp's bridging/proposing
+        // above (mtp_bridge_and_propose, the mtp_kv_valid advances, commit_sequence_kv) already
+        // ran and is left exactly as it would for an ordinary request. Skipping it for a scoring
+        // request is not safe here: the engine maintains sequence.mtp_kv_valid ==
+        // sequence.execution_frontier as a standing invariant once a sequence is at rest between
+        // requests (see the forced-token frontier check in decode_forced_tokens), so a later
+        // request on this sequence (an ordinary continuation or a forced-token row, see the
+        // frontier check in append_forced_tokens) would see a stale mtp_kv_valid and fail or
+        // silently reuse an unprepared MTP frontier. Running the
+        // normal Mtp prefill path and only adding the candidate-logprobs read here keeps that
+        // invariant intact at the cost of the wasted (but otherwise harmless) draft proposal for
+        // the one token this request produces before it ends.
+        if (!staged.score_candidates.empty()) {
+            work.reset();
+            mark_workspace_usage(workspace_plan.score_next_token);
+            const auto candidate_count = static_cast<std::int32_t>(staged.score_candidates.size());
+            Tensor score_logits  = work.alloc(DType::BF16, {TextConfig::output_rows, 1});
+            Tensor score_targets = work.alloc(DType::I32, {candidate_count});
+            Tensor score_logprobs_device = work.alloc(DType::FP32, {candidate_count});
+            ops::linear(sequence.tail_hidden, model.output_head, score_logits, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(score_targets.data, staged.score_candidates.data(),
+                                       score_targets.bytes(), cudaMemcpyHostToDevice,
+                                       device.stream));
+            ops::target_logprobs(score_logits, score_targets, TextConfig::token_domain,
+                                 score_logprobs_device, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(score_next_token_host.data(), score_logprobs_device.data,
+                                       score_logprobs_device.bytes(), cudaMemcpyDeviceToHost,
+                                       device.stream));
+        }
+
         copy_round_token();
         std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
@@ -12232,6 +12271,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
+        if (!staged.score_candidates.empty()) {
+            const auto* host = static_cast<const float*>(score_next_token_host.data());
+            request.candidate_logprobs.assign(host, host + staged.score_candidates.size());
+            work.reset();
+        }
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
@@ -12278,6 +12322,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
             .timing                  = timing.finish(),
+            .candidate_logprobs      = std::move(request.candidate_logprobs),
         };
     } catch (...) {
         timing.begin_wait();

@@ -263,8 +263,33 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    base->summary.publish_continuation =
-        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    if (!options.score_candidates.empty()) {
+        if (is_masked_draft_backend(speculative_backend)) {
+            throw std::invalid_argument(
+                "score_candidates is not supported on an Engine started with the DFlash or "
+                "DFlash2 speculative backend; use SpeculativeBackend::None or "
+                "SpeculativeBackend::Mtp");
+        }
+        for (const TokenId id : options.score_candidates) {
+            if (id < 0 || id >= TextConfig::token_domain) {
+                throw std::invalid_argument(
+                    "score_candidates contains a token outside the 248077-token domain");
+            }
+        }
+        base->score_candidates = options.score_candidates;
+    }
+    // A scoring request (ExecutionOptions::score_candidates) is strictly read-only with respect
+    // to retained sessions/slots: it computes exactly one set of candidate logprobs and must
+    // never publish its own resulting state as a reusable continuation or catalog entry. See
+    // resource_manager.h, where `!base.summary().publish_continuation` (true here precisely
+    // because score_candidates is non-empty, in the only case where it would otherwise matter --
+    // cache enabled, prompt reusable, allow_prefix_reuse requested) also forces a matched private
+    // source into PrivateSourceMode::Retain (fork) instead of ConsumeToActive, so a scoring
+    // request can never advance/consume a named slot or any other retained private continuation
+    // in place.
+    base->summary.publish_continuation = base->score_candidates.empty() &&
+                                         options.allow_prefix_reuse && prompt.identity.reusable &&
+                                         context_cache.enabled;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -332,12 +357,20 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
     };
     validate_execution_frontiers(prompt.prefill_execution_frontiers, "prefill execution frontiers");
-    if (base->summary.publish_continuation) {
+    // Digest computation gates whether this request can MATCH an existing catalog entry
+    // (via prefix_shortlist_key()) and is required for both publishing requests and
+    // read-only (scoring) requests that still need to find and fork from a shared
+    // source. Publishing eligibility (base->summary.publish_continuation) additionally
+    // requires score_candidates to be empty, but must not gate digest computation itself,
+    // or read-only requests would never be able to match anything.
+    const bool reuse_eligible =
+        options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    if (reuse_eligible) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
     }
-    if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
+    if (reuse_eligible) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
                                      bool long_anchor, SharedCandidateEvidence evidence) {
@@ -484,6 +517,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
+    plan->score_candidates            = base.score_candidates;
 
     if ((source != nullptr && shared_source != nullptr) ||
         ((source == nullptr && shared_source == nullptr) != !checkpoint.has_value())) {

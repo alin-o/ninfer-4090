@@ -1816,8 +1816,9 @@ MediaCacheSummary Frontend::media_cache_summary() const {
     };
 }
 
-PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
-                                        bool allow_prefix_identity) const {
+PreparedPrompt
+Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
+                         std::span<const std::uint32_t> shared_prefix_frontiers) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw_context_length_exceeded(impl_->max_context);
@@ -1829,6 +1830,17 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                     std::to_string(token));
         }
     }
+    for (std::size_t i = 0; i < shared_prefix_frontiers.size(); ++i) {
+        const std::uint32_t frontier = shared_prefix_frontiers[i];
+        if (frontier == 0 || frontier >= token_ids.size()) {
+            throw std::invalid_argument(
+                "prepare_tokens shared_prefix_frontiers must lie strictly inside the prompt");
+        }
+        if (i > 0 && frontier <= shared_prefix_frontiers[i - 1]) {
+            throw std::invalid_argument(
+                "prepare_tokens shared_prefix_frontiers must be strictly ascending");
+        }
+    }
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
@@ -1836,6 +1848,15 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
     result.context_cache.update_session_index = false;
+    result.context_cache.opportunities.reserve(shared_prefix_frontiers.size());
+    for (std::size_t i = 0; i < shared_prefix_frontiers.size(); ++i) {
+        result.context_cache.opportunities.push_back(PreparedCacheOpportunity{
+            .kind        = PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence    = SharedCandidateEvidence::ExplicitBoundary,
+            .frontier    = shared_prefix_frontiers[i],
+            .input_order = static_cast<std::uint32_t>(i),
+        });
+    }
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

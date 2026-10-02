@@ -139,8 +139,9 @@ public:
                                          const PreparationControl& control = {}) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
-    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true) const;
+    [[nodiscard]] PreparedPrompt
+    prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
+                   std::span<const std::uint32_t> shared_prefix_frontiers = {}) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

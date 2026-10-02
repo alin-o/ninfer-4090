@@ -181,6 +181,10 @@ struct RequestRecord {
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;
+    // Set once at prefill completion from Package::PrefillProgress::candidate_logprobs when the
+    // request carried ExecutionOptions::score_candidates; consumed into GenerationResult by
+    // complete_success(). Empty for an ordinary (non-scoring) request.
+    std::vector<float> candidate_logprobs;
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};

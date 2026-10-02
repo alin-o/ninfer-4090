@@ -62,8 +62,18 @@ void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_
     }
 
     require_rank_two(logits, "logits");
-    const std::int32_t columns = logits.ne[1];
-    require_vector(target_ids, columns, "target_ids");
+    const std::int32_t logits_columns = logits.ne[1];
+    if (target_ids.ne[1] != 1 || target_ids.ne[2] != 1 || target_ids.ne[3] != 1 ||
+        target_ids.ne[0] <= 0) {
+        throw std::invalid_argument("target_logprobs: target_ids must be rank-1 with positive "
+                                    "length");
+    }
+    const std::int32_t columns = target_ids.ne[0];
+    if (logits_columns != 1 && logits_columns != columns) {
+        throw std::invalid_argument(
+            "target_logprobs: logits columns must equal target_ids length, or be 1 to broadcast "
+            "a single logits column against every target");
+    }
     require_vector(output, columns, "output");
     if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
         throw std::invalid_argument("target_logprobs: valid_rows must be in [1, physical_rows]");

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -95,8 +96,17 @@ public:
                                          const PreparationControl& control = {}) const;
 
     // Raw token input is retained for repeatable correctness and performance measurement.
-    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true) const;
+    // `shared_prefix_frontiers` declares cache-boundary candidates strictly inside the prompt
+    // (0 < frontier < token_ids.size(), strictly ascending, at most
+    // kMaximumExplicitPromptCacheMarkers entries): each becomes an opt-in SharedStablePrefix
+    // PreparedCacheOpportunity (ssd_eligible=false), so an independent later prepare_tokens()
+    // call sharing the same leading tokens can reuse that prefix even though its suffix diverges.
+    // An empty span writes nothing beyond today's Root-path append-only reuse. Throws
+    // std::invalid_argument if a frontier is out of range, non-ascending, or the count exceeds
+    // kMaximumExplicitPromptCacheMarkers.
+    [[nodiscard]] PreparedPrompt
+    prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
+                   std::span<const std::uint32_t> shared_prefix_frontiers = {}) const;
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
@@ -154,6 +164,17 @@ public:
                                            const std::string& expected_digest = {});
     [[nodiscard]] SlotRestoreResult restore_slot(std::uint32_t lane, const std::string& path);
     std::uint32_t erase_slot(std::uint32_t lane, const std::string& expected_digest = {});
+
+    // Returns the exact confirmed-reusable token ledger of an idle retained slot: the prefix a
+    // later request (prepare_tokens/prepare) can reuse. This is the sequence's execution frontier,
+    // not necessarily the full raw ledger - the most recently generated token of a just-finished
+    // request is excluded when it has not yet been confirmed by a forward pass. A non-empty
+    // expected_digest that does not match the slot's resident session raises SlotSessionMismatch,
+    // checked atomically with the read; a slot claimed by a running request or open resource
+    // transaction raises RequestError(Overloaded); an empty/missing slot raises
+    // std::invalid_argument. This is a pure read: it never changes slot occupancy or digest.
+    [[nodiscard]] std::vector<TokenId> slot_tokens(std::uint32_t lane,
+                                                   const std::string& expected_digest = {});
 
     // Truthful per-slot occupancy, read from the snapshot published at every unit boundary.
     [[nodiscard]] std::vector<SlotState> slot_states() const;

@@ -428,7 +428,15 @@ if(NINFER_BUILD_SERVE)
     serve/http_server.cpp
     serve/openai_responses_http.cpp
     serve/serve_metrics.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    serve/restricted_softmax.cpp
+    serve/checkpoint_lookup.cpp
+    serve/score_request.cpp
+    serve/score_http.cpp
+    serve/systemone_request.cpp
+    serve/systemone_prompt.cpp
+    serve/systemone_answer.cpp
+    serve/systemone_http.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_BINARY_DIR}/generated

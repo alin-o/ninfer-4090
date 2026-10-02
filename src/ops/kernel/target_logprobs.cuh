@@ -42,9 +42,10 @@ template <int BlockSize>
 __launch_bounds__(BlockSize) __global__
     void target_logprobs_kernel(const __nv_bfloat16* logits, const std::int32_t* target_ids,
                                 float* output, std::int32_t valid_rows,
-                                std::int32_t physical_rows) {
-    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
-    const std::int64_t base   = static_cast<std::int64_t>(column) * physical_rows;
+                                std::int32_t physical_rows, std::int32_t logits_columns) {
+    const std::int32_t column        = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t logits_column = logits_columns == 1 ? 0 : column;
+    const std::int64_t base          = static_cast<std::int64_t>(logits_column) * physical_rows;
 
     float local_max = -CUDART_INF_F;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;

@@ -161,6 +161,53 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     return failures;
 }
 
+int run_broadcast_case(const std::string& label, std::int32_t physical_rows,
+                       std::int32_t valid_rows, std::int32_t candidates,
+                       const std::vector<std::uint16_t>& logits_column) {
+    // A single logits column (L=1) is broadcast against `candidates` distinct target ids: every
+    // output shares the same logsumexp denominator and differs only by its target lookup.
+    auto targets = make_targets(valid_rows, candidates);
+    // make_targets can repeat ids across columns by construction; broadcast scoring must still
+    // match the independent oracle even when targets repeat, so no dedup is needed here.
+    const auto single_column_logits = logits_column; // [physical_rows]
+    std::vector<double> expected(static_cast<std::size_t>(candidates));
+    {
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (std::int32_t row = 0; row < valid_rows; ++row) {
+            maximum =
+                std::max(maximum, static_cast<double>(bf16_to_f32(single_column_logits[row])));
+        }
+        double sum = 0.0;
+        for (std::int32_t row = 0; row < valid_rows; ++row) {
+            sum += std::exp(static_cast<double>(bf16_to_f32(single_column_logits[row])) - maximum);
+        }
+        for (std::int32_t column = 0; column < candidates; ++column) {
+            const double target =
+                static_cast<double>(bf16_to_f32(single_column_logits[targets[static_cast<std::size_t>(
+                    column)]]));
+            expected[static_cast<std::size_t>(column)] = target - maximum - std::log(sum);
+        }
+    }
+
+    GuardedDeviceBuffer device_logits(single_column_logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_targets(targets.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_output(targets.size() * sizeof(float));
+    device_logits.copy_from_host(single_column_logits.data(), device_logits.bytes());
+    device_targets.copy_from_host(targets.data(), device_targets.bytes());
+    device_output.fill(0xcd);
+
+    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, 1});
+    Tensor targets_tensor(device_targets.data(), DType::I32, {candidates});
+    Tensor output_tensor(device_output.data(), DType::FP32, {candidates});
+    ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_reduction(label, fp32_as_double(device_output.data(), targets.size()),
+                                    expected, kTargetLogprobsFp32Criterion);
+    failures += device_output.verify_guards(label + " output guards");
+    return failures;
+}
+
 template <class Function>
 int expect_invalid(const char* label, Function&& function) {
     try {
@@ -212,6 +259,10 @@ int run_validation_cases() {
         rank_three.ne[2]  = 2;
         ops::target_logprobs(rank_three, targets, 8, output, nullptr);
     });
+    failures += expect_invalid("target_logprobs rejects logits columns neither 1 nor C", [&] {
+        Tensor mismatched_logits(logits_data.p, DType::BF16, {8, 2});
+        ops::target_logprobs(mismatched_logits, targets, 8, output, nullptr);
+    });
     return failures;
 }
 
@@ -238,6 +289,10 @@ int main() {
                          make_shift_logits(257, 257, 31, 0.0f));
     failures += run_case("target_logprobs shifted logits", 257, 257, 31,
                          make_shift_logits(257, 257, 31, 32.0f));
+    failures += run_broadcast_case("target_logprobs broadcast single column C=257", 248320,
+                                   248077, 257, make_random_logits(248320, 248077, 1));
+    failures += run_broadcast_case("target_logprobs broadcast uniform logits", 263, 257, 11,
+                                   make_uniform_logits(263, 257, 1, 3.5f));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " target_logprobs\n";

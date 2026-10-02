@@ -14,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::runtime {
 
@@ -162,6 +163,9 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Mirrors ExecutionOptions::score_candidates; non-empty makes this a next-token scoring
+    // request (see include/ninfer/types.h for the full contract).
+    std::vector<TokenId> score_candidates;
 };
 
 struct ResolvedRequestOptions {
@@ -720,6 +724,9 @@ struct PrefillStepResult {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     ExecutionTiming timing;
+    // Populated only when `complete` and the request carried ExecutionOptions::score_candidates:
+    // one full-vocabulary log p(candidate | prompt) per candidate, in order.
+    std::vector<float> candidate_logprobs;
 };
 
 struct GenerationReservationState {

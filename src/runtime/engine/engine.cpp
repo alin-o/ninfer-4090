@@ -126,6 +126,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
+    resolved.execution.score_candidates        = std::move(options.execution.score_candidates);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -387,11 +388,27 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
         impl_->active);
 }
 
-PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
-                                      bool allow_prefix_identity) const {
+PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
+                                      std::span<const std::uint32_t> shared_prefix_frontiers) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (shared_prefix_frontiers.size() > kMaximumExplicitPromptCacheMarkers) {
+        throw std::invalid_argument("prepare_tokens accepts at most " +
+                                    std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                                    " shared_prefix_frontiers");
+    }
+    for (std::size_t i = 0; i < shared_prefix_frontiers.size(); ++i) {
+        const std::uint32_t frontier = shared_prefix_frontiers[i];
+        if (frontier == 0 || frontier >= token_ids.size()) {
+            throw std::invalid_argument(
+                "prepare_tokens shared_prefix_frontiers must lie strictly inside the prompt");
+        }
+        if (i > 0 && frontier <= shared_prefix_frontiers[i - 1]) {
+            throw std::invalid_argument(
+                "prepare_tokens shared_prefix_frontiers must be strictly ascending");
+        }
+    }
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
@@ -399,8 +416,8 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                 throw RequestError(RequestErrorKind::ContextLengthExceeded,
                                    context_capacity_error(token_ids.size(), target_ptr->capacity));
             }
-            auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
-                                                                             allow_prefix_identity);
+            auto prepared = target_ptr->loaded->frontend.prepare_tokens(
+                std::move(token_ids), allow_prefix_identity, shared_prefix_frontiers);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
@@ -507,6 +524,23 @@ Engine::submit_with_recovery(PreparedPrompt prompt, RequestOptions options,
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+
+    if (!resolved_options.execution.score_candidates.empty()) {
+        const std::vector<TokenId>& candidates = resolved_options.execution.score_candidates;
+        if (resolved_options.execution.requested_output_tokens != 1U) {
+            throw std::invalid_argument(
+                "score_candidates requires exactly one requested output token");
+        }
+        if (candidates.size() > 1024U) {
+            throw std::invalid_argument("score_candidates accepts at most 1024 candidates");
+        }
+        std::vector<TokenId> sorted_candidates = candidates;
+        std::sort(sorted_candidates.begin(), sorted_candidates.end());
+        if (std::adjacent_find(sorted_candidates.begin(), sorted_candidates.end()) !=
+            sorted_candidates.end()) {
+            throw std::invalid_argument("score_candidates must be distinct");
+        }
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
@@ -769,6 +803,19 @@ std::uint32_t Engine::erase_slot(std::uint32_t lane, const std::string& expected
         [&](auto& core) -> std::uint32_t {
             if constexpr (requires { core->erase_retained_lane(lane, expected_digest); }) {
                 return core->erase_retained_lane(lane, expected_digest);
+            } else {
+                throw std::logic_error("session persistence requires a generation Engine");
+            }
+        },
+        impl_->core);
+}
+
+std::vector<TokenId> Engine::slot_tokens(std::uint32_t lane, const std::string& expected_digest) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> std::vector<TokenId> {
+            if constexpr (requires { core->retained_lane_tokens(lane, expected_digest); }) {
+                return core->retained_lane_tokens(lane, expected_digest);
             } else {
                 throw std::logic_error("session persistence requires a generation Engine");
             }

@@ -503,6 +503,16 @@ std::string ProgramImplCore::continuation_digest(const ContinuationHandle& conti
     return ledger_digest(sequence.ledger);
 }
 
+std::vector<TokenId>
+ProgramImplCore::continuation_tokens(const ContinuationHandle& continuation) const {
+    if (!valid_continuation(continuation)) { return {}; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
+    const std::uint32_t frontier =
+        std::min(sequence.execution_frontier, static_cast<std::uint32_t>(sequence.ledger.size()));
+    return std::vector<TokenId>(sequence.ledger.begin(),
+                                sequence.ledger.begin() + static_cast<std::ptrdiff_t>(frontier));
+}
+
 ContextMemory ProgramImplCore::resident_memory(const SequenceState& sequence,
                                                std::uint32_t frontier,
                                                std::span<const StateImageHandle> states) const {

@@ -839,6 +839,9 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
     std::optional<CaptureOffer<Variant>> capture;
+    // Populated only when `complete` and the request carried ExecutionOptions::score_candidates
+    // (see runtime::PrefillStepResult::candidate_logprobs).
+    std::vector<float> candidate_logprobs;
 };
 
 enum class CaptureStatePlacement : std::uint8_t {
@@ -1168,6 +1171,12 @@ public:
     [[nodiscard]] std::vector<SlotCheckpoint>
     continuation_checkpoints(const ContinuationHandle<Variant>& continuation,
                              bool memory_only = false) const;
+    // The confirmed-reusable token prefix: the sequence's execution_frontier, which excludes a
+    // just-generated trailing token that has not yet been confirmed by a forward pass (at most
+    // one token shorter than the full ledger). This is the exact prefix a later request can match
+    // against this continuation's endpoint checkpoint.
+    [[nodiscard]] std::vector<TokenId>
+    continuation_tokens(const ContinuationHandle<Variant>& continuation) const;
     [[nodiscard]] ContextMemory sequence_memory(SequenceHandle<Variant> sequence) const;
     // Session persistence for one catalogued continuation. `model_binding` pins the snapshot to
     // the serving weights identity; restore rejects a mismatched binding or configuration and

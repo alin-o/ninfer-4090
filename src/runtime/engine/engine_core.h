@@ -770,6 +770,21 @@ public:
         return instance_.program->begin_save_continuation(*view.handle, model_binding);
     }
 
+    // Pure read of an idle retained slot's confirmed-reusable token ledger. Never changes slot
+    // occupancy, binding, or digest - unlike save_retained_lane/erase_retained_lane this performs
+    // no catalog mutation at all.
+    [[nodiscard]] std::vector<TokenId> retained_lane_tokens(std::uint32_t slot,
+                                                            std::string_view expected_digest) const {
+        std::scoped_lock lock(execution_mutex_);
+        require_settled_slot(slot);
+        const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
+        require_session_digest(view, expected_digest);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::invalid_argument("slot holds no retained session");
+        }
+        return instance_.program->continuation_tokens(*view.handle);
+    }
+
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_settled_slot(slot);
@@ -1766,6 +1781,7 @@ private:
         result.session_digest          = request->retained_session_digest;
         result.checkpoints             = request->checkpoint_summary;
         result.checkpoint_lifecycle    = std::move(request->checkpoint_lifecycle);
+        result.candidate_logprobs      = std::move(request->candidate_logprobs);
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -2289,6 +2305,7 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
+        request->candidate_logprobs = std::move(progress.candidate_logprobs);
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }

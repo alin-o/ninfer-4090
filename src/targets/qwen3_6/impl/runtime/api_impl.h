@@ -675,6 +675,12 @@ Program<Variant>::continuation_digest(const ContinuationHandle<Variant>& continu
 }
 
 template <>
+std::vector<TokenId>
+Program<Variant>::continuation_tokens(const ContinuationHandle<Variant>& continuation) const {
+    return impl_->continuation_tokens(continuation);
+}
+
+template <>
 std::vector<SlotCheckpoint>
 Program<Variant>::continuation_checkpoints(const ContinuationHandle<Variant>& continuation,
                                            bool memory_only) const {

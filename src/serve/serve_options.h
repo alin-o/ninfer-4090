@@ -70,6 +70,13 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens = 8192;
     bool use_cuda_graph             = true;
     bool allow_prefix_reuse         = true;
+    // /v1/score, /v1/systemone, /v1/systemone/batch: declare a shared-prefix frontier on the
+    // first prompt of a sibling group (several questions on one state, or one question over
+    // several states) so later siblings in the group reuse that prefix automatically. This is the
+    // only way scoring ever writes to the Engine (an evictable internal catalog entry, never a
+    // slot); --no-score-prefix-cache disables it for strict read-only scoring (frontiers are
+    // always empty).
+    bool score_prefix_cache = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

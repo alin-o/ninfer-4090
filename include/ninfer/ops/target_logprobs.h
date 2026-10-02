@@ -18,9 +18,13 @@ namespace ninfer::ops {
  *                - log(sum_{r=0..valid_rows-1} exp(l[r,c])).
  *
  * Logical shapes:
- *   logits is [physical_rows,C], target_ids is [C], and output is [C], with C>0 and
- *   1<=valid_rows<=physical_rows. Values in target_ids are in [0,valid_rows). Physical rows
- *   [valid_rows,physical_rows) do not participate in either the denominator or target lookup.
+ *   logits is [physical_rows,L], target_ids is [C], and output is [C], with C>0,
+ *   1<=valid_rows<=physical_rows, and L equal to either C or 1. Values in target_ids are in
+ *   [0,valid_rows). Physical rows [valid_rows,physical_rows) do not participate in either the
+ *   denominator or target lookup. When L==1 (and C>1), every target shares the single logits
+ *   column: l[r,c] above reads logits column 0 for every c, so ideal[c] differs only in its
+ *   target lookup. This broadcast form amortizes one logits column (e.g. one GEMV) across many
+ *   candidate targets instead of materializing C identical columns.
  *
  * Supported domain:
  *   logits is contiguous finite BF16, target_ids is contiguous I32, and output is contiguous

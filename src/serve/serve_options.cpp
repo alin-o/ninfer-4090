@@ -94,11 +94,13 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--no-score-prefix-cache] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
-           "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       serves OpenAI Responses/Chat Completions, Anthropic Messages, /v1/score, and "
+           "SystemOne endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -142,6 +144,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --no-score-prefix-cache disables /v1/score and SystemOne's sibling-prefix "
+           "sharing (an evictable internal cache entry); scoring never writes anything else, "
+           "and this makes it strictly read-only (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -399,6 +404,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--no-score-prefix-cache") {
+            options.score_prefix_cache = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

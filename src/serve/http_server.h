@@ -96,6 +96,9 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
+    void handle_score(const httplib::Request& req, httplib::Response& res);
+    void handle_systemone(const httplib::Request& req, httplib::Response& res);
+    void handle_systemone_batch(const httplib::Request& req, httplib::Response& res);
 
     void record_request_start(RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);

@@ -64,6 +64,11 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    // Prefill-finalize next-token candidate scoring (ExecutionOptions::score_candidates): one
+    // broadcast logits column plus up to kCausalScoreTile target ids/logprobs. Unconditional
+    // (cheap, independent of causal_scoring) since any non-speculative Generation request may ask
+    // for it.
+    std::size_t score_next_token = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;

@@ -69,6 +69,9 @@ omitted at startup.
 | `GET /monitor/data` | coherent Engine context snapshot for the dashboard; authenticated like `/slots` |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
+| `POST /v1/score` | next-token candidate scoring (full-vocabulary logprob per candidate) |
+| `POST /v1/systemone` | single-state closed-form question answering (noul/choice/score) |
+| `POST /v1/systemone/batch` | multi-state closed-form question answering |
 
 A fatal Engine failure permanently disables inference. The server checks Engine health every
 250 ms, stops accepting HTTP connections, and exits with status 1 so its supervisor can restart
@@ -999,6 +1002,287 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
   }'
 ```
 
+## Candidate scoring and SystemOne
+
+These three routes share one Engine primitive (`ExecutionOptions::score_candidates` /
+`GenerationResult::candidate_logprobs`): a prompt is admitted and prefilled exactly like any other
+request, but instead of sampling, Engine returns the full-vocabulary log p(candidate|prompt) for a
+small, explicitly listed set of next-token candidates. They go through the same bounded FIFO
+ingress, concurrency, client-disconnect cancellation, and API-key/model-id checks as the other
+routes; `/v1/score` returns OpenAI-style error bodies, SystemOne returns laya-style status codes
+(see below).
+
+### `POST /v1/score`
+
+```bash
+curl http://127.0.0.1:8080/v1/score \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "The capital of France is",
+    "candidates": [" Paris", " London", " Berlin"]
+  }'
+```
+
+Request fields:
+
+- `model` (optional) — any non-empty local label; validated like the other routes and echoed back.
+- `prompt` — a string (tokenized with `Engine::tokenize_text`, no chat template) or an array of
+  raw token ids (passed to `Engine::prepare_tokens` with prefix reuse enabled). When `checkpoint`
+  (below) is given, `prompt` is always the *continuation* appended after the checkpoint's resident
+  ledger, not the full prompt.
+- `candidates` — 1 to 1024 distinct entries, each a string or a token id. A string candidate must
+  tokenize to exactly one artifact token; anything else is a 400. Token-id candidates are used
+  as-is; an invalid id surfaces as Engine's `std::invalid_argument`, mapped to 400.
+- `checkpoint` (optional) — `{"slot": N, "session_digest": "..."}` naming a retained slot from
+  `GET /slots`; see [Named checkpoints](#named-checkpoints) below.
+
+Response:
+
+```json
+{
+  "object": "score",
+  "model": "qwen3.8-27b",
+  "prompt_tokens": 7,
+  "cached_tokens": 3,
+  "candidates": [
+    {"token": " Paris", "token_id": 12345, "logprob": -0.05, "probability": 0.95,
+     "restricted_probability": 0.97},
+    {"token_id": 234, "logprob": -4.1, "probability": 0.016, "restricted_probability": 0.02}
+  ],
+  "candidate_mass": 0.98
+}
+```
+
+`logprob`/`probability` are the raw full-vocabulary values Engine returns. `restricted_probability`
+renormalizes just the listed candidates against each other (`restricted_softmax`); `candidate_mass`
+is the unnormalized sum of the candidates' raw probabilities, i.e. how much of the full distribution
+the candidate set captures. `cached_tokens` reports prefix-cache reuse on the prompt, same meaning
+as elsewhere in this document. A token-id candidate has no `token` field: NInfer's Engine API has no
+public detokenize/decode-single-token route, so the server cannot name a token it was only given as
+an id (this is a real limitation of the current Engine surface, not an omission in this route).
+
+### SystemOne (`/v1/systemone`, `/v1/systemone/batch`)
+
+SystemOne answers small sets of closed-form questions (yes/no, multiple choice, or a numeric score)
+about one or more pieces of free-text "state", by restricting generation to one output token drawn
+from a fixed label alphabet and reading that token's restricted probability distribution. It is
+NInfer's own implementation of the wire protocol used by `laya`'s `/v1/systemone` proxy; the
+original `examples/systemone-proxy/systemone.ts` reference implementation was already removed from
+the tree (with no recoverable git history) before this work began. The request/response shapes
+below were derived from the task specification and from reading `laya`'s Python-side client
+(`laya/common.py`, `laya/serve.py`) for protocol *shape* only. laya's own production backend for
+this route is a BERT-style masked-token classifier, not a ChatML/logprob LLM, so it could not supply
+prompt wording or an LLM-side implementation to port either way: **the system/user prompt text sent
+to the model, and the confidence formula below, are original NInfer designs**, not a port of
+laya's or Jev's wording. Treat both as subject to revision once validated against real model output.
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": "The invoice total is $4,200, due in 30 days.",
+    "questions": {
+      "overdue": {"type": "noul", "instructions": "Is this invoice already overdue?"},
+      "category": {"type": "choice", "instructions": "Which category best fits this document?",
+                   "criteria": {"invoice": "a billing document", "contract": "a legal agreement"}},
+      "urgency": {"type": "score", "instructions": "Rate how urgent this is.",
+                  "criteria": ["not urgent", "somewhat urgent", "very urgent"]}
+    }
+  }'
+```
+
+`state` may be a JSON string (used verbatim) or any other JSON value (serialized). A lone
+`{"body": X}` wrapper object is unwrapped to `X` first (any other key alongside `body` disables the
+unwrap, so `{"body": "x", "other": "y"}` is serialized as-is). `state` is required unless `checkpoint`
+(below) is given, in which case it is optional: a question about the checkpointed conversation
+itself omits it. `/v1/systemone/batch`'s `states` array is always required, with or without a
+`checkpoint` — a checkpoint only supplies the shared prefix every state's prompt continues from, it
+does not replace the per-state text the batch exists to answer. `questions` is an object keyed by
+caller-chosen question id, iterated and answered in the given key order; each question has:
+
+- `type`: `"noul"` (yes/no), `"choice"`, or `"score"`.
+- `instructions`: the question text shown to the model.
+- `criteria`: required for `choice`/`score`, omitted or optional for `noul`.
+  - `choice`: an object mapping option name to a description (`null`/empty for none), or an array
+    of option-name strings. Up to **26** options (rendered as labels `A`..`Z`).
+  - `score`: an array of level descriptions, index 0 first. Up to **10** levels (labels `0`..`9`).
+  - `noul`: an optional object with only the keys `"true"`/`"false"` giving custom descriptions;
+    the option order is always `[false, true]` and the wire label text is `No`/`Yes`.
+- `checkpoint` (optional, both `/v1/systemone` and `/v1/systemone/batch`) —
+  `{"slot": N, "session_digest": "..."}` naming a retained slot from `GET /slots`; see
+  [Named checkpoints](#named-checkpoints) below.
+
+Response:
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "answers": {
+    "overdue": {"type": "noul", "noul": 0.12, "confidence": 0.76},
+    "category": {"type": "choice", "choice": "invoice",
+                 "probabilities": {"invoice": 0.91, "contract": 0.09}, "confidence": 0.82},
+    "urgency": {"type": "score", "score": 1.4,
+                "legend": {"0": "not urgent", "1": "somewhat urgent", "2": "very urgent"},
+                "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}, "confidence": 0.33}
+  },
+  "usage": {"input_tokens": 142, "output_tokens": 0, "cached_tokens": 96}
+}
+```
+
+`noul` is `P(Yes)`. `choice`/`score` `probabilities` are keyed by option name (for `score`, the
+option name is the stringified level index). `output_tokens` is always 0: SystemOne never samples a
+free-form completion, only full-vocabulary logprobs for the label alphabet. `cached_tokens` is an
+NInfer extension inside `usage` reporting prefix-cache reuse across the question set; it is additive
+information and does not change the documented `usage` schema's required fields.
+
+`POST /v1/systemone/batch` answers the same `questions` across multiple `states`:
+
+```json
+{"states": ["state A text", "state B text"], "questions": {"...": "as above"}}
+```
+
+```json
+{
+  "results": [
+    {"model": "qwen3.8-27b", "answers": {"...": "as above"}, "usage": {"...": "as above"}},
+    {"model": "qwen3.8-27b", "answers": {"...": "as above"}, "usage": {"...": "as above"}}
+  ],
+  "total_usage": {"input_tokens": 284, "output_tokens": 0, "cached_tokens": 150}
+}
+```
+
+Limits: up to 64 states, up to 64 questions, state text up to 50,000 characters, request body up to
+2 MiB. `model` is accepted on either route for interface compatibility but is functionally ignored:
+NInfer serves exactly one resident model per process, and the response always echoes the resident
+model's id (or the request's `model` string, if given, exactly as the other routes do).
+
+Status codes follow `laya-serve`, not the OpenAI error shape used elsewhere in this document: `400`
+for a malformed body or missing `state`/`states`/`questions`, `413` for exceeding any of the limits
+above (including the 26/10 option caps), `422` for an invalid question (unknown `type`, missing or
+empty `instructions`, missing/empty/duplicate `criteria`), `401` for a failed API key check, and
+`503` (`type: "server_error"`, `code: "busy"`) when admission is overloaded.
+
+**Deviations from laya-serve/Jev**, all intentional: option caps are 26/10 (laya allows up to
+100/32) because NInfer labels are single uppercase letters or single digits, not laya's
+multi-character label scheme; there are no `routing`, `lang`, `task`, or `min_confidence` request
+controls (NInfer has one resident model and does not implement laya's routing/confidence-gating
+logic); the confidence formula is NInfer's own `clamp((N*peak-1)/(N-1), 0, 1)` over the restricted
+label distribution (laya's `answer_confidence`/`confidence_from_probs` use a bare max-probability or
+a normalized-entropy formula, both different).
+
+#### Named checkpoints
+
+All three routes accept an optional `checkpoint` object — `{"slot": N, "session_digest": "..."}`,
+the same `slot`/`session_digest` shape `GET /slots` reports for a retained lane. Giving one builds
+the prompt on top of that lane's resident conversation instead of starting a fresh ChatML exchange:
+
+- `GenerationService::slot_tokens(slot, session_digest)` (the Engine's `Engine::slot_tokens`
+  underneath) returns the retained lane's exact token ledger. This is a **pure read**: it never
+  changes slot occupancy, never advances or replaces the retained continuation, and never consumes
+  the lane.
+- The ledger's last (possibly incomplete) turn is closed before the new content starts: if the
+  ledger's last token is already `<|im_end|>`, only a bare `"\n"` reopens the ChatML stream;
+  otherwise the full `"<|im_end|>\n"` closes it first. A new `<|im_start|>user\n...` turn then
+  carries the request's actual content — `/v1/score`'s `prompt` field verbatim, or one new user turn
+  built from the SystemOne question/state the usual way (skipping the system preamble, since the
+  checkpoint's own history already established it).
+- `/v1/score`'s `prompt` is always the continuation only; the checkpoint's ledger is prepended
+  server-side, not merged into `prompt_tokens` on the wire.
+- `/v1/systemone`'s `state` becomes optional once `checkpoint` is given (omit it to ask about the
+  checkpointed conversation itself); `/v1/systemone/batch`'s `states` stays required regardless, since
+  a checkpoint only supplies the shared conversation prefix, not the per-state text being scored.
+
+A typical workflow pins a conversation at some point A, asks several closed-form questions about
+it, generates past A to a new point B, then asks more questions about B — all without re-prefilling
+the shared history and without disturbing A's own completion:
+
+```bash
+# 1. Drive a normal generation (e.g. /v1/chat/completions on a retained lane) until point A, then
+#    inspect GET /slots to learn its {slot, session_digest}.
+# 2. Score several questions against the checkpoint at A, in parallel; none of these touch the slot.
+curl http://127.0.0.1:8080/v1/score -d '{
+  "checkpoint": {"slot": 3, "session_digest": "abcd1234"},
+  "prompt": "<|im_start|>user\nIs the answer above final?<|im_end|>\n<|im_start|>assistant\n",
+  "candidates": [" yes", " no"]
+}'
+curl http://127.0.0.1:8080/v1/systemone -d '{
+  "checkpoint": {"slot": 3, "session_digest": "abcd1234"},
+  "questions": {"final": {"type": "noul", "instructions": "Is the answer above final?"}}
+}'
+# 3. Separately, continue the real conversation on slot 3 past A to a new point B (ordinary
+#    generation; this is the only path that actually advances the slot).
+# 4. Repeat step 2 against slot 3's new session_digest at B.
+```
+
+Error mapping mirrors `/slots`' own precedent: an unknown or empty slot is a 400
+(`invalid_request_error` for `/v1/score`, laya-style `400` for SystemOne); a `session_digest` that no
+longer matches the lane's current occupant (the slot moved on, e.g. a new conversation reused it) is
+a 409 `slot_session_mismatch`; a lane that is currently processing another request is a 409
+`slot_busy` (SystemOne remaps this the same way it remaps other overload conditions, to `503`
+`busy`). None of these paths create, replace, or advance a slot — a failed checkpoint lookup leaves
+the named slot exactly as it was.
+
+**Limitation**: a retained slot is not guaranteed to survive indefinitely under memory pressure from
+other private continuations — its capacity is governed by `--max-private-continuations` (and the
+context-cache's normal eviction policy) like any other retained continuation. A checkpoint reference
+that outlives its slot's eviction surfaces as the same 400 an unknown/empty slot would.
+
+#### Prompt layout and prefix-cache sharing
+
+Each question renders as ChatML
+`<|im_start|>system ... <|im_end|>\n<|im_start|>user\n[STATE][QUESTION+options]<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`,
+with the label scaffolding (`A\n`, `B\n`, ...) always last so distinct questions on the same state
+differ only at the tail:
+
+- `/v1/systemone` (one state, several questions) orders `[state][question]` so every question's
+  prompt shares the `[system-or-checkpoint][state]` prefix.
+- `/v1/systemone/batch` with exactly one question across several states orders
+  `[question+options][state]` instead, so every state's prompt shares the
+  `[system-or-checkpoint][question]` prefix; with more than one question it falls back to the
+  state-first layout per state.
+- With a `checkpoint` given and no `state` at all (a checkpoint-only question), the whole checkpoint
+  preamble is the shared prefix: siblings share `[checkpoint][closing][user-turn-open]` and diverge
+  only in the question text.
+
+Fixed scaffolding (ChatML control text, the system prompt, `"Options:\n"`, and each label line) is
+tokenized once per process and cached; only the variable state/instructions/option-description text
+is tokenized per request. Every individual tokenization call's text ends in `"\n"` except possibly
+the prompt's very last segment, so concatenating separately-tokenized segments cannot merge across a
+call boundary differently than tokenizing the whole text at once would. Per-label output token ids
+(the single token the model must emit, e.g. `"A"`) are resolved once per process by tokenizing the
+bare label text (trying a leading-space spelling if the bare spelling is not a single token) and
+fail loudly if neither spelling is a single token for the loaded artifact's tokenizer — this
+resolution has not been exercised against a live tokenizer and is the main thing to check first in
+live validation.
+
+Within a prefix-sharing group, the server submits and waits for the *first* prompt (so its KV
+becomes the reusable prefix), then submits the rest concurrently so they land in Engine's existing
+batching/prefix-cache machinery; independent groups (e.g. different states in the batch's
+state-first fallback) are otherwise submitted with ordinary concurrency. Sharing is declared by
+passing the boundary above to `Engine::prepare_tokens`' `shared_prefix_frontiers` on that first
+prompt only, registering it as an evictable shared-prefix catalog entry sibling prompts then reuse
+automatically; a lone sibling (no actual sharing opportunity, e.g. a single-question
+`/v1/systemone` call) never declares one.
+
+`--no-score-prefix-cache` disables this sharing for all three routes: every call passes an empty
+`shared_prefix_frontiers`, so scoring never writes anything to the Engine beyond the request's own
+(forked, never-published) prefill — a strictly read-only mode, at the cost of re-prefilling the
+shared prefix for every sibling instead of reusing one lane's work. It is enabled by default.
+
+#### What could not be verified without a live model
+
+Everything above that depends on tokenizer behavior — the single-token-candidate checks in
+`/v1/score`, the newline-boundary concatenation-safety assumption, the label-token leading-space
+resolution in SystemOne, the checkpoint ledger-closing rule (`"\n"` vs. the full `"<|im_end|>\n"`),
+and the shared-prefix frontier offset for every layout/checkpoint/`has_state` combination — is
+covered by schema/unit tests against a fake recording tokenizer (`tests/test_score_request.cpp`,
+`tests/test_systemone.cpp`), not against a real artifact's tokenizer or the Engine's actual
+`score_candidates`/`prepare_tokens`/`slot_tokens` execution paths. In particular, `checkpoint`'s
+three Engine-side error mappings (`SlotSessionMismatch` → 409, a busy lane → 409, an
+empty/erased/unknown slot → 400) are exercised as pure request/response-shape unit tests
+(`src/serve/checkpoint_lookup.cpp`'s mapping logic) but not against a live `GenerationService`/Engine
+instance, since no GPU or model load was performed while implementing these routes.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
@@ -1057,6 +1341,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--no-score-prefix-cache` | disable `/v1/score`/SystemOne sibling-prefix sharing (an evictable internal cache entry); scoring is then strictly read-only | sharing on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |

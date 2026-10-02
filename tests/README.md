@@ -391,6 +391,14 @@ the solo reply is not required because batch position may flip a near-tied token
 selection the ordinary variant fails (vault replies answer the numbers task or the other vault's
 content); with it both variants pass.
 
+`ninfer_host_indexing_stress_test` is CPU-only. Page-layout, transfer-work and cyclic planning
+are checked against hand-computed layouts; Tensor slice/permute/view chains against element
+values read through the logical index; and the MTP draft-tensor contract (dim 0 is the fast axis,
+so one proposal step of a `{batch, drafts}` tensor is a contiguous `{batch}` view). The pinned Host
+KV arena is checked for constructor contracts, views, stale handles and fragmentation, and by
+20,000 randomized operations against an independent shadow model that also verifies data
+integrity. The arena sections need pinned Host memory and report a skip note without it.
+
 ## What belongs here
 
 A permanent test should protect one current risk, such as:

@@ -4257,7 +4257,13 @@ private:
         }
         if (result.victims.size() != record->private_claims.size() ||
             result.shared_victims.size() != record->shared_claims.size()) {
-            throw std::logic_error("materialization result is not action aligned");
+            throw std::logic_error(
+                "materialization result is not action aligned: status " +
+                std::to_string(static_cast<int>(result.status)) + ", program private/shared victims " +
+                std::to_string(result.victims.size()) + "/" +
+                std::to_string(result.shared_victims.size()) + ", logical claims " +
+                std::to_string(record->private_claims.size()) + "/" +
+                std::to_string(record->shared_claims.size()));
         }
         const auto private_result_for = [&](const OwnerClaim& claim) -> const auto& {
             const auto found =

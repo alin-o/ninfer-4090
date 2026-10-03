@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <algorithm>
 #include <vector>
@@ -2313,10 +2315,20 @@ int exercise_concurrent_resource_settlement(const char* artifact,
             return 1;
         }
     }
-    const ninfer::RuntimeStats settled = engine.runtime_stats();
-    if (settled.running_requests != 0 || settled.materializing_requests != 0 ||
-        settled.prefilling_requests != 0 || settled.decode_ready_requests != 0 ||
-        settled.capture_pending_requests != 0 || settled.terminal_pending_requests != 0) {
+    // Results become visible before the worker removes the slot and publishes the settled
+    // snapshot, so wait for the published boundary snapshot instead of reading it immediately.
+    const auto no_live_membership = [](const ninfer::RuntimeStats& stats) {
+        return stats.running_requests == 0 && stats.materializing_requests == 0 &&
+               stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
+               stats.capture_pending_requests == 0 && stats.terminal_pending_requests == 0;
+    };
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::RuntimeStats settled = engine.runtime_stats();
+    while (!no_live_membership(settled) && std::chrono::steady_clock::now() < settle_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        settled = engine.runtime_stats();
+    }
+    if (!no_live_membership(settled)) {
         std::cerr << "C=8 terminal settlement left live logical membership: running="
                   << settled.running_requests << " materializing=" << settled.materializing_requests
                   << " prefill=" << settled.prefilling_requests

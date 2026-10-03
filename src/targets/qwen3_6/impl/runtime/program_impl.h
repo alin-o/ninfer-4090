@@ -6042,7 +6042,10 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         // Keep the transaction at HostReleases and let the worker boundary retry after the
         // completion event becomes ready.
         retire_ready_snapshot_sources();
-        if (!snapshot_source_retirements_.empty()) { return out; }
+        if (!snapshot_source_retirements_.empty()) {
+            out.status = runtime::ContextTransactionStatus::InProgress;
+            return out;
+        }
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.option.evicts_continuation) {

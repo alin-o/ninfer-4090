@@ -387,9 +387,14 @@ NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer \
 unrelated prompts solo, which leaves retained sessions behind as a server does, and then start
 pairs of them together in several orders. A reply fails when it is shorter than 20 tokens, lacks
 its own task words, or contains words that belong only to another prompt's task. Equality with
-the solo reply is not required because batch position may flip a near-tied token. Without the row
-selection the ordinary variant fails (vault replies answer the numbers task or the other vault's
-content); with it both variants pass.
+the solo reply is deliberately not required: batched logits differ from the solo run's by one or
+two BF16 steps in every round (the solo run itself is fully deterministic), so a greedy token whose
+two best candidates are within a step can resolve differently. In the vault reply this happens once,
+at output token 40, where the solo logits are 27.75 and 27.625 and a batched row rounds them to
+27.5 and 27.5; the sampler then picks the lower token id. Op contracts do not promise bitwise batch
+invariance (`docs/maintainer/op-development.md`). Without the row selection the ordinary variant
+fails (vault replies answer the numbers task or the other vault's content); with it both variants
+pass.
 
 `ninfer_host_indexing_stress_test` is CPU-only. Page-layout, transfer-work and cyclic planning
 are checked against hand-computed layouts; Tensor slice/permute/view chains against element

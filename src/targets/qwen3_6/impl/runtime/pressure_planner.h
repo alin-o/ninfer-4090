@@ -140,6 +140,33 @@ dropped_checkpoint_count(const qwen3_6::detail::PressureDecision& decision) noex
     return decision.checkpoint_drops;
 }
 
+// Device State victim class of one pressure decision: None when no Device State slot is removed,
+// Intermediate for shared owners and non-endpoint State, PrivateEndpoint when the decision
+// removes a private continuation's endpoint State. The planner protects conversation heads by
+// ranking PrivateEndpoint reclamation of a head after every other class.
+inline runtime::DeviceStateVictimClass
+device_state_victim_class(const qwen3_6::detail::PressureDecision& decision) noexcept {
+    if (decision.effect.removed.device.state_slots == 0) {
+        return runtime::DeviceStateVictimClass::None;
+    }
+    if (decision.shared_owner) { return runtime::DeviceStateVictimClass::Intermediate; }
+    if (decision.evicts_continuation ||
+        std::any_of(
+            decision.state_changes.begin(), decision.state_changes.end(),
+            [](qwen3_6::detail::PressureStateDecision change) {
+                return change ==
+                           qwen3_6::detail::PressureStateDecision::DropEndpointDeviceDuplicate ||
+                       change == qwen3_6::detail::PressureStateDecision::DemoteEndpointToHost;
+            }) ||
+        std::any_of(decision.dropped_checkpoints.begin(), decision.dropped_checkpoints.end(),
+                    [](runtime::CheckpointRef ref) {
+                        return ref.kind == runtime::CheckpointKind::SessionEndpoint;
+                    })) {
+        return runtime::DeviceStateVictimClass::PrivateEndpoint;
+    }
+    return runtime::DeviceStateVictimClass::Intermediate;
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -883,6 +910,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance_choices(
                                                               : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = decision.checkpoint_drops,
+            .device_state_victim_class =
+                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(decision),
         });
     }
     detail::PhysicalResources residual =
@@ -1064,6 +1093,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                                                                : runtime::VictimDisposition::Retained,
             .degradation_units = units,
             .dropped_checkpoints = dropped,
+            .device_state_victim_class =
+                NINFER_QWEN36_RUNTIME_NS::device_state_victim_class(*decision),
         });
         ++projection_work;
     }
@@ -1185,6 +1216,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         .physical_status       = status,
         .source_mode           = projected->source_mode,
         .machine_work          = machine_work,
+        .unique_reclamation    = projected->unique_reclamation,
         .owner_outcomes        = assessment_outcomes,
         .checkpoint_impacts    = {},
         .candidate             = candidate_ids[node.candidate_index],

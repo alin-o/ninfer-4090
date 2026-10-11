@@ -1206,6 +1206,8 @@ private:
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
+    void observe_physical_reclamation(detail::PhysicalResources before,
+                                      runtime::UniquePhysicalReclamation& total) const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] std::optional<StateImageHandle>
     try_selected_state(const SequenceState& sequence, ReusePath reuse,
@@ -1422,6 +1424,9 @@ private:
     // Single-sequence kernels read their KV table row from one Program-wide device scalar.
     // Select this sequence's rows before launching such work.
     void select_sequence_kv_rows(const SequenceState& sequence);
+    // DFlash prefill reads its lane, State selectors and DFlash KV row from one Program-wide
+    // ingress block; upload this sequence's values before its prefill work.
+    void upload_dflash_prefill_ingress(const SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);

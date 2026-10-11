@@ -14,7 +14,29 @@
 #include <utility>
 #include <algorithm>
 #include <vector>
+#include "core/paged_kv_cache.h"
+#include "runtime/contract/types.h"
+#include "runtime/engine/durable_shared_snapshot_access.h"
+#include "runtime/engine/context_transfer_test_gate.h"
+#include "runtime/engine/shared_snapshot_test_access.h"
+#include "serve/durable_shared_prefix_catalog.h"
+#include "serve/openai_responses.h"
+#include "serve/request_events.h"
+#include "serve/translate.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <atomic>
+#include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <future>
+#include <new>
+#include <numeric>
+#include <span>
 
+
+cudaError_t launch_context_transfer_failure(cudaStream_t stream) noexcept;
 namespace {
 
 ninfer::EngineOptions engine_options(const char* artifact) {
@@ -66,6 +88,37 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+ninfer::EngineOptions groupwise_host_restore_engine_options(const char* artifact) {
+    ninfer::EngineOptions options = host_restore_engine_options(artifact);
+    options.kv_cache              = ninfer::KvCacheStorage::RK4V4E8;
+    // Pressure first needs one cell for the Host-demoted source and one for the unrelated Root
+    // request that creates the pressure. The consuming restore then runs with this two-cell
+    // catalog full, so it must reuse the selected source cell rather than require a third cell.
+    return options;
+}
+
+
+ninfer::EngineOptions shared_snapshot_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                    = 128;
+    options.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                  = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 2;
+    options.context_cache.host_state_slots   = 2;
+    options.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 2;
     options.context_cache.max_long_anchors_per_continuation = 0;
     return options;
 }
@@ -226,6 +279,14 @@ ninfer::EngineOptions pressure_resume_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 4;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+
+ninfer::EngineOptions groupwise_pressure_resume_engine_options(const char* artifact) {
+    ninfer::EngineOptions options = pressure_resume_engine_options(artifact);
+    options.kv_cache              = ninfer::KvCacheStorage::RK4V4E8;
+    options.speculative           = groupwise_host_restore_engine_options(artifact).speculative;
     return options;
 }
 
@@ -502,8 +563,9 @@ int exercise_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
-int exercise_host_restore(const char* artifact) {
-    ninfer::Engine engine(host_restore_engine_options(artifact));
+int exercise_host_restore(const char* artifact, bool groupwise_backing = false) {
+    ninfer::Engine engine(groupwise_backing ? groupwise_host_restore_engine_options(artifact)
+                                            : host_restore_engine_options(artifact));
     auto options = [](std::uint32_t outputs, bool reuse) {
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = outputs;
@@ -537,6 +599,10 @@ int exercise_host_restore(const char* artifact) {
     }
 
     ninfer::PromptInput continuation = retained_input();
+    // Keep the source as a bound head too. This fixture measures duplicate backing release;
+    // superseding it would let pressure choose cheaper obsolete history instead of the
+    // intended pair of retained heads.
+    continuation.context_cache.session_key = "host-restore-continuation";
     ninfer::ChatMessage assistant;
     assistant.role              = ninfer::ChatRole::Assistant;
     assistant.reasoning_content = retained.reasoning;
@@ -549,9 +615,13 @@ int exercise_host_restore(const char* artifact) {
         .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
     continuation.messages.push_back(std::move(followup));
 
+    // This must be a distinct root owner. Reusing the retained session key lets the logical
+    // catalog replace the source rather than exercising physical admission pressure.
+    ninfer::PromptInput pressure_input         = continuation;
+    pressure_input.context_cache.session_key   = "host-restore-pressure";
     const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
     const ninfer::GenerationResult pressure_result =
-        engine.generate(engine.prepare(continuation), options(2, false));
+        engine.generate(engine.prepare(std::move(pressure_input)), options(2, false));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
     if (pressure_result.generated_token_ids.size() != 2 ||
         after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
@@ -568,6 +638,24 @@ int exercise_host_restore(const char* artifact) {
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare(std::move(continuation)), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.runtime_stats();
+    const auto offloaded =
+        std::find_if(pressure_result.checkpoint_lifecycle.begin(),
+                     pressure_result.checkpoint_lifecycle.end(), [&](const auto& fact) {
+                         return fact.operation == ninfer::CheckpointLifecycleOperation::Offloaded &&
+                                fact.source_tier == ninfer::CheckpointLifecycleTier::Device &&
+                                fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                                fact.status == ninfer::CheckpointLifecycleStatus::Committed &&
+                                fact.frontier == restored.reused_prompt_tokens;
+                     });
+    const auto host_restore =
+        std::find_if(restored.checkpoint_lifecycle.begin(), restored.checkpoint_lifecycle.end(),
+                     [&](const auto& fact) {
+                         return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                                fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                                fact.destination_tier == ninfer::CheckpointLifecycleTier::Device &&
+                                fact.status == ninfer::CheckpointLifecycleStatus::Committed &&
+                                fact.frontier == restored.reused_prompt_tokens;
+                     });
     if (restored.generated_token_ids.size() != 2 ||
         restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
         restored.reused_prompt_tokens == 0 ||
@@ -578,11 +666,97 @@ int exercise_host_restore(const char* artifact) {
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
+                  << " slots=" << retained.slot << '/' << restored.slot
                   << " state=" << after_restore.state_h2d_count
                   << " main=" << after_restore.main_kv_h2d_pages
                   << " backend=" << after_restore.backend_kv_h2d_pages
                   << " degraded=" << after_restore.pressure_private_owners_degraded
                   << " evicted=" << after_restore.pressure_private_owners_evicted << '\n';
+        return 1;
+    }
+    if (offloaded == pressure_result.checkpoint_lifecycle.end() ||
+        host_restore == restored.checkpoint_lifecycle.end() ||
+        offloaded->key_digests == std::array<std::uint64_t, 2>{} ||
+        host_restore->key_digests != offloaded->key_digests ||
+        host_restore->role != offloaded->role || host_restore->scope != offloaded->scope ||
+        host_restore->state_images != offloaded->state_images ||
+        host_restore->main_kv_pages != offloaded->main_kv_pages ||
+        host_restore->backend_kv_pages != offloaded->backend_kv_pages ||
+        offloaded->state_images != 1 || offloaded->main_kv_pages == 0 ||
+        (groupwise_backing && offloaded->backend_kv_pages == 0) || !offloaded->kv_snapshot ||
+        !host_restore->kv_snapshot || !host_restore->elapsed_ns) {
+        std::cerr << "Host offload/H2D restore lifecycle lost exact identity, quantities, or "
+                     "settlement snapshots\n";
+        return 1;
+    }
+
+    if (!groupwise_backing) { return 0; }
+
+    // Restore must not consume the Host-backed prefix. The resumed endpoint itself is newly
+    // generated, so pressure may back up its one mutable tail, but not the unchanged prefix.
+    if (after_restore.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host restore lost its backing before duplicate-pressure admission: state="
+                  << after_restore.host_state_occupied_slots
+                  << " kv=" << after_restore.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+    // Keep the restored head catalogued through pressure so production must retain its Host
+    // replica while reclaiming only duplicate Device residency. The demoted source and restored
+    // continuation remain independently bound, and both owners alias unchanged backing.
+    const ninfer::RuntimeStats before_duplicate_pressure = engine.runtime_stats();
+    if (before_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "consuming Host restore released its backing before pressure\n";
+        return 1;
+    }
+    ninfer::PromptInput duplicate_pressure       = retained_input();
+    duplicate_pressure.context_cache.session_key = "host-restore-duplicate-pressure";
+    const ninfer::GenerationResult duplicate_removed =
+        engine.generate(engine.prepare(std::move(duplicate_pressure)), options(1, false));
+    const ninfer::RuntimeStats after_duplicate_pressure = engine.runtime_stats();
+    if (duplicate_removed.generated_token_ids.size() != 1 ||
+        after_duplicate_pressure.pressure_private_owners_degraded <=
+            before_duplicate_pressure.pressure_private_owners_degraded ||
+        // The restored State image already has a Host replica, while its fork boundary and mutable
+        // tail own two Device-only Main/MTP pages. The older Host-backed pages remain aliases:
+        // copying any State or more than these exact KV deltas would recopy unchanged backing.
+        after_duplicate_pressure.state_d2h_count != before_duplicate_pressure.state_d2h_count ||
+        after_duplicate_pressure.main_kv_d2h_pages !=
+            before_duplicate_pressure.main_kv_d2h_pages + 2 ||
+        after_duplicate_pressure.backend_kv_d2h_pages !=
+            before_duplicate_pressure.backend_kv_d2h_pages + 2 ||
+        after_duplicate_pressure.host_state_occupied_slots == 0 ||
+        after_duplicate_pressure.host_kv_occupied_bytes == 0) {
+        std::cerr << "Host-backed duplicate pressure recopied unchanged backing or lost quota: "
+                  << "degraded=" << before_duplicate_pressure.pressure_private_owners_degraded
+                  << '/' << after_duplicate_pressure.pressure_private_owners_degraded
+                  << " state_d2h=" << before_duplicate_pressure.state_d2h_count << '/'
+                  << after_duplicate_pressure.state_d2h_count
+                  << " main_d2h=" << before_duplicate_pressure.main_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.main_kv_d2h_pages
+                  << " backend_d2h=" << before_duplicate_pressure.backend_kv_d2h_pages << '/'
+                  << after_duplicate_pressure.backend_kv_d2h_pages
+                  << " host_state=" << after_duplicate_pressure.host_state_occupied_slots
+                  << " host_kv=" << after_duplicate_pressure.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
+    // The unrelated pressure request is not catalogued.  The consumed-and-restored continuation
+    // is therefore the sole backing dependency, and releasing it must recover the Host quota.
+    const std::uint32_t restored_released =
+        restored.slot < 0
+            ? 0
+            : engine.erase_slot(static_cast<std::uint32_t>(restored.slot), restored.session_digest);
+    if (restored_released == 0 || duplicate_removed.slot >= 0) {
+        std::cerr << "Host backing cleanup fixture did not retain its sole consumed owner: "
+                  << "restored=" << restored.slot << '/' << restored_released
+                  << " duplicate=" << duplicate_removed.slot << '\n';
+        return 1;
+    }
+    const ninfer::RuntimeStats after_cleanup = engine.runtime_stats();
+    if (after_cleanup.host_state_occupied_slots != 0 || after_cleanup.host_kv_occupied_bytes != 0) {
+        std::cerr << "final Host dependency release did not recover physical capacity: state="
+                  << after_cleanup.host_state_occupied_slots
+                  << " kv=" << after_cleanup.host_kv_occupied_bytes << '\n';
         return 1;
     }
 
@@ -2248,6 +2422,20 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         return 1;
     }
 
+    // The late older finish must not displace the newer session binding. Check it before the
+    // catalog fillers: under Device State pressure conversation heads are reclaimed oldest
+    // publication first, so after seven newer sessions this one is a legitimate victim.
+    const ninfer::GenerationResult replay = engine.generate(
+        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        fixed_output(2));
+    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
+        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        std::cerr << "late older finish displaced the newer session binding: path="
+                  << static_cast<int>(replay.prefix_reuse_path)
+                  << " reused=" << replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
     for (std::uint32_t index = 0; index < 7; ++index) {
         const std::string suffix              = std::to_string(index);
         const ninfer::GenerationResult filler = engine.generate(
@@ -2272,16 +2460,6 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         return 1;
     }
 
-    const ninfer::GenerationResult replay = engine.generate(
-        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
-        fixed_output(2));
-    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
-        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
-        std::cerr << "late older finish exposed the newer session binding to pressure: path="
-                  << static_cast<int>(replay.prefix_reuse_path)
-                  << " reused=" << replay.reused_prompt_tokens << '\n';
-        return 1;
-    }
 
     {
         std::vector<ninfer::TokenId> long_prompt(400, 198);
@@ -2677,6 +2855,5160 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
     return 0;
 }
 
+
+int exercise_endpoint_with_shared_anchor(const char* artifact, bool evict_shared_owner = false) {
+    std::cout << std::unitbuf;
+    auto configured                             = engine_options(artifact);
+    configured.max_context                      = 1024;
+    configured.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    configured.prefill_chunk                    = 128;
+    configured.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    configured.context_cache.device_state_slots = 6;
+    configured.context_cache.host_state_slots   = evict_shared_owner ? 0 : 8;
+    configured.context_cache.host_kv_capacity_bytes    = evict_shared_owner ? 0 : 512ULL << 20;
+    configured.context_cache.max_private_continuations = 4;
+    configured.context_cache.max_shared_prefixes       = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(configured);
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage value;
+        value.role = role;
+        value.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return value;
+    };
+    ninfer::PromptInput input;
+    std::string instructions = "Reply with a short greeting. Stable context:";
+    for (int i = 0; i < 160; ++i) { instructions += " stable"; }
+    input.messages.push_back(message(ninfer::ChatRole::System, std::move(instructions)));
+    input.messages.push_back(message(ninfer::ChatRole::User, "Hi."));
+    input.options.enable_thinking   = false;
+    input.options.preserve_thinking = true;
+    for (const auto kind : {ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                            ninfer::PromptCacheMarkerKind::PrivateLongAnchor}) {
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 1,
+            .kind                = kind,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+    }
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 128;
+    request.execution.sampling.temperature    = 0.0F;
+    const auto source                         = engine.generate(engine.prepare(input), request);
+    if (source.finish_reason != ninfer::FinishReason::StopToken || source.content.empty()) {
+        std::cerr << "shared-anchor endpoint fixture did not finish its greeting\n";
+        return 1;
+    }
+    std::uint32_t shared_frontier = 0;
+    for (const auto& fact : source.checkpoint_lifecycle) {
+        if (fact.role == ninfer::CheckpointLifecycleRole::SharedStablePrefix &&
+            fact.operation == ninfer::CheckpointLifecycleOperation::Created) {
+            shared_frontier = fact.frontier;
+        }
+    }
+    const bool coincident_anchor =
+        std::any_of(source.checkpoint_lifecycle.begin(), source.checkpoint_lifecycle.end(),
+                    [&](const auto& fact) {
+                        return fact.role == ninfer::CheckpointLifecycleRole::LongAnchor &&
+                               fact.operation == ninfer::CheckpointLifecycleOperation::Created &&
+                               fact.frontier == shared_frontier;
+                    });
+    if (shared_frontier == 0 || !coincident_anchor) {
+        std::cerr << "endpoint fixture did not co-publish shared and private anchor roles\n";
+        return 1;
+    }
+    input.messages.push_back(message(ninfer::ChatRole::Assistant, source.content));
+    input.messages.push_back(message(ninfer::ChatRole::User, "Say hello once more."));
+    auto continuation_request = request;
+    // A full-pool entitlement cannot coexist with the shared partial KV tail when Host
+    // storage is disabled. Admission must evict that owner and transfer its anchor state
+    // into the consumed private lineage instead of counting it twice or losing it.
+    continuation_request.execution.requested_output_tokens =
+        evict_shared_owner ? std::numeric_limits<std::uint32_t>::max() : 8;
+    continuation_request.stop.include_model_defaults = evict_shared_owner;
+    const auto before                                = engine.runtime_stats();
+    const auto warm     = engine.generate(engine.prepare(input), continuation_request);
+    const auto after    = engine.runtime_stats();
+    const auto endpoint = source.prompt.prompt_tokens + source.generated_token_ids.size() - 1U;
+    if (!engine.healthy() || warm.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        warm.reused_prompt_tokens != endpoint || warm.generated_token_ids.empty() ||
+        (!evict_shared_owner && warm.generated_token_ids.size() != 8)) {
+        std::cerr << "shared anchor prevented complete endpoint continuation: reused="
+                  << warm.reused_prompt_tokens << " endpoint=" << endpoint << '\n';
+        return 1;
+    }
+    if (evict_shared_owner &&
+        after.pressure_shared_owners_evicted <= before.pressure_shared_owners_evicted) {
+        std::cerr << "full-capacity endpoint did not exercise shared-anchor ownership transfer\n";
+        return 1;
+    }
+    auto cold_request                         = continuation_request;
+    cold_request.execution.allow_prefix_reuse = false;
+    const auto cold = engine.generate(engine.prepare(input), cold_request);
+    if (cold.generated_token_ids != warm.generated_token_ids ||
+        cold.speculative.drafted_tokens != warm.speculative.drafted_tokens ||
+        cold.speculative.accepted_tokens != warm.speculative.accepted_tokens) {
+        std::cerr << "shared-anchor endpoint continuation differs from the cold MTP result\n";
+        return 1;
+    }
+    std::cout << "shared_anchor_endpoint evict_shared=" << evict_shared_owner
+              << " frontier=" << shared_frontier << " endpoint=" << endpoint
+              << " reused=" << warm.reused_prompt_tokens << " exact_cold_match=true\n";
+    return 0;
+}
+
+
+int exercise_latest_response_under_state_pressure(const char* artifact,
+                                                  bool full_private_catalog = false,
+                                                  bool retire_history       = false) {
+    std::cout << std::unitbuf;
+    auto configured                                            = engine_options(artifact);
+    configured.enable_vision                                   = false;
+    configured.kv_cache                                        = ninfer::KvCacheStorage::RK4V4E8;
+    configured.context_cache.device_state_slots                = retire_history ? 6 : 2;
+    configured.context_cache.host_state_slots                  = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    configured.context_cache.max_private_continuations         = full_private_catalog ? 2 : 8;
+    configured.context_cache.max_shared_prefixes               = 0;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(configured);
+    const auto directory =
+        std::filesystem::temp_directory_path() / "ninfer-latest-response-retention";
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } guard{directory};
+
+    const auto settled_slots = [&](const ninfer::GenerationResult& result) {
+        // Completion wakes the caller before the worker publishes its final slot gauges.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            auto slots = engine.slot_states();
+            if (result.slot >= 0 && slots[result.slot].retained &&
+                slots[result.slot].session_digest == result.session_digest) {
+                return slots;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("completed continuation did not publish its slot gauges");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage result;
+        result.role = role;
+        result.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return result;
+    };
+    ninfer::PromptInput input;
+    input.options.enable_thinking   = false;
+    input.options.preserve_thinking = true;
+    input.context_cache.session_key = "latest-response-state-pressure";
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    std::string instructions        = "Follow the user's formatting request. Stable context:";
+    for (int i = 0; i < 800; ++i) { instructions += " stable"; }
+    input.messages.push_back(message(ninfer::ChatRole::System, std::move(instructions)));
+    input.messages.push_back(
+        message(ninfer::ChatRole::User,
+                "Reply with the integers 1 to 60 in order, separated by spaces. No other text."));
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 512;
+    request.execution.sampling.temperature    = 0.0F;
+
+    std::uint32_t endpoint = 0;
+    ninfer::GenerationResult last;
+    const int turns = retire_history ? 6 : 4;
+    int saved_slot  = -1;
+    ninfer::PromptInput saved_input;
+    ninfer::GenerationResult saved_result;
+    for (int turn = 0; turn < turns; ++turn) {
+        const auto before = engine.runtime_stats();
+        last              = engine.generate(engine.prepare(input), request);
+        std::cout << "latest_response_pressure full_catalog=" << full_private_catalog
+                  << " turn=" << turn << " expected=" << endpoint
+                  << " reused=" << last.reused_prompt_tokens
+                  << " state=" << before.device_state_occupied_slots << '/'
+                  << before.host_state_occupied_slots << '\n';
+        if (last.finish_reason != ninfer::FinishReason::StopToken || last.content.empty() ||
+            (turn != 0 && (last.reused_prompt_tokens != endpoint ||
+                           last.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint))) {
+            std::cerr
+                << "State pressure replayed an earlier response instead of the latest endpoint\n";
+            return 1;
+        }
+        const auto slots    = settled_slots(last);
+        const auto retained = std::count_if(slots.begin(), slots.end(),
+                                            [](const auto& slot) { return slot.retained; });
+        if (retire_history) {
+            // Keep one explicitly saved old endpoint. All other old private owners must
+            // disappear as soon as the replacement is published, with no pressure required.
+            const int expected_retained = turn == 0 ? 1 : 2;
+            if (retained != expected_retained || (saved_slot >= 0 && !slots[saved_slot].retained)) {
+                std::cerr << "retirement kept obsolete history or lost SSD-backed state: turn="
+                          << turn << " retained=" << retained << '\n';
+                return 1;
+            }
+        }
+        if (!retire_history || turn == 0 || turn == 3) {
+            // The pressure cases deliberately preserve old owners with completed SSD saves.
+            // The retirement case rebinds its file at turn 3, invalidating the old backing.
+            const auto path =
+                directory /
+                (retire_history ? "saved.bin" : ("saved-" + std::to_string(turn) + ".bin"));
+            (void)engine.save_slot(static_cast<std::uint32_t>(last.slot), path.string(),
+                                   last.session_digest);
+            saved_slot = last.slot;
+            if (retire_history) {
+                saved_input  = input;
+                saved_result = last;
+            }
+        }
+        if (retire_history) {
+            std::cout << "retirement turn=" << turn << " resident_private=" << retained
+                      << " saved_slot=" << saved_slot << '\n';
+        }
+        endpoint = last.prompt.prompt_tokens + last.generated_token_ids.size() - 1U;
+        if (turn != turns - 1) {
+            input.messages.push_back(message(ninfer::ChatRole::Assistant, last.content));
+            input.messages.push_back(message(ninfer::ChatRole::User, "Repeat the same list."));
+        }
+    }
+    const auto stats = engine.runtime_stats();
+    if (!engine.healthy() || (!retire_history && (stats.state_d2h_count == 0 ||
+                                                  stats.reclaimed_device_state_slots_total == 0))) {
+        std::cerr << "latest-response fixture did not exercise Device State reclamation\n";
+        return 1;
+    }
+    if (retire_history) {
+        const auto slots = settled_slots(last);
+        for (std::uint32_t slot = 0; slot < slots.size(); ++slot) {
+            if (slots[slot].retained) { (void)engine.erase_slot(slot); }
+        }
+        const auto restored = engine.restore_slot(0, (directory / "saved.bin").string());
+        saved_input.messages.push_back(message(ninfer::ChatRole::Assistant, saved_result.content));
+        saved_input.messages.push_back(message(ninfer::ChatRole::User, "Repeat the same list."));
+        request.execution.allow_prefix_reuse = true;
+        const auto resumed  = engine.generate(engine.prepare(saved_input), request);
+        const auto after    = settled_slots(resumed);
+        const auto retained = std::count_if(after.begin(), after.end(),
+                                            [](const auto& slot) { return slot.retained; });
+        const auto saved_endpoint =
+            saved_result.prompt.prompt_tokens + saved_result.generated_token_ids.size() - 1U;
+        if (resumed.reused_prompt_tokens != saved_endpoint || retained != 2 || !after[0].retained ||
+            resumed.slot == 0) {
+            std::cerr << "restored SSD checkpoint was consumed without pressure: reused="
+                      << resumed.reused_prompt_tokens << " saved=" << restored.tokens
+                      << " expected=" << saved_endpoint << " slot=" << resumed.slot
+                      << " reclaimed=" << resumed.materialization.selected_degradation_units
+                      << " retained=" << retained << '\n';
+            return 1;
+        }
+        std::cout << "retirement restored_reuse=" << resumed.reused_prompt_tokens
+                  << " saved_source_preserved=true\n";
+    }
+    request.execution.allow_prefix_reuse = false;
+    const auto cold                      = engine.generate(engine.prepare(input), request);
+    if (cold.generated_token_ids != last.generated_token_ids ||
+        cold.speculative.drafted_tokens != last.speculative.drafted_tokens ||
+        cold.speculative.accepted_tokens != last.speculative.accepted_tokens) {
+        std::cerr << "latest response under State pressure differs from cold MTP execution\n";
+        return 1;
+    }
+    std::cout << "latest_response_pressure exact_cold_match=true\n";
+    return 0;
+}
+
+
+int exercise_short_prefill_during_long_prefill(const char* artifact) {
+    auto configured                 = engine_options(artifact);
+    configured.enable_vision        = false;
+    configured.kv_cache             = ninfer::KvCacheStorage::RK4V4E8;
+    configured.max_context          = 16384;
+    configured.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(49152);
+    configured.prefill_chunk        = 256;
+    configured.max_concurrency      = 3;
+    configured.max_pending_requests = 3;
+    configured.context_cache.device_state_slots                = 6;
+    configured.context_cache.host_state_slots                  = 4;
+    configured.context_cache.host_kv_capacity_bytes            = 256ULL << 20;
+    configured.context_cache.max_private_continuations         = 4;
+    configured.context_cache.max_shared_prefixes               = 0;
+    configured.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(configured);
+    const auto request = fixed_output(8);
+    std::vector<ninfer::TokenId> short_prompt(512, 220);
+    short_prompt[0]                = 846;
+    const auto seed_prompt         = short_prompt;
+    const auto seed = engine.generate(engine.prepare_tokens(seed_prompt), request);
+    short_prompt.insert(short_prompt.end(), seed.generated_token_ids.begin(),
+                        seed.generated_token_ids.end());
+    short_prompt.insert(short_prompt.end(), 16, 198);
+    const auto expected_endpoint = seed.prompt.prompt_tokens + seed.generated_token_ids.size() - 1U;
+    std::vector<ninfer::TokenId> long_prompt(12000, 100);
+    const auto before   = engine.runtime_stats();
+    auto long_request   = engine.submit(engine.prepare_tokens(long_prompt), fixed_output(8, false));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    bool long_prefilling = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto stats = engine.runtime_stats();
+        if (stats.prefilling_requests == 1 &&
+            stats.computed_prefill_tokens >= before.computed_prefill_tokens + 512) {
+            long_prefilling = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!long_prefilling) {
+        std::cerr << "long prompt did not reach the prefill overlap fixture\n";
+        return 1;
+    }
+    const auto started      = std::chrono::steady_clock::now();
+    const auto short_result = engine.generate(engine.prepare_tokens(short_prompt), request);
+    const auto elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    const auto overlap = engine.runtime_stats();
+    const bool short_finished_during_long_prefill =
+        overlap.prefilling_requests == 1 &&
+        overlap.computed_prefill_tokens < before.computed_prefill_tokens + long_prompt.size();
+    const auto long_result = long_request.wait();
+    if (!short_finished_during_long_prefill ||
+        short_result.reused_prompt_tokens != expected_endpoint ||
+        short_result.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+        std::cerr << "cached side request waited for long prefill: elapsed=" << elapsed
+                  << " reused=" << short_result.reused_prompt_tokens
+                  << " expected=" << expected_endpoint
+                  << " prefilling=" << overlap.prefilling_requests << '\n';
+        return 1;
+    }
+    // Interleaving must not change any result. Compare the interleaved side request with the
+    // same endpoint reuse executed alone: restoring a resident endpoint follows a different
+    // floating-point schedule than a cold prefill, so equality with a cold run is not a contract
+    // (docs/maintainer/shared-prefix-snapshot.md), and this degenerate prompt has near-tied
+    // tokens. The long request has no reuse, so it is compared with a cold run directly.
+    const auto reseed = engine.generate(engine.prepare_tokens(seed_prompt), request);
+    const auto short_sequential = engine.generate(engine.prepare_tokens(short_prompt), request);
+    if (reseed.generated_token_ids != seed.generated_token_ids ||
+        short_sequential.reused_prompt_tokens != expected_endpoint ||
+        short_sequential.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+        std::cerr << "sequential endpoint-reuse reference did not reproduce the seed endpoint\n";
+        return 1;
+    }
+    auto cold_request                         = request;
+    cold_request.execution.allow_prefix_reuse = false;
+    const auto short_cold = engine.generate(engine.prepare_tokens(short_prompt), cold_request);
+    const auto long_cold  = engine.generate(engine.prepare_tokens(long_prompt), cold_request);
+    const auto same       = [](const auto& a, const auto& b) {
+        return a.generated_token_ids == b.generated_token_ids &&
+               a.speculative.drafted_tokens == b.speculative.drafted_tokens &&
+               a.speculative.accepted_tokens == b.speculative.accepted_tokens;
+    };
+    if (!engine.healthy() || !same(short_result, short_sequential) ||
+        !same(long_result, long_cold)) {
+        const auto report = [](const char* name, const auto& result) {
+            std::cerr << name << " drafted=" << result.speculative.drafted_tokens
+                      << " accepted=" << result.speculative.accepted_tokens << " tokens=";
+            for (const auto token : result.generated_token_ids) { std::cerr << token << ','; }
+            std::cerr << '\n';
+        };
+        report("short interleaved", short_result);
+        report("short sequential", short_sequential);
+        report("short cold (informational)", short_cold);
+        report("long interleaved", long_result);
+        report("long cold", long_cold);
+        std::cerr << "interleaved prefill changed output or MTP decisions\n";
+        return 1;
+    }
+    std::cout << "prefill_interleave reused=" << short_result.reused_prompt_tokens
+              << " side_seconds=" << elapsed
+              << " completed_during_long_prefill=true exact_sequential_match=true\n";
+    return 0;
+}
+
+
+int exercise_idle_cache_pressure(const char* artifact) {
+    std::cout << std::unitbuf;
+    auto configured                             = engine_options(artifact);
+    configured.enable_vision                    = false;
+    configured.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    configured.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    configured.max_concurrency                  = 3;
+    configured.max_pending_requests             = 3;
+    configured.context_cache.device_state_slots = 3;
+    configured.context_cache.host_state_slots   = 8;
+    configured.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    configured.context_cache.max_private_continuations         = 6;
+    configured.context_cache.max_shared_prefixes               = 3;
+    configured.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(configured);
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        return ninfer::ChatMessage{
+            .role  = role,
+            .parts = {{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)}}};
+    };
+    std::string padding;
+    for (int i = 0; i < 300; ++i) { padding += " stable"; }
+    std::uint32_t peak_states = 0;
+    for (int turn = 0; turn < 8; ++turn) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking                 = false;
+        input.context_cache.session_key               = "idle-pressure-" + std::to_string(turn);
+        input.context_cache.retention                 = ninfer::CacheRetentionHint::LiveSession;
+        input.context_cache.automatic_private_anchors = 2;
+        input.messages                                = {
+            message(ninfer::ChatRole::System, "Harness " + std::to_string(turn % 3) + padding),
+            message(ninfer::ChatRole::User, "First turn " + std::to_string(turn) + padding),
+            message(ninfer::ChatRole::User, "Second turn " + padding),
+        };
+        input.context_cache.markers.push_back({
+            .after_message_count = 1,
+            .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        });
+        const auto result = engine.generate(engine.prepare(input), fixed_output(1));
+        const auto stats  = engine.runtime_stats();
+        peak_states       = std::max(peak_states, stats.logical_state_used_slots);
+        std::cout << "idle_pressure turn=" << turn << " logical=" << stats.logical_state_used_slots
+                  << '/' << stats.logical_state_capacity_slots
+                  << " device=" << stats.device_state_occupied_slots
+                  << " host=" << stats.host_state_occupied_slots
+                  << " fallback=" << stats.pressure_maximal_fallback_selections << '\n';
+        if (!engine.healthy() || result.generated_token_ids.size() != 1) { return 1; }
+    }
+    const auto pressured = engine.runtime_stats();
+    if (peak_states != pressured.logical_state_capacity_slots ||
+        pressured.reclaimed_device_state_slots_total == 0) {
+        std::cerr << "idle pressure fixture did not fill and reclaim State capacity\n";
+        return 1;
+    }
+    ninfer::PromptInput fresh;
+    fresh.options.enable_thinking   = true;
+    fresh.context_cache.session_key = "idle-pressure-fresh";
+    fresh.messages    = {message(ninfer::ChatRole::User, "What is 7 plus 5? Answer briefly.")};
+    const auto warm   = engine.generate(engine.prepare(fresh), fixed_output(8));
+    auto cold_options = fixed_output(8);
+    cold_options.execution.allow_prefix_reuse = false;
+    const auto cold = engine.generate(engine.prepare(fresh), cold_options);
+    if (!engine.healthy() || warm.generated_token_ids != cold.generated_token_ids ||
+        warm.speculative.drafted_tokens != cold.speculative.drafted_tokens ||
+        warm.speculative.accepted_tokens != cold.speculative.accepted_tokens) {
+        std::cerr << "idle admission did not recover with exact cold MTP parity\n";
+        return 1;
+    }
+    std::cout << "idle_pressure subsequent_requests_healthy=true exact_cold_match=true\n";
+    return 0;
+}
+
+
+constexpr std::size_t kSharedSnapshotHeaderBytes    = 60;
+
+constexpr std::size_t kSharedSnapshotChecksumOffset = 28;
+
+
+template <class T>
+T snapshot_pod(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+        throw std::runtime_error("shared snapshot test fixture is truncated");
+    }
+    T value{};
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+
+
+template <class T>
+void set_snapshot_pod(std::vector<std::uint8_t>& bytes, std::size_t offset, T value) {
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+        throw std::runtime_error("shared snapshot test fixture is truncated");
+    }
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+
+void refresh_shared_snapshot_checksum(std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() < kSharedSnapshotHeaderBytes) {
+        throw std::runtime_error("shared snapshot test fixture has no envelope");
+    }
+    const auto checksum = ninfer::targets::qwen3_6::frontend_internal::sha256(
+        std::span<const std::uint8_t>(bytes).subspan(kSharedSnapshotHeaderBytes));
+    std::memcpy(bytes.data() + kSharedSnapshotChecksumOffset, checksum.data(), checksum.size());
+}
+
+
+ninfer::PromptInput shared_snapshot_prompt() {
+    ninfer::PromptInput input;
+    constexpr std::string_view marker = "=== CACHE_BREAKPOINT ===";
+    std::string stable;
+    for (std::uint32_t index = 0; index < 700; ++index) { stable += "stable "; }
+    stable += "\n=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>";
+    const std::size_t marker_end = stable.find(marker) + marker.size();
+    input.messages.push_back(
+        ninfer::ChatMessage{.role  = ninfer::ChatRole::System,
+                            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                       .text = stable + "\nCurrent working directory: x"}}});
+    input.messages.push_back(ninfer::ChatMessage{
+        .role  = ninfer::ChatRole::User,
+        .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Reply yes."}}});
+    input.options.enable_thinking = false;
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .kind                      = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence                  = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+        .leading_instruction_bytes = static_cast<std::uint32_t>(marker_end + 1U),
+    });
+    input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    return input;
+}
+
+
+struct SharedRecordFixture {
+    ninfer::PromptInput prompt;
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t frontier = 0;
+    std::string digest;
+    ninfer::CheckpointLifecycleFact checkpoint;
+};
+
+
+SharedRecordFixture make_shared_record(const char* artifact, ninfer::EngineOptions options,
+                                       std::uint32_t prompt_tokens, std::string_view word) {
+    using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
+    ninfer::Engine source(std::move(options));
+    constexpr std::string_view marker = "=== CACHE_BREAKPOINT ===";
+    const auto build_prompt           = [&](std::uint32_t repetitions) {
+        std::string stable(word);
+        stable.push_back(' ');
+        for (std::uint32_t index = 0; index < repetitions; ++index) { stable += "stable "; }
+        stable += "\n=== CACHE_BREAKPOINT ===\n<project_context>\n</INSTRUCTIONS>";
+        const std::size_t marker_end = stable.find(marker) + marker.size();
+        ninfer::PromptInput input;
+        input.messages.push_back(
+            ninfer::ChatMessage{.role  = ninfer::ChatRole::System,
+                                          .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                     .text = stable + "\nCurrent working directory: x"}}});
+        input.messages.push_back(ninfer::ChatMessage{
+                      .role  = ninfer::ChatRole::User,
+                      .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Reply yes."}}});
+        input.options.enable_thinking = false;
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                      .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                      .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                      .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                      .leading_instruction_bytes = static_cast<std::uint32_t>(marker_end + 1U),
+        });
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
+    std::uint32_t low          = 0;
+    std::uint32_t high         = prompt_tokens;
+    ninfer::PromptInput prompt = build_prompt(0);
+    while (low <= high) {
+        const std::uint32_t middle    = low + (high - low) / 2U;
+        ninfer::PromptInput candidate = build_prompt(middle);
+        const std::uint32_t tokens    = source.count_tokens(candidate);
+        if (tokens <= prompt_tokens) { prompt = std::move(candidate); }
+        if (tokens < prompt_tokens) {
+            low = middle + 1U;
+        } else {
+            if (middle == 0) { break; }
+            high = middle - 1U;
+        }
+    }
+    const ninfer::GenerationResult generated =
+        source.generate(source.prepare(prompt), fixed_output(1));
+    if (generated.generated_token_ids.size() != 1) {
+        throw std::runtime_error("shared-record source generation failed");
+    }
+    auto [slot, snapshot] = Access::export_first_durable(source);
+    (void)slot;
+    snapshot.await_transfer(snapshot.bytes);
+    SharedRecordFixture fixture{
+        .prompt     = prompt,
+        .bytes      = snapshot.bytes,
+        .frontier   = snapshot.tokens,
+        .digest     = snapshot.content_digest,
+        .checkpoint = snapshot.checkpoint,
+    };
+    snapshot.release_storage();
+    return fixture;
+}
+
+
+ninfer::targets::qwen3_6::RetainedSessionSnapshot
+catalog_snapshot(const SharedRecordFixture& fixture) {
+    ninfer::targets::qwen3_6::RetainedSessionSnapshot snapshot;
+    snapshot.bytes          = fixture.bytes;
+    snapshot.transfer_bytes = fixture.bytes.size();
+    snapshot.tokens         = fixture.frontier;
+    snapshot.content_digest = fixture.digest;
+    snapshot.checkpoint     = fixture.checkpoint;
+    return snapshot;
+}
+
+
+std::uint64_t token_fixture_hash(std::span<const ninfer::TokenId> tokens) {
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (const ninfer::TokenId token : tokens) {
+        const auto value = static_cast<std::uint32_t>(token);
+        for (unsigned shift = 0; shift != 32; shift += 8) {
+            digest ^= static_cast<std::uint8_t>(value >> shift);
+            digest *= 1099511628211ULL;
+        }
+    }
+    return digest;
+}
+
+
+class ControlledSnapshotTransferGate {
+public:
+    explicit ControlledSnapshotTransferGate(bool active_capture = false)
+        : active_capture_(active_capture) {
+        try {
+            check(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming), "create gate event");
+            check(cudaHostAlloc(&host_word_, sizeof(*host_word_), cudaHostAllocMapped),
+                  "allocate mapped gate word");
+            *host_word_ = 0;
+            check(cudaHostGetDevicePointer(&device_word_, host_word_, 0),
+                  "map gate word to device");
+            registration_ = ninfer::runtime::testing::ContextTransferTestGate{
+                .context = this,
+                .enqueue = &enqueue_delay,
+            };
+            if (active_capture_) {
+                ninfer::runtime::testing::install_active_capture_transfer_gate(&registration_);
+            } else {
+                ninfer::runtime::testing::install_snapshot_transfer_gate(&registration_);
+            }
+        } catch (...) {
+            if (event_ != nullptr) { (void)cudaEventDestroy(event_); }
+            if (host_word_ != nullptr) { (void)cudaFreeHost(host_word_); }
+            throw;
+        }
+    }
+
+    ~ControlledSnapshotTransferGate() {
+        if (active_capture_) {
+            ninfer::runtime::testing::clear_active_capture_transfer_gate();
+        } else {
+            ninfer::runtime::testing::clear_snapshot_transfer_gate();
+        }
+        release();
+        if (submitted_.load(std::memory_order_acquire) && event_ != nullptr) {
+            (void)cudaEventSynchronize(event_);
+        }
+        if (event_ != nullptr) { (void)cudaEventDestroy(event_); }
+        if (host_word_ != nullptr) { (void)cudaFreeHost(host_word_); }
+    }
+
+    ControlledSnapshotTransferGate(const ControlledSnapshotTransferGate&)            = delete;
+    ControlledSnapshotTransferGate& operator=(const ControlledSnapshotTransferGate&) = delete;
+
+    void release() noexcept {
+        if (released_.exchange(true, std::memory_order_acq_rel) || host_word_ == nullptr) {
+            return;
+        }
+        std::atomic_ref<std::uint32_t>(*host_word_).store(1, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool pending() const {
+        if (!submitted_.load(std::memory_order_acquire)) { return false; }
+        const cudaError_t status = cudaEventQuery(event_);
+        if (status == cudaErrorNotReady) { return true; }
+        check(status, "query gate event");
+        return false;
+    }
+
+private:
+    static cudaError_t enqueue_delay(void* context, cudaStream_t stream) noexcept {
+        auto& gate                 = *static_cast<ControlledSnapshotTransferGate*>(context);
+        const CUresult wait_status = cuStreamWaitValue32(
+            reinterpret_cast<CUstream>(stream), reinterpret_cast<CUdeviceptr>(gate.device_word_), 1,
+            CU_STREAM_WAIT_VALUE_EQ);
+        if (wait_status != CUDA_SUCCESS) { return cudaErrorUnknown; }
+        const cudaError_t status = cudaEventRecord(gate.event_, stream);
+        if (status == cudaSuccess) { gate.submitted_.store(true, std::memory_order_release); }
+        return status;
+    }
+
+    static void check(cudaError_t status, const char* operation) {
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        }
+    }
+
+    ninfer::runtime::testing::ContextTransferTestGate registration_;
+    cudaEvent_t event_          = nullptr;
+    std::uint32_t* host_word_   = nullptr;
+    std::uint32_t* device_word_ = nullptr;
+    std::atomic<bool> submitted_{false};
+    std::atomic<bool> released_{false};
+    bool active_capture_ = false;
+};
+
+
+class SharedSnapshotImportGate {
+public:
+    enum class Action : std::uint8_t { Reject, Fail, Cancel, Delay, AllocationFailure, StalePlan };
+
+    SharedSnapshotImportGate(ninfer::runtime::testing::SharedSnapshotImportStage stage,
+                             Action action, std::atomic<bool>* cancellation = nullptr)
+        : stage_(stage), action_(action), cancellation_(cancellation) {
+        registration_ = ninfer::runtime::testing::SharedSnapshotImportTestGate{
+            .context    = this,
+            .checkpoint = &checkpoint,
+        };
+        ninfer::runtime::testing::install_shared_snapshot_import_gate(&registration_);
+    }
+
+    ~SharedSnapshotImportGate() { ninfer::runtime::testing::clear_shared_snapshot_import_gate(); }
+
+    SharedSnapshotImportGate(const SharedSnapshotImportGate&)            = delete;
+    SharedSnapshotImportGate& operator=(const SharedSnapshotImportGate&) = delete;
+
+    [[nodiscard]] bool triggered() const noexcept {
+        return triggered_.load(std::memory_order_acquire);
+    }
+
+private:
+    static void checkpoint(void* context,
+                           ninfer::runtime::testing::SharedSnapshotImportStage stage) {
+        auto& gate = *static_cast<SharedSnapshotImportGate*>(context);
+        if (stage != gate.stage_) { return; }
+        const bool already_triggered = gate.triggered_.exchange(true, std::memory_order_acq_rel);
+        switch (gate.action_) {
+        case Action::Reject:
+            throw std::invalid_argument("injected rejection with misleading stale/checksum text");
+        case Action::Fail:
+            throw std::logic_error("injected fatal shared import invariant failure");
+        case Action::Cancel:
+            if (gate.cancellation_ == nullptr) {
+                throw std::logic_error("shared import cancellation gate has no flag");
+            }
+            gate.cancellation_->store(true, std::memory_order_release);
+            return;
+        case Action::Delay:
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return;
+        case Action::AllocationFailure:
+            throw std::bad_alloc();
+        case Action::StalePlan:
+            if (already_triggered) { return; }
+            throw ninfer::runtime::DurableImportError(
+                ninfer::runtime::DurableImportErrorKind::StalePlan, "projection changed");
+        }
+    }
+
+    ninfer::runtime::testing::SharedSnapshotImportTestGate registration_;
+    ninfer::runtime::testing::SharedSnapshotImportStage stage_;
+    Action action_;
+    std::atomic<bool>* cancellation_ = nullptr;
+    std::atomic<bool> triggered_{false};
+};
+
+
+class SharedSnapshotExportAllocationGate {
+public:
+    explicit SharedSnapshotExportAllocationGate(
+        ninfer::runtime::testing::SharedSnapshotExportStage stage)
+        : stage_(stage) {
+        registration_ = ninfer::runtime::testing::SharedSnapshotExportTestGate{
+            .context    = this,
+            .checkpoint = &checkpoint,
+        };
+        ninfer::runtime::testing::install_shared_snapshot_export_gate(&registration_);
+    }
+
+    ~SharedSnapshotExportAllocationGate() {
+        ninfer::runtime::testing::clear_shared_snapshot_export_gate();
+    }
+
+    SharedSnapshotExportAllocationGate(const SharedSnapshotExportAllocationGate&) = delete;
+    SharedSnapshotExportAllocationGate&
+    operator=(const SharedSnapshotExportAllocationGate&) = delete;
+
+    [[nodiscard]] bool triggered() const noexcept {
+        return triggered_.load(std::memory_order_acquire);
+    }
+
+private:
+    static void checkpoint(void* context,
+                           ninfer::runtime::testing::SharedSnapshotExportStage stage) {
+        auto& gate = *static_cast<SharedSnapshotExportAllocationGate*>(context);
+        if (stage == gate.stage_) {
+            gate.triggered_.store(true, std::memory_order_release);
+            throw std::bad_alloc();
+        }
+    }
+
+    ninfer::runtime::testing::SharedSnapshotExportTestGate registration_;
+    ninfer::runtime::testing::SharedSnapshotExportStage stage_;
+    std::atomic<bool> triggered_{false};
+};
+
+
+class CountingOutputSink final : public ninfer::OutputSink {
+public:
+    void start(ninfer::GenerationStart) override { started.store(true, std::memory_order_release); }
+
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta) override { deltas.fetch_add(1, std::memory_order_acq_rel); }
+
+    std::atomic<bool> started{false};
+    std::atomic<std::uint32_t> deltas{0};
+};
+
+
+class AsynchronousTransferFailureGate {
+public:
+    AsynchronousTransferFailureGate() {
+        registration_ = ninfer::runtime::testing::ContextTransferTestGate{
+            .context = nullptr,
+            .enqueue =
+                [](void*, cudaStream_t stream) noexcept {
+                    return launch_context_transfer_failure(stream);
+                },
+        };
+        ninfer::runtime::testing::install_active_capture_transfer_gate(&registration_);
+    }
+
+    ~AsynchronousTransferFailureGate() {
+        ninfer::runtime::testing::clear_active_capture_transfer_gate();
+    }
+
+    AsynchronousTransferFailureGate(const AsynchronousTransferFailureGate&)            = delete;
+    AsynchronousTransferFailureGate& operator=(const AsynchronousTransferFailureGate&) = delete;
+
+private:
+    ninfer::runtime::testing::ContextTransferTestGate registration_;
+};
+
+
+template <class Predicate>
+bool wait_until(Predicate&& predicate, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) { return true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return predicate();
+}
+
+// A result is delivered before the worker retires its slot, publishes the endpoint owner, and
+// republishes stats; baselines must read the settled snapshot rather than the last published one.
+ninfer::RuntimeStats settled_runtime_stats(ninfer::Engine& engine) {
+    ninfer::RuntimeStats stats = engine.runtime_stats();
+    (void)wait_until(
+        [&] {
+            stats = engine.runtime_stats();
+            return stats.running_requests == 0 && stats.materializing_requests == 0 &&
+                   stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
+                   stats.capture_pending_requests == 0 && stats.terminal_pending_requests == 0;
+        },
+        std::chrono::seconds(5));
+    return stats;
+}
+
+
+// Runs the production Engine worker and concrete Program with a real pending D2H. The gate is an
+// event dependency in the existing transfer stream, so this would deadlock independent model
+// execution if Program restored the removed transfer-completion wait to device.stream. This is
+// materialization pressure; active-capture pressure has a separate concrete scenario below.
+int exercise_delayed_spill_lifecycle(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 4;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.auto_save_evicted                = true;
+    options.auto_save_queue_jobs             = 1;
+    options.auto_save_queue_bytes            = 1ULL << 30;
+    options.context_cache.device_state_slots = 4;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 3;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    std::atomic<std::uint32_t> writer_failures{0};
+    options.auto_save_listener = [&](const ninfer::SlotAutoSaveEvent& event) {
+        if (!event.error.empty()) { writer_failures.fetch_add(1, std::memory_order_acq_rel); }
+    };
+    ninfer::Engine engine(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-delayed-spill";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } guard{directory};
+
+    const auto bound_prompt = [](std::string text) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind  = ninfer::MessagePartKind::Text,
+            .text  = std::move(text),
+            .media = {},
+        });
+        prompt.messages.push_back(std::move(user));
+        prompt.options.enable_thinking = false;
+        prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return prompt;
+    };
+    for (std::uint32_t index = 0; index < 2; ++index) {
+        const ninfer::GenerationResult victim = engine.generate(
+            engine.prepare(bound_prompt("Retain bounded spill victim " + std::to_string(index))),
+            fixed_output(1));
+        if (victim.slot < 0 || victim.session_digest.empty()) {
+            std::cerr << "delayed spill fixture did not retain victim " << index << '\n';
+            return 1;
+        }
+        (void)engine.save_slot(static_cast<std::uint32_t>(victim.slot),
+                               (directory / ("bound-" + std::to_string(index) + ".bin")).string(),
+                               victim.session_digest);
+    }
+    // Keep the live slot binding but make the eventual Host publication fail deterministically.
+    std::filesystem::remove_all(directory);
+
+    CountingOutputSink independent_sink;
+    auto independent_handle =
+        engine.submit(engine.prepare_tokens({248045, 846, 198, 9011, 248046, 198}),
+                      fixed_output(1000), ninfer::OutputConsumerMode::Streaming);
+    std::atomic<bool> cancel_independent{false};
+    auto independent =
+        std::async(std::launch::async, [handle = std::move(independent_handle), &independent_sink,
+                                        &cancel_independent]() mutable {
+            return handle.wait(&independent_sink, ninfer::CancellationView([&] {
+                return cancel_independent.load(std::memory_order_acquire);
+            }));
+        });
+    if (!wait_until([&] {
+            return independent_sink.started.load(std::memory_order_acquire) &&
+                   independent_sink.deltas.load(std::memory_order_acquire) != 0;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        (void)independent.get();
+        const ninfer::RuntimeStats diagnostics = engine.runtime_stats();
+        std::cerr << "independent request did not execute before eviction pressure: running="
+                  << diagnostics.running_requests
+                  << " materializing=" << diagnostics.materializing_requests
+                  << " capture=" << diagnostics.capture_pending_requests << '\n';
+        return 1;
+    }
+
+    ControlledSnapshotTransferGate gate;
+    auto capture_handle =
+        engine.submit(engine.prepare(bound_prompt("Force a third bounded retained continuation.")),
+                      fixed_output(1));
+    std::atomic<bool> cancel_capture{false};
+    auto capture = std::async(
+        std::launch::async, [handle = std::move(capture_handle), &cancel_capture]() mutable {
+            return handle.wait(nullptr, ninfer::CancellationView([&] {
+                                   return cancel_capture.load(std::memory_order_acquire);
+                               }));
+        });
+
+    if (!wait_until([&] { return ninfer::runtime::testing::snapshot_transfer_gate_waits() != 0; },
+                    std::chrono::seconds(10))) {
+        const ninfer::RuntimeStats diagnostics = engine.runtime_stats();
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "materialization pressure did not submit the gated victim spill: "
+                  << "private_evicted=" << diagnostics.pressure_private_owners_evicted
+                  << " private_degraded=" << diagnostics.pressure_private_owners_degraded
+                  << " running=" << diagnostics.running_requests
+                  << " materializing=" << diagnostics.materializing_requests
+                  << " independent_deltas="
+                  << independent_sink.deltas.load(std::memory_order_acquire) << '\n';
+        return 1;
+    }
+    // This MTP configuration has a nonzero backend payload. While the hook holds the real
+    // transfer stream, the writer reservation must cover both exact-capacity assembly and the
+    // complete pinned backing; begin_save_continuation enforces capacity == transfer_bytes.
+    if (!wait_until([&] {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            const auto accounting            = ninfer::runtime::testing::snapshot_host_accounting();
+            return stats.auto_save_reserved_jobs == 1 && accounting.resident_bytes != 0 &&
+                   stats.backend_kv_d2h_pages != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0;
+        })) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "MTP snapshot Host reservation/backend payload was not observable: reserved="
+                  << stats.auto_save_reserved_jobs << '/' << stats.auto_save_reserved_bytes
+                  << " backend_pages=" << stats.backend_kv_d2h_pages << '\n';
+        return 1;
+    }
+    const ninfer::RuntimeStats pending_snapshot = engine.runtime_stats();
+    const auto accounting = ninfer::runtime::testing::snapshot_host_accounting();
+    if (accounting.metadata_bytes == 0 || accounting.state_bytes == 0 ||
+        accounting.main_kv_bytes == 0 || accounting.backend_kv_bytes == 0 ||
+        accounting.transfer_bytes != accounting.metadata_bytes + accounting.state_bytes +
+                                         accounting.main_kv_bytes + accounting.backend_kv_bytes ||
+        accounting.staging_bytes != accounting.transfer_bytes ||
+        accounting.resident_bytes != accounting.transfer_bytes + accounting.staging_bytes ||
+        pending_snapshot.auto_save_reserved_bytes != accounting.resident_bytes ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() !=
+            accounting.staging_bytes) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "snapshot Host assembly accounting is not exact: metadata="
+                  << accounting.metadata_bytes << " state=" << accounting.state_bytes
+                  << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " transfer=" << accounting.transfer_bytes
+                  << " staging=" << accounting.staging_bytes
+                  << " resident=" << accounting.resident_bytes
+                  << " reserved=" << pending_snapshot.auto_save_reserved_bytes << '\n';
+        return 1;
+    }
+    if (std::getenv("NINFER_REPORT_SNAPSHOT_ACCOUNTING") != nullptr) {
+        std::cout << "snapshot_host_accounting metadata=" << accounting.metadata_bytes
+                  << " state=" << accounting.state_bytes << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " transfer=" << accounting.transfer_bytes
+                  << " staging=" << accounting.staging_bytes
+                  << " resident=" << accounting.resident_bytes << '\n';
+    }
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; })) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "no Engine/Program decode unit completed during snapshot D2H\n";
+        return 1;
+    }
+    if (!gate.pending()) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "snapshot delay drained before the independent progress observation\n";
+        return 1;
+    }
+
+    cancel_capture.store(true, std::memory_order_release);
+    if (!wait_until([&] {
+            return ninfer::runtime::testing::materialization_submitted_cancellations() == 1;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "Program did not observe cancellation after snapshot offload scheduling\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats cancelled_pending = engine.runtime_stats();
+    if (!gate.pending() ||
+        cancelled_pending.context_cache_owners[ninfer::context_cache_owner_metric_index(
+            ninfer::ContextCacheMetricRole::Transient, ninfer::ContextCacheMetricPlacement::Device,
+            ninfer::ContextCacheMetricPin::Pinned, ninfer::ContextCacheMetricIdentity::None)] ==
+            0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "cancelled materialization lost its logical claim or physical source pins "
+                     "before settlement\n";
+        return 1;
+    }
+    gate.release();
+    const ninfer::GenerationResult cancelled = capture.get();
+    cancel_independent.store(true, std::memory_order_release);
+    (void)independent.get();
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "submitted materialization did not settle through cancellation\n";
+        return 1;
+    }
+    if (!wait_until([&] {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            return writer_failures.load(std::memory_order_acquire) == 1 &&
+                   stats.auto_save_reserved_jobs == 0 && stats.auto_save_reserved_bytes == 0 &&
+                   stats.auto_save_queued_jobs == 0 && stats.auto_save_in_flight_jobs == 0 &&
+                   stats.capture_pending_requests == 0 && stats.materializing_requests == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_settlements() == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() == 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0 &&
+                   stats.context_cache_owners[ninfer::context_cache_owner_metric_index(
+                       ninfer::ContextCacheMetricRole::Transient,
+                       ninfer::ContextCacheMetricPlacement::Device,
+                       ninfer::ContextCacheMetricPin::Pinned,
+                       ninfer::ContextCacheMetricIdentity::None)] == 0;
+        })) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "cancelled/failed spill leaked terminal accounting: reserved="
+                  << stats.auto_save_reserved_jobs << '/' << stats.auto_save_reserved_bytes
+                  << " queued=" << stats.auto_save_queued_jobs
+                  << " active=" << stats.auto_save_in_flight_jobs
+                  << " capture=" << stats.capture_pending_requests
+                  << " failures=" << writer_failures.load(std::memory_order_acquire) << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult after = engine.generate(
+        engine.prepare_tokens({248045, 846, 198, 9012, 248046, 198}), fixed_output(1, false));
+    if (!engine.healthy() || after.generated_token_ids.size() != 1) {
+        std::cerr << "Engine did not remain usable after gated capture settlement\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_snapshot_quota_rejection(const char* artifact) {
+    ninfer::EngineOptions options                = engine_options(artifact);
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.pending_timeout_ms                   = 120000;
+    options.enable_vision                        = false;
+    options.auto_save_evicted                    = true;
+    options.auto_save_queue_jobs                 = 1;
+    options.auto_save_queue_bytes                = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-snapshot-quota-rejection";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } directory_guard{directory};
+
+    const auto prompt = [](std::string text) {
+        ninfer::PromptInput value;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        value.messages.push_back(std::move(user));
+        value.options.enable_thinking = false;
+        value.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return value;
+    };
+    const ninfer::GenerationResult victim = engine.generate(
+        engine.prepare(prompt("Retain the quota rejection victim.")), fixed_output(1));
+    if (victim.slot < 0 || victim.session_digest.empty()) {
+        std::cerr << "snapshot quota fixture did not retain its victim\n";
+        return 1;
+    }
+    (void)engine.save_slot(static_cast<std::uint32_t>(victim.slot),
+                           (directory / "victim.bin").string(), victim.session_digest);
+
+    ControlledSnapshotTransferGate gate;
+    const ninfer::GenerationResult replacement = engine.generate(
+        engine.prepare(prompt("Evict the victim with a deliberately undersized Host quota.")),
+        fixed_output(1));
+    const auto accounting               = ninfer::runtime::testing::snapshot_host_accounting();
+    const ninfer::RuntimeStats rejected = engine.runtime_stats();
+    if (replacement.generated_token_ids.size() != 1 || accounting.metadata_bytes == 0 ||
+        accounting.state_bytes == 0 || accounting.main_kv_bytes == 0 ||
+        accounting.backend_kv_bytes == 0 ||
+        accounting.transfer_bytes != accounting.metadata_bytes + accounting.state_bytes +
+                                         accounting.main_kv_bytes + accounting.backend_kv_bytes ||
+        accounting.staging_bytes != accounting.transfer_bytes ||
+        accounting.resident_bytes != accounting.transfer_bytes + accounting.staging_bytes ||
+        accounting.resident_bytes <= 1 || rejected.auto_save_rejected_jobs != 1 ||
+        rejected.auto_save_reserved_jobs != 0 || rejected.auto_save_reserved_bytes != 0 ||
+        rejected.auto_save_queued_jobs != 0 || rejected.auto_save_in_flight_jobs != 0 ||
+        rejected.materializing_requests != 0 || rejected.capture_pending_requests != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_gate_waits() != 0 || gate.pending() ||
+        ninfer::runtime::testing::snapshot_transfer_live_settlements() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0) {
+        std::cerr << "snapshot quota rejection did not preserve exact accounting/cleanup: "
+                  << "metadata=" << accounting.metadata_bytes << " state=" << accounting.state_bytes
+                  << " main_kv=" << accounting.main_kv_bytes
+                  << " backend_kv=" << accounting.backend_kv_bytes
+                  << " resident=" << accounting.resident_bytes
+                  << " rejected=" << rejected.auto_save_rejected_jobs
+                  << " reserved=" << rejected.auto_save_reserved_jobs << '/'
+                  << rejected.auto_save_reserved_bytes
+                  << " waits=" << ninfer::runtime::testing::snapshot_transfer_gate_waits()
+                  << " pins=" << ninfer::runtime::testing::snapshot_transfer_pinned_sources()
+                  << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult after = engine.generate(
+        engine.prepare_tokens({248045, 846, 198, 9013, 248046, 198}), fixed_output(1, false));
+    if (!engine.healthy() || after.generated_token_ids.size() != 1) {
+        std::cerr << "Engine did not remain usable after snapshot quota rejection\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_responses_host_continuation(const char* artifact) {
+    using Json = nlohmann::json;
+    using namespace ninfer::serve;
+    const auto prepare_input = [](const Json& history) {
+        OpenAIResponsesStore store(8, 1ULL << 20);
+        const auto request = parse_openai_responses_create_request(
+            Json{{"model", "qwen3.8"}, {"store", false}, {"input", history}}, RequestLimits{});
+        auto resolved =
+            resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", request.store);
+        auto input          = to_prompt_input(resolved.generation,
+                                              {.enable_thinking = false, .preserve_thinking = true}, {});
+        input.context_cache = std::move(resolved.cache_hints);
+        // Keep the serving execution boundaries identical in the cold and reused runs.
+        input.context_cache.automatic_private_anchors = 2;
+        return input;
+    };
+    std::string text;
+    for (std::uint32_t index = 0; index < 5000; ++index) { text += "alpha "; }
+    Json history = Json::array({Json{{"role", "user"}, {"content", "Remember this conversation."}},
+                                Json{{"role", "assistant"}, {"content", "I will continue it."}},
+                                Json{{"role", "user"}, {"content", text}}});
+    auto engine_config        = groupwise_host_restore_engine_options(artifact);
+    engine_config.max_context = 8192;
+    engine_config.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    engine_config.context_cache.device_state_slots        = 0;
+    engine_config.context_cache.host_state_slots          = 4;
+    engine_config.context_cache.max_private_continuations = 3;
+    ninfer::Engine engine(engine_config);
+    const auto settled_stats = [&engine] {
+        // generate() fulfills the result before the worker publishes its terminal stats/slots.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto stats = engine.runtime_stats();
+            if (stats.running_requests == 0 && stats.waiting_requests == 0 &&
+                stats.materializing_requests == 0) {
+                return stats;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("Response terminal statistics did not settle");
+    };
+    auto source_options                        = fixed_output(64);
+    source_options.stop.include_model_defaults = true;
+    const auto source = engine.generate(engine.prepare(prepare_input(history)), source_options);
+    const auto after_source = settled_stats();
+    const auto slots        = engine.slot_states();
+    const std::uint32_t completed_tokens =
+        source.prompt.prompt_tokens + static_cast<std::uint32_t>(source.generated_token_ids.size());
+    if (source.finish_reason != ninfer::FinishReason::StopToken ||
+        source.generated_token_ids.size() < 2 || source.slot < 0 ||
+        static_cast<std::size_t>(source.slot) >= slots.size() || !slots[source.slot].retained ||
+        slots[source.slot].cached_tokens != completed_tokens ||
+        after_source.session_publications_initial_prefix_total != 1 ||
+        after_source.context_cache_owners[ninfer::context_cache_owner_metric_index(
+            ninfer::ContextCacheMetricRole::ConversationHead,
+            ninfer::ContextCacheMetricPlacement::Device, ninfer::ContextCacheMetricPin::Unpinned,
+            ninfer::ContextCacheMetricIdentity::InitialPrefix)] != 1) {
+        std::cerr << "unstored Response did not retain its completed assistant response as a "
+                     "Device conversation head: slot="
+                  << source.slot
+                  << " publications=" << after_source.session_publications_initial_prefix_total
+                  << " finish=" << static_cast<int>(source.finish_reason)
+                  << " generated=" << source.generated_token_ids.size()
+                  << " retained_tokens=" << (source.slot < 0 ? 0 : slots[source.slot].cached_tokens)
+                  << " state_d2h=" << after_source.state_d2h_count << '\n';
+        return 1;
+    }
+
+    history.push_back(Json{{"role", "assistant"}, {"content", source.content}});
+    history.push_back(Json{{"role", "user"}, {"content", "Continue briefly."}});
+    Json pressure_history          = history;
+    pressure_history[0]["content"] = "An unrelated conversation needing its own model state.";
+    // Only one Device State slot is available. An unrelated active request must offload the
+    // completed endpoint itself; offloading only an older replay checkpoint cannot satisfy this.
+    const auto pressure =
+        engine.generate(engine.prepare(prepare_input(pressure_history)), fixed_output(2));
+    const auto after_pressure = settled_stats();
+    if (pressure.generated_token_ids.size() != 2 ||
+        after_pressure.state_d2h_count <= after_source.state_d2h_count ||
+        after_pressure.main_kv_d2h_pages <= after_source.main_kv_d2h_pages ||
+        after_pressure.backend_kv_d2h_pages <= after_source.backend_kv_d2h_pages) {
+        std::cerr << "unstored Response pressure did not offload complete State/Main/MTP\n";
+        return 1;
+    }
+
+    const auto restored = engine.generate(engine.prepare(prepare_input(history)), fixed_output(8));
+    const auto after_restore = settled_stats();
+    // The final sampled token can be pending at finish, requiring one token of boundary replay.
+    // The assistant response preceding that token must be reused, not re-prefilled from its prompt.
+    if (restored.reused_prompt_tokens < completed_tokens - 1 ||
+        restored.reused_prompt_tokens * 100ULL < restored.prompt.prompt_tokens * 99ULL ||
+        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
+        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+        after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages ||
+        after_restore.session_publications_initial_prefix_total !=
+            after_pressure.session_publications_initial_prefix_total + 1 ||
+        after_restore.session_supersessions_total != 1) {
+        std::cerr << "unstored Response lost its completed response or conversation head on RAM "
+                     "restore: reused="
+                  << restored.reused_prompt_tokens << " completed=" << completed_tokens
+                  << " path=" << static_cast<int>(restored.prefix_reuse_path)
+                  << " best=" << restored.materialization.best_reuse_prompt_tokens
+                  << " dropped=" << after_pressure.pressure_checkpoints_dropped
+                  << " d2h=" << after_pressure.state_d2h_count
+                  << " h2d=" << after_restore.state_h2d_count
+                  << " restores=" << after_restore.state_restores
+                  << " state_occupancy=" << after_source.device_state_occupied_slots << '/'
+                  << after_pressure.device_state_occupied_slots << '/'
+                  << after_pressure.host_state_occupied_slots
+                  << " content=" << Json(source.content).dump()
+                  << " publications=" << after_restore.session_publications_initial_prefix_total
+                  << " supersessions=" << after_restore.session_supersessions_total << '\n';
+        return 1;
+    }
+    const auto cold =
+        engine.generate(engine.prepare(prepare_input(history)), fixed_output(8, false));
+    if (restored.generated_token_ids != cold.generated_token_ids ||
+        restored.speculative.drafted_tokens != cold.speculative.drafted_tokens ||
+        restored.speculative.accepted_tokens != cold.speculative.accepted_tokens ||
+        cold.reused_prompt_tokens != 0 || cold.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+        std::cerr << "RAM-restored completed Response diverged from cold continuation\n";
+        return 1;
+    }
+    std::cout << "responses_host_continuation completed_tokens=" << completed_tokens
+              << " reused_tokens=" << restored.reused_prompt_tokens
+              << " next_prompt_tokens=" << restored.prompt.prompt_tokens
+              << " generated_tokens=" << restored.generated_token_ids.size()
+              << " state_h2d=" << after_restore.state_h2d_count - after_pressure.state_h2d_count
+              << " main_h2d_pages="
+              << after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages
+              << " mtp_h2d_pages="
+              << after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages
+              << " exact_cold_match=true\n";
+    return 0;
+}
+
+
+int exercise_cache_fixture_equivalence(const char* artifact) {
+    const auto initial_input = [](std::string session_key) {
+        std::string text;
+        text.reserve(6U * 300U);
+        for (std::uint32_t index = 0; index < 300; ++index) { text += "alpha "; }
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = std::move(session_key);
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        // Match the serving default so cold and cache-participating requests declare the same
+        // canonical trailing message-boundary decomposition.
+        input.context_cache.automatic_private_anchors = 2;
+        return input;
+    };
+    const auto continuation_input = [&initial_input](std::string session_key,
+                                                     const ninfer::GenerationResult& initial) {
+        ninfer::PromptInput input = initial_input(std::move(session_key));
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = initial.reasoning;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = initial.content, .media = {}});
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+        input.messages.push_back(std::move(user));
+        return input;
+    };
+    ninfer::PromptInput reference_continuation;
+    std::vector<ninfer::TokenId> initial_tokens;
+    std::vector<ninfer::TokenId> device_tokens;
+    std::uint64_t device_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        // Atomic publication retains the successful head until its replacement completes. Give
+        // this Device-only comparison a second State slot so exact reuse can fork without
+        // pressure selecting a feasible Root execution instead.
+        options.context_cache.device_state_slots = 2;
+        ninfer::Engine engine(std::move(options));
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(initial_input("host-restore-real")), fixed_output(5));
+        initial_tokens         = initial.generated_token_ids;
+        reference_continuation = continuation_input("host-restore-real", initial);
+        const ninfer::GenerationResult device =
+            engine.generate(engine.prepare(reference_continuation), fixed_output(2));
+        if (initial_tokens.size() != 5 || device.generated_token_ids.size() != 2 ||
+            device.reused_prompt_tokens == 0 ||
+            device.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+            std::cerr << "Device fixture did not use its exact retained checkpoint: initial="
+                      << initial_tokens.size() << " output=" << device.generated_token_ids.size()
+                      << " reused=" << device.reused_prompt_tokens
+                      << " path=" << static_cast<int>(device.prefix_reuse_path) << '\n';
+            return 1;
+        }
+        device_tokens = device.generated_token_ids;
+        device_hash   = token_fixture_hash(device_tokens);
+    }
+
+    std::uint64_t existing_hash = 0;
+    {
+        // Existing cache baseline: anonymous exact-prefix reuse with Device-only checkpointing,
+        // before explicit conversation-head identity participates. The rendered request fixture
+        // and greedy generation settings are identical to the new Device/Host paths below.
+        ninfer::EngineOptions options            = groupwise_host_restore_engine_options(artifact);
+        options.context_cache.device_state_slots = 1;
+        options.context_cache.host_state_slots   = 0;
+        options.context_cache.host_kv_capacity_bytes            = 0;
+        options.context_cache.max_private_continuations         = 2;
+        options.context_cache.max_shared_prefixes               = 0;
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        ninfer::Engine engine(std::move(options));
+        ninfer::PromptInput existing_initial = initial_input("unused-existing-session");
+        existing_initial.context_cache.session_key.reset();
+        existing_initial.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(std::move(existing_initial)), fixed_output(5));
+        ninfer::PromptInput existing_continuation =
+            continuation_input("unused-existing-session", initial);
+        existing_continuation.context_cache.session_key.reset();
+        existing_continuation.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        const ninfer::GenerationResult existing =
+            engine.generate(engine.prepare(std::move(existing_continuation)), fixed_output(2));
+        existing_hash = token_fixture_hash(existing.generated_token_ids);
+        if (initial.generated_token_ids != initial_tokens ||
+            existing.generated_token_ids != device_tokens || existing.reused_prompt_tokens == 0 ||
+            existing.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+            std::cerr << "existing-cache fixture diverged from deterministic reference: hashes="
+                      << existing_hash << '/' << device_hash << '\n';
+            return 1;
+        }
+    }
+
+    std::uint64_t disabled_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        options.context_cache         = ninfer::ContextCacheOptions{.enabled = false};
+        ninfer::Engine engine(std::move(options));
+        ninfer::PromptInput disabled_input       = reference_continuation;
+        disabled_input.context_cache.session_key = "cache-fixture-disabled";
+        const ninfer::GenerationResult disabled =
+            engine.generate(engine.prepare(std::move(disabled_input)), fixed_output(2, false));
+        disabled_hash = token_fixture_hash(disabled.generated_token_ids);
+        if (disabled.generated_token_ids != device_tokens || disabled.reused_prompt_tokens != 0 ||
+            disabled.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+            std::cerr << "disabled-cache fixture diverged from existing/Device reuse: hashes="
+                      << disabled_hash << '/' << existing_hash << '/' << device_hash << '\n';
+            return 1;
+        }
+    }
+
+    std::uint64_t host_hash = 0;
+    {
+        ninfer::EngineOptions options = groupwise_host_restore_engine_options(artifact);
+        ninfer::Engine engine(std::move(options));
+        const ninfer::GenerationResult initial =
+            engine.generate(engine.prepare(initial_input("host-restore-real")), fixed_output(5));
+        if (initial.generated_token_ids != initial_tokens) {
+            std::cerr << "Host fixture initial deterministic boundary changed\n";
+            return 1;
+        }
+        ninfer::PromptInput host_continuation    = continuation_input("host-restore-real", initial);
+        ninfer::PromptInput pressure_input       = host_continuation;
+        pressure_input.context_cache.session_key = "cache-fixture-pressure";
+        const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+        const ninfer::GenerationResult pressure =
+            engine.generate(engine.prepare(std::move(pressure_input)), fixed_output(2, false));
+        const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+        if (pressure.generated_token_ids.size() != 2 ||
+            after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
+            after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
+            after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
+            std::cerr << "Host fixture did not demote its exact checkpoint\n";
+            return 1;
+        }
+        const ninfer::GenerationResult host =
+            engine.generate(engine.prepare(std::move(host_continuation)), fixed_output(2));
+        const ninfer::RuntimeStats after_host = engine.runtime_stats();
+        host_hash                             = token_fixture_hash(host.generated_token_ids);
+        if (host.generated_token_ids != device_tokens || host.reused_prompt_tokens == 0 ||
+            host.prefix_reuse_path == ninfer::PrefixReusePath::Root ||
+            after_host.state_h2d_count <= after_pressure.state_h2d_count ||
+            after_host.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+            after_host.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
+            std::cerr << "Host fixture diverged from existing/Device/disabled reference: hashes="
+                      << host_hash << '/' << existing_hash << '/' << device_hash << '/'
+                      << disabled_hash << '\n';
+            return 1;
+        }
+    }
+    if (std::getenv("NINFER_REPORT_CACHE_FIXTURE_HASHES") != nullptr) {
+        std::cout << "cache_fixture_hash disabled=" << disabled_hash
+                  << " existing=" << existing_hash << " device=" << device_hash
+                  << " host=" << host_hash << '\n';
+    }
+    return 0;
+}
+
+
+int exercise_target_cache_calibration(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 128000;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::automatic();
+    options.kv_cache                         = ninfer::KvCacheStorage::RK4V4E8;
+    options.max_concurrency                  = 4;
+    options.max_pending_requests             = 4;
+    options.enable_vision                    = false;
+    options.context_cache                    = {};
+    options.context_cache.device_state_slots = 4;
+    ninfer::Engine engine(std::move(options));
+
+    const ninfer::EngineOptions& effective = engine.options();
+    const ninfer::MemorySummary memory     = engine.memory_summary();
+    const ninfer::LoadSummary load         = engine.load_summary();
+    if (effective.max_context != 128000 || effective.max_concurrency != 4 ||
+        effective.kv_capacity.mode != ninfer::KvCapacityMode::Automatic ||
+        effective.kv_cache != ninfer::KvCacheStorage::RK4V4E8 ||
+        effective.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
+        effective.speculative.draft_tokens != 3 ||
+        effective.speculative.proposal_head != ninfer::ProposalHead::Optimized ||
+        effective.context_cache.device_state_slots != 4 ||
+        effective.context_cache.host_state_slots != 8 ||
+        effective.context_cache.host_kv_capacity_bytes != (8ULL << 30) ||
+        effective.context_cache.max_private_continuations != 8 ||
+        effective.context_cache.max_shared_prefixes != 4 ||
+        effective.context_cache.max_long_anchors_per_continuation != 2 ||
+        memory.kv_capacity_mode != ninfer::KvCapacityMode::Automatic || memory.kv_capacity == 0 ||
+        memory.kv_capacity >= 4U * 128000U || memory.host_state_capacity_slots != 8 ||
+        memory.host_kv_capacity_bytes != (8ULL << 30) || memory.gdn_state_bytes == 0 ||
+        memory.checkpoint_state_image_bytes == 0 ||
+        memory.checkpoint_state_image_bytes >= memory.gdn_state_bytes) {
+        std::cerr << "target cache calibration resolved an unexpected workload profile: context="
+                  << effective.max_context << " concurrency=" << effective.max_concurrency
+                  << " kv_mode=" << static_cast<int>(effective.kv_capacity.mode)
+                  << " kv_storage=" << static_cast<int>(effective.kv_cache)
+                  << " device_state=" << effective.context_cache.device_state_slots.value_or(0)
+                  << " host_state=" << effective.context_cache.host_state_slots
+                  << " host_kv=" << effective.context_cache.host_kv_capacity_bytes
+                  << " private=" << effective.context_cache.max_private_continuations.value_or(0)
+                  << " shared=" << effective.context_cache.max_shared_prefixes.value_or(0)
+                  << " anchors="
+                  << effective.context_cache.max_long_anchors_per_continuation.value_or(0)
+                  << " resolved_kv=" << memory.kv_capacity
+                  << " resolved_host_state=" << memory.host_state_capacity_slots
+                  << " resolved_host_kv=" << memory.host_kv_capacity_bytes
+                  << " gdn=" << memory.gdn_state_bytes
+                  << " checkpoint_state_image=" << memory.checkpoint_state_image_bytes << '\n';
+        return 1;
+    }
+    std::cout << "target_cache_calibration"
+              << " max_context=" << memory.max_context << " kv_capacity=" << memory.kv_capacity
+              << " kv_page_groups=" << memory.kv_capacity_page_groups
+              << " kv_max_page_groups=" << memory.kv_capacity_max_page_groups
+              << " gdn_state=" << memory.gdn_state_bytes
+              << " checkpoint_state_image=" << memory.checkpoint_state_image_bytes
+              << " device_state_active=4 device_state_cache=4 device_state_total=8"
+              << " host_state_slots=" << memory.host_state_capacity_slots
+              << " host_kv=" << memory.host_kv_capacity_bytes
+              << " weights=" << memory.weights.capacity_bytes
+              << " sequence=" << memory.sequence.capacity_bytes
+              << " workspace=" << memory.workspace.capacity_bytes
+              << " minimum_runtime=" << memory.minimum_runtime_reservation_bytes
+              << " runtime=" << memory.runtime_reservation_bytes
+              << " available_after_weights=" << memory.available_after_weights_bytes
+              << " available_after_startup=" << memory.available_after_startup_bytes
+              << " headroom=" << memory.kv_capacity_headroom_bytes
+              << " slack=" << memory.planned_slack_bytes << " transfer_cost="
+              << ninfer::context_cost_preset_source_name(load.context_cost.transfer_source)
+              << " prefill_cost="
+              << ninfer::context_cost_preset_source_name(load.context_cost.prefill_source) << '\n';
+    return 0;
+}
+
+
+int exercise_four_request_root_fallback(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 4;
+    options.max_pending_requests             = 4;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.context_cache.device_state_slots = 0;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 4;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        const ninfer::GenerationResult warm = engine.generate(
+            engine.prepare(session_turn("four-pressure-owner-" + std::to_string(row),
+                                        "Retain one deterministic pressure owner " +
+                                            std::to_string(row) + '.')),
+            fixed_output(1));
+        if (warm.generated_token_ids.size() != 1) {
+            std::cerr << "four-request pressure fixture did not populate owner " << row << '\n';
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    if (before.device_state_occupied_slots != 4 || before.host_state_occupied_slots != 0 ||
+        before.host_kv_occupied_bytes != 0) {
+        std::cerr << "four-request pressure fixture did not fill its bounded Device-only cache: "
+                  << before.device_state_occupied_slots << '/' << before.host_state_occupied_slots
+                  << '/' << before.host_kv_occupied_bytes << '\n';
+        return 1;
+    }
+
+    std::array<CountingOutputSink, 4> sinks;
+    std::array<std::atomic<bool>, 4> cancelled{};
+    std::vector<std::future<ninfer::GenerationResult>> requests;
+    requests.reserve(4);
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        auto handle = engine.submit(
+            engine.prepare_tokens(
+                {248045, 846, 198, static_cast<ninfer::TokenId>(9200 + row), 248046, 198}, false),
+            fixed_output(64, false), ninfer::OutputConsumerMode::Streaming);
+        requests.push_back(
+            std::async(std::launch::async, [handle = std::move(handle), &sink = sinks[row],
+                                            &cancel = cancelled[row]]() mutable {
+                return handle.wait(&sink, ninfer::CancellationView([&] {
+                    return cancel.load(std::memory_order_acquire);
+                }));
+            }));
+    }
+
+    const bool four_admitted = wait_until(
+        [&] {
+            const bool all_started =
+                std::all_of(sinks.begin(), sinks.end(), [](const CountingOutputSink& sink) {
+                    return sink.started.load(std::memory_order_acquire);
+                });
+            return all_started && engine.runtime_stats().running_requests == 4;
+        },
+        std::chrono::seconds(120));
+    for (auto& flag : cancelled) { flag.store(true, std::memory_order_release); }
+    std::array<ninfer::GenerationResult, 4> results;
+    for (std::size_t row = 0; row < requests.size(); ++row) { results[row] = requests[row].get(); }
+    if (!four_admitted) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "constrained pressure did not admit four requests concurrently: running="
+                  << stats.running_requests
+                  << " fallback=" << stats.pressure_maximal_fallback_selections << '\n';
+        return 1;
+    }
+    for (const ninfer::GenerationResult& result : results) {
+        if (result.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+            std::cerr << "constrained four-request admission selected a non-root source\n";
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    if (after.pressure_maximal_fallback_selections <= before.pressure_maximal_fallback_selections ||
+        after.reclaimed_device_state_slots_total < before.reclaimed_device_state_slots_total + 4U ||
+        after.device_state_occupied_slots > 4 || after.host_state_occupied_slots != 0 ||
+        after.host_kv_occupied_bytes != 0 || after.running_requests != 0 ||
+        after.materializing_requests != 0 || after.terminal_pending_requests != 0) {
+        std::cerr << "four-request root fallback did not reclaim bounded physical capacity: "
+                  << "fallback=" << before.pressure_maximal_fallback_selections << '/'
+                  << after.pressure_maximal_fallback_selections
+                  << " state_reclaimed=" << before.reclaimed_device_state_slots_total << '/'
+                  << after.reclaimed_device_state_slots_total
+                  << " occupancy=" << after.device_state_occupied_slots << '/'
+                  << after.host_state_occupied_slots << '/' << after.host_kv_occupied_bytes
+                  << " running=" << after.running_requests << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_delayed_active_capture_lifecycle(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 512;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 2;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.context_cache.device_state_slots = 0;
+    options.context_cache.host_state_slots   = 2;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 1;
+    ninfer::Engine engine(std::move(options));
+
+    CountingOutputSink independent_sink;
+    auto independent_handle =
+        engine.submit(engine.prepare_tokens({248045, 846, 198, 9021, 248046, 198}, false),
+                      fixed_output(500, false), ninfer::OutputConsumerMode::Streaming);
+    std::atomic<bool> cancel_independent{false};
+    auto independent =
+        std::async(std::launch::async, [handle = std::move(independent_handle), &independent_sink,
+                                        &cancel_independent]() mutable {
+            return handle.wait(&independent_sink, ninfer::CancellationView([&] {
+                return cancel_independent.load(std::memory_order_acquire);
+            }));
+        });
+    if (!wait_until([&] {
+            return independent_sink.started.load(std::memory_order_acquire) &&
+                   independent_sink.deltas.load(std::memory_order_acquire) != 0;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        (void)independent.get();
+        std::cerr << "active-capture fixture did not start independent execution\n";
+        return 1;
+    }
+
+    ControlledSnapshotTransferGate gate(true);
+    ninfer::PromptInput capture_prompt;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind  = ninfer::MessagePartKind::Text,
+        .text  = "Create a private checkpoint at this stable conversation boundary.",
+        .media = {},
+    });
+    capture_prompt.messages.push_back(std::move(user));
+    ninfer::ChatMessage continuation;
+    continuation.role = ninfer::ChatRole::User;
+    continuation.parts.push_back(ninfer::MessagePart{
+        .kind  = ninfer::MessagePartKind::Text,
+        .text  = "Continue after the checkpoint while another request remains active.",
+        .media = {},
+    });
+    capture_prompt.messages.push_back(std::move(continuation));
+    capture_prompt.options.enable_thinking = false;
+    capture_prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    capture_prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+    // Leave decode work after the prompt-frontier commit. A one-token budget is terminal in the
+    // same Begin commit and correctly skips that frontier's optional capture.
+    auto capture_handle = engine.submit(engine.prepare(std::move(capture_prompt)), fixed_output(2));
+    std::atomic<bool> cancel_capture{false};
+    auto capture = std::async(
+        std::launch::async, [handle = std::move(capture_handle), &cancel_capture]() mutable {
+            return handle.wait(nullptr, ninfer::CancellationView([&] {
+                                   return cancel_capture.load(std::memory_order_acquire);
+                               }));
+        });
+
+    if (!wait_until(
+            [&] { return ninfer::runtime::testing::active_capture_transfer_gate_waits() != 0; },
+            std::chrono::seconds(60))) {
+        const ninfer::RuntimeStats diagnostics = engine.runtime_stats();
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "Program did not enqueue the controlled active-capture transfer: captures="
+                  << diagnostics.active_captures_completed << '/'
+                  << diagnostics.active_captures_aborted
+                  << " pending=" << diagnostics.capture_pending_requests
+                  << " running=" << diagnostics.running_requests
+                  << " prefill=" << diagnostics.prefilling_requests
+                  << " decode=" << diagnostics.decode_ready_requests
+                  << " waiting=" << diagnostics.waiting_requests
+                  << " roots=" << diagnostics.root_selections
+                  << " state=" << diagnostics.device_state_occupied_slots << '/'
+                  << diagnostics.host_state_occupied_slots
+                  << " prefill_tokens=" << diagnostics.computed_prefill_tokens << '\n';
+        return 1;
+    }
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; })) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "no Engine/Program decode unit completed during active-capture D2H\n";
+        return 1;
+    }
+    if (!gate.pending()) {
+        cancel_capture.store(true, std::memory_order_release);
+        cancel_independent.store(true, std::memory_order_release);
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "active-capture delay drained before the independent progress observation\n";
+        return 1;
+    }
+
+    cancel_capture.store(true, std::memory_order_release);
+    if (!wait_until([&] {
+            return ninfer::runtime::testing::active_capture_submitted_cancellations() == 1;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr << "Program did not observe cancellation of the submitted active capture\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats cancelled_pending = engine.runtime_stats();
+    if (!gate.pending() || cancelled_pending.capture_pending_requests != 1 ||
+        cancelled_pending.active_captures_completed != 0 ||
+        cancelled_pending.active_captures_aborted != 0 ||
+        cancelled_pending.host_state_occupied_slots == 0) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr
+            << "submitted capture released/published ownership before cancellation settlement: "
+            << "pending=" << cancelled_pending.capture_pending_requests
+            << " captures=" << cancelled_pending.active_captures_completed << '/'
+            << cancelled_pending.active_captures_aborted
+            << " host_state=" << cancelled_pending.host_state_occupied_slots << '\n';
+        return 1;
+    }
+    gate.release();
+    const ninfer::GenerationResult cancelled = capture.get();
+    cancel_independent.store(true, std::memory_order_release);
+    (void)independent.get();
+    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "active capture published after cancellation while its transfer was pending\n";
+        return 1;
+    }
+    if (!wait_until([&] {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            return stats.running_requests == 0 && stats.materializing_requests == 0 &&
+                   stats.capture_pending_requests == 0 && stats.terminal_pending_requests == 0 &&
+                   stats.device_state_occupied_slots == 0 && stats.host_state_occupied_slots == 0 &&
+                   stats.active_captures_completed == 0 && stats.active_captures_aborted == 1;
+        })) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "cancelled active capture leaked terminal ownership: running="
+                  << stats.running_requests << " materializing=" << stats.materializing_requests
+                  << " capture=" << stats.capture_pending_requests
+                  << " terminal=" << stats.terminal_pending_requests
+                  << " state=" << stats.device_state_occupied_slots << '/'
+                  << stats.host_state_occupied_slots
+                  << " captures=" << stats.active_captures_completed << '/'
+                  << stats.active_captures_aborted << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult after =
+        engine.generate(engine.prepare_tokens({248045, 846, 198, 9022, 248046, 198}, false),
+                        fixed_output(1, false));
+    if (!engine.healthy() || after.generated_token_ids.size() != 1) {
+        std::cerr << "Engine did not remain usable after active-capture cancellation\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+// Distinct from materialization pressure and from cancellation of the capture's own State D2H:
+// the shared capture needs one more Device State slot, its selected private victim is observed
+// only after Program reserves the pressure topology, and the observer starts a retained-session
+// snapshot whose source pins defer the capture's destructive HostReleases phase.
+int exercise_delayed_active_capture_pressure(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 2;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.auto_save_evicted                = true;
+    options.auto_save_queue_jobs             = 1;
+    options.auto_save_queue_bytes            = 1ULL << 30;
+    options.context_cache.device_state_slots = 1;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 1;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    std::atomic<std::uint32_t> writer_failures{0};
+    options.auto_save_listener = [&](const ninfer::SlotAutoSaveEvent& event) {
+        if (!event.error.empty()) { writer_failures.fetch_add(1, std::memory_order_acq_rel); }
+    };
+    ninfer::Engine engine(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-delayed-active-capture-pressure";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } guard{directory};
+
+    ninfer::PromptInput victim_prompt;
+    ninfer::ChatMessage victim_message;
+    victim_message.role = ninfer::ChatRole::User;
+    victim_message.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                       .text  = "Retain one short pressure victim.",
+                                                       .media = {}});
+    victim_prompt.messages.push_back(std::move(victim_message));
+    victim_prompt.options.enable_thinking = false;
+    victim_prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    const ninfer::GenerationResult victim =
+        engine.generate(engine.prepare(std::move(victim_prompt)), fixed_output(1));
+    if (victim.slot < 0 || victim.session_digest.empty()) {
+        std::cerr << "active-capture pressure fixture did not retain its victim\n";
+        return 1;
+    }
+    (void)engine.save_slot(static_cast<std::uint32_t>(victim.slot),
+                           (directory / "victim.bin").string(), victim.session_digest);
+
+    CountingOutputSink independent_sink;
+    auto independent_handle =
+        engine.submit(engine.prepare_tokens({248045, 846, 198, 9031, 248046, 198}, false),
+                      fixed_output(900, false), ninfer::OutputConsumerMode::Streaming);
+    std::atomic<bool> cancel_independent{false};
+    auto independent =
+        std::async(std::launch::async, [handle = std::move(independent_handle), &independent_sink,
+                                        &cancel_independent]() mutable {
+            return handle.wait(&independent_sink, ninfer::CancellationView([&] {
+                return cancel_independent.load(std::memory_order_acquire);
+            }));
+        });
+    if (!wait_until([&] {
+            return independent_sink.started.load(std::memory_order_acquire) &&
+                   independent_sink.deltas.load(std::memory_order_acquire) != 0;
+        })) {
+        cancel_independent.store(true, std::memory_order_release);
+        (void)independent.get();
+        std::cerr << "active-capture pressure fixture did not start independent execution\n";
+        return 1;
+    }
+
+    ControlledSnapshotTransferGate gate;
+    std::string stable_prefix;
+    stable_prefix.reserve(2'048);
+    for (std::uint32_t token = 0; token < 128; ++token) {
+        stable_prefix += "stable shared capture boundary ";
+    }
+    ninfer::PromptInput capture_prompt;
+    ninfer::ChatMessage stable;
+    stable.role = ninfer::ChatRole::User;
+    stable.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(stable_prefix), .media = {}});
+    capture_prompt.messages.push_back(std::move(stable));
+    ninfer::ChatMessage suffix;
+    suffix.role = ninfer::ChatRole::User;
+    suffix.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                               .text  = "Continue beyond the shared boundary.",
+                                               .media = {}});
+    capture_prompt.messages.push_back(std::move(suffix));
+    capture_prompt.options.enable_thinking = false;
+    capture_prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    capture_prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+    auto capture_handle = engine.submit(engine.prepare(std::move(capture_prompt)), fixed_output(2));
+    auto capture = std::async(std::launch::async, [handle = std::move(capture_handle)]() mutable {
+        return handle.wait();
+    });
+
+    if (!wait_until([&] { return ninfer::runtime::testing::snapshot_transfer_gate_waits() != 0; },
+                    std::chrono::seconds(60))) {
+        const ninfer::RuntimeStats diagnostics = engine.runtime_stats();
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        const ninfer::GenerationResult capture_result = capture.get();
+        (void)independent.get();
+        std::cerr << "active capture pressure did not enqueue the victim snapshot: captures="
+                  << diagnostics.active_captures_completed << '/'
+                  << diagnostics.active_captures_aborted
+                  << " private_evicted=" << diagnostics.pressure_private_owners_evicted
+                  << " capture_reason=" << static_cast<int>(capture_result.finish_reason) << '\n';
+        return 1;
+    }
+    const std::uint64_t submitted_round = engine.runtime_stats().decode_rounds;
+    if (!wait_until([&] { return engine.runtime_stats().decode_rounds > submitted_round; }) ||
+        !gate.pending()) {
+        cancel_independent.store(true, std::memory_order_release);
+        gate.release();
+        (void)capture.get();
+        (void)independent.get();
+        std::cerr
+            << "no Engine/Program decode unit completed during active-capture pressure spill\n";
+        return 1;
+    }
+
+    gate.release();
+    const ninfer::GenerationResult captured = capture.get();
+    cancel_independent.store(true, std::memory_order_release);
+    (void)independent.get();
+    if (captured.generated_token_ids.size() != 2) {
+        std::cerr << "active capture pressure request did not finish after spill settlement\n";
+        return 1;
+    }
+    if (!wait_until([&] {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            return stats.active_captures_completed != 0 &&
+                   stats.pressure_private_owners_evicted != 0 &&
+                   stats.auto_save_reserved_jobs == 0 && stats.auto_save_reserved_bytes == 0 &&
+                   stats.auto_save_queued_jobs == 0 && stats.auto_save_in_flight_jobs == 0 &&
+                   stats.capture_pending_requests == 0 && stats.materializing_requests == 0;
+        })) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "active-capture pressure spill leaked or did not publish: captures="
+                  << stats.active_captures_completed << '/' << stats.active_captures_aborted
+                  << " evicted=" << stats.pressure_private_owners_evicted
+                  << " reserved=" << stats.auto_save_reserved_jobs << '/'
+                  << stats.auto_save_reserved_bytes << " queued=" << stats.auto_save_queued_jobs
+                  << " active=" << stats.auto_save_in_flight_jobs << '\n';
+        return 1;
+    }
+    if (!engine.healthy() || writer_failures.load(std::memory_order_acquire) != 0) {
+        std::cerr << "Engine or retained-session writer failed after active capture pressure\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+// Engine::Impl must drain its bounded Host consumer before destroying Program/device state. This
+// scenario starts a real retained-session D2H, drops all request-side Engine owners, and destroys
+// the Engine while the CUDA completion remains gated. The test-only ownership observations are
+// emitted by PendingTransferSettlement at the same points where backing and source pins are
+// acquired/released; a synthetic writer callback cannot establish this lifetime.
+int exercise_pending_snapshot_shutdown(const char* artifact) {
+    ninfer::EngineOptions options            = engine_options(artifact);
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                    = 256;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 4;
+    options.pending_timeout_ms               = 120000;
+    options.enable_vision                    = false;
+    options.auto_save_evicted                = true;
+    options.auto_save_queue_jobs             = 1;
+    options.auto_save_queue_bytes            = 1ULL << 30;
+    options.context_cache.device_state_slots = 4;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 3;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    std::atomic<std::uint32_t> writer_failures{0};
+    options.auto_save_listener = [&](const ninfer::SlotAutoSaveEvent& event) {
+        if (!event.error.empty()) { writer_failures.fetch_add(1, std::memory_order_acq_rel); }
+    };
+    auto engine = std::make_unique<ninfer::Engine>(std::move(options));
+
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-pending-snapshot-shutdown";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
+    std::filesystem::create_directories(directory);
+
+    struct DirectoryGuard {
+        std::filesystem::path path;
+
+        ~DirectoryGuard() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } directory_guard{directory};
+
+    const auto bound_prompt = [](std::string text) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind  = ninfer::MessagePartKind::Text,
+            .text  = std::move(text),
+            .media = {},
+        });
+        prompt.messages.push_back(std::move(user));
+        prompt.options.enable_thinking = false;
+        prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return prompt;
+    };
+    for (std::uint32_t index = 0; index < 2; ++index) {
+        const ninfer::GenerationResult victim = engine->generate(
+            engine->prepare(bound_prompt("Retain shutdown spill victim " + std::to_string(index))),
+            fixed_output(1));
+        if (victim.slot < 0 || victim.session_digest.empty()) {
+            std::cerr << "shutdown fixture did not retain victim " << index << '\n';
+            return 1;
+        }
+        (void)engine->save_slot(static_cast<std::uint32_t>(victim.slot),
+                                (directory / ("bound-" + std::to_string(index) + ".bin")).string(),
+                                victim.session_digest);
+    }
+
+    auto independent = engine->submit(engine->prepare_tokens({248045, 846, 198, 9041, 248046, 198}),
+                                      fixed_output(1000));
+    if (!wait_until([&] { return engine->runtime_stats().decode_rounds != 0; })) {
+        std::cerr << "shutdown fixture did not start independent model execution\n";
+        return 1;
+    }
+
+    ControlledSnapshotTransferGate gate;
+    auto pressure = engine->submit(
+        engine->prepare(bound_prompt("Force a retained snapshot during Engine shutdown.")),
+        fixed_output(1));
+    if (!wait_until([&] { return ninfer::runtime::testing::snapshot_transfer_gate_waits() == 1; },
+                    std::chrono::seconds(60)) ||
+        !wait_until([&] {
+            return ninfer::runtime::testing::snapshot_transfer_live_settlements() == 1 &&
+                   ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 &&
+                   ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0;
+        })) {
+        gate.release();
+        std::cerr << "shutdown fixture did not acquire real snapshot backing/source pins\n";
+        return 1;
+    }
+    const std::uint64_t backing_bytes =
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes();
+    const std::uint64_t pinned_sources =
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources();
+    if (!wait_until([&] { return engine->runtime_stats().auto_save_in_flight_jobs == 1; })) {
+        gate.release();
+        std::cerr << "shutdown fixture writer did not begin consuming the pending snapshot\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats pending = engine->runtime_stats();
+    if (!gate.pending() || pending.auto_save_reserved_jobs != 1 ||
+        pending.auto_save_reserved_bytes < backing_bytes || pending.auto_save_in_flight_jobs != 1) {
+        gate.release();
+        std::cerr << "shutdown fixture did not expose its pending bounded writer ownership: "
+                  << "reserved=" << pending.auto_save_reserved_jobs << '/'
+                  << pending.auto_save_reserved_bytes
+                  << " active=" << pending.auto_save_in_flight_jobs << " backing=" << backing_bytes
+                  << " pins=" << pinned_sources << '\n';
+        return 1;
+    }
+
+    // GenerationHandle keeps Engine::Impl alive. Drop both handles first so Engine is the sole
+    // owner, then destroy it on another thread while the writer is blocked on the CUDA event.
+    pressure      = {};
+    independent   = {};
+    auto shutdown = std::async(std::launch::async, [&] { engine.reset(); });
+    if (shutdown.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready ||
+        !gate.pending() || ninfer::runtime::testing::snapshot_transfer_live_settlements() != 1 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != backing_bytes ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != pinned_sources) {
+        gate.release();
+        shutdown.get();
+        std::cerr << "Engine teardown released pending snapshot ownership before settlement\n";
+        return 1;
+    }
+
+    gate.release();
+    shutdown.get();
+    const auto shutdown_cleanup = ninfer::runtime::testing::snapshot_shutdown_cleanup();
+    if (gate.pending() || ninfer::runtime::testing::snapshot_transfer_live_settlements() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_live_backing_bytes() != 0 ||
+        ninfer::runtime::testing::snapshot_transfer_pinned_sources() != 0 ||
+        shutdown_cleanup.observations != 1 || shutdown_cleanup.catalog_owners != 0 ||
+        shutdown_cleanup.device_state_slots != 0 || shutdown_cleanup.host_state_slots != 0 ||
+        shutdown_cleanup.device_main_kv_pages != 0 || shutdown_cleanup.device_backend_pages != 0 ||
+        shutdown_cleanup.host_kv_bytes != 0 ||
+        writer_failures.load(std::memory_order_acquire) != 0) {
+        std::cerr << "Engine teardown did not completely retire snapshot/catalog ownership: "
+                  << "cleanup=" << shutdown_cleanup.observations << '/'
+                  << shutdown_cleanup.catalog_owners
+                  << " state=" << shutdown_cleanup.device_state_slots << '/'
+                  << shutdown_cleanup.host_state_slots
+                  << " kv=" << shutdown_cleanup.device_main_kv_pages << '/'
+                  << shutdown_cleanup.device_backend_pages << '/' << shutdown_cleanup.host_kv_bytes
+                  << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+
+// Run only as an isolated process: the deliberately trapping kernel poisons this CUDA context.
+// The hook itself returns success after launch, so the Engine observes the error asynchronously
+// while settling the real active-capture completion event and must fail all ownership cleanly.
+int exercise_asynchronous_transfer_failure(const char* artifact) {
+    ninfer::EngineOptions options                = engine_options(artifact);
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.pending_timeout_ms                   = 120000;
+    options.enable_vision                        = false;
+    options.context_cache.device_state_slots     = 0;
+    options.context_cache.host_state_slots       = 1;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 1;
+    ninfer::Engine engine(std::move(options));
+    AsynchronousTransferFailureGate failure;
+
+    ninfer::PromptInput prompt;
+    ninfer::ChatMessage stable;
+    stable.role = ninfer::ChatRole::User;
+    stable.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                               .text  = "Capture this private boundary.",
+                                               .media = {}});
+    prompt.messages.push_back(std::move(stable));
+    ninfer::ChatMessage suffix;
+    suffix.role = ninfer::ChatRole::User;
+    suffix.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                               .text  = "Continue after the failing transfer.",
+                                               .media = {}});
+    prompt.messages.push_back(std::move(suffix));
+    prompt.options.enable_thinking = false;
+    prompt.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+    });
+
+    bool failed = false;
+    try {
+        (void)engine.generate(engine.prepare(std::move(prompt)), fixed_output(2));
+    } catch (const std::exception&) { failed = true; }
+    if (!failed || ninfer::runtime::testing::active_capture_transfer_gate_waits() != 1) {
+        std::cerr << "active-capture CUDA failure was not submitted and observed asynchronously\n";
+        return 1;
+    }
+    if (!wait_until([&] {
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            return !engine.healthy() && stats.running_requests == 0 &&
+                   stats.materializing_requests == 0 && stats.capture_pending_requests == 0 &&
+                   stats.terminal_pending_requests == 0 && stats.device_state_occupied_slots == 0 &&
+                   stats.host_state_occupied_slots == 0 && stats.auto_save_reserved_jobs == 0 &&
+                   stats.auto_save_reserved_bytes == 0;
+        })) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "asynchronous CUDA failure leaked Engine/Program ownership: healthy="
+                  << engine.healthy() << " running=" << stats.running_requests
+                  << " materializing=" << stats.materializing_requests
+                  << " capture=" << stats.capture_pending_requests
+                  << " terminal=" << stats.terminal_pending_requests
+                  << " state=" << stats.device_state_occupied_slots << '/'
+                  << stats.host_state_occupied_slots
+                  << " reserved=" << stats.auto_save_reserved_jobs << '/'
+                  << stats.auto_save_reserved_bytes << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_durable_import_errors(const char* artifact, const std::vector<std::uint8_t>& bytes,
+                                   const std::string& digest, std::uint32_t frontier,
+                                   const std::vector<ninfer::TokenId>& expected_tokens) {
+    using Access = ninfer::runtime::DurableSharedSnapshotAccess;
+    for (int mode = 0; mode != 3; ++mode) {
+        ninfer::Engine engine(shared_snapshot_engine_options(artifact));
+        auto prompt = engine.prepare(shared_snapshot_prompt());
+        const std::array candidates{
+            Access::Candidate{.content_digest = digest, .frontier = frontier}};
+        const auto selected = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+        if (selected.reservation_id == 0) {
+            std::cerr << "import error fixture could not reserve SSD recovery\n";
+            return 1;
+        }
+        auto recovery       = std::make_shared<ninfer::runtime::DeferredDurableRecovery>();
+        recovery->candidate = {.content_digest = digest, .frontier = frontier};
+        recovery->available_candidates.push_back(recovery->candidate);
+        recovery->reservation_id = selected.reservation_id;
+        auto payload             = std::make_shared<std::vector<std::uint8_t>>(bytes);
+        if (mode == 0) { payload->back() ^= 1U; }
+        recovery->bytes          = payload;
+        recovery->load_completed = true;
+        SharedSnapshotImportGate gate(
+            ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+            mode == 2 ? SharedSnapshotImportGate::Action::StalePlan
+                      : SharedSnapshotImportGate::Action::Reject);
+        auto handle          = Access::submit(engine, std::move(prompt), fixed_output(3),
+                                              ninfer::OutputConsumerMode::Aggregate,
+                                              ninfer::GenerationObservationOptions{},
+                                              std::chrono::steady_clock::time_point::max(), recovery);
+        const auto generated = handle.wait(nullptr, {});
+        const std::string expected_reason = mode == 0   ? "ssd-checksum-failure"
+                                            : mode == 1 ? "ssd-adoption-failure"
+                                                        : "ssd-successful-restore";
+        if (!recovery->completed || recovery->reservation_id != 0 || recovery->bytes ||
+            recovery->fallback_reason != expected_reason ||
+            recovery->invalidate_record != (mode == 0) ||
+            recovery->loaded_from_ssd != (mode == 2) || !engine.healthy() ||
+            generated.generated_token_ids != expected_tokens) {
+            std::cerr << "typed import failure classification failed: " << recovery->fallback_reason
+                      << '\n';
+            return 1;
+        }
+    }
+    // Fill the logical catalog while leaving enough physical capacity for staged adoption.
+    // Export failure injection proves this path never needs a rollback D2H snapshot.
+    auto options                              = shared_snapshot_engine_options(artifact);
+    options.context_cache.max_shared_prefixes = 1;
+    ninfer::Engine engine(std::move(options));
+    auto resident                                   = shared_snapshot_prompt();
+    resident.messages.front().parts.front().text[0] = 'X';
+    (void)engine.generate(engine.prepare(resident), fixed_output(3));
+    // Delivery can finish before the worker publishes its final ownership statistics.
+    ninfer::runtime::testing::SharedSnapshotTestAccess::with_execution_lock(engine, [] {});
+    const auto before = engine.runtime_stats();
+    const std::array candidates{Access::Candidate{.content_digest = digest, .frontier = frontier}};
+    const auto payload = std::make_shared<const std::vector<std::uint8_t>>(bytes);
+    for (bool reject : {true, false}) {
+        auto prompt         = engine.prepare(shared_snapshot_prompt());
+        const auto selected = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+        if (!selected.replacement || selected.reservation_id == 0) {
+            std::cerr << "staged replacement fixture did not select its resident victim\n";
+            return 1;
+        }
+        SharedSnapshotExportAllocationGate no_snapshot(
+            ninfer::runtime::testing::SharedSnapshotExportStage::StatePinnedBeforeRegistration);
+        if (reject) {
+            bool rejected = false;
+            SharedSnapshotImportGate gate(
+                ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                SharedSnapshotImportGate::Action::Reject);
+            try {
+                (void)Access::import(engine, candidates.front(), payload, {},
+                                     selected.reservation_id);
+            } catch (const std::invalid_argument&) { rejected = gate.triggered(); }
+            const auto after = engine.runtime_stats();
+            if (!rejected || !engine.healthy() ||
+                before.context_cache_owners != after.context_cache_owners ||
+                before.device_state_occupied_slots != after.device_state_occupied_slots ||
+                before.host_state_occupied_slots != after.host_state_occupied_slots ||
+                before.device_main_kv_occupied_pages != after.device_main_kv_occupied_pages ||
+                before.device_backend_kv_occupied_pages != after.device_backend_kv_occupied_pages ||
+                before.host_kv_occupied_bytes != after.host_kv_occupied_bytes) {
+                std::cerr << "staged adoption failure changed its retained victim: rejected="
+                          << rejected << " healthy=" << engine.healthy() << " owners="
+                          << (before.context_cache_owners == after.context_cache_owners)
+                          << " state=" << before.device_state_occupied_slots << '/'
+                          << after.device_state_occupied_slots
+                          << " host=" << before.host_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots
+                          << " main=" << before.device_main_kv_occupied_pages << '/'
+                          << after.device_main_kv_occupied_pages
+                          << " backend=" << before.device_backend_kv_occupied_pages << '/'
+                          << after.device_backend_kv_occupied_pages
+                          << " hostkv=" << before.host_kv_occupied_bytes << '/'
+                          << after.host_kv_occupied_bytes << '\n';
+                return 1;
+            }
+        } else {
+            const auto imported =
+                Access::import(engine, candidates.front(), payload, {}, selected.reservation_id);
+            if (!imported.displaced_checkpoint || imported.frontier != frontier) {
+                std::cerr << "staged adoption did not publish the replacement\n";
+                return 1;
+            }
+        }
+    }
+    auto [slot, exported] =
+        ninfer::runtime::testing::SharedSnapshotTestAccess::export_first_durable(engine);
+    (void)slot;
+    exported.await_transfer(exported.bytes);
+    if (exported.bytes != bytes) {
+        std::cerr << "staged replacement changed imported State/KV bytes\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_zero_output_durable_recovery(const char* artifact) {
+    using Access = ninfer::runtime::DurableSharedSnapshotAccess;
+    ninfer::Engine engine(shared_snapshot_engine_options(artifact));
+    auto prompt            = engine.prepare(shared_snapshot_prompt());
+    const auto candidates  = Access::candidates(engine, prompt);
+    const auto reservation = Access::decide_recovery(engine, prompt, fixed_output(3), candidates);
+    if (reservation.reservation_id == 0) {
+        std::cerr << "zero-output recovery fixture could not reserve its SSD plan\n";
+        return 1;
+    }
+    auto recovery            = std::make_shared<ninfer::runtime::DeferredDurableRecovery>();
+    recovery->candidate      = {.content_digest = reservation.candidate.content_digest,
+                                .frontier       = reservation.candidate.frontier};
+    recovery->reservation_id = reservation.reservation_id;
+    recovery->bytes          = std::make_shared<const std::vector<std::uint8_t>>(3, 0);
+    auto handle              = Access::submit(engine, std::move(prompt), fixed_output(0),
+                                              ninfer::OutputConsumerMode::Aggregate,
+                                              ninfer::GenerationObservationOptions{},
+                                              std::chrono::steady_clock::time_point::max(), recovery);
+    const auto result        = handle.wait(nullptr, {});
+    if (!result.generated_token_ids.empty() ||
+        result.finish_reason != ninfer::FinishReason::OutputLimit || !recovery->completed ||
+        recovery->reservation_id != 0 || recovery->bytes || recovery->lifecycle.size() != 1 ||
+        recovery->lifecycle.front().status != ninfer::CheckpointLifecycleStatus::Aborted ||
+        recovery->lifecycle.front().serialized_bytes != 3) {
+        std::cerr << "zero-output request did not abort and release durable recovery\n";
+        return 1;
+    }
+    auto next_prompt = engine.prepare(shared_snapshot_prompt());
+    const auto next  = Access::decide_recovery(engine, next_prompt, fixed_output(3), candidates);
+    Access::cancel_recovery(engine, next.reservation_id);
+    if (next.reservation_id == 0 || next.reservation_id == reservation.reservation_id) {
+        std::cerr << "zero-output request retained its durable reservation\n";
+        return 1;
+    }
+    return 0;
+}
+
+
+int exercise_shared_snapshot_round_trip(const char* artifact, bool allocation_rollback_only = false,
+                                        bool durable_lifecycle_only = false,
+                                        bool import_errors_only     = false) {
+    using Access = ninfer::runtime::testing::SharedSnapshotTestAccess;
+
+    std::vector<std::uint8_t> bytes;
+    std::vector<ninfer::TokenId> expected_tokens;
+    std::uint32_t durable_frontier = 0;
+    std::string durable_digest;
+    std::size_t durable_host_kv_bytes   = 0;
+    std::size_t host_main_page_bytes    = 0;
+    std::size_t host_backend_page_bytes = 0;
+    ninfer::runtime::testing::SealedSharedSnapshotTestImport source_validated;
+    {
+        ninfer::Engine source(shared_snapshot_engine_options(artifact));
+        if (source.count_tokens(shared_snapshot_prompt()) + 3U > source.options().max_context) {
+            std::cerr << "shared snapshot fixture exceeds its bounded context\n";
+            return 1;
+        }
+        const ninfer::GenerationResult generated =
+            source.generate(source.prepare(shared_snapshot_prompt()), fixed_output(3));
+        if (generated.generated_token_ids.size() != 3) {
+            std::cerr << "shared snapshot source did not complete deterministic generation\n";
+            return 1;
+        }
+        expected_tokens                   = generated.generated_token_ids;
+        const auto same_source_accounting = [](const ninfer::RuntimeStats& left,
+                                               const ninfer::RuntimeStats& right) {
+            return left.context_cache_owners == right.context_cache_owners &&
+                   left.device_state_occupied_slots == right.device_state_occupied_slots &&
+                   left.host_state_occupied_slots == right.host_state_occupied_slots &&
+                   left.device_main_kv_occupied_pages == right.device_main_kv_occupied_pages &&
+                   left.device_backend_kv_occupied_pages ==
+                       right.device_backend_kv_occupied_pages &&
+                   left.host_kv_occupied_bytes == right.host_kv_occupied_bytes;
+        };
+        const ninfer::RuntimeStats export_baseline = source.runtime_stats();
+        const auto expect_allocation_rollback      = [&](auto stage, std::string_view label) {
+            const std::uint64_t pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            bool rejected = false;
+            {
+                SharedSnapshotExportAllocationGate gate(stage);
+                try {
+                    (void)Access::export_first_durable(source);
+                } catch (const std::bad_alloc&) { rejected = true; }
+                if (ninfer::runtime::testing::shared_snapshot_export_pinned_sources() !=
+                    pins_before) {
+                    std::cerr << "shared snapshot " << label
+                              << " allocation failure leaked a source pin\n";
+                    return false;
+                }
+            }
+            if (!rejected || !source.healthy() ||
+                !same_source_accounting(export_baseline, source.runtime_stats())) {
+                std::cerr << "shared snapshot " << label
+                          << " allocation failure changed source ownership/accounting\n";
+                return false;
+            }
+            return true;
+        };
+        if (allocation_rollback_only) {
+            // Each injection constructs the complete pinned staging image before it opens the
+            // tested registration gap. Keep that stress isolated from the ordinary round trip;
+            // the dedicated scenario exercises both allocation failures in one Program.
+            constexpr auto state_stage =
+                ninfer::runtime::testing::SharedSnapshotExportStage::StatePinnedBeforeRegistration;
+            constexpr auto kv_stage =
+                ninfer::runtime::testing::SharedSnapshotExportStage::KvPinnedBeforeRegistration;
+            if (!expect_allocation_rollback(state_stage, "State pin registration") ||
+                !expect_allocation_rollback(kv_stage, "KV pin registration")) {
+                return 1;
+            }
+            return 0;
+        }
+        std::pair<std::uint32_t, ninfer::targets::qwen3_6::RetainedSessionSnapshot> exported;
+        try {
+            exported = Access::export_first_durable(source);
+        } catch (const std::invalid_argument& error) {
+            const ninfer::RuntimeStats stats = source.runtime_stats();
+            std::cerr << "shared snapshot source had no durable owner: " << error.what()
+                      << " captures=" << stats.active_captures_completed
+                      << " aborted=" << stats.active_captures_aborted
+                      << " pressure_shared=" << stats.pressure_shared_owners_evicted << '\n';
+            return 1;
+        }
+        auto& [slot, snapshot] = exported;
+        (void)slot;
+        if (!snapshot.await_transfer) {
+            std::cerr << "shared snapshot export did not publish a bounded transfer\n";
+            return 1;
+        }
+        snapshot.await_transfer(snapshot.bytes);
+        if (snapshot.bytes.size() < kSharedSnapshotHeaderBytes ||
+            std::string_view(reinterpret_cast<const char*>(snapshot.bytes.data()), 8) !=
+                "NINFSHR1") {
+            std::cerr << "shared snapshot export produced an invalid envelope\n";
+            return 1;
+        }
+        bytes                                     = std::move(snapshot.bytes);
+        durable_frontier                          = snapshot.tokens;
+        durable_digest                            = snapshot.content_digest;
+        const ninfer::MemorySummary source_memory = source.memory_summary();
+        host_main_page_bytes                      = source_memory.host_main_kv_page_bytes;
+        host_backend_page_bytes                   = source_memory.host_backend_kv_page_bytes;
+        const auto pages_for                      = [](std::uint32_t frontier) {
+            return frontier == 0 ? 0U
+                                                      : 1U + (frontier - 1U) /
+                                            static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+        };
+        durable_host_kv_bytes = static_cast<std::size_t>(pages_for(durable_frontier)) *
+                                    source_memory.host_main_kv_page_bytes +
+                                static_cast<std::size_t>(pages_for(durable_frontier - 1U)) *
+                                    source_memory.host_backend_kv_page_bytes;
+        snapshot.release_storage();
+        source_validated = Access::parse(source, bytes);
+        if (import_errors_only) {
+            (void)ninfer::runtime::DurableSharedSnapshotAccess::settle_export(source, slot, 0,
+                                                                              false);
+            SharedSnapshotExportAllocationGate gate(
+                ninfer::runtime::testing::SharedSnapshotExportStage::BeforeReadinessQuery);
+            auto [held_slot, held] = Access::export_first_durable(source);
+            held.await_transfer(held.bytes);
+            try {
+                (void)ninfer::runtime::DurableSharedSnapshotAccess::settle_export(source, held_slot,
+                                                                                  0, false);
+            } catch (const std::bad_alloc&) {}
+            if (!gate.triggered() ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() != 0) {
+                std::cerr << "snapshot query failure retained pins while consumer held the image\n";
+                return 1;
+            }
+        }
+    }
+    if (import_errors_only) {
+        return exercise_durable_import_errors(artifact, bytes, durable_digest, durable_frontier,
+                                              expected_tokens);
+    }
+
+    if (!durable_lifecycle_only) {
+        {
+            ninfer::Engine target(shared_snapshot_engine_options(artifact));
+            std::atomic<std::uint32_t> checks{0};
+            const auto retained = std::shared_ptr<const std::vector<std::uint8_t>>(
+                &bytes, [](const std::vector<std::uint8_t>*) {});
+            bool cancelled = false;
+            try {
+                (void)ninfer::runtime::DurableSharedSnapshotAccess::import(
+                    target, {.content_digest = durable_digest, .frontier = durable_frontier},
+                    retained, ninfer::CancellationView([&] {
+                        return checks.fetch_add(1, std::memory_order_acq_rel) >= 1U;
+                    }));
+            } catch (const ninfer::RequestError& error) {
+                cancelled = error.kind() == ninfer::RequestErrorKind::Cancelled;
+            }
+            const ninfer::GenerationResult continued =
+                target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (!cancelled || !target.healthy() ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr
+                    << "shared snapshot validation cancellation poisoned subsequent generation"
+                    << " cancelled=" << cancelled << " healthy=" << target.healthy() << '\n';
+                return 1;
+            }
+        }
+
+        {
+            ninfer::EngineOptions insufficient          = shared_snapshot_engine_options(artifact);
+            insufficient.context_cache.host_state_slots = 0;
+            insufficient.context_cache.host_kv_capacity_bytes = 0;
+            ninfer::Engine engine(std::move(insufficient));
+            bool rejected = false;
+            try {
+                (void)Access::import(engine, bytes);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            if (!rejected || after.host_state_occupied_slots != 0 ||
+                after.host_kv_occupied_bytes != 0) {
+                std::cerr << "shared snapshot capacity failure changed Host accounting: state="
+                          << after.host_state_occupied_slots
+                          << " kv=" << after.host_kv_occupied_bytes << '\n';
+                return 1;
+            }
+        }
+
+        {
+            // Keep unrelated shared/private owners plus the imported Host owner resident while the
+            // importer temporarily maps KV through an idle lane. The artifact compatibility remains
+            // max_context=1024; only this rollback fixture's physical/catalog headroom is larger.
+            ninfer::EngineOptions target_options = shared_snapshot_engine_options(artifact);
+            target_options.max_concurrency       = 2;
+            target_options.max_pending_requests  = 2;
+            target_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+            target_options.context_cache.max_private_continuations = 2;
+            target_options.context_cache.max_shared_prefixes       = 4;
+            target_options.context_cache.host_state_slots          = 4;
+            ninfer::Engine target(std::move(target_options));
+            ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
+            constexpr std::string_view resident_prefix = "unrelated durable owner\n";
+            resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
+            resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
+                static_cast<std::uint32_t>(resident_prefix.size());
+            const ninfer::GenerationResult resident_generated =
+                target.generate(target.prepare(resident_prompt), fixed_output(3));
+            if (resident_generated.generated_token_ids.size() != 3) {
+                std::cerr << "shared snapshot rollback fixture did not create its shared owner\n";
+                return 1;
+            }
+
+            // Publish the conversation head in its own transition, then displace the resident
+            // prompt's exact private endpoint so the later health check must select the shared
+            // owner.
+            ninfer::PromptInput private_prompt = pressure_turn(
+                "Keep this unrelated conversation head resident.",
+                "shared-snapshot-rollback-private", ninfer::CacheRetentionHint::LiveSession);
+            const ninfer::GenerationResult private_generated =
+                target.generate(target.prepare(private_prompt), fixed_output(3));
+            if (private_generated.generated_token_ids.size() != 3 || private_generated.slot < 0 ||
+                private_generated.session_digest.empty()) {
+                std::cerr << "shared snapshot rollback fixture did not create its private owner\n";
+                return 1;
+            }
+            const ninfer::GenerationResult private_evictor = target.generate(
+                target.prepare(pressure_turn("Displace the exact resident endpoint.", "",
+                                             ninfer::CacheRetentionHint::Disposable)),
+                fixed_output(3));
+            if (private_evictor.generated_token_ids.size() != 3) {
+                std::cerr
+                    << "shared snapshot rollback fixture did not displace its exact endpoint\n";
+                return 1;
+            }
+            const auto same_physical_owners = [](const ninfer::RuntimeStats& left,
+                                                 const ninfer::RuntimeStats& right) {
+                return left.context_cache_owners == right.context_cache_owners &&
+                       left.device_state_occupied_slots == right.device_state_occupied_slots &&
+                       left.host_state_occupied_slots == right.host_state_occupied_slots &&
+                       left.device_main_kv_occupied_pages == right.device_main_kv_occupied_pages &&
+                       left.device_backend_kv_occupied_pages ==
+                           right.device_backend_kv_occupied_pages &&
+                       left.host_kv_occupied_bytes == right.host_kv_occupied_bytes;
+            };
+            const auto owner_count = [](const ninfer::RuntimeStats& stats,
+                                        ninfer::ContextCacheMetricRole role) {
+                constexpr std::size_t metrics_per_role =
+                    static_cast<std::size_t>(ninfer::ContextCacheMetricPlacement::Count) *
+                    static_cast<std::size_t>(ninfer::ContextCacheMetricPin::Count) *
+                    static_cast<std::size_t>(ninfer::ContextCacheMetricIdentity::Count);
+                const std::size_t begin = static_cast<std::size_t>(role) * metrics_per_role;
+                std::uint64_t count     = 0;
+                for (std::size_t index = begin; index < begin + metrics_per_role; ++index) {
+                    count += stats.context_cache_owners[index];
+                }
+                return count;
+            };
+            const auto owners_unpinned = [](const ninfer::RuntimeStats& stats) {
+                for (std::uint8_t role = 0;
+                     role < static_cast<std::uint8_t>(ninfer::ContextCacheMetricRole::Count);
+                     ++role) {
+                    for (std::uint8_t placement = 0;
+                         placement <
+                         static_cast<std::uint8_t>(ninfer::ContextCacheMetricPlacement::Count);
+                         ++placement) {
+                        for (std::uint8_t identity = 0;
+                             identity <
+                             static_cast<std::uint8_t>(ninfer::ContextCacheMetricIdentity::Count);
+                             ++identity) {
+                            const std::size_t index = ninfer::context_cache_owner_metric_index(
+                                static_cast<ninfer::ContextCacheMetricRole>(role),
+                                static_cast<ninfer::ContextCacheMetricPlacement>(placement),
+                                ninfer::ContextCacheMetricPin::Pinned,
+                                static_cast<ninfer::ContextCacheMetricIdentity>(identity));
+                            if (stats.context_cache_owners[index] != 0) { return false; }
+                        }
+                    }
+                }
+                return true;
+            };
+            if (!wait_until([&] { return owners_unpinned(target.runtime_stats()); })) {
+                std::cerr << "shared snapshot rollback fixture owners did not settle\n";
+                return 1;
+            }
+            ninfer::RuntimeStats rollback_baseline = target.runtime_stats();
+            const std::uint64_t shared_owners =
+                owner_count(rollback_baseline, ninfer::ContextCacheMetricRole::Harness) +
+                owner_count(rollback_baseline, ninfer::ContextCacheMetricRole::Project);
+            const std::uint64_t private_owners =
+                owner_count(rollback_baseline, ninfer::ContextCacheMetricRole::ConversationHead);
+            if (shared_owners == 0 || private_owners == 0) {
+                std::cerr
+                    << "shared snapshot rollback fixture lacks existing shared/private owners: "
+                    << shared_owners << '/' << private_owners << '\n';
+                return 1;
+            }
+
+            bool foreign_rejected = false;
+            try {
+                Access::import_validated(target, source_validated);
+            } catch (const std::invalid_argument&) { foreign_rejected = true; }
+            if (!foreign_rejected || !target.healthy() ||
+                !same_physical_owners(rollback_baseline, target.runtime_stats())) {
+                std::cerr << "shared snapshot accepted a plan sealed by another Program\n";
+                return 1;
+            }
+
+            bool allocated_rejected = false;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                try {
+                    (void)Access::import(target, bytes);
+                } catch (const std::invalid_argument&) { allocated_rejected = true; }
+            }
+            if (!allocated_rejected || !target.healthy() ||
+                !same_physical_owners(rollback_baseline, target.runtime_stats())) {
+                std::cerr
+                    << "shared snapshot post-Main-KV rejection did not roll back accounting\n";
+                return 1;
+            }
+            const ninfer::GenerationResult reused_resident =
+                target.generate(target.prepare(resident_prompt), fixed_output(3));
+            if (reused_resident.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix) {
+                std::cerr << "shared snapshot rollback damaged an existing reusable owner\n";
+                return 1;
+            }
+            if (!wait_until([&] { return owners_unpinned(target.runtime_stats()); })) {
+                std::cerr << "shared snapshot reused owners did not settle\n";
+                return 1;
+            }
+            rollback_baseline = target.runtime_stats();
+
+            std::atomic<bool> cancellation{false};
+            std::uint32_t cancelled_disposition = 0;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::BeforeCatalogPublication,
+                    SharedSnapshotImportGate::Action::Cancel, &cancellation);
+                cancelled_disposition =
+                    Access::import_with_cancellation(target, bytes, cancellation);
+            }
+            const ninfer::RuntimeStats cancelled_stats = target.runtime_stats();
+            if (cancelled_disposition != 2U || !target.healthy() ||
+                !same_physical_owners(rollback_baseline, cancelled_stats)) {
+                std::cerr
+                    << "shared snapshot pre-publication cancellation did not release its owner: "
+                    << "disposition=" << cancelled_disposition << " healthy=" << target.healthy()
+                    << " state=" << rollback_baseline.device_state_occupied_slots << '/'
+                    << rollback_baseline.host_state_occupied_slots << " -> "
+                    << cancelled_stats.device_state_occupied_slots << '/'
+                    << cancelled_stats.host_state_occupied_slots
+                    << " main=" << rollback_baseline.device_main_kv_occupied_pages << " -> "
+                    << cancelled_stats.device_main_kv_occupied_pages
+                    << " backend=" << rollback_baseline.device_backend_kv_occupied_pages << " -> "
+                    << cancelled_stats.device_backend_kv_occupied_pages
+                    << " host_kv=" << rollback_baseline.host_kv_occupied_bytes << " -> "
+                    << cancelled_stats.host_kv_occupied_bytes << '\n';
+                for (std::size_t index = 0; index < rollback_baseline.context_cache_owners.size();
+                     ++index) {
+                    if (rollback_baseline.context_cache_owners[index] !=
+                        cancelled_stats.context_cache_owners[index]) {
+                        std::cerr << "owner[" << index
+                                  << "]=" << rollback_baseline.context_cache_owners[index] << " -> "
+                                  << cancelled_stats.context_cache_owners[index] << '\n';
+                    }
+                }
+                return 1;
+            }
+            ninfer::runtime::testing::SharedSnapshotImportObservation imported;
+            try {
+                imported = Access::import(target, bytes);
+            } catch (const std::invalid_argument& error) {
+                std::uint64_t owners = 0;
+                for (const std::uint32_t count : target.runtime_stats().context_cache_owners) {
+                    owners += count;
+                }
+                std::cerr << "shared snapshot import after cancellation failed: " << error.what()
+                          << " owners=" << owners << '\n';
+                return 1;
+            }
+            if (imported.disposition != 0U || imported.frontier == 0 ||
+                imported.main_frontier != imported.frontier ||
+                imported.backend_frontier + 1U != imported.frontier ||
+                imported.state_residency != ninfer::runtime::ReplicaResidency::HostOnly) {
+                std::cerr << "shared snapshot import lost its State/KV boundary: disposition="
+                          << imported.disposition << " frontier=" << imported.frontier
+                          << " main=" << imported.main_frontier
+                          << " backend=" << imported.backend_frontier << '\n';
+                return 1;
+            }
+            const auto repeated = Access::import(target, bytes);
+            if (repeated.disposition != 1U || repeated.slot != imported.slot ||
+                repeated.frontier != imported.frontier) {
+                std::cerr << "repeated shared snapshot import did not coalesce exactly\n";
+                return 1;
+            }
+
+            const auto expect_rejected = [&](std::span<const std::uint8_t> candidate,
+                                             std::string_view label) {
+                try {
+                    (void)Access::import(target, candidate);
+                } catch (const std::invalid_argument&) { return true; }
+                std::cerr << "shared snapshot " << label << " input was accepted\n";
+                return false;
+            };
+
+            const auto version = snapshot_pod<std::uint32_t>(bytes, 8);
+            set_snapshot_pod<std::uint32_t>(bytes, 8, 1);
+            const bool old_identity_rejected = expect_rejected(bytes, "obsolete-identity-version");
+            set_snapshot_pod(bytes, 8, version);
+            if (!old_identity_rejected) { return 1; }
+
+            bytes.back() ^= 0x1U;
+            const bool corrupt_rejected = expect_rejected(bytes, "corrupt");
+            bytes.back() ^= 0x1U;
+            if (!corrupt_rejected ||
+                !expect_rejected(std::span<const std::uint8_t>(bytes).first(bytes.size() - 1U),
+                                 "truncated")) {
+                return 1;
+            }
+            bytes.push_back(0);
+            const bool trailing_rejected = expect_rejected(bytes, "trailing");
+            bytes.pop_back();
+            if (!trailing_rejected) { return 1; }
+
+            const std::uint32_t binding_size = snapshot_pod<std::uint32_t>(bytes, 60);
+            if (binding_size == 0 || 64U + binding_size > bytes.size()) {
+                std::cerr << "shared snapshot test could not locate the model binding\n";
+                return 1;
+            }
+            bytes[64] ^= 0x1U;
+            refresh_shared_snapshot_checksum(bytes);
+            const bool model_rejected = expect_rejected(bytes, "wrong-model");
+            bytes[64] ^= 0x1U;
+            refresh_shared_snapshot_checksum(bytes);
+            if (!model_rejected) { return 1; }
+
+            constexpr std::size_t snapshot_config_bytes    = 56;
+            constexpr std::size_t shared_config_tail_bytes = 20;
+            const std::size_t config_offset                = 64U + binding_size;
+            const std::size_t identity_tag_offset = config_offset + snapshot_config_bytes + 16U;
+            const std::uint32_t identity_tag =
+                snapshot_pod<std::uint32_t>(bytes, identity_tag_offset);
+            set_snapshot_pod(bytes, identity_tag_offset, identity_tag ^ 1U);
+            refresh_shared_snapshot_checksum(bytes);
+            const bool config_rejected = expect_rejected(bytes, "wrong-config");
+            set_snapshot_pod(bytes, identity_tag_offset, identity_tag);
+            refresh_shared_snapshot_checksum(bytes);
+            if (!config_rejected) { return 1; }
+
+            constexpr std::size_t boundary_bytes =
+                3U * sizeof(std::uint32_t) + sizeof(std::uint8_t) +
+                sizeof(ninfer::runtime::PrefillWork) + 2U * sizeof(std::uint32_t);
+            constexpr std::size_t provenance_bytes = sizeof(std::uint8_t) + sizeof(std::uint32_t) +
+                                                     3U * sizeof(std::uint8_t) +
+                                                     sizeof(std::uint32_t);
+            const std::size_t identity_size_offset =
+                config_offset + snapshot_config_bytes + shared_config_tail_bytes + boundary_bytes +
+                provenance_bytes + 32U + 2U * sizeof(std::uint64_t);
+            const std::uint64_t identity_size =
+                snapshot_pod<std::uint64_t>(bytes, identity_size_offset);
+            const std::size_t identity_offset = identity_size_offset + sizeof(std::uint64_t);
+            if (identity_size <= sizeof(std::uint64_t) || identity_offset > bytes.size() ||
+                identity_size > bytes.size() - identity_offset) {
+                std::cerr << "shared snapshot test could not locate the exact prefix identity\n";
+                return 1;
+            }
+            bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+            refresh_shared_snapshot_checksum(bytes);
+            const bool identity_rejected = expect_rejected(bytes, "wrong-prefix");
+            bytes[identity_offset + sizeof(std::uint64_t)] ^= 0x1U;
+            refresh_shared_snapshot_checksum(bytes);
+            if (!identity_rejected) { return 1; }
+
+            std::array<std::uint8_t, kSharedSnapshotHeaderBytes> original_header{};
+            std::memcpy(original_header.data(), bytes.data(), original_header.size());
+            const std::size_t original_size = bytes.size();
+            const std::uint64_t text_page_stride =
+                snapshot_pod<std::uint64_t>(bytes, config_offset + 36U);
+            const std::uint64_t backend_page_stride =
+                snapshot_pod<std::uint64_t>(bytes, config_offset + 48U);
+            if (text_page_stride >
+                std::numeric_limits<std::size_t>::max() - backend_page_stride - 16384U) {
+                std::cerr << "shared snapshot test page geometry is not representable\n";
+                return 1;
+            }
+            const std::size_t oversized_padding =
+                static_cast<std::size_t>(text_page_stride + backend_page_stride) + 16384U;
+            bytes.resize(original_size + oversized_padding, 0);
+            set_snapshot_pod<std::uint64_t>(bytes, 12, bytes.size());
+            set_snapshot_pod<std::uint64_t>(bytes, 20, bytes.size() - kSharedSnapshotHeaderBytes);
+            refresh_shared_snapshot_checksum(bytes);
+            bool oversized_rejected = false;
+            try {
+                (void)Access::import(target, bytes);
+            } catch (const std::invalid_argument&) { oversized_rejected = true; }
+            bytes.resize(original_size);
+            std::memcpy(bytes.data(), original_header.data(), original_header.size());
+            if (!oversized_rejected) {
+                std::cerr << "shared snapshot oversized input was accepted\n";
+                return 1;
+            }
+
+            const ninfer::GenerationResult continued =
+                target.generate(target.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (continued.generated_token_ids != expected_tokens ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != imported.frontier) {
+                std::cerr << "shared snapshot continuation diverged: path="
+                          << static_cast<int>(continued.prefix_reuse_path)
+                          << " reused=" << continued.reused_prompt_tokens
+                          << " expected=" << imported.frontier << '\n';
+                return 1;
+            }
+
+            auto round_trip = Access::export_slot(target, imported.slot);
+            round_trip.await_transfer(round_trip.bytes);
+            const bool exact_round_trip = round_trip.bytes == bytes;
+            round_trip.release_storage();
+            if (!exact_round_trip) {
+                std::cerr << "shared snapshot State/Main/MTP payload did not round-trip exactly\n";
+                return 1;
+            }
+        }
+
+        {
+            ninfer::EngineOptions failed_options = shared_snapshot_engine_options(artifact);
+            // Canonical rewrite frontiers keep the unrelated resident and fatal-path prompt owners
+            // distinct. Reserve bounded structural-capture headroom so the tested import reaches
+            // the injected State-allocation failure instead of being rejected earlier by logical
+            // capacity.
+            failed_options.context_cache.max_shared_prefixes = 6;
+            failed_options.context_cache.host_state_slots    = 6;
+            ninfer::Engine failed(std::move(failed_options));
+            ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
+            constexpr std::string_view resident_prefix = "fatal owner fixture\n";
+            resident_prompt.messages.front().parts.front().text.insert(0, resident_prefix);
+            resident_prompt.context_cache.markers.front().leading_instruction_bytes +=
+                static_cast<std::uint32_t>(resident_prefix.size());
+            const ninfer::GenerationResult resident_generated =
+                failed.generate(failed.prepare(resident_prompt), fixed_output(3));
+            const ninfer::GenerationResult private_generated = failed.generate(
+                failed.prepare(pressure_turn("Keep a fatal-path conversation head resident.",
+                                             "shared-snapshot-fatal-private",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(3));
+            if (resident_generated.generated_token_ids.size() != 3 ||
+                private_generated.generated_token_ids.size() != 3 || private_generated.slot < 0 ||
+                private_generated.session_digest.empty()) {
+                std::cerr << "shared snapshot fatal fixture did not create existing owners\n";
+                return 1;
+            }
+            std::uint64_t owners_before = 0;
+            if (!wait_until([&] {
+                    owners_before = 0;
+                    for (const std::uint32_t owners : failed.runtime_stats().context_cache_owners) {
+                        owners_before += owners;
+                    }
+                    return owners_before >= 2;
+                })) {
+                std::cerr << "shared snapshot fatal fixture owners did not settle\n";
+                return 1;
+            }
+            bool injected = false;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                    SharedSnapshotImportGate::Action::Fail);
+                try {
+                    (void)Access::import(failed, bytes);
+                } catch (const std::logic_error&) { injected = true; }
+            }
+            const ninfer::RuntimeStats cleaned = failed.runtime_stats();
+            std::uint64_t owners_after         = 0;
+            for (const std::uint32_t owners : cleaned.context_cache_owners) {
+                owners_after += owners;
+            }
+            bool unavailable = false;
+            try {
+                (void)Access::import(failed, bytes);
+            } catch (const ninfer::RequestError& error) {
+                unavailable = error.kind() == ninfer::RequestErrorKind::Unavailable;
+            }
+            if (owners_before < 2 || !injected || failed.healthy() || !unavailable ||
+                owners_after != 0 || cleaned.device_state_occupied_slots != 0 ||
+                cleaned.host_state_occupied_slots != 0 ||
+                cleaned.device_main_kv_occupied_pages != 0 ||
+                cleaned.device_backend_kv_occupied_pages != 0 ||
+                cleaned.host_kv_occupied_bytes != 0) {
+                std::cerr << "shared snapshot invariant failure did not latch and clean the Engine"
+                          << " before=" << owners_before << " after=" << owners_after
+                          << " healthy=" << failed.healthy() << '\n';
+                return 1;
+            }
+        }
+    }
+    {
+        const std::filesystem::path directory =
+            std::filesystem::temp_directory_path() / "ninfer-durable-shared-restart";
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        std::atomic<bool> inject_payload_read_failure{false};
+        std::atomic<bool> inject_load_registration_failure{false};
+        std::atomic<bool> inject_load_enqueue_failure{false};
+        std::atomic<bool> pause_payload_read{false};
+        std::atomic<bool> payload_read_paused{false};
+        std::atomic<bool> release_payload_read{false};
+        ninfer::serve::DurableSharedPrefixCatalogOptions catalog_options{
+            .directory     = directory,
+            .max_records   = 2,
+            .max_bytes     = 4ULL << 30U,
+            .workers       = 1,
+            .max_jobs      = 1,
+            .staging_bytes = 4ULL << 30U,
+        };
+        catalog_options.before_payload_read = [&] {
+            if (inject_payload_read_failure.load(std::memory_order_acquire)) {
+                throw std::runtime_error("injected durable payload read failure");
+            }
+            if (pause_payload_read.load(std::memory_order_acquire)) {
+                payload_read_paused.store(true, std::memory_order_release);
+                payload_read_paused.notify_all();
+                while (!release_payload_read.load(std::memory_order_acquire)) {
+                    release_payload_read.wait(false, std::memory_order_acquire);
+                }
+            }
+        };
+        catalog_options.before_load_registration = [&] {
+            if (inject_load_registration_failure.load(std::memory_order_acquire)) {
+                throw std::runtime_error("injected durable load registration failure");
+            }
+        };
+        catalog_options.before_load_enqueue = [&] {
+            if (inject_load_enqueue_failure.load(std::memory_order_acquire)) {
+                throw std::runtime_error("injected durable load enqueue failure");
+            }
+        };
+        std::vector<ninfer::CheckpointLifecycleFact> persistence_facts;
+        catalog_options.lifecycle_observer = [&](const auto& fact) {
+            persistence_facts.push_back(fact);
+        };
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine publisher(shared_snapshot_engine_options(artifact));
+            const ninfer::GenerationResult published =
+                publisher.generate(publisher.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (published.generated_token_ids != expected_tokens) {
+                std::cerr << "durable publisher changed the deterministic continuation\n";
+                return 1;
+            }
+            const std::uint64_t pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            catalog.schedule_exports(publisher);
+            catalog.drain();
+            catalog.schedule_exports(publisher);
+            catalog.schedule_exports(publisher);
+            catalog.drain();
+            const auto persisted = std::find_if(
+                persistence_facts.begin(), persistence_facts.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Persisted;
+                });
+            if (catalog.stats().writes_completed != 1 ||
+                catalog.stats().pending_export_claims != 0 ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() != pins_before ||
+                persisted == persistence_facts.end() ||
+                persisted->status != ninfer::CheckpointLifecycleStatus::Committed ||
+                persisted->source_tier != ninfer::CheckpointLifecycleTier::Host ||
+                persisted->destination_tier != ninfer::CheckpointLifecycleTier::Ssd ||
+                persisted->content_digest != durable_digest ||
+                persisted->frontier != durable_frontier || persisted->state_images != 1 ||
+                persisted->serialized_bytes == 0 || !persisted->elapsed_ns) {
+                std::cerr << "durable shared snapshot did not settle its exact persistence "
+                             "fact, claims, "
+                             "manifest and source pins\n";
+                return 1;
+            }
+        }
+        {
+            // Arrange a bounded four-page Program arena as V0/S0/V1/S1, where V is the
+            // SSD-backed logical victim and S is a retained separator. The one-page incoming
+            // record consumes one released hole before the injected failure. Program adoption,
+            // not this fixture, must capture and restore both original disjoint runs.
+            auto source_options                = shared_snapshot_engine_options(artifact);
+            source_options.max_context         = 512;
+            source_options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(512);
+            source_options.speculative.backend = ninfer::SpeculativeBackend::None;
+            source_options.speculative.draft_tokens          = 0;
+            source_options.speculative.proposal_head         = ninfer::ProposalHead::Full;
+            source_options.context_cache.device_state_slots  = 4;
+            source_options.context_cache.host_state_slots    = 4;
+            source_options.context_cache.max_shared_prefixes = 2;
+            const SharedRecordFixture fragmented_victim =
+                make_shared_record(artifact, source_options, 140, "fragment-victim");
+            const SharedRecordFixture fragmented_separator =
+                make_shared_record(artifact, source_options, 140, "fragment-separator");
+            const SharedRecordFixture fragmented_incoming =
+                make_shared_record(artifact, source_options, 80, "fragment-incoming");
+            const auto pages_for = [](std::uint32_t frontier) {
+                return frontier == 0
+                           ? 0U
+                           : 1U + (frontier - 1U) /
+                                      static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+            };
+            if (pages_for(fragmented_victim.frontier) != 2 ||
+                pages_for(fragmented_separator.frontier) != 2 ||
+                pages_for(fragmented_incoming.frontier) != 1) {
+                std::cerr << "fragmented Program rollback fixture has unexpected page geometry: "
+                          << fragmented_victim.frontier << '/' << fragmented_separator.frontier
+                          << '/' << fragmented_incoming.frontier << '\n';
+                return 1;
+            }
+
+            const std::filesystem::path fragmented_directory =
+                directory / "fragmented-program-rollback";
+            ninfer::serve::DurableSharedPrefixCatalogOptions fragmented_catalog_options{
+                .directory     = fragmented_directory,
+                .max_records   = 3,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            };
+            ninfer::serve::DurableSharedPrefixCatalog fragmented_catalog(
+                fragmented_catalog_options);
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_victim));
+            fragmented_catalog.drain();
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_separator));
+            fragmented_catalog.drain();
+            fragmented_catalog.enqueue(catalog_snapshot(fragmented_incoming));
+            fragmented_catalog.drain();
+
+            ninfer::EngineOptions target_options                = source_options;
+            target_options.context_cache.host_kv_capacity_bytes = 4U * host_main_page_bytes;
+            ninfer::Engine fragmented_engine(std::move(target_options));
+            const auto victim_storage =
+                std::make_shared<const std::vector<std::uint8_t>>(fragmented_victim.bytes);
+            const auto separator_storage =
+                std::make_shared<const std::vector<std::uint8_t>>(fragmented_separator.bytes);
+            const auto victim_import = ninfer::runtime::DurableSharedSnapshotAccess::import(
+                fragmented_engine,
+                {.content_digest = fragmented_victim.digest,
+                 .frontier       = fragmented_victim.frontier},
+                victim_storage);
+            const auto separator_import = ninfer::runtime::DurableSharedSnapshotAccess::import(
+                fragmented_engine,
+                {.content_digest = fragmented_separator.digest,
+                 .frontier       = fragmented_separator.frontier},
+                separator_storage);
+            Access::duplicate_shared_to_device(fragmented_engine, victim_import.slot);
+            Access::duplicate_shared_to_device(fragmented_engine, separator_import.slot);
+            Access::fragment_shared_host_kv(fragmented_engine, victim_import.slot,
+                                            separator_import.slot);
+            auto before_snapshot = Access::export_slot(fragmented_engine, victim_import.slot);
+            before_snapshot.await_transfer(before_snapshot.bytes);
+            const std::vector<std::uint8_t> original_victim_bytes = before_snapshot.bytes;
+            before_snapshot.release_storage();
+            const ninfer::RuntimeStats fragmented_before = fragmented_engine.runtime_stats();
+            const std::uint64_t source_pins_before =
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources();
+            ninfer::serve::DurableSharedPrefixRestore rejected;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                ninfer::PreparedPrompt prepared =
+                    fragmented_engine.prepare(fragmented_incoming.prompt);
+                rejected = fragmented_catalog.restore_matching(
+                    fragmented_engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+            }
+            const ninfer::RuntimeStats fragmented_after = fragmented_engine.runtime_stats();
+            auto after_snapshot = Access::export_slot(fragmented_engine, victim_import.slot);
+            after_snapshot.await_transfer(after_snapshot.bytes);
+            const bool exact_victim_bytes = after_snapshot.bytes == original_victim_bytes;
+            after_snapshot.release_storage();
+            const bool exact_fragmented_accounting =
+                fragmented_after.context_cache_owners == fragmented_before.context_cache_owners &&
+                fragmented_after.device_state_occupied_slots ==
+                    fragmented_before.device_state_occupied_slots &&
+                fragmented_after.host_state_occupied_slots ==
+                    fragmented_before.host_state_occupied_slots &&
+                fragmented_after.device_main_kv_occupied_pages ==
+                    fragmented_before.device_main_kv_occupied_pages &&
+                fragmented_after.host_kv_occupied_bytes == fragmented_before.host_kv_occupied_bytes;
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-adoption-failure" ||
+                !exact_victim_bytes || !exact_fragmented_accounting ||
+                ninfer::runtime::testing::shared_snapshot_export_pinned_sources() !=
+                    source_pins_before ||
+                std::any_of(rejected.lifecycle.begin(), rejected.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            })) {
+                std::cerr << "fragmented Program adoption did not roll back exact bytes/topology: "
+                          << rejected.fallback_reason << " bytes=" << exact_victim_bytes
+                          << " accounting=" << exact_fragmented_accounting << '\n';
+                return 1;
+            }
+        }
+        {
+            // Build two private branches which share their long-anchor prefix pages. A delayed
+            // real session export pins the older branch's sources while the newer branch owns a
+            // Both endpoint, a Device-only non-head checkpoint, and selected Both KV replicas.
+            // Durable adoption must consume only the inspected unpinned private release set.
+            auto incoming_options = shared_snapshot_engine_options(artifact);
+            incoming_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture private_incoming =
+                make_shared_record(artifact, incoming_options, 80, "private-import");
+            const auto pages_for = [](std::uint32_t frontier) {
+                return frontier == 0
+                           ? 0U
+                           : 1U + (frontier - 1U) /
+                                      static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+            };
+            if (pages_for(private_incoming.frontier) != 1 ||
+                pages_for(private_incoming.frontier - 1U) != 1) {
+                std::cerr << "private release incoming record is not one Main/MTP page\n";
+                return 1;
+            }
+            const auto private_branch = [](std::string third) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                input.messages = {
+                    message(std::string(80, 'a') + " common private prefix one"),
+                    message(std::string(160, 'b') + " common private prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const auto exercise_private_release = [&](bool state_pressure) {
+                const std::filesystem::path private_directory =
+                    directory / (state_pressure ? "private-state-release" : "private-kv-release");
+                ninfer::serve::DurableSharedPrefixCatalogOptions private_catalog_options{
+                    .directory     = private_directory,
+                    .max_records   = 1,
+                    .max_bytes     = 1ULL << 30U,
+                    .workers       = 1,
+                    .max_jobs      = 1,
+                    .staging_bytes = 1ULL << 30U,
+                };
+                ninfer::serve::DurableSharedPrefixCatalog private_catalog(private_catalog_options);
+                private_catalog.enqueue(catalog_snapshot(private_incoming));
+                private_catalog.drain();
+
+                ninfer::EngineOptions options            = incoming_options;
+                options.max_concurrency                  = 2;
+                options.max_pending_requests             = 2;
+                options.context_cache.device_state_slots = 8;
+                options.context_cache.host_state_slots   = state_pressure ? 1 : 2;
+                options.context_cache.host_kv_capacity_bytes =
+                    state_pressure ? 512ULL << 20U
+                                   : 2U * (host_main_page_bytes + host_backend_page_bytes);
+                options.context_cache.max_private_continuations         = 3;
+                options.context_cache.max_shared_prefixes               = 1;
+                options.context_cache.max_long_anchors_per_continuation = 2;
+                ninfer::Engine engine(std::move(options));
+                const ninfer::GenerationResult older = engine.generate(
+                    engine.prepare(private_branch("older private branch")), fixed_output(1));
+                const ninfer::GenerationResult mixed =
+                    engine.generate(engine.prepare(private_branch(
+                                        std::string(640, 'c') + " newer divergent private branch")),
+                                    fixed_output(1));
+                if (older.slot < 0 || mixed.slot < 0 || older.slot == mixed.slot ||
+                    mixed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor) {
+                    std::cerr << "private release fixture did not retain an aliased long-anchor "
+                                 "branch: path="
+                              << static_cast<int>(mixed.prefix_reuse_path)
+                              << " slots=" << older.slot << '/' << mixed.slot << '\n';
+                    return false;
+                }
+                Access::prepare_private_host_reclamation(engine,
+                                                         static_cast<std::uint32_t>(mixed.slot));
+                const auto before = Access::observe_private_host_reclamation(
+                    engine, static_cast<std::uint32_t>(mixed.slot));
+                const ninfer::RuntimeStats stats_before = engine.runtime_stats();
+                if (before.both_state_checkpoints == 0 ||
+                    before.device_only_state_checkpoints == 0 ||
+                    before.unchanged_checkpoint_frontier == 0 || before.main_host_pages != 2 ||
+                    before.main_aliased_host_pages != 1 || before.backend_host_pages != 2 ||
+                    before.backend_aliased_host_pages != 1 ||
+                    (!state_pressure &&
+                     stats_before.host_kv_occupied_bytes !=
+                         2U * (host_main_page_bytes + host_backend_page_bytes))) {
+                    std::cerr << "private release fixture did not establish mixed State/KV "
+                                 "residency and aliases\n";
+                    return false;
+                }
+
+                ControlledSnapshotTransferGate transfer_gate;
+                auto pending_export =
+                    Access::begin_private_export(engine, static_cast<std::uint32_t>(older.slot));
+                const bool export_pinned = wait_until([&] {
+                    if (ninfer::runtime::testing::snapshot_transfer_gate_waits() == 0 ||
+                        ninfer::runtime::testing::snapshot_transfer_pinned_sources() == 0) {
+                        return false;
+                    }
+                    const auto pinned = Access::observe_private_host_reclamation(
+                        engine, static_cast<std::uint32_t>(mixed.slot));
+                    return pinned.main_pinned_host_pages == 1 &&
+                           pinned.backend_pinned_host_pages == 1;
+                });
+
+                ninfer::serve::DurableSharedPrefixRestore restored;
+                std::exception_ptr restore_failure;
+                if (export_pinned) {
+                    try {
+                        ninfer::PreparedPrompt prepared = engine.prepare(private_incoming.prompt);
+                        restored                        = private_catalog.restore_matching(
+                            engine, prepared,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(1));
+                    } catch (...) { restore_failure = std::current_exception(); }
+                }
+                const auto after = Access::observe_private_host_reclamation(
+                    engine, static_cast<std::uint32_t>(mixed.slot));
+                const ninfer::RuntimeStats stats_after    = engine.runtime_stats();
+                const bool transfer_pending_during_commit = transfer_gate.pending();
+                transfer_gate.release();
+                bool export_completed = false;
+                try {
+                    pending_export.await_transfer(pending_export.bytes);
+                    export_completed = !pending_export.bytes.empty();
+                } catch (...) {}
+                pending_export.release_storage();
+                if (restore_failure) {
+                    try {
+                        std::rethrow_exception(restore_failure);
+                    } catch (const std::exception& error) {
+                        std::cerr << "private release adoption threw: " << error.what() << '\n';
+                    }
+                    return false;
+                }
+
+                const auto reclaimed = std::find_if(
+                    restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                               fact.scope == ninfer::CheckpointLifecycleScope::Private;
+                    });
+                const bool unchanged_has_no_event = std::none_of(
+                    restored.lifecycle.begin(), restored.lifecycle.end(), [&](const auto& fact) {
+                        return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                               fact.frontier == before.unchanged_checkpoint_frontier;
+                    });
+                const bool exact_state_only =
+                    state_pressure && reclaimed != restored.lifecycle.end() &&
+                    reclaimed->frontier == before.endpoint_frontier &&
+                    reclaimed->state_images == 1 && reclaimed->main_kv_pages == 0 &&
+                    reclaimed->backend_kv_pages == 0 &&
+                    after.both_state_checkpoints + 1U == before.both_state_checkpoints &&
+                    after.main_host_pages == before.main_host_pages &&
+                    after.backend_host_pages == before.backend_host_pages &&
+                    stats_after.host_state_occupied_slots ==
+                        stats_before.host_state_occupied_slots &&
+                    stats_after.host_kv_occupied_bytes == stats_before.host_kv_occupied_bytes +
+                                                              host_main_page_bytes +
+                                                              host_backend_page_bytes;
+                const bool exact_kv_only =
+                    !state_pressure && reclaimed != restored.lifecycle.end() &&
+                    reclaimed->frontier == before.endpoint_frontier &&
+                    reclaimed->state_images == 0 && reclaimed->main_kv_pages == 1 &&
+                    reclaimed->backend_kv_pages == 1 &&
+                    after.both_state_checkpoints == before.both_state_checkpoints &&
+                    after.main_host_pages == 1 && after.main_aliased_host_pages == 1 &&
+                    after.main_pinned_host_pages == 1 && after.backend_host_pages == 1 &&
+                    after.backend_aliased_host_pages == 1 && after.backend_pinned_host_pages == 1 &&
+                    stats_after.host_state_occupied_slots ==
+                        stats_before.host_state_occupied_slots + 1U &&
+                    stats_after.host_kv_occupied_bytes == stats_before.host_kv_occupied_bytes;
+                if (!export_pinned || !export_completed || !restored.loaded_from_ssd ||
+                    restored.fallback_reason != "ssd-successful-replacement" ||
+                    (!exact_state_only && !exact_kv_only) || !unchanged_has_no_event ||
+                    !transfer_pending_during_commit) {
+                    std::cerr << "private mixed-residency release did not preserve its pinned "
+                                 "alias or exact lifecycle: pressure="
+                              << state_pressure << " loaded=" << restored.loaded_from_ssd
+                              << " reason=" << restored.fallback_reason
+                              << " export_pinned=" << export_pinned
+                              << " export_completed=" << export_completed
+                              << " pending=" << transfer_pending_during_commit
+                              << " unchanged_event_free=" << unchanged_has_no_event
+                              << " lifecycle=" << restored.lifecycle.size();
+                    if (reclaimed != restored.lifecycle.end()) {
+                        std::cerr << " reclaimed=" << reclaimed->frontier << ':'
+                                  << reclaimed->state_images << '/' << reclaimed->main_kv_pages
+                                  << '/' << reclaimed->backend_kv_pages;
+                    }
+                    std::cerr << " checkpoints=" << before.endpoint_frontier << '/'
+                              << before.unchanged_checkpoint_frontier
+                              << " state=" << before.device_only_state_checkpoints << '/'
+                              << before.both_state_checkpoints << "->"
+                              << after.device_only_state_checkpoints << '/'
+                              << after.both_state_checkpoints << " main=" << before.main_host_pages
+                              << '/' << before.main_pinned_host_pages << "->"
+                              << after.main_host_pages << '/' << after.main_pinned_host_pages
+                              << " backend=" << before.backend_host_pages << '/'
+                              << before.backend_pinned_host_pages << "->"
+                              << after.backend_host_pages << '/' << after.backend_pinned_host_pages
+                              << " accounting=" << stats_before.host_state_occupied_slots << '/'
+                              << stats_before.host_kv_occupied_bytes << "->"
+                              << stats_after.host_state_occupied_slots << '/'
+                              << stats_after.host_kv_occupied_bytes << '\n';
+                    return false;
+                }
+                return true;
+            };
+            if (!exercise_private_release(true) || !exercise_private_release(false)) { return 1; }
+        }
+        {
+            // Reproduce the post-merge failure's literal logical/physical pressure boundary. The
+            // logical store has three genuinely free descriptors while Device State is 6/6 and
+            // physical Host State is only 5/8. SSD admission must not collapse those independent
+            // gauges into a false HostStateCapacity rejection.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            record_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture incoming_record =
+                make_shared_record(artifact, record_options, 80, "logical-incoming");
+            const std::filesystem::path logical_directory = directory / "logical-state-pressure";
+            ninfer::serve::DurableSharedPrefixCatalog logical_catalog({
+                .directory     = logical_directory,
+                .max_records   = 1,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            });
+            logical_catalog.enqueue(catalog_snapshot(incoming_record));
+            logical_catalog.drain();
+
+            ninfer::EngineOptions options                           = record_options;
+            options.max_concurrency                                 = 2;
+            options.max_pending_requests                            = 2;
+            options.context_cache.device_state_slots                = 4;
+            options.context_cache.host_state_slots                  = 8;
+            options.context_cache.host_kv_capacity_bytes            = 1ULL << 30U;
+            options.context_cache.max_private_continuations         = 6;
+            options.context_cache.max_shared_prefixes               = 3;
+            options.context_cache.max_long_anchors_per_continuation = 2;
+            ninfer::Engine engine(std::move(options));
+
+            const auto branch = [](std::string third, std::string session_key) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                // Independent heads keep the occupancy fixture stable across history
+                // supersession policy; both branches must remain current rollback points.
+                input.context_cache.session_key = std::move(session_key);
+                input.messages = {
+                    message(std::string(80, 'a') + " logical pressure prefix one"),
+                    message(std::string(160, 'b') + " logical pressure prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const ninfer::GenerationResult first = engine.generate(
+                engine.prepare(branch("logical first branch", "logical-first")), fixed_output(1));
+            const ninfer::GenerationResult second = engine.generate(
+                engine.prepare(branch(std::string(640, 'c') + " logical second branch",
+                                      "logical-second")),
+                fixed_output(1));
+            const ninfer::GenerationResult third = engine.generate(
+                engine.prepare(pressure_turn("logical pressure third head", "logical-third",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fourth = engine.generate(
+                engine.prepare(pressure_turn("logical pressure fourth head", "logical-fourth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fifth = engine.generate(
+                engine.prepare(pressure_turn("logical pressure fifth head", "logical-fifth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::RuntimeStats full = settled_runtime_stats(engine);
+            if (first.slot < 0 || second.slot < 0 || third.slot < 0 || fourth.slot < 0 ||
+                fifth.slot < 0 || full.logical_state_capacity_slots != 14 ||
+                full.logical_state_used_slots != 11 || full.logical_state_reserved_slots != 0 ||
+                full.logical_state_inflight_slots != 0 || full.device_state_occupied_slots != 6 ||
+                full.host_state_occupied_slots != 5) {
+                std::cerr << "logical State pressure fixture did not establish 11/14 descriptors "
+                             "over exact Device 6/6 and Host 5/8 physical occupancy: logical="
+                          << full.logical_state_used_slots << '+'
+                          << full.logical_state_reserved_slots << '/'
+                          << full.logical_state_capacity_slots
+                          << " inflight=" << full.logical_state_inflight_slots
+                          << " physical=" << full.device_state_occupied_slots << '/'
+                          << full.host_state_occupied_slots << " slots=" << first.slot << '/'
+                          << second.slot << '/' << third.slot << '/' << fourth.slot << '/'
+                          << fifth.slot << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.logical_state_capacity_slots == full.logical_state_capacity_slots &&
+                       observed.logical_state_used_slots == full.logical_state_used_slots &&
+                       observed.logical_state_reserved_slots == full.logical_state_reserved_slots &&
+                       observed.logical_state_inflight_slots == full.logical_state_inflight_slots &&
+                       observed.device_state_occupied_slots == full.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == full.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           full.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           full.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == full.host_kv_occupied_bytes &&
+                       observed.context_cache_owners == full.context_cache_owners;
+            };
+
+            ninfer::PreparedPrompt failed_prompt = engine.prepare(incoming_record.prompt);
+            ninfer::serve::DurableSharedPrefixRestore failed;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                failed = logical_catalog.restore_matching(
+                    engine, failed_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+            }
+            if (failed.loaded_from_ssd || failed.fallback_reason != "ssd-adoption-failure" ||
+                !same_topology(engine.runtime_stats()) ||
+                std::any_of(failed.lifecycle.begin(), failed.lifecycle.end(), [](const auto& fact) {
+                    return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                })) {
+                std::cerr << "logical State reclamation rollback changed the accumulated topology: "
+                          << failed.fallback_reason << '\n';
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = engine.prepare(incoming_record.prompt);
+            const auto restored             = logical_catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(1));
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            const auto logical_drop          = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Private &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::None &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto shared_restore = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Shared &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            if (!restored.loaded_from_ssd || restored.frontier != incoming_record.frontier ||
+                restored.fallback_reason != "ssd-successful-restore" ||
+                logical_drop != restored.lifecycle.end() ||
+                shared_restore == restored.lifecycle.end() || shared_restore->state_images != 1 ||
+                after.logical_state_capacity_slots != 14 || after.logical_state_used_slots != 12 ||
+                after.logical_state_reserved_slots != 0 ||
+                after.logical_state_inflight_slots != 0 || after.device_state_occupied_slots != 6 ||
+                after.host_state_occupied_slots != 6) {
+                std::cerr << "SSD recovery misclassified or mutated the exact 6/6 Device, 5/8 Host "
+                             "admission boundary: loaded="
+                          << restored.loaded_from_ssd << " reason=" << restored.fallback_reason
+                          << " logical=" << after.logical_state_used_slots << '+'
+                          << after.logical_state_reserved_slots << '/'
+                          << after.logical_state_capacity_slots
+                          << " physical=" << after.device_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots;
+                for (const auto& fact : restored.lifecycle) {
+                    std::cerr << " fact=" << static_cast<int>(fact.operation) << ':'
+                              << static_cast<int>(fact.scope) << ':'
+                              << static_cast<int>(fact.source_tier) << "->"
+                              << static_cast<int>(fact.destination_tier) << ':' << fact.state_images
+                              << '/' << fact.main_kv_pages << '/' << fact.backend_kv_pages;
+                }
+                std::cerr << '\n';
+                return 1;
+            }
+        }
+        {
+            // Fill the StateImage descriptor store itself, then force the only safe admission
+            // plan to detach a Host-only private checkpoint. Both injected paths fail after the
+            // detach and incoming State/Main-KV allocation, so byte-identical private snapshots
+            // and exact accounting prove the destructive Program transaction rolled back.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            record_options.context_cache.max_long_anchors_per_continuation = 2;
+            const SharedRecordFixture incoming_record =
+                make_shared_record(artifact, record_options, 80, "descriptor-incoming");
+            const std::filesystem::path descriptor_directory =
+                directory / "logical-descriptor-reclamation";
+            ninfer::serve::DurableSharedPrefixCatalog descriptor_catalog({
+                .directory     = descriptor_directory,
+                .max_records   = 1,
+                .max_bytes     = 1ULL << 30U,
+                .workers       = 1,
+                .max_jobs      = 1,
+                .staging_bytes = 1ULL << 30U,
+            });
+            descriptor_catalog.enqueue(catalog_snapshot(incoming_record));
+            descriptor_catalog.drain();
+
+            ninfer::EngineOptions options                           = record_options;
+            options.max_concurrency                                 = 2;
+            options.max_pending_requests                            = 2;
+            options.context_cache.device_state_slots                = 4;
+            options.context_cache.host_state_slots                  = 5;
+            options.context_cache.host_kv_capacity_bytes            = 1ULL << 30U;
+            options.context_cache.max_private_continuations         = 6;
+            options.context_cache.max_shared_prefixes               = 3;
+            options.context_cache.max_long_anchors_per_continuation = 2;
+            ninfer::Engine engine(std::move(options));
+
+            const auto branch = [](std::string third, std::string session_key) {
+                const auto message = [](std::string text) {
+                    return ninfer::ChatMessage{
+                        .role  = ninfer::ChatRole::User,
+                        .parts = {{.kind  = ninfer::MessagePartKind::Text,
+                                   .text  = std::move(text),
+                                   .media = {}}},
+                    };
+                };
+                ninfer::PromptInput input;
+                input.context_cache.session_key = std::move(session_key);
+                input.messages = {
+                    message(std::string(80, 'a') + " descriptor pressure prefix one"),
+                    message(std::string(160, 'b') + " descriptor pressure prefix two"),
+                    message(std::move(third)),
+                };
+                input.options.enable_thinking = false;
+                input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+                input.context_cache.automatic_private_anchors = 2;
+                return input;
+            };
+            const ninfer::GenerationResult first = engine.generate(
+                engine.prepare(branch("descriptor first branch", "descriptor-first")),
+                fixed_output(1));
+            const ninfer::GenerationResult second = engine.generate(
+                engine.prepare(branch(std::string(640, 'c') + " descriptor second branch",
+                                      "descriptor-second")),
+                fixed_output(1));
+            const ninfer::GenerationResult third = engine.generate(
+                engine.prepare(pressure_turn("descriptor third head", "descriptor-third",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fourth = engine.generate(
+                engine.prepare(pressure_turn("descriptor fourth head", "descriptor-fourth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const ninfer::GenerationResult fifth = engine.generate(
+                engine.prepare(pressure_turn("descriptor fifth head", "descriptor-fifth",
+                                             ninfer::CacheRetentionHint::LiveSession)),
+                fixed_output(1));
+            const std::array private_slots{first.slot, second.slot, third.slot, fourth.slot,
+                                           fifth.slot};
+            const ninfer::RuntimeStats full = settled_runtime_stats(engine);
+            if (std::any_of(private_slots.begin(), private_slots.end(),
+                            [](int slot) { return slot < 0; }) ||
+                full.logical_state_capacity_slots != 11 || full.logical_state_used_slots != 11 ||
+                full.logical_state_reserved_slots != 0 || full.logical_state_inflight_slots != 0 ||
+                full.device_state_occupied_slots != 6 || full.host_state_occupied_slots != 5) {
+                std::cerr << "descriptor pressure fixture did not fill exact logical/physical "
+                             "capacity: logical="
+                          << full.logical_state_used_slots << '+'
+                          << full.logical_state_reserved_slots << '/'
+                          << full.logical_state_capacity_slots
+                          << " inflight=" << full.logical_state_inflight_slots
+                          << " physical=" << full.device_state_occupied_slots << '/'
+                          << full.host_state_occupied_slots << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.logical_state_capacity_slots == full.logical_state_capacity_slots &&
+                       observed.logical_state_used_slots == full.logical_state_used_slots &&
+                       observed.logical_state_reserved_slots == full.logical_state_reserved_slots &&
+                       observed.logical_state_inflight_slots == full.logical_state_inflight_slots &&
+                       observed.device_state_occupied_slots == full.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == full.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           full.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           full.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == full.host_kv_occupied_bytes &&
+                       observed.context_cache_owners == full.context_cache_owners;
+            };
+            const auto private_bytes = [&] {
+                std::array<std::vector<std::uint8_t>, private_slots.size()> snapshots;
+                for (std::size_t index = 0; index < private_slots.size(); ++index) {
+                    auto snapshot = Access::begin_private_export(
+                        engine, static_cast<std::uint32_t>(private_slots[index]));
+                    snapshot.await_transfer(snapshot.bytes);
+                    snapshots[index] = snapshot.bytes;
+                    snapshot.release_storage();
+                }
+                return snapshots;
+            };
+            const auto original_private_bytes = private_bytes();
+            const auto original_slots         = engine.slot_states();
+            if (!same_topology(engine.runtime_stats())) {
+                std::cerr << "descriptor fixture snapshot probes changed source ownership\n";
+                return 1;
+            }
+            const auto private_rollback_exact = [&] {
+                if (private_bytes() != original_private_bytes) { return false; }
+                const auto observed = engine.slot_states();
+                if (observed.size() != original_slots.size()) { return false; }
+                for (std::size_t index = 0; index < observed.size(); ++index) {
+                    if (observed[index].processing != original_slots[index].processing ||
+                        observed[index].retained != original_slots[index].retained ||
+                        observed[index].prompt_tokens != original_slots[index].prompt_tokens ||
+                        observed[index].cached_tokens != original_slots[index].cached_tokens ||
+                        observed[index].session_digest != original_slots[index].session_digest ||
+                        observed[index].checkpoints.size() !=
+                            original_slots[index].checkpoints.size()) {
+                        return false;
+                    }
+                    for (std::size_t checkpoint = 0;
+                         checkpoint < observed[index].checkpoints.size(); ++checkpoint) {
+                        if (observed[index].checkpoints[checkpoint].frontier !=
+                                original_slots[index].checkpoints[checkpoint].frontier ||
+                            observed[index].checkpoints[checkpoint].session_digest !=
+                                original_slots[index].checkpoints[checkpoint].session_digest) {
+                            return false;
+                        }
+                    }
+                }
+                return same_topology(engine.runtime_stats());
+            };
+
+            ninfer::PreparedPrompt failed_prompt = engine.prepare(incoming_record.prompt);
+            ninfer::serve::DurableSharedPrefixRestore failed;
+            bool rejection_reached_post_detach = false;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                failed = descriptor_catalog.restore_matching(
+                    engine, failed_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(1));
+                rejection_reached_post_detach = gate.triggered();
+            }
+            if (!rejection_reached_post_detach || failed.loaded_from_ssd ||
+                failed.fallback_reason != "ssd-adoption-failure" || !private_rollback_exact() ||
+                std::any_of(failed.lifecycle.begin(), failed.lifecycle.end(), [](const auto& fact) {
+                    return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                })) {
+                std::cerr << "post-detach descriptor rejection did not restore exact private "
+                             "checkpoints/accounting\n";
+                return 1;
+            }
+
+            std::atomic<bool> cancelled{false};
+            ninfer::PreparedPrompt cancelled_prompt = engine.prepare(incoming_record.prompt);
+            bool cancelled_without_commit           = false;
+            bool cancellation_reached_post_detach   = false;
+            try {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Cancel, &cancelled);
+                (void)descriptor_catalog.restore_matching(
+                    engine, cancelled_prompt,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    ninfer::CancellationView(
+                        [&] { return cancelled.load(std::memory_order_acquire); }),
+                    fixed_output(1));
+                cancellation_reached_post_detach = gate.triggered();
+            } catch (const ninfer::RequestError& error) {
+                cancellation_reached_post_detach = cancelled.load(std::memory_order_acquire);
+                cancelled_without_commit =
+                    error.kind() == ninfer::RequestErrorKind::Cancelled &&
+                    std::none_of(error.checkpoint_lifecycle().begin(),
+                                 error.checkpoint_lifecycle().end(), [](const auto& fact) {
+                                     return fact.status ==
+                                            ninfer::CheckpointLifecycleStatus::Committed;
+                                 });
+            }
+            if (!cancellation_reached_post_detach || !cancelled_without_commit ||
+                !private_rollback_exact()) {
+                std::cerr << "post-detach descriptor cancellation did not restore exact private "
+                             "checkpoints/accounting\n";
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = engine.prepare(incoming_record.prompt);
+            const auto restored             = descriptor_catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(1));
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            const auto logical_drop          = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Evicted &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Private &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::None &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto shared_restore = std::find_if(
+                restored.lifecycle.begin(), restored.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.scope == ninfer::CheckpointLifecycleScope::Shared &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            const auto committed_slots         = engine.slot_states();
+            const auto committed_private_bytes = private_bytes();
+            const bool identities_preserved =
+                committed_slots.size() == original_slots.size() &&
+                std::equal(committed_slots.begin(), committed_slots.end(), original_slots.begin(),
+                           [](const ninfer::SlotState& left, const ninfer::SlotState& right) {
+                               return left.processing == right.processing &&
+                                      left.retained == right.retained &&
+                                      left.prompt_tokens == right.prompt_tokens &&
+                                      left.cached_tokens == right.cached_tokens &&
+                                      left.session_digest == right.session_digest;
+                           });
+            const bool displaced_identity_existed =
+                logical_drop != restored.lifecycle.end() &&
+                std::any_of(original_slots.begin(), original_slots.end(), [&](const auto& slot) {
+                    return std::any_of(slot.checkpoints.begin(), slot.checkpoints.end(),
+                                       [&](const auto& checkpoint) {
+                                           return checkpoint.frontier == logical_drop->frontier;
+                                       });
+                });
+            std::size_t changed_snapshot_count = 0;
+            std::optional<std::size_t> changed_snapshot_slot;
+            for (std::size_t index = 0; index < original_private_bytes.size(); ++index) {
+                if (committed_private_bytes[index] != original_private_bytes[index]) {
+                    ++changed_snapshot_count;
+                    changed_snapshot_slot = index;
+                }
+            }
+            std::size_t changed_checkpoint_slot_count = 0;
+            std::optional<std::size_t> changed_checkpoint_slot;
+            std::optional<ninfer::SlotCheckpoint> removed_checkpoint;
+            const auto checkpoint_equal = [](const ninfer::SlotCheckpoint& left,
+                                             const ninfer::SlotCheckpoint& right) {
+                return left.frontier == right.frontier &&
+                       left.session_digest == right.session_digest;
+            };
+            const auto checkpoint_vectors_equal = [&](const auto& left, const auto& right) {
+                return left.size() == right.size() &&
+                       std::equal(left.begin(), left.end(), right.begin(), checkpoint_equal);
+            };
+            for (std::size_t index = 0; index < original_slots.size(); ++index) {
+                const auto& before_checkpoints = original_slots[index].checkpoints;
+                const auto& after_checkpoints  = committed_slots[index].checkpoints;
+                if (checkpoint_vectors_equal(before_checkpoints, after_checkpoints)) { continue; }
+                ++changed_checkpoint_slot_count;
+                changed_checkpoint_slot = index;
+                if (before_checkpoints.size() != after_checkpoints.size() + 1U) { continue; }
+                for (std::size_t removed = 0; removed < before_checkpoints.size(); ++removed) {
+                    bool equal_without_removed = true;
+                    for (std::size_t after_index = 0; after_index < after_checkpoints.size();
+                         ++after_index) {
+                        const std::size_t before_index =
+                            after_index < removed ? after_index : after_index + 1U;
+                        if (!checkpoint_equal(after_checkpoints[after_index],
+                                              before_checkpoints[before_index])) {
+                            equal_without_removed = false;
+                            break;
+                        }
+                    }
+                    if (equal_without_removed) {
+                        removed_checkpoint = before_checkpoints[removed];
+                        break;
+                    }
+                }
+            }
+            const std::size_t matching_original_frontiers =
+                logical_drop == restored.lifecycle.end()
+                    ? 0U
+                    : static_cast<std::size_t>(std::count_if(
+                          original_slots.begin(), original_slots.end(), [&](const auto& slot) {
+                              return std::any_of(slot.checkpoints.begin(), slot.checkpoints.end(),
+                                                 [&](const auto& checkpoint) {
+                                                     return checkpoint.frontier ==
+                                                            logical_drop->frontier;
+                                                 });
+                          }));
+            const ninfer::MemorySummary memory = engine.memory_summary();
+            const std::size_t imported_host_kv_bytes =
+                static_cast<std::size_t>(incoming_record.checkpoint.main_kv_pages) *
+                    memory.host_main_kv_page_bytes +
+                static_cast<std::size_t>(incoming_record.checkpoint.backend_kv_pages) *
+                    memory.host_backend_kv_page_bytes;
+            const auto owner_count = [](const ninfer::RuntimeStats& stats) {
+                return std::accumulate(stats.context_cache_owners.begin(),
+                                       stats.context_cache_owners.end(), std::uint64_t{0});
+            };
+            std::size_t changed_owner_metrics = 0;
+            bool exact_owner_delta            = true;
+            for (std::size_t index = 0; index < full.context_cache_owners.size(); ++index) {
+                if (after.context_cache_owners[index] == full.context_cache_owners[index]) {
+                    continue;
+                }
+                ++changed_owner_metrics;
+                exact_owner_delta = exact_owner_delta && after.context_cache_owners[index] ==
+                                                             full.context_cache_owners[index] + 1U;
+            }
+            if (!restored.loaded_from_ssd || restored.frontier != incoming_record.frontier ||
+                restored.fallback_reason != "ssd-successful-replacement" ||
+                logical_drop == restored.lifecycle.end() || logical_drop->state_images != 1 ||
+                logical_drop->role == ninfer::CheckpointLifecycleRole::SessionEndpoint ||
+                logical_drop->key_digests == std::array<std::uint64_t, 2>{} ||
+                shared_restore == restored.lifecycle.end() || shared_restore->state_images != 1 ||
+                shared_restore->frontier != incoming_record.frontier ||
+                shared_restore->content_digest != incoming_record.digest ||
+                shared_restore->main_kv_pages != incoming_record.checkpoint.main_kv_pages ||
+                shared_restore->backend_kv_pages != incoming_record.checkpoint.backend_kv_pages ||
+                after.logical_state_capacity_slots != 11 || after.logical_state_used_slots != 11 ||
+                after.logical_state_reserved_slots != 0 ||
+                after.logical_state_inflight_slots != 0 || after.device_state_occupied_slots != 6 ||
+                after.host_state_occupied_slots != 5 || !identities_preserved ||
+                after.device_main_kv_occupied_pages != full.device_main_kv_occupied_pages ||
+                after.device_backend_kv_occupied_pages != full.device_backend_kv_occupied_pages ||
+                after.host_kv_occupied_bytes !=
+                    full.host_kv_occupied_bytes + imported_host_kv_bytes ||
+                changed_snapshot_count != 1 || changed_checkpoint_slot_count != 1 ||
+                !changed_snapshot_slot || !changed_checkpoint_slot ||
+                *changed_snapshot_slot != *changed_checkpoint_slot || !removed_checkpoint ||
+                removed_checkpoint->frontier != logical_drop->frontier ||
+                removed_checkpoint->session_digest.empty() || matching_original_frontiers != 1 ||
+                changed_owner_metrics != 1 || !exact_owner_delta ||
+                owner_count(after) != owner_count(full) + 1U || !displaced_identity_existed) {
+                std::cerr << "full descriptor reclamation did not atomically drop one private "
+                             "checkpoint and publish SSD owner: loaded="
+                          << restored.loaded_from_ssd << " reason=" << restored.fallback_reason
+                          << " logical=" << after.logical_state_used_slots << '+'
+                          << after.logical_state_reserved_slots << '/'
+                          << after.logical_state_capacity_slots
+                          << " physical=" << after.device_state_occupied_slots << '/'
+                          << after.host_state_occupied_slots
+                          << " kv=" << full.device_main_kv_occupied_pages << '/'
+                          << full.device_backend_kv_occupied_pages << '/'
+                          << full.host_kv_occupied_bytes << "->"
+                          << after.device_main_kv_occupied_pages << '/'
+                          << after.device_backend_kv_occupied_pages << '/'
+                          << after.host_kv_occupied_bytes << " changed=" << changed_snapshot_count
+                          << '/' << changed_checkpoint_slot_count << '/' << changed_owner_metrics
+                          << " lifecycle=" << restored.lifecycle.size() << '\n';
+                return 1;
+            }
+        }
+        {
+            // Exercise Program's sealed physical release set directly, beyond the
+            // ResourceManager fake. The first imported shared checkpoint is materialized to Both
+            // beside a Device-only continuation; the second is left Host-only. Only the precise
+            // limiting tier of the first checkpoint may be reclaimed, and the protected Host-only
+            // checkpoint must produce no lifecycle fact.
+            struct ResidentImport {
+                std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+                std::uint32_t frontier    = 0;
+                std::size_t host_kv_bytes = 0;
+            };
+
+            const auto make_resident = [&](std::size_t trim) {
+                ResidentImport fixture;
+                ninfer::PromptInput prompt = shared_snapshot_prompt();
+                prompt.messages.front().parts.front().text.erase(0, trim);
+                prompt.context_cache.markers.front().leading_instruction_bytes -=
+                    static_cast<std::uint32_t>(trim);
+                ninfer::Engine source(shared_snapshot_engine_options(artifact));
+                const ninfer::GenerationResult generated =
+                    source.generate(source.prepare(prompt), fixed_output(3));
+                if (generated.generated_token_ids.size() != 3) {
+                    throw std::runtime_error("physical release fixture generation failed");
+                }
+                auto [slot, snapshot] = Access::export_first_durable(source);
+                (void)slot;
+                snapshot.await_transfer(snapshot.bytes);
+                fixture.frontier = snapshot.tokens;
+                fixture.bytes =
+                    std::make_shared<const std::vector<std::uint8_t>>(std::move(snapshot.bytes));
+                const ninfer::MemorySummary memory = source.memory_summary();
+                const auto pages_for               = [](std::uint32_t frontier) {
+                    return frontier == 0
+                                             ? 0U
+                                             : 1U + (frontier - 1U) /
+                                          static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+                };
+                fixture.host_kv_bytes = static_cast<std::size_t>(pages_for(fixture.frontier)) *
+                                            memory.host_main_kv_page_bytes +
+                                        static_cast<std::size_t>(pages_for(fixture.frontier - 1U)) *
+                                            memory.host_backend_kv_page_bytes;
+                snapshot.release_storage();
+                return fixture;
+            };
+            const ResidentImport both_source      = make_resident(3500);
+            const ResidentImport host_only_source = make_resident(4200);
+            const auto exercise_filtered_release  = [&](bool state_pressure) {
+                ninfer::EngineOptions options = shared_snapshot_engine_options(artifact);
+                options.max_concurrency       = 4;
+                options.max_pending_requests  = 4;
+                options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+                options.context_cache.device_state_slots        = 6;
+                options.context_cache.max_private_continuations = 4;
+                options.context_cache.max_shared_prefixes       = 3;
+                options.context_cache.host_state_slots          = state_pressure ? 2 : 3;
+                options.context_cache.host_kv_capacity_bytes =
+                    state_pressure ? 1ULL << 30U
+                                    : durable_host_kv_bytes + host_only_source.host_kv_bytes;
+                ninfer::Engine engine(std::move(options));
+                const auto host_only_import = Access::import(engine, *host_only_source.bytes);
+                const auto both_import      = Access::import(engine, *both_source.bytes);
+                ninfer::GenerationResult device_only;
+                try {
+                    device_only = engine.generate(
+                        engine.prepare(pressure_turn("Keep a Device-only checkpoint beside mixed "
+                                                       "shared replicas.",
+                                                      "physical-release-device-only",
+                                                      ninfer::CacheRetentionHint::LiveSession)),
+                        fixed_output(1));
+                } catch (const std::bad_alloc&) {
+                    std::cerr << "Program physical release fixture could not create Device-only "
+                                  "checkpoint\n";
+                    return false;
+                }
+                const ninfer::RuntimeStats after_device_only = engine.runtime_stats();
+                const std::array retained_shared_slots{both_import.slot, host_only_import.slot};
+                Access::erase_shared_except(engine, retained_shared_slots);
+                const ninfer::RuntimeStats after_shared_cleanup = engine.runtime_stats();
+                try {
+                    Access::duplicate_shared_to_device(engine, both_import.slot);
+                } catch (const std::exception& error) {
+                    std::cerr << "Program physical release fixture could not duplicate shared "
+                                  "replicas to Device: "
+                              << error.what() << '\n';
+                    return false;
+                }
+                const ninfer::RuntimeStats before = engine.runtime_stats();
+                if (device_only.generated_token_ids.size() != 1 ||
+                    before.device_state_occupied_slots < 2 ||
+                    before.host_state_occupied_slots != 2 ||
+                    before.host_kv_occupied_bytes !=
+                        both_source.host_kv_bytes + host_only_source.host_kv_bytes) {
+                    std::cerr << "Program physical release fixture did not establish mixed "
+                                  "Both/Device-only/Host-only ownership: tokens="
+                              << device_only.generated_token_ids.size()
+                              << " device_state=" << before.device_state_occupied_slots
+                              << " host_state=" << before.host_state_occupied_slots
+                              << " host_kv=" << before.host_kv_occupied_bytes
+                              << " expected_host_kv="
+                              << both_source.host_kv_bytes + host_only_source.host_kv_bytes
+                              << " slot=" << device_only.slot
+                              << " stages=" << after_device_only.device_state_occupied_slots << '/'
+                              << after_shared_cleanup.device_state_occupied_slots << '/'
+                              << before.device_state_occupied_slots << '\n';
+                    return false;
+                }
+
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::PreparedPrompt prepared = engine.prepare(shared_snapshot_prompt());
+                const auto restored             = catalog.restore_matching(
+                    engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                const ninfer::RuntimeStats after = engine.runtime_stats();
+                if (!restored.loaded_from_ssd ||
+                    restored.fallback_reason != "ssd-successful-replacement" ||
+                    restored.lifecycle.size() != 2 ||
+                    restored.lifecycle.back().operation !=
+                        ninfer::CheckpointLifecycleOperation::Restored) {
+                    std::cerr << "Program filtered physical release did not commit exact SSD "
+                                  "adoption: pressure="
+                              << state_pressure << " loaded=" << restored.loaded_from_ssd
+                              << " reason=" << restored.fallback_reason
+                              << " lifecycle=" << restored.lifecycle.size();
+                    for (const auto& fact : restored.lifecycle) {
+                        std::cerr << ' ' << static_cast<int>(fact.operation) << ':'
+                                  << static_cast<int>(fact.source_tier) << "->"
+                                  << static_cast<int>(fact.destination_tier) << ':'
+                                  << fact.state_images << '/' << fact.main_kv_pages << '/'
+                                  << fact.backend_kv_pages;
+                    }
+                    std::cerr << '\n';
+                    return false;
+                }
+                const auto& reclaimed              = restored.lifecycle.front();
+                const ninfer::MemorySummary memory = engine.memory_summary();
+                const std::size_t reclaimed_kv_bytes =
+                    static_cast<std::size_t>(reclaimed.main_kv_pages) *
+                        memory.host_main_kv_page_bytes +
+                    static_cast<std::size_t>(reclaimed.backend_kv_pages) *
+                        memory.host_backend_kv_page_bytes;
+                const bool exact_state_only =
+                    state_pressure && reclaimed.state_images == 1 && reclaimed.main_kv_pages == 0 &&
+                    reclaimed.backend_kv_pages == 0 &&
+                    after.host_state_occupied_slots == before.host_state_occupied_slots &&
+                    after.host_kv_occupied_bytes ==
+                        before.host_kv_occupied_bytes + durable_host_kv_bytes;
+                const bool exact_kv_only =
+                    !state_pressure && reclaimed.state_images == 0 && reclaimed_kv_bytes != 0 &&
+                    after.host_state_occupied_slots == before.host_state_occupied_slots + 1U &&
+                    after.host_kv_occupied_bytes ==
+                        before.host_kv_occupied_bytes + durable_host_kv_bytes - reclaimed_kv_bytes;
+                if (reclaimed.operation != ninfer::CheckpointLifecycleOperation::Evicted ||
+                    reclaimed.status != ninfer::CheckpointLifecycleStatus::Committed ||
+                    reclaimed.frontier != both_source.frontier ||
+                    (!exact_state_only && !exact_kv_only) ||
+                    std::any_of(restored.lifecycle.begin(), restored.lifecycle.end(),
+                                 [&](const auto& fact) {
+                                    return fact.frontier == host_only_source.frontier &&
+                                           fact.operation !=
+                                               ninfer::CheckpointLifecycleOperation::Restored;
+                                })) {
+                    std::cerr << "Program physical release over-reclaimed a protected replica or "
+                                  "misattributed its exact tier delta: pressure="
+                              << state_pressure << " frontier=" << reclaimed.frontier << '/'
+                              << both_source.frontier << " state=" << reclaimed.state_images
+                              << " main=" << reclaimed.main_kv_pages
+                              << " backend=" << reclaimed.backend_kv_pages
+                              << " host_state=" << before.host_state_occupied_slots << "->"
+                              << after.host_state_occupied_slots
+                              << " host_kv=" << before.host_kv_occupied_bytes << "+"
+                              << durable_host_kv_bytes << "-" << reclaimed_kv_bytes << "->"
+                              << after.host_kv_occupied_bytes
+                              << " capacity=" << memory.host_kv_capacity_bytes
+                              << " tiers=" << static_cast<int>(reclaimed.source_tier) << "->"
+                              << static_cast<int>(reclaimed.destination_tier) << '\n';
+                    return false;
+                }
+                return true;
+            };
+            if (!exercise_filtered_release(true) || !exercise_filtered_release(false)) { return 1; }
+        }
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::EngineOptions insufficient          = shared_snapshot_engine_options(artifact);
+            insufficient.context_cache.host_state_slots = 0;
+            insufficient.context_cache.host_kv_capacity_bytes = 0;
+            ninfer::Engine engine(std::move(insufficient));
+            ninfer::PreparedPrompt prepared = engine.prepare(shared_snapshot_prompt());
+            const auto rejected             = catalog.restore_matching(
+                engine, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            const ninfer::GenerationResult generated =
+                engine.generate(std::move(prepared), fixed_output(3));
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-host-state-capacity" ||
+                catalog.stats().loads_completed != 0 ||
+                generated.generated_token_ids != expected_tokens) {
+                std::cerr << "infeasible SSD adoption performed I/O or blocked root fallback\n";
+                return 1;
+            }
+        }
+        {
+            // The resident victim is longer than the requested SSD checkpoint and owns only
+            // Device replicas. Host KV is sized for the smaller incoming record, so rebuilding
+            // the victim through ordinary Host adoption would exceed a capacity that preflight
+            // never promised. Inject failure after incoming KV allocation and require the exact
+            // Device-only topology to survive.
+            ninfer::serve::DurableSharedPrefixCatalogOptions rollback_options = catalog_options;
+            rollback_options.directory = directory / "device-only-rollback";
+            ninfer::serve::DurableSharedPrefixCatalog catalog(rollback_options);
+            ninfer::PromptInput incoming_prompt = shared_snapshot_prompt();
+            constexpr std::size_t incoming_trim = 4200;
+            incoming_prompt.messages.front().parts.front().text.erase(0, incoming_trim);
+            incoming_prompt.context_cache.markers.front().leading_instruction_bytes -=
+                static_cast<std::uint32_t>(incoming_trim);
+            std::uint32_t incoming_frontier    = 0;
+            std::size_t incoming_host_kv_bytes = 0;
+            {
+                ninfer::Engine incoming_source(shared_snapshot_engine_options(artifact));
+                const ninfer::GenerationResult incoming = incoming_source.generate(
+                    incoming_source.prepare(incoming_prompt), fixed_output(3));
+                if (incoming.generated_token_ids.size() != 3) {
+                    std::cerr << "Device-only rollback fixture could not generate SSD source\n";
+                    return 1;
+                }
+                auto [slot, snapshot] = Access::export_first_durable(incoming_source);
+                (void)slot;
+                snapshot.await_transfer(snapshot.bytes);
+                incoming_frontier                  = snapshot.tokens;
+                const ninfer::MemorySummary memory = incoming_source.memory_summary();
+                const auto pages_for               = [](std::uint32_t frontier) {
+                    return frontier == 0
+                                             ? 0U
+                                             : 1U + (frontier - 1U) /
+                                          static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+                };
+                incoming_host_kv_bytes =
+                    static_cast<std::size_t>(pages_for(incoming_frontier)) *
+                        memory.host_main_kv_page_bytes +
+                    static_cast<std::size_t>(pages_for(incoming_frontier - 1U)) *
+                        memory.host_backend_kv_page_bytes;
+                catalog.enqueue(std::move(snapshot));
+                catalog.drain();
+            }
+            ninfer::EngineOptions constrained = shared_snapshot_engine_options(artifact);
+            constrained.context_cache.max_shared_prefixes       = 2;
+            constrained.context_cache.device_state_slots        = 4;
+            constrained.context_cache.host_state_slots          = 1;
+            constrained.context_cache.host_kv_capacity_bytes    = incoming_host_kv_bytes;
+            constrained.context_cache.max_private_continuations = 1;
+            ninfer::Engine engine(std::move(constrained));
+            ninfer::PromptInput victim_prompt = shared_snapshot_prompt();
+            const ninfer::GenerationResult victim =
+                engine.generate(engine.prepare(victim_prompt), fixed_output(3));
+            catalog.schedule_exports(engine);
+            catalog.drain();
+            const ninfer::RuntimeStats baseline = engine.runtime_stats();
+            if (victim.generated_token_ids.size() != 3 || incoming_frontier >= durable_frontier ||
+                incoming_host_kv_bytes >= durable_host_kv_bytes ||
+                baseline.host_state_occupied_slots != 0 || baseline.host_kv_occupied_bytes != 0 ||
+                baseline.device_state_occupied_slots == 0 ||
+                catalog.stats().writes_completed != 2) {
+                std::cerr << "Device-only replacement rollback fixture did not persist its victim: "
+                          << "state=" << baseline.device_state_occupied_slots << '/'
+                          << baseline.host_state_occupied_slots
+                          << " host_kv=" << baseline.host_kv_occupied_bytes
+                          << " writes=" << catalog.stats().writes_completed << '\n';
+                return 1;
+            }
+            const auto same_topology = [&](const ninfer::RuntimeStats& observed) {
+                return observed.context_cache_owners == baseline.context_cache_owners &&
+                       observed.device_state_occupied_slots ==
+                           baseline.device_state_occupied_slots &&
+                       observed.host_state_occupied_slots == baseline.host_state_occupied_slots &&
+                       observed.device_main_kv_occupied_pages ==
+                           baseline.device_main_kv_occupied_pages &&
+                       observed.device_backend_kv_occupied_pages ==
+                           baseline.device_backend_kv_occupied_pages &&
+                       observed.host_kv_occupied_bytes == baseline.host_kv_occupied_bytes;
+            };
+            ninfer::serve::DurableSharedPrefixRestore rejected;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                    SharedSnapshotImportGate::Action::Reject);
+                ninfer::PreparedPrompt prepared = engine.prepare(incoming_prompt);
+                rejected                        = catalog.restore_matching(
+                    engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+            }
+            if (rejected.loaded_from_ssd || rejected.fallback_reason != "ssd-adoption-failure" ||
+                !engine.healthy() || !same_topology(engine.runtime_stats()) ||
+                std::any_of(rejected.lifecycle.begin(), rejected.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            })) {
+                std::cerr << "Device-only constrained replacement did not roll back exactly: "
+                          << rejected.fallback_reason << '\n';
+                return 1;
+            }
+            auto [restored_slot, restored_snapshot] = Access::export_first_durable(engine);
+            (void)restored_slot;
+            restored_snapshot.await_transfer(restored_snapshot.bytes);
+            const bool exact_rollback = restored_snapshot.content_digest == durable_digest &&
+                                        restored_snapshot.tokens == durable_frontier &&
+                                        restored_snapshot.bytes == bytes;
+            restored_snapshot.release_storage();
+            if (!exact_rollback) {
+                std::cerr << "Device-only replacement rollback lost its exact victim image\n";
+                return 1;
+            }
+        }
+        {
+            // Deliberately fill both the one-cell shared catalog and one-slot Host State pool
+            // with a distinct, fully persisted owner. The deeper exact SSD record must reclaim
+            // that safe owner only after validation and publish the replacement in the same
+            // Engine-locked commit.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            std::vector<std::uint8_t> resident_bytes;
+            std::string resident_digest;
+            std::uint32_t resident_frontier = 0;
+            {
+                ninfer::Engine resident_source(shared_snapshot_engine_options(artifact));
+                ninfer::PromptInput resident_prompt        = shared_snapshot_prompt();
+                constexpr std::size_t removed_stable_bytes = 7;
+                resident_prompt.messages.front().parts.front().text.erase(0, removed_stable_bytes);
+                resident_prompt.context_cache.markers.front().leading_instruction_bytes -=
+                    static_cast<std::uint32_t>(removed_stable_bytes);
+                const ninfer::GenerationResult resident = resident_source.generate(
+                    resident_source.prepare(resident_prompt), fixed_output(3));
+                if (resident.generated_token_ids.size() != 3) {
+                    std::cerr << "durable replacement fixture could not generate resident\n";
+                    return 1;
+                }
+                auto [slot, snapshot] = Access::export_first_durable(resident_source);
+                (void)slot;
+                snapshot.await_transfer(snapshot.bytes);
+                resident_bytes    = snapshot.bytes;
+                resident_digest   = snapshot.content_digest;
+                resident_frontier = snapshot.tokens;
+                catalog.enqueue(std::move(snapshot));
+                catalog.drain();
+            }
+            const auto resident_storage =
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(resident_bytes));
+            const auto exercise_pressure_dimension = [&](std::uint32_t host_state_slots,
+                                                         std::size_t host_kv_bytes,
+                                                         bool require_full_host_kv) {
+                ninfer::EngineOptions pressured = shared_snapshot_engine_options(artifact);
+                pressured.context_cache.max_shared_prefixes    = 1;
+                pressured.context_cache.host_state_slots       = host_state_slots;
+                pressured.context_cache.host_kv_capacity_bytes = host_kv_bytes;
+                ninfer::Engine engine(std::move(pressured));
+                const auto resident_import = ninfer::runtime::DurableSharedSnapshotAccess::import(
+                    engine, {.content_digest = resident_digest, .frontier = resident_frontier},
+                    resident_storage);
+                const ninfer::RuntimeStats full = settled_runtime_stats(engine);
+                if (resident_import.frontier == 0 || resident_frontier >= durable_frontier ||
+                    full.host_state_occupied_slots != 1 ||
+                    (host_state_slots == 1 && full.host_state_occupied_slots != host_state_slots) ||
+                    (require_full_host_kv && full.host_kv_occupied_bytes != host_kv_bytes) ||
+                    catalog.stats().writes_completed == 0) {
+                    std::cerr << "durable replacement fixture did not fill its bounded dimension: "
+                              << full.host_state_occupied_slots << '/' << host_state_slots
+                              << " host_kv=" << full.host_kv_occupied_bytes << '/' << host_kv_bytes
+                              << " frontiers=" << resident_frontier << '/' << durable_frontier
+                              << " writes=" << catalog.stats().writes_completed << '\n';
+                    return false;
+                }
+                const auto same_resident_topology = [&](const ninfer::RuntimeStats& observed) {
+                    return observed.device_state_occupied_slots ==
+                               full.device_state_occupied_slots &&
+                           observed.host_state_occupied_slots == full.host_state_occupied_slots &&
+                           observed.device_main_kv_occupied_pages ==
+                               full.device_main_kv_occupied_pages &&
+                           observed.device_backend_kv_occupied_pages ==
+                               full.device_backend_kv_occupied_pages &&
+                           observed.host_kv_occupied_bytes == full.host_kv_occupied_bytes &&
+                           observed.context_cache_owners == full.context_cache_owners;
+                };
+                if (host_state_slots == 1) {
+                    inject_load_registration_failure.store(true, std::memory_order_release);
+                    bool registration_failed = false;
+                    try {
+                        ninfer::PreparedPrompt registration_prompt =
+                            engine.prepare(shared_snapshot_prompt());
+                        (void)catalog.restore_matching(
+                            engine, registration_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(3));
+                    } catch (const std::runtime_error&) { registration_failed = true; }
+                    inject_load_registration_failure.store(false, std::memory_order_release);
+                    if (!registration_failed || !same_resident_topology(engine.runtime_stats())) {
+                        std::cerr << "load-registration failure leaked replacement reservation\n";
+                        return false;
+                    }
+
+                    inject_load_enqueue_failure.store(true, std::memory_order_release);
+                    bool enqueue_failed = false;
+                    try {
+                        ninfer::PreparedPrompt enqueue_prompt =
+                            engine.prepare(shared_snapshot_prompt());
+                        (void)catalog.restore_matching(
+                            engine, enqueue_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(3));
+                    } catch (const std::runtime_error&) { enqueue_failed = true; }
+                    inject_load_enqueue_failure.store(false, std::memory_order_release);
+                    if (!enqueue_failed || !same_resident_topology(engine.runtime_stats())) {
+                        std::cerr << "load-enqueue failure leaked replacement reservation\n";
+                        return false;
+                    }
+
+                    inject_payload_read_failure.store(true, std::memory_order_release);
+                    ninfer::PreparedPrompt read_failed_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    const auto read_failed = catalog.restore_matching(
+                        engine, read_failed_prompt,
+                        ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                            std::chrono::seconds(30),
+                        {}, fixed_output(3));
+                    inject_payload_read_failure.store(false, std::memory_order_release);
+                    if (read_failed.loaded_from_ssd ||
+                        read_failed.fallback_reason != "ssd-io-failure" ||
+                        !same_resident_topology(engine.runtime_stats()) ||
+                        std::any_of(read_failed.lifecycle.begin(), read_failed.lifecycle.end(),
+                                    [](const auto& fact) {
+                                        return fact.status ==
+                                               ninfer::CheckpointLifecycleStatus::Committed;
+                                    })) {
+                        std::cerr << "read-failed replacement mutated or committed its resident\n";
+                        return false;
+                    }
+
+                    ninfer::PreparedPrompt expired_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    const auto expired = catalog.restore_matching(
+                        engine, expired_prompt,
+                        ninfer::serve::DurableSharedPrefixCatalog::Clock::now(), {},
+                        fixed_output(3));
+                    if (expired.loaded_from_ssd || expired.fallback_reason != "ssd-deadline" ||
+                        !same_resident_topology(engine.runtime_stats()) ||
+                        std::any_of(expired.lifecycle.begin(), expired.lifecycle.end(),
+                                    [](const auto& fact) {
+                                        return fact.status ==
+                                               ninfer::CheckpointLifecycleStatus::Committed;
+                                    })) {
+                        std::cerr << "expired replacement mutated or committed its resident\n";
+                        return false;
+                    }
+
+                    ninfer::PreparedPrompt expires_after_load_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    ninfer::serve::DurableSharedPrefixRestore expires_after_load;
+                    {
+                        SharedSnapshotImportGate gate(
+                            ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                            SharedSnapshotImportGate::Action::Delay);
+                        expires_after_load = catalog.restore_matching(
+                            engine, expires_after_load_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::milliseconds(5),
+                            {}, fixed_output(3));
+                    }
+                    if (expires_after_load.loaded_from_ssd ||
+                        expires_after_load.fallback_reason != "ssd-deadline" ||
+                        !same_resident_topology(engine.runtime_stats()) ||
+                        std::any_of(expires_after_load.lifecycle.begin(),
+                                    expires_after_load.lifecycle.end(), [](const auto& fact) {
+                                        return fact.status ==
+                                               ninfer::CheckpointLifecycleStatus::Committed;
+                                    })) {
+                        std::cerr << "post-load deadline committed or lost replacement victim\n";
+                        return false;
+                    }
+
+                    ninfer::PreparedPrompt rejected_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    ninfer::serve::DurableSharedPrefixRestore rejected;
+                    {
+                        SharedSnapshotImportGate gate(
+                            ninfer::runtime::testing::SharedSnapshotImportStage::MainKvAllocated,
+                            SharedSnapshotImportGate::Action::Reject);
+                        rejected = catalog.restore_matching(
+                            engine, rejected_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            {}, fixed_output(3));
+                    }
+                    if (rejected.loaded_from_ssd ||
+                        rejected.fallback_reason != "ssd-adoption-failure" ||
+                        !same_resident_topology(engine.runtime_stats()) ||
+                        std::any_of(rejected.lifecycle.begin(), rejected.lifecycle.end(),
+                                    [](const auto& fact) {
+                                        return fact.status ==
+                                               ninfer::CheckpointLifecycleStatus::Committed;
+                                    })) {
+                        std::cerr << "rejected replacement mutated or committed its resident\n";
+                        return false;
+                    }
+
+                    std::atomic<bool> cancelled{false};
+                    ninfer::PreparedPrompt cancelled_prompt =
+                        engine.prepare(shared_snapshot_prompt());
+                    bool cancelled_without_commit = false;
+                    try {
+                        SharedSnapshotImportGate gate(
+                            ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                            SharedSnapshotImportGate::Action::Cancel, &cancelled);
+                        (void)catalog.restore_matching(
+                            engine, cancelled_prompt,
+                            ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                std::chrono::seconds(30),
+                            ninfer::CancellationView(
+                                [&] { return cancelled.load(std::memory_order_acquire); }),
+                            fixed_output(3));
+                    } catch (const ninfer::RequestError& error) {
+                        cancelled_without_commit =
+                            error.kind() == ninfer::RequestErrorKind::Cancelled &&
+                            std::none_of(error.checkpoint_lifecycle().begin(),
+                                         error.checkpoint_lifecycle().end(), [](const auto& fact) {
+                                             return fact.status ==
+                                                    ninfer::CheckpointLifecycleStatus::Committed;
+                                         });
+                    }
+                    if (!cancelled_without_commit ||
+                        !same_resident_topology(engine.runtime_stats())) {
+                        std::cerr << "cancelled replacement mutated or committed its resident\n";
+                        return false;
+                    }
+                }
+                ninfer::PreparedPrompt prepared = engine.prepare(shared_snapshot_prompt());
+                const auto restored             = catalog.restore_matching(
+                    engine, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                const ninfer::GenerationResult continued =
+                    engine.generate(std::move(prepared), fixed_output(3));
+                const bool committed_eviction =
+                    restored.lifecycle.size() == 2 &&
+                    restored.lifecycle[0].operation ==
+                        ninfer::CheckpointLifecycleOperation::Evicted &&
+                    restored.lifecycle[0].status == ninfer::CheckpointLifecycleStatus::Committed &&
+                    restored.lifecycle[1].operation ==
+                        ninfer::CheckpointLifecycleOperation::Restored &&
+                    restored.lifecycle[1].status == ninfer::CheckpointLifecycleStatus::Committed;
+                const ninfer::RuntimeStats after = engine.runtime_stats();
+                if (!restored.loaded_from_ssd ||
+                    restored.fallback_reason != "ssd-successful-replacement" ||
+                    restored.frontier != durable_frontier || !committed_eviction ||
+                    continued.generated_token_ids != expected_tokens ||
+                    continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                    continued.reused_prompt_tokens != durable_frontier ||
+                    after.host_state_occupied_slots != 1 ||
+                    after.host_kv_occupied_bytes != durable_host_kv_bytes) {
+                    std::cerr << "bounded durable replacement did not restore exact continuation: "
+                              << restored.fallback_reason
+                              << " lifecycle=" << restored.lifecycle.size()
+                              << " reused=" << continued.reused_prompt_tokens
+                              << " host=" << after.host_state_occupied_slots << '/'
+                              << after.host_kv_occupied_bytes << '\n';
+                    return false;
+                }
+                return true;
+            };
+            if (!exercise_pressure_dimension(1, 512ULL << 20, false) ||
+                !exercise_pressure_dimension(2, durable_host_kv_bytes, true)) {
+                return 1;
+            }
+        }
+        {
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto restored             = catalog.restore_matching(
+                restarted, prepared,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            const ninfer::GenerationResult continued =
+                restarted.generate(std::move(prepared), fixed_output(3));
+            ninfer::PreparedPrompt warm_prompt = restarted.prepare(shared_snapshot_prompt());
+            const std::uint64_t loads_before   = catalog.stats().loads_completed;
+            const auto warm                    = catalog.restore_matching(
+                restarted, warm_prompt,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            const auto host_restore = std::find_if(
+                continued.checkpoint_lifecycle.begin(), continued.checkpoint_lifecycle.end(),
+                [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Host &&
+                           fact.destination_tier == ninfer::CheckpointLifecycleTier::Device;
+                });
+            if (!restored.loaded_from_ssd || restored.frontier != durable_frontier ||
+                restored.lifecycle.size() != 1 ||
+                restored.lifecycle.front().operation !=
+                    ninfer::CheckpointLifecycleOperation::Restored ||
+                restored.lifecycle.front().status != ninfer::CheckpointLifecycleStatus::Committed ||
+                restored.lifecycle.front().source_tier != ninfer::CheckpointLifecycleTier::Ssd ||
+                restored.lifecycle.front().destination_tier !=
+                    ninfer::CheckpointLifecycleTier::Host ||
+                restored.lifecycle.front().content_digest != durable_digest ||
+                restored.lifecycle.front().frontier != durable_frontier ||
+                restored.lifecycle.front().state_images != 1 ||
+                restored.lifecycle.front().serialized_bytes == 0 ||
+                !restored.lifecycle.front().elapsed_ns ||
+                continued.generated_token_ids != expected_tokens ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier ||
+                host_restore == continued.checkpoint_lifecycle.end() ||
+                host_restore->status != ninfer::CheckpointLifecycleStatus::Committed ||
+                host_restore->key_digests != restored.lifecycle.front().key_digests ||
+                host_restore->frontier != restored.lifecycle.front().frontier ||
+                host_restore->state_images != restored.lifecycle.front().state_images ||
+                host_restore->main_kv_pages != restored.lifecycle.front().main_kv_pages ||
+                host_restore->backend_kv_pages != restored.lifecycle.front().backend_kv_pages ||
+                !warm.warm_available || warm.loaded_from_ssd || warm.frontier < durable_frontier ||
+                catalog.stats().loads_completed != loads_before) {
+                std::cerr << "restart lazy durable reuse did not restore the exact shared boundary"
+                          << " loaded=" << restored.loaded_from_ssd
+                          << " restored=" << restored.frontier
+                          << " reused=" << continued.reused_prompt_tokens
+                          << " warm=" << warm.warm_available << '\n';
+                return 1;
+            }
+        }
+        {
+            // Candidate discovery is intentionally non-mutating. Remove the warm owner after the
+            // Gateway has captured SSD identity but before submission; FIFO admission must inspect
+            // the changed topology, reserve SSD, request the read, and reuse the restored owner.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt initial = restarted.prepare(shared_snapshot_prompt());
+            const auto initial_restore     = catalog.restore_matching(
+                restarted, initial,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            if (!initial_restore.loaded_from_ssd) {
+                std::cerr << "stale warm-to-SSD fixture could not establish its warm owner\n";
+                return 1;
+            }
+
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged = catalog.stage_matching(restarted, prepared, deadline);
+            if (!staged.deferred_recovery) {
+                std::cerr << "stale warm-to-SSD fixture did not carry immutable SSD identity\n";
+                return 1;
+            }
+            Access::erase_shared_except(restarted, std::span<const std::uint32_t>{});
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+            catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (!settled.loaded_from_ssd || settled.fallback_reason != "ssd-successful-restore" ||
+                settled.frontier != durable_frontier ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr << "stale warm topology did not fall back to SSD at FIFO admission: "
+                          << settled.fallback_reason << " reused=" << continued.reused_prompt_tokens
+                          << '\n';
+                return 1;
+            }
+        }
+        {
+            // A later request may discover a warm owner while an earlier request is queued, but
+            // that discovery must not pin admission-visible topology. The earlier FIFO request
+            // needs the warm owner as its safe SSD-backed replacement victim and must retain the
+            // first right to reserve it once the active lane becomes available.
+            auto record_options = shared_snapshot_engine_options(artifact);
+            const SharedRecordFixture queued_ssd =
+                make_shared_record(artifact, record_options, 800, "fifo-earlier-ssd");
+            auto fifo_options      = catalog_options;
+            fifo_options.directory = directory / "fifo-admission";
+            ninfer::serve::DurableSharedPrefixCatalog catalog(fifo_options);
+            const auto enqueue_record = [&](const SharedRecordFixture& record) {
+                ninfer::serve::DurableSharedPrefixCatalog::Snapshot snapshot;
+                snapshot.bytes          = record.bytes;
+                snapshot.transfer_bytes = snapshot.bytes.size();
+                snapshot.tokens         = record.frontier;
+                snapshot.session_digest = "fifo-admission";
+                snapshot.content_digest = record.digest;
+                snapshot.checkpoint     = record.checkpoint;
+                catalog.enqueue(std::move(snapshot));
+                catalog.drain();
+            };
+            SharedRecordFixture resident_record{
+                .prompt     = shared_snapshot_prompt(),
+                .bytes      = bytes,
+                .frontier   = durable_frontier,
+                .digest     = durable_digest,
+                .checkpoint = {},
+            };
+            resident_record.checkpoint.content_digest = durable_digest;
+            resident_record.checkpoint.frontier       = durable_frontier;
+            resident_record.checkpoint.role  = ninfer::CheckpointLifecycleRole::SharedStablePrefix;
+            resident_record.checkpoint.scope = ninfer::CheckpointLifecycleScope::Shared;
+            enqueue_record(resident_record);
+            enqueue_record(queued_ssd);
+
+            auto engine_options                 = shared_snapshot_engine_options(artifact);
+            engine_options.max_pending_requests = 3;
+            engine_options.context_cache.max_shared_prefixes = 1;
+            engine_options.context_cache.device_state_slots  = 2;
+            engine_options.context_cache.host_state_slots    = 2;
+            ninfer::Engine restarted(std::move(engine_options));
+            ninfer::PreparedPrompt resident = restarted.prepare(shared_snapshot_prompt());
+            const auto setup_deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            const auto setup_restore =
+                catalog.restore_matching(restarted, resident, setup_deadline, {}, fixed_output(3));
+            const auto setup_generation = restarted.generate(std::move(resident), fixed_output(3));
+            if (!setup_restore.loaded_from_ssd ||
+                setup_generation.reused_prompt_tokens != durable_frontier) {
+                std::cerr << "FIFO reservation fixture could not establish its resident victim\n";
+                return 1;
+            }
+
+            auto blocker = restarted.submit(
+                restarted.prepare_tokens({248045, 846, 198, 9011, 248046, 198}, false),
+                fixed_output(64, false));
+            if (!wait_until([&] { return restarted.runtime_stats().running_requests == 1; })) {
+                std::cerr << "FIFO reservation fixture did not occupy its active lane\n";
+                return 1;
+            }
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::minutes(2);
+            ninfer::PreparedPrompt earlier_prompt = restarted.prepare(queued_ssd.prompt);
+            auto earlier_staged = catalog.stage_matching(restarted, earlier_prompt, deadline);
+            auto earlier        = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(earlier_prompt), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, earlier_staged.deferred_recovery);
+            auto earlier_loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, earlier_staged.deferred_recovery, deadline);
+            });
+
+            ninfer::PreparedPrompt later_prompt = restarted.prepare(shared_snapshot_prompt());
+            auto later_staged = catalog.stage_matching(restarted, later_prompt, deadline);
+            auto later        = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(later_prompt), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, later_staged.deferred_recovery);
+            auto later_loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, later_staged.deferred_recovery, deadline);
+            });
+
+            (void)blocker.wait(nullptr, {});
+            const auto earlier_result = earlier.wait(nullptr, {});
+            earlier_loader.get();
+            const auto earlier_restore = catalog.settle_staged(earlier_staged.deferred_recovery);
+            const auto later_result    = later.wait(nullptr, {});
+            later_loader.get();
+            const auto later_restore = catalog.settle_staged(later_staged.deferred_recovery);
+            if (!earlier_restore.loaded_from_ssd ||
+                earlier_restore.fallback_reason != "ssd-successful-replacement" ||
+                earlier_restore.frontier != queued_ssd.frontier ||
+                earlier_result.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                earlier_result.reused_prompt_tokens != queued_ssd.frontier ||
+                later_result.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                later_result.reused_prompt_tokens != durable_frontier ||
+                later_restore.fallback_reason != "ssd-successful-replacement") {
+                std::cerr << "later pre-admission discovery stole the earlier FIFO victim/source: "
+                          << earlier_restore.fallback_reason << '/' << later_restore.fallback_reason
+                          << " earlier_reused=" << earlier_result.reused_prompt_tokens << '\n';
+                return 1;
+            }
+        }
+        {
+            // Make the topology genuinely stale after FIFO admission reserved SSD capacity and
+            // before adoption. A concurrent exact warm publication changes Program feasibility;
+            // the sealed SSD victim/source plan must not coalesce around revision validation.
+            // Full reinspection must select the now-warm owner without committing an SSD restore.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+
+            pause_payload_read.store(true, std::memory_order_release);
+            auto loader = std::async(std::launch::async, [&] {
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            });
+            payload_read_paused.wait(false, std::memory_order_acquire);
+            std::optional<ninfer::runtime::testing::SharedSnapshotImportObservation> warm_import;
+            try {
+                warm_import = Access::import(restarted, bytes);
+            } catch (...) {
+                release_payload_read.store(true, std::memory_order_release);
+                release_payload_read.notify_all();
+                loader.wait();
+                throw;
+            }
+            release_payload_read.store(true, std::memory_order_release);
+            release_payload_read.notify_all();
+            loader.get();
+            pause_payload_read.store(false, std::memory_order_release);
+
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled       = catalog.settle_staged(staged.deferred_recovery);
+            const bool committed_ssd = std::any_of(
+                settled.lifecycle.begin(), settled.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                });
+            if (!warm_import || warm_import->frontier != durable_frontier ||
+                settled.loaded_from_ssd || !settled.warm_available ||
+                settled.fallback_reason != "ssd-stale-replanned-warm-selected" || committed_ssd ||
+                continued.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+                continued.reused_prompt_tokens != durable_frontier ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr << "post-reservation stale SSD plan committed or missed warm replan: "
+                          << settled.fallback_reason << " loaded=" << settled.loaded_from_ssd
+                          << " reused=" << continued.reused_prompt_tokens << '\n';
+                return 1;
+            }
+        }
+        {
+            // Cancel after FIFO admission has reserved SSD replacement but before Gateway starts
+            // the read. Handle abandonment must release the reservation, wake the worker, and let
+            // the next request enter without a topology mutation from the cancelled import.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt initial = restarted.prepare(shared_snapshot_prompt());
+            const auto initial_restore     = catalog.restore_matching(
+                restarted, initial,
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30),
+                {}, fixed_output(3));
+            if (!initial_restore.loaded_from_ssd) {
+                std::cerr << "deferred cancellation fixture could not establish its warm owner\n";
+                return 1;
+            }
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged = catalog.stage_matching(restarted, prepared, deadline);
+            Access::erase_shared_except(restarted, std::span<const std::uint32_t>{});
+            {
+                auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                    restarted, std::move(prepared), fixed_output(3),
+                    ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+                std::unique_lock lock(staged.deferred_recovery->mutex);
+                if (!staged.deferred_recovery->cv.wait_for(
+                        lock, std::chrono::seconds(5),
+                        [&] {
+                            return staged.deferred_recovery->load_requested ||
+                                   staged.deferred_recovery->completed;
+                        }) ||
+                    !staged.deferred_recovery->load_requested) {
+                    std::cerr << "deferred cancellation fixture never reserved its SSD plan\n";
+                    return 1;
+                }
+            }
+            {
+                std::unique_lock lock(staged.deferred_recovery->mutex);
+                if (!staged.deferred_recovery->cv.wait_for(lock, std::chrono::seconds(5), [&] {
+                        return staged.deferred_recovery->completed;
+                    })) {
+                    std::cerr << "cancelled deferred recovery did not wake and settle\n";
+                    return 1;
+                }
+            }
+            const auto cancelled = catalog.settle_staged(staged.deferred_recovery);
+            const auto next =
+                restarted.generate(restarted.prepare(shared_snapshot_prompt()), fixed_output(3));
+            if (cancelled.fallback_reason != "ssd-cancelled" ||
+                std::any_of(cancelled.lifecycle.begin(), cancelled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                next.generated_token_ids != expected_tokens) {
+                std::cerr << "cancelled deferred recovery retained state or blocked admission\n";
+                return 1;
+            }
+        }
+        {
+            // Allocation/size failures are recoverable import outcomes. They must roll back the
+            // deferred reservation and let this request root-prefill without poisoning Engine
+            // health or unrelated work.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::StateAllocated,
+                    SharedSnapshotImportGate::Action::AllocationFailure);
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            }
+            const ninfer::GenerationResult continued = generation.wait(nullptr, {});
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (!restarted.healthy() || settled.loaded_from_ssd ||
+                settled.fallback_reason != "ssd-adoption-failure" ||
+                std::any_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                continued.reused_prompt_tokens != 0 ||
+                continued.generated_token_ids != expected_tokens) {
+                std::cerr
+                    << "recoverable deferred allocation failure poisoned Engine or committed: "
+                    << settled.fallback_reason << " healthy=" << restarted.healthy() << '\n';
+                return 1;
+            }
+        }
+        {
+            // Cancellation arriving after a successful SSD read but at Program's final
+            // publication checkpoint must be visible to Engine immediately. Gateway has not yet
+            // returned from load_staged, so waiting for GenerationHandle::wait to copy the flag
+            // would permit a committed replacement after client cancellation.
+            ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            std::atomic<bool> cancelled{false};
+            const ninfer::CancellationView cancellation(
+                [&] { return cancelled.load(std::memory_order_acquire); });
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged     = catalog.stage_matching(restarted, prepared, deadline, cancellation);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+            ninfer::GenerationResult result;
+            {
+                SharedSnapshotImportGate gate(
+                    ninfer::runtime::testing::SharedSnapshotImportStage::BeforeCatalogPublication,
+                    SharedSnapshotImportGate::Action::Cancel, &cancelled);
+                catalog.load_staged(restarted, staged.deferred_recovery, deadline, cancellation);
+                result = generation.wait(nullptr, {});
+            }
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            if (result.finish_reason != ninfer::FinishReason::Cancelled ||
+                settled.loaded_from_ssd || settled.fallback_reason != "ssd-cancelled" ||
+                std::none_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                             [](const auto& fact) {
+                                 return fact.operation ==
+                                            ninfer::CheckpointLifecycleOperation::Restored &&
+                                        fact.status == ninfer::CheckpointLifecycleStatus::Aborted;
+                             }) ||
+                std::any_of(settled.lifecycle.begin(), settled.lifecycle.end(),
+                            [](const auto& fact) {
+                                return fact.status == ninfer::CheckpointLifecycleStatus::Committed;
+                            }) ||
+                !restarted.healthy() ||
+                restarted.runtime_stats().logical_state_reserved_slots != 0) {
+                std::cerr << "post-read cancellation committed deferred SSD adoption: "
+                          << settled.fallback_reason << '\n';
+                return 1;
+            }
+        }
+        {
+            // A FIFO-head deadline after submission is distinct from cancellation and from an
+            // I/O failure. The pending request must settle its deferred recovery as Aborted,
+            // release every reservation, and discard a read which completes after settlement.
+            auto deadline_options                = catalog_options;
+            deadline_options.before_payload_read = [] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            };
+            ninfer::serve::DurableSharedPrefixCatalog catalog(deadline_options);
+            ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+            ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+            const auto staging_deadline =
+                ninfer::serve::DurableSharedPrefixCatalog::Clock::now() + std::chrono::seconds(30);
+            auto staged         = catalog.stage_matching(restarted, prepared, staging_deadline);
+            const auto deadline = ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                                  std::chrono::milliseconds(5);
+            auto generation = ninfer::runtime::DurableSharedSnapshotAccess::submit(
+                restarted, std::move(prepared), fixed_output(3),
+                ninfer::OutputConsumerMode::Aggregate, ninfer::GenerationObservationOptions{}, deadline, staged.deferred_recovery);
+            catalog.load_staged(restarted, staged.deferred_recovery, deadline);
+            bool queue_timeout = false;
+            try {
+                (void)generation.wait(nullptr, {});
+            } catch (const ninfer::RequestError& error) {
+                queue_timeout = error.kind() == ninfer::RequestErrorKind::QueueTimeout;
+            }
+            const auto settled = catalog.settle_staged(staged.deferred_recovery);
+            const bool aborted = std::any_of(
+                settled.lifecycle.begin(), settled.lifecycle.end(), [](const auto& fact) {
+                    return fact.operation == ninfer::CheckpointLifecycleOperation::Restored &&
+                           fact.source_tier == ninfer::CheckpointLifecycleTier::Ssd &&
+                           fact.status == ninfer::CheckpointLifecycleStatus::Aborted;
+                });
+            if (!queue_timeout || settled.fallback_reason != "ssd-deadline" || !aborted ||
+                !restarted.healthy() ||
+                restarted.runtime_stats().logical_state_reserved_slots != 0) {
+                std::cerr << "deferred FIFO deadline was misclassified or retained recovery state: "
+                          << settled.fallback_reason << " aborted=" << aborted << '\n';
+                return 1;
+            }
+        }
+        const auto mutate_record = [&](const auto& mutation) {
+            std::filesystem::path record;
+            for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                const std::string name = entry.path().filename().string();
+                if (name.starts_with(durable_digest) && name.ends_with(".nsh")) {
+                    record = entry.path();
+                    break;
+                }
+            }
+            if (record.empty()) { throw std::runtime_error("durable record is missing"); }
+            std::ifstream input(record, std::ios::binary | std::ios::ate);
+            const std::streamsize size = input.tellg();
+            std::vector<std::uint8_t> record_bytes(static_cast<std::size_t>(size));
+            input.seekg(0);
+            input.read(reinterpret_cast<char*>(record_bytes.data()), size);
+            if (!input) { throw std::runtime_error("durable record read failed"); }
+            mutation(record_bytes);
+            std::ofstream output(record, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(record_bytes.data()),
+                         static_cast<std::streamsize>(record_bytes.size()));
+            if (!output) { throw std::runtime_error("durable record rewrite failed"); }
+        };
+        const auto reject_regenerate_publish_restart = [&](std::string_view label,
+                                                           std::string_view reason) {
+            {
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::Engine regenerated(shared_snapshot_engine_options(artifact));
+                ninfer::PreparedPrompt prepared = regenerated.prepare(shared_snapshot_prompt());
+                const auto rejected             = catalog.restore_matching(
+                    regenerated, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                const ninfer::GenerationResult generated =
+                    regenerated.generate(std::move(prepared), fixed_output(3));
+                catalog.schedule_exports(regenerated);
+                catalog.drain();
+                if (rejected.loaded_from_ssd || rejected.fallback_reason != reason ||
+                    generated.generated_token_ids != expected_tokens ||
+                    catalog.stats().corrupt_records != 1 || catalog.stats().writes_completed != 1 ||
+                    catalog.stats().pending_export_claims != 0) {
+                    std::cerr << "durable " << label
+                              << " record did not invalidate, regenerate and publish\n";
+                    return false;
+                }
+            }
+            {
+                ninfer::serve::DurableSharedPrefixCatalog catalog(catalog_options);
+                ninfer::Engine restarted(shared_snapshot_engine_options(artifact));
+                ninfer::PreparedPrompt prepared = restarted.prepare(shared_snapshot_prompt());
+                const auto restored             = catalog.restore_matching(
+                    restarted, prepared,
+                    ninfer::serve::DurableSharedPrefixCatalog::Clock::now() +
+                        std::chrono::seconds(30),
+                    {}, fixed_output(3));
+                if (!restored.loaded_from_ssd || restored.frontier != durable_frontier) {
+                    std::cerr << "durable " << label
+                              << " replacement was not reusable after restart\n";
+                    return false;
+                }
+            }
+            return true;
+        };
+        mutate_record([](std::vector<std::uint8_t>& record_bytes) {
+            const std::uint32_t binding_size =
+                snapshot_pod<std::uint32_t>(record_bytes, kSharedSnapshotHeaderBytes);
+            constexpr std::size_t snapshot_config_bytes = 56;
+            const std::size_t identity_tag_offset =
+                64U + binding_size + snapshot_config_bytes + 16U;
+            const std::uint32_t identity_tag =
+                snapshot_pod<std::uint32_t>(record_bytes, identity_tag_offset);
+            set_snapshot_pod(record_bytes, identity_tag_offset, identity_tag ^ 1U);
+            refresh_shared_snapshot_checksum(record_bytes);
+        });
+        if (!reject_regenerate_publish_restart("wrong-configuration", "ssd-validation-failure")) {
+            return 1;
+        }
+        mutate_record([](std::vector<std::uint8_t>& record_bytes) { record_bytes.back() ^= 1U; });
+        if (!reject_regenerate_publish_restart("checksum-invalid", "ssd-checksum-failure")) {
+            return 1;
+        }
+        std::filesystem::remove_all(directory, ignored);
+    }
+    return 0;
+}
+
+
+int exercise_capture_after_prefix_fork(const char* artifact) {
+    ninfer::EngineOptions options                   = shared_snapshot_engine_options(artifact);
+    options.max_concurrency                         = 1;
+    options.max_pending_requests                    = 1;
+    options.context_cache.device_state_slots        = 3;
+    options.context_cache.host_state_slots          = 4;
+    options.context_cache.host_kv_capacity_bytes    = 512ULL << 20;
+    options.context_cache.max_private_continuations = 8;
+    options.context_cache.max_shared_prefixes       = 4;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(std::move(options));
+
+    const auto branch = [](std::string suffix) {
+        ninfer::PromptInput input = shared_snapshot_prompt();
+        input.messages.back().parts.front().text =
+            "Begin with TEST, then identify synthetic branch " + std::move(suffix) + '.';
+        input.context_cache.automatic_private_anchors = 2;
+        return input;
+    };
+
+    std::uint32_t reused = 0;
+    for (std::uint32_t index = 0; index < 5; ++index) {
+        const ninfer::GenerationResult generated =
+            engine.generate(engine.prepare(branch(std::to_string(index))), fixed_output(8));
+        if (generated.generated_token_ids.size() != 8 ||
+            generated.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "capture-after-prefix-fork branch " << index
+                      << " did not complete after optional capture contention\n";
+            return 1;
+        }
+        reused += generated.reused_prompt_tokens != 0;
+    }
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    if (!engine.healthy() || reused < 2 || stats.shared_stable_prefix_selections == 0) {
+        std::cerr << "capture-after-prefix-fork did not preserve reusable execution: healthy="
+                  << engine.healthy() << " reused=" << reused
+                  << " shared=" << stats.shared_stable_prefix_selections << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+
 int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -2734,6 +8066,11 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
         result != 0) {
         return result;
     }
+    if (expected_target == "qwen3_8_27b") {
+        if (const int result = exercise_capture_after_prefix_fork(artifact); result != 0) {
+            return result;
+        }
+    }
     // Own Engine (and scope) per exercise: auto-save-on-eviction is a startup option.
     if (const int result = exercise_auto_save_evicted(artifact); result != 0) { return result; }
     if (const int result = exercise_auto_save_binding_is_per_session(artifact); result != 0) {
@@ -2754,6 +8091,193 @@ int main() {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "prefill-interleave") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        return exercise_short_prefill_during_long_prefill(qwen38_groupwise);
+    }
+    if (scenario != nullptr && (std::string_view(scenario) == "latest-response-pressure" ||
+                                std::string_view(scenario) == "latest-response-catalog" ||
+                                std::string_view(scenario) == "superseded-retirement")) {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "latest-response-pressure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_latest_response_under_state_pressure(
+            qwen38_groupwise, std::string_view(scenario) == "latest-response-catalog",
+            std::string_view(scenario) == "superseded-retirement");
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "idle-cache-pressure") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "idle-cache-pressure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_idle_cache_pressure(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-anchor-endpoint") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-anchor-endpoint requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_endpoint_with_shared_anchor(qwen38_groupwise);
+        if (result != 0) { return result; }
+        const int pressure = exercise_endpoint_with_shared_anchor(qwen38_groupwise, true);
+        if (pressure == 0) { std::cout << "ok\n"; }
+        return pressure;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "host-restore") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "host-restore requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_host_restore(qwen38_groupwise, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "responses-host-continuation") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cout << "skip: responses-host-continuation requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 77;
+        }
+        const int result = exercise_responses_host_continuation(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-import-errors") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        const int result =
+            exercise_shared_snapshot_round_trip(qwen38_groupwise, false, false, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-recovery-zero-output") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') { return 77; }
+        const int result = exercise_zero_output_durable_recovery(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-snapshot") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-snapshot requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-snapshot-lifecycle") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cout << "skip: shared-snapshot-lifecycle requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 77;
+        }
+        const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise, false, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "shared-snapshot-export-allocation") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "shared-snapshot-export-allocation requires "
+                         "NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_shared_snapshot_round_trip(qwen38_groupwise, true);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "delayed-spill") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "delayed-spill requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_delayed_spill_lifecycle(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "snapshot-quota-rejection") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "snapshot-quota-rejection requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_snapshot_quota_rejection(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "cache-fixture-equivalence") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "cache-fixture-equivalence requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_cache_fixture_equivalence(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "target-cache-calibration") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "target-cache-calibration requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_target_cache_calibration(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "four-request-root-fallback") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "four-request-root-fallback requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_four_request_root_fallback(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "capture-after-prefix-fork") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "capture-after-prefix-fork requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_capture_after_prefix_fork(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "delayed-active-capture") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "delayed-active-capture requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_delayed_active_capture_lifecycle(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "delayed-active-capture-pressure") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "delayed-active-capture-pressure requires "
+                         "NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_delayed_active_capture_pressure(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "pending-snapshot-shutdown") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "pending-snapshot-shutdown requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_pending_snapshot_shutdown(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "cuda-transfer-failure") {
+        if (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') {
+            std::cerr << "cuda-transfer-failure requires NINFER_QWEN3_8_27B_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_asynchronous_transfer_failure(qwen38_groupwise);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
     }
     if (scenario != nullptr && std::string_view(scenario) == "stream-observations") {
         const char* artifact = groupwise != nullptr && *groupwise != '\0' ? groupwise : nvfp4;

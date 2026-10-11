@@ -392,18 +392,23 @@ public:
         const auto less_valuable = [&](const ReplacementCandidate& left,
                                        const ReplacementCandidate& right) {
             const auto rank = [&](const ReplacementCandidate& value) {
-                std::uint64_t hits    = 0;
-                std::uint32_t credit  = 0;
-                std::uint64_t epoch   = 0;
-                std::uint64_t rebuild = 0;
+                // A victim whose image persists on SSD remains recoverable; only an unbacked
+                // victim loses its context. Prefer recoverable victims before comparing value.
+                std::uint8_t unrecoverable = 0;
+                std::uint64_t hits         = 0;
+                std::uint32_t credit       = 0;
+                std::uint64_t epoch        = 0;
+                std::uint64_t rebuild      = 0;
                 if (value.slot != kInvalidCatalogSlot) {
                     const SharedCatalogEntry& entry = shared_catalog_[value.slot];
+                    unrecoverable                   = entry.ssd_backed ? 0U : 1U;
                     hits                            = entry.observation.selected_hit_count;
                     credit                          = entry.explicit_credit ? 1U : 0U;
                     epoch                           = entry.observation.last_hit_epoch;
                     rebuild = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work);
                 }
-                return std::tuple{value.portfolio_loss,
+                return std::tuple{unrecoverable,
+                                  value.portfolio_loss,
                                   hits,
                                   credit,
                                   epoch,
@@ -469,8 +474,13 @@ public:
             // may be a private owner or a different shared owner whose complete Device replica
             // remains. Program is the authority for aliasing and exact allocator feasibility;
             // ResourceManager only ranks the feasible logical owners by retained value/last use.
-            if (!selected &&
-                (result.infeasibility == DurableImportFeasibility::LogicalCapacity ||
+            // These options compete with whole-owner replacement: dropping a duplicate loses no
+            // recoverable context, so it must not be skipped merely because a destructive
+            // replacement was also feasible.
+            const bool direct_publication =
+                vacant_slot && direct.feasibility == DurableImportFeasibility::Feasible;
+            if (!direct_publication &&
+                (selected || result.infeasibility == DurableImportFeasibility::LogicalCapacity ||
                  result.infeasibility == DurableImportFeasibility::LogicalStateCapacity ||
                  result.infeasibility == DurableImportFeasibility::HostStateCapacity ||
                  result.infeasibility == DurableImportFeasibility::HostKvCapacity)) {

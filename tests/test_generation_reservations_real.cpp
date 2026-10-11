@@ -71,6 +71,21 @@ struct Sink : ninfer::OutputSink {
 
 enum class Workload { Numbers, EarlyStop, ThinkingControl, ContextLimit };
 
+// A result is delivered before the engine retires its slot and republishes stats, so the last
+// published snapshot may still count the finished requests. Wait for the settled snapshot.
+ninfer::RuntimeStats settled_stats(ninfer::Engine& engine) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        auto stats = engine.runtime_stats();
+        if ((stats.running_requests == 0 && stats.waiting_requests == 0 &&
+             stats.generation_host_backing_bytes == 0) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return stats;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
 void run_mixed(const char* artifact, bool mtp, bool ample = false) {
     ninfer::EngineOptions options;
     options.artifact_path      = artifact;
@@ -190,7 +205,7 @@ void run_mixed(const char* artifact, bool mtp, bool ample = false) {
                         "mixed continuation differs from isolated greedy baseline");
             }
         }
-        const auto after = engine.runtime_stats();
+        const auto after = settled_stats(engine);
         std::cout << "mixed mtp=" << mtp << " cancel_full=" << cancel_full
                   << " peak_running=" << peak_running
                   << " short_finished_first=" << short_finished_first
@@ -215,15 +230,15 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
          Workload workload = Workload::Numbers, bool ample_pool = false,
          bool large_ceiling = false) {
     ninfer::EngineOptions options;
-    options.artifact_path      = artifact;
-    options.max_context        = large_ceiling ? 200000 : concurrency == 8 || shared ? 1024 : 512;
-    options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(
+    options.artifact_path = artifact;
+    options.max_context   = large_ceiling ? 200000 : concurrency == 8 || shared ? 1024 : 512;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(
         options.max_context * (ample_pool ? concurrency : 1));
-    options.max_concurrency    = concurrency;
-    options.pending_timeout_ms = 120000;
-    options.prefill_chunk      = 128;
-    options.generation_reservation_tokens        = quantum;
-    options.use_cuda_graph                       = concurrency != 2;
+    options.max_concurrency               = concurrency;
+    options.pending_timeout_ms            = 120000;
+    options.prefill_chunk                 = 128;
+    options.generation_reservation_tokens = quantum;
+    options.use_cuda_graph                = concurrency != 2;
     if (mtp) {
         options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
@@ -232,7 +247,7 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
     options.context_cache.host_kv_capacity_bytes =
         host ? (tight_host ? (mtp ? 10ULL : 32ULL) : 512ULL) << 20 : 0;
     if (large_ceiling) { options.context_cache.host_kv_capacity_bytes = 10ULL << 30; }
-    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_state_slots                  = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
     ninfer::Engine engine(options);
     const auto tokens =
@@ -252,26 +267,26 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
         input.options.enable_thinking = thinking;
         input.messages                = {
             {.role  = ninfer::ChatRole::System,
-                                                   .parts = {{.text =
+                            .parts = {{.text =
                                            "You are a precise assistant. Write only the requested numeric list. "
-                                                                                 "Separate consecutive integers with commas and spaces. Do not explain "
-                                                                                 "the task. "
-                                                                                 "Continue the list until the requested upper bound, without skipping "
-                                                                                 "numbers."}}},
+                                                          "Separate consecutive integers with commas and spaces. Do not explain "
+                                                          "the task. "
+                                                          "Continue the list until the requested upper bound, without skipping "
+                                                          "numbers."}}},
             {.role  = ninfer::ChatRole::User,
-                                                   .parts = {
+                            .parts = {
                  {.text = "Write the numbers from one to one thousand, separated by commas:"}}}};
         input.context_cache.allow_engine_automatic_shared_prefixes = false;
         if (shared) { input.context_cache.markers.push_back({.after_message_count = 1}); }
         return engine.prepare(std::move(input));
     };
     auto baseline = engine.generate(prepare(), request);
-    const auto expected_output = workload == Workload::ContextLimit
-                                     ? options.max_context - tokens.size() + 1 : 400;
+    const auto expected_output =
+        workload == Workload::ContextLimit ? options.max_context - tokens.size() + 1 : 400;
     require(baseline.generated_token_ids.size() == expected_output, "baseline output budget");
     require(baseline.finish_reason == (workload == Workload::ContextLimit
-                                          ? ninfer::FinishReason::ContextCapacity
-                                          : ninfer::FinishReason::OutputLimit),
+                                           ? ninfer::FinishReason::ContextCapacity
+                                           : ninfer::FinishReason::OutputLimit),
             "baseline limit reason");
     if (thinking) {
         require(baseline.thinking.applied && baseline.thinking.injected_tokens > 0,
@@ -333,7 +348,7 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
         while (results[i].wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
             peak_host_backing =
                 std::max(peak_host_backing, engine.runtime_stats().generation_host_backing_bytes);
-            const auto monitor = engine.context_snapshot();
+            const auto monitor    = engine.context_snapshot();
             std::uint32_t running = 0;
             for (const auto& slot : monitor.slots) {
                 if (!slot.processing) { continue; }
@@ -418,7 +433,7 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
                     "suspension changed forced thinking control");
         }
     }
-    const auto after = engine.runtime_stats();
+    const auto after = settled_stats(engine);
     if (delayed_cancellation) {
         require(transfer_delay.entered && transfer_delay.released && !transfer_delay.timed_out,
                 "cancellation did not progress independently of the delayed spill");
@@ -442,8 +457,8 @@ void run(const char* artifact, std::uint32_t concurrency, bool host, int cancel_
         require(after.generation_suspensions == 0, "zero Host budget suspended a request");
     }
     if (!host) {
-        require(peak_running == 1 && after.generation_extension_grants >
-                                       before.generation_extension_grants,
+        require(peak_running == 1 &&
+                    after.generation_extension_grants > before.generation_extension_grants,
                 "unbacked owners did not serialize with chunked reservations");
     }
     if (early_stop || ample_pool) {

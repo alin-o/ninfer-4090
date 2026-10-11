@@ -6,6 +6,7 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "runtime/engine/context_transfer_test_gate.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -3794,6 +3795,13 @@ bool ProgramImplCore::compose_pressure_candidate(
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
+    details.unique_reclamation               = runtime::UniquePhysicalReclamation{
+                      .device_state_slots      = removed.device.state_slots,
+                      .device_main_kv_pages    = removed.device.main_kv_pages,
+                      .device_backend_kv_pages = removed.device.backend_kv_pages,
+                      .host_state_slots        = removed.host.state_slots,
+                      .host_kv_bytes           = removed.host.kv_bytes,
+    };
 
     if (projection->source_state_fork_required &&
         details.state_fork_required != *projection->source_state_fork_required) {
@@ -5474,7 +5482,29 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
     work.state_changes.clear();
     work.main_kv_changes.clear();
     work.backend_kv_changes.clear();
+    work.pending_kv_offloads.clear();
     if (work.option.evicts_continuation) { return; }
+
+    const auto count_demotions = [](const auto& actions) {
+        return static_cast<std::size_t>(
+            std::count_if(actions.begin(), actions.end(), [](const auto& action) {
+                return action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+            }));
+    };
+    work.pending_kv_offloads.reserve(count_demotions(work.option.main_kv_changes) +
+                                     count_demotions(work.option.backend_kv_changes));
+    const auto record_demotions = [&](const auto& actions, runtime::ContextResourceClass resource) {
+        for (const qwen3_6::detail::PressureKVDecision& action : actions) {
+            if (action.kind != qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) { continue; }
+            work.pending_kv_offloads.push_back(runtime::CommittedKvOffloadRange{
+                .resource   = resource,
+                .begin_page = action.begin_page,
+                .page_count = action.page_count,
+            });
+        }
+    };
+    record_demotions(work.option.main_kv_changes, runtime::ContextResourceClass::MainKV);
+    record_demotions(work.option.backend_kv_changes, runtime::ContextResourceClass::BackendKV);
 
     work.state_changes.resize(work.option.state_changes.size());
 
@@ -5912,9 +5942,14 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     if (transaction_ptr == nullptr || transaction_ptr->terminal) {
         throw std::logic_error("Program has no progressable context transaction");
     }
-    MaterializationTransaction& transaction = *transaction_ptr;
-    PressureTransition& pressure_transition = transaction.pressure_transition;
-    const auto collect_pressure_operations  = [&](MaterializationTransaction::PressureWork& work) {
+    MaterializationTransaction& transaction  = *transaction_ptr;
+    PressureTransition& pressure_transition  = transaction.pressure_transition;
+    const auto observe_committed_reclamation = [&](auto&& operation) {
+        const detail::PhysicalResources before = physical_occupancy();
+        operation();
+        observe_physical_reclamation(before, transaction.committed_reclamation);
+    };
+    const auto collect_pressure_operations = [&](MaterializationTransaction::PressureWork& work) {
         if (work.spill_pages > std::numeric_limits<std::uint64_t>::max() -
                                    transaction.operations.pressure_spill_pages) {
             transaction.operations.pressure_spill_pages = std::numeric_limits<std::uint64_t>::max();
@@ -6020,6 +6055,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         release_materialization_staging(transaction);
         transaction.terminal      = true;
         out.status                = runtime::ContextTransactionStatus::Aborted;
+        out.committed_reclamation = transaction.committed_reclamation;
         out.transfer_observations = std::move(transaction.transfer_observations);
         out.operations            = transaction.operations;
         complete_source_acknowledgement(false);
@@ -6028,22 +6064,31 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_shared_victim_acknowledgement();
     };
 
-    if (cancellation.requested()) { transaction.cancel_pending = true; }
+    if (cancellation.requested()) {
+        transaction.cancel_pending = true;
+        if (!transaction.submitted_snapshot_cancellation_observed &&
+            !snapshot_source_retirements_.empty() &&
+            runtime::testing::snapshot_transfer_gate() != nullptr) {
+            runtime::testing::note_materialization_submitted_cancellation();
+            transaction.submitted_snapshot_cancellation_observed = true;
+        }
+    }
 
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        if (transaction.cancel_pending) {
-            abort_transaction();
-            return out;
-        }
         // An involuntary eviction may have started an asynchronous snapshot of one of these
         // owners during reservation.  The snapshot pins its State/KV sources until the
         // transfer-stream completion event retires; releasing the owner before that point would
         // make the planned victim appear non-releasable (and, worse, could race source reuse).
         // Keep the transaction at HostReleases and let the worker boundary retry after the
-        // completion event becomes ready.
+        // completion event becomes ready. This precedes cancellation: an aborted transaction
+        // must keep its logical claims and source pins until the snapshot has settled.
         retire_ready_snapshot_sources();
         if (!snapshot_source_retirements_.empty()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
+            return out;
+        }
+        if (transaction.cancel_pending) {
+            abort_transaction();
             return out;
         }
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
@@ -6065,8 +6110,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
                     throw std::logic_error("shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                detail::PhysicalResources released;
+                observe_committed_reclamation([&] {
+                    released =
+                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                });
                 if (released != exclusive) {
                     throw std::logic_error("shared pressure eviction acknowledgement is invalid");
                 }
@@ -6080,14 +6128,15 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 };
                 transaction.shared_victim_released[position] = true;
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
             }
         }
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
-                const PhysicalReleaseResult released =
-                    release_materialization_victim(transaction, position);
+                PhysicalReleaseResult released;
+                observe_committed_reclamation(
+                    [&] { released = release_materialization_victim(transaction, position); });
                 if (released.status != runtime::ConsumeStatus::Consumed ||
                     released.delta.added != detail::PhysicalResources{} ||
                     work.option.effect.added != detail::PhysicalResources{}) {
@@ -6098,7 +6147,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 work.mutation_published = true;
                 evict_private_result(transaction.pressure_results[position]);
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     SequenceState& victim = continuation_states[work.continuation_index];
                     retain_private_result(transaction.pressure_results[position], victim);
@@ -6249,14 +6298,15 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.completed) { continue; }
-            publish_pressure_work(work);
+            observe_committed_reclamation([&] { publish_pressure_work(work); });
             collect_pressure_operations(work);
             const std::uint32_t index = transaction.shared_victim_indices[position];
             transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
-                .owner              = transaction.shared_pressure_results[position].owner,
-                .disposition        = runtime::VictimDisposition::Retained,
-                .pressure_committed = true,
-                .final_summary      = shared_prefix_summary(shared_prefix_states[index]),
+                .owner                 = transaction.shared_pressure_results[position].owner,
+                .disposition           = runtime::VictimDisposition::Retained,
+                .pressure_committed    = true,
+                .final_summary         = shared_prefix_summary(shared_prefix_states[index]),
+                .committed_kv_offloads = std::move(work.pending_kv_offloads),
             };
             complete_pressure_delta(work);
             transaction.shared_victim_released[position] = true;
@@ -6266,11 +6316,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.completed) { continue; }
-            publish_pressure_work(work);
+            observe_committed_reclamation([&] { publish_pressure_work(work); });
             collect_pressure_operations(work);
             retain_private_result(transaction.pressure_results[position],
                                   continuation_states[work.continuation_index]);
             transaction.pressure_results[position].pressure_committed = true;
+            transaction.pressure_results[position].committed_kv_offloads =
+                std::move(work.pending_kv_offloads);
             complete_pressure_delta(work);
             transaction.victim_released[position] = true;
         }
@@ -6380,6 +6432,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     }
     transaction.terminal      = true;
     out.status                = runtime::ContextTransactionStatus::Published;
+    out.committed_reclamation = transaction.committed_reclamation;
     out.transfer_observations = std::move(transaction.transfer_observations);
     out.operations            = transaction.operations;
     complete_source_acknowledgement(true);
@@ -6391,6 +6444,10 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
 ContextTransactionProgress<Variant>
 ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    // Source pins are Program capabilities. The Host writer may wait for and consume its private
+    // image, but only this worker boundary mutates State/KV ownership, so retire settled pins
+    // before any transaction step inspects victim releasability.
+    retire_ready_snapshot_sources();
     // Planned eviction observers run after reservation and before this first physical step. Once
     // progress begins, no new snapshot may race the transaction's source mutations.
     snapshot_save_window_ = false;
@@ -6919,6 +6976,38 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
     }
     if (host_kv_arena) { out.host.kv_bytes = host_kv_arena->occupied_bytes(); }
     return out;
+}
+
+void ProgramImplCore::observe_physical_reclamation(
+    detail::PhysicalResources before, runtime::UniquePhysicalReclamation& total) const noexcept {
+    const detail::PhysicalResources after = physical_occupancy();
+    const auto add_u32 = [](std::uint32_t& destination, std::uint32_t value) noexcept {
+        destination = value > std::numeric_limits<std::uint32_t>::max() - destination
+                          ? std::numeric_limits<std::uint32_t>::max()
+                          : destination + value;
+    };
+    const auto add_size = [](std::size_t& destination, std::size_t value) noexcept {
+        destination = value > std::numeric_limits<std::size_t>::max() - destination
+                          ? std::numeric_limits<std::size_t>::max()
+                          : destination + value;
+    };
+    add_u32(total.device_state_slots, before.device.state_slots > after.device.state_slots
+                                          ? before.device.state_slots - after.device.state_slots
+                                          : 0U);
+    add_u32(total.device_main_kv_pages,
+            before.device.main_kv_pages > after.device.main_kv_pages
+                ? before.device.main_kv_pages - after.device.main_kv_pages
+                : 0U);
+    add_u32(total.device_backend_kv_pages,
+            before.device.backend_kv_pages > after.device.backend_kv_pages
+                ? before.device.backend_kv_pages - after.device.backend_kv_pages
+                : 0U);
+    add_u32(total.host_state_slots, before.host.state_slots > after.host.state_slots
+                                        ? before.host.state_slots - after.host.state_slots
+                                        : 0U);
+    add_size(total.host_kv_bytes, before.host.kv_bytes > after.host.kv_bytes
+                                      ? before.host.kv_bytes - after.host.kv_bytes
+                                      : 0U);
 }
 
 detail::PhysicalResources
@@ -8198,8 +8287,10 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
                                                  SharedPrefixSlotRole::ReservedReplacement)) {
                 throw std::logic_error("shared capture replacement is not strictly releasable");
             }
+            const detail::PhysicalResources before  = physical_occupancy();
             const detail::PhysicalResources removed = release_shared_prefix_state_strict(
                 *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement);
+            observe_physical_reclamation(before, transaction.committed_reclamation);
             if (removed != transaction.capacity_preparation_removed) {
                 throw std::logic_error("shared capture preparation release changed");
             }
@@ -8323,6 +8414,14 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::BackendKV);
         ++transaction.operations.partial_tail_cow_pages;
+    }
+    if (const auto* gate = runtime::testing::active_capture_transfer_gate(); gate != nullptr) {
+        if (gate->enqueue == nullptr) {
+            throw std::logic_error("active capture transfer test gate has no enqueue hook");
+        }
+        cuda_check(gate->enqueue(gate->context, device.transfer_stream),
+                   "enqueue active capture transfer test delay", __FILE__, __LINE__);
+        runtime::testing::note_active_capture_transfer_gate_wait();
     }
     context_completion_.record(device.transfer_stream);
     transaction.transfer_enqueue_pending = false;
@@ -8458,6 +8557,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         state_store->retain_checkpoint_reference(transaction.source_state);
     }
     if (transaction.publish_private) {
+        const detail::PhysicalResources before = physical_occupancy();
         if (transaction.recycles_private_state) {
             if (!sequence.rewrite_state ||
                 *sequence.rewrite_state != transaction.destination_state ||
@@ -8472,6 +8572,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
                                              transaction.private_replacement));
+        observe_physical_reclamation(before, transaction.committed_reclamation);
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {
@@ -8507,6 +8608,7 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     ActiveCaptureResult out;
     out.status                         = runtime::ContextTransactionStatus::Published;
     out.capacity_preparation_committed = transaction.replacement_removed;
+    out.committed_reclamation          = transaction.committed_reclamation;
     if (transaction.publish_private) {
         populate_continuation_summary(sequence, transaction.active_summary);
         out.active_summary = std::move(transaction.active_summary);
@@ -8562,10 +8664,26 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction_ptr == nullptr) {
         throw std::logic_error("Program has no active capture transaction");
     }
-    ActiveCaptureTransaction& transaction   = *transaction_ptr;
-    PressureTransition& pressure_transition = transaction.pressure_transition;
+    ActiveCaptureTransaction& transaction    = *transaction_ptr;
+    PressureTransition& pressure_transition  = transaction.pressure_transition;
+    const auto observe_committed_reclamation = [&](auto&& operation) {
+        const detail::PhysicalResources before = physical_occupancy();
+        operation();
+        observe_physical_reclamation(before, transaction.committed_reclamation);
+    };
     if (transaction.published) {
         throw std::logic_error("active capture terminal result was already returned");
+    }
+    if (cancellation.requested() && !transaction.cancel_pending) {
+        // The lifecycle regression observes cancellation only after the real State transfer has
+        // been submitted and its capability still owns the pinned source/destination. This is
+        // deliberately earlier than settlement and publication, which remain event-gated below.
+        if (transaction.transfer_submitted && transaction.state_snapshot &&
+            transaction.state_snapshot->valid() &&
+            runtime::testing::active_capture_transfer_gate() != nullptr) {
+            runtime::testing::note_active_capture_submitted_cancellation();
+        }
+        transaction.cancel_pending = true;
     }
     const auto abort = [&]() -> ActiveCaptureResult {
         abort_active_capture(transaction);
@@ -8582,6 +8700,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         ActiveCaptureResult out;
         out.status                         = runtime::ContextTransactionStatus::Aborted;
         out.capacity_preparation_committed = transaction.replacement_removed;
+        out.committed_reclamation          = transaction.committed_reclamation;
         out.victims                        = std::move(transaction.pressure_results);
         out.shared_victims                 = std::move(transaction.shared_pressure_results);
         out.transfer_observations          = std::move(transaction.transfer_observations);
@@ -8609,7 +8728,24 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
-        if (cancellation.requested()) { return abort(); }
+        // The Engine may have sealed an eviction snapshot after this capture topology was
+        // reserved. Its immutable sources stay pinned until the transfer event settles. That
+        // bounded handoff is not a topology violation: keep the transaction in progress and let
+        // independent admitted lanes run between progress boundaries. Preflight proved each
+        // victim releasable before the observer ran; the strict checks below still catch every
+        // unrelated ownership change.
+        retire_ready_snapshot_sources();
+        if (!snapshot_source_retirements_.empty()) {
+            for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
+                const auto& pending = transaction.pressure[position];
+                if (pending.option.evicts_continuation &&
+                    !can_release_continuation_slot_strict(transaction.victim_indices[position])) {
+                    return ActiveCaptureResult{.status =
+                                                   runtime::ContextTransactionStatus::InProgress};
+                }
+            }
+        }
+        if (transaction.cancel_pending) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -8627,8 +8763,11 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     throw std::logic_error(
                         "capture shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                detail::PhysicalResources released;
+                observe_committed_reclamation([&] {
+                    released =
+                        release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                });
                 if (released != exclusive ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("capture shared pressure eviction changed");
@@ -8642,7 +8781,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                 };
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     transaction.shared_pressure_results[position] =
                         MaterializationSharedVictimResult{
@@ -8671,7 +8810,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 }
                 const detail::PhysicalResources exclusive =
                     owner_exclusive_resources(continuation_states[index]);
-                release_continuation_slot_strict(index);
+                observe_committed_reclamation([&] { release_continuation_slot_strict(index); });
                 work.committed_delta    = detail::PhysicalDelta{.removed = exclusive};
                 work.completed          = true;
                 work.mutation_published = true;
@@ -8681,7 +8820,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                 };
             } else {
-                publish_pressure_host_releases(work);
+                observe_committed_reclamation([&] { publish_pressure_host_releases(work); });
                 if (work.completed) {
                     transaction.pressure_results[position] = MaterializationVictimResult{
                         .owner              = transaction.pressure_results[position].owner,
@@ -8788,7 +8927,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work = transaction.shared_pressure[position];
             if (!work.completed) {
-                publish_pressure_work(work);
+                observe_committed_reclamation([&] { publish_pressure_work(work); });
                 collect_spill(work);
                 transaction.shared_pressure_results[position] = MaterializationSharedVictimResult{
                     .owner              = transaction.shared_pressure_results[position].owner,
@@ -8796,13 +8935,14 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = shared_prefix_summary(
                         shared_prefix_states[transaction.shared_victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             auto& work = transaction.pressure[position];
             if (!work.completed) {
-                publish_pressure_work(work);
+                observe_committed_reclamation([&] { publish_pressure_work(work); });
                 collect_spill(work);
                 transaction.pressure_results[position] = MaterializationVictimResult{
                     .owner              = transaction.pressure_results[position].owner,
@@ -8810,6 +8950,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     .pressure_committed = true,
                     .final_summary      = continuation_summary(
                         continuation_states[transaction.victim_indices[position]]),
+                    .committed_kv_offloads = std::move(work.pending_kv_offloads),
                 };
             }
         }
@@ -8832,9 +8973,11 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (has_pressure() && pressure_transition.phase != PressureTransitionPhase::Committed) {
         throw std::logic_error("capture pressure transition did not reach a stable phase");
     }
-    if (cancellation.requested()) { return abort(); }
+    // A prepared capture may already own transfer-stream work. Cancellation is adopted below,
+    // after context_completion_ is ready, so abort_active_capture cannot release a live State
+    // destination, KV snapshot reservation, or source pin.
     if (!transaction.prepared) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             prepare_active_capture(transaction);
         } catch (...) {
@@ -8844,7 +8987,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
     }
     if (transaction.transfer_enqueue_pending) {
-        if (cancellation.requested()) { return abort(); }
+        if (transaction.cancel_pending) { return abort(); }
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
@@ -8900,7 +9043,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
         transaction.transfer_submitted = false;
     }
-    if (cancellation.requested()) { return abort(); }
+    if (transaction.cancel_pending) { return abort(); }
     return publish_active_capture(transaction);
 }
 
@@ -9363,6 +9506,10 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     if (state.state.fork_pending && state.state.borrows_read()) { return out; }
     try {
         out.summary.long_anchors.reserve(state.long_anchors.size());
+        // ResourceManager publishes at most endpoint + rewrite + every long anchor after the
+        // physical freeze. Reserve before mutation so observability cannot introduce a
+        // post-commit allocation failure at terminal retention.
+        out.lifecycle.reserve(state.long_anchors.size() + 2U);
     } catch (...) { return out; }
     try {
         if (state.state.fork_pending) {
@@ -9528,6 +9675,7 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
 void ProgramImplCore::fail_all_cleanup() noexcept {
     snapshot_save_window_ = false;
     pending_transaction_.reset();
+    settle_snapshot_sources();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
@@ -10533,21 +10681,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
-        if (is_masked_draft_backend(speculative_backend)) {
-            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
-                throw std::logic_error("DFlash prefill state is incomplete");
-            }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
-        }
+        upload_dflash_prefill_ingress(sequence);
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
@@ -11373,6 +11507,23 @@ void ProgramImplCore::select_sequence_kv_rows(const SequenceState& sequence) {
                                         : 0);
 }
 
+void ProgramImplCore::upload_dflash_prefill_ingress(const SequenceState& sequence) {
+    if (!is_masked_draft_backend(speculative_backend)) { return; }
+    if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
+        throw std::logic_error("DFlash prefill state is incomplete");
+    }
+    *dflash_host_ingress                            = {};
+    dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
+    const StateImageSelectors selectors             = state_selectors(sequence);
+    dflash_host_ingress->state_source_slots[0]      = selectors.source;
+    dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+    dflash_host_ingress->dflash_kv_table_rows[0] =
+        sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+    CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                               sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {
@@ -12023,7 +12174,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     }
 
     RequestControl::Prefill& staged = *request.prefill;
+    // The previous unit may belong to another admitted request. The KV table rows and the DFlash
+    // prefill ingress are Program-wide execution controls, so select this sequence's controls
+    // before every prefill step.
     select_sequence_kv_rows(sequence);
+    upload_dflash_prefill_ingress(sequence);
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }

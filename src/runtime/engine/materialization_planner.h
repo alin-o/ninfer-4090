@@ -218,10 +218,10 @@ public:
                                           : MaterializationStopReason::NoPressure,
                     false);
                 diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
-                diagnostics.budget_exhausted  = needs_optional_search;
-                diagnostics.search_stop_phase = needs_optional_search
-                                                    ? MaterializationSearchPhase::Setup
-                                                    : MaterializationSearchPhase::None;
+                diagnostics.budget_exhausted         = needs_optional_search;
+                diagnostics.search_stop_phase        = needs_optional_search
+                                                           ? MaterializationSearchPhase::Setup
+                                                           : MaterializationSearchPhase::None;
                 diagnostics.search_boundary_limited =
                     needs_optional_search && allowance.remaining(planning_now_ns<Clock>()) == 0;
                 Result result;
@@ -278,11 +278,10 @@ public:
                     fallback_candidate = candidate;
                 }
             }
-            const auto fallback_target = fallback_candidate == root_candidate_index
-                                             ? session.root_maximal_target(
-                                                   candidates[fallback_candidate].id)
-                                             : session.maximal_target(
-                                                   candidates[fallback_candidate].id);
+            const auto fallback_target =
+                fallback_candidate == root_candidate_index
+                    ? session.root_maximal_target(candidates[fallback_candidate].id)
+                    : session.maximal_target(candidates[fallback_candidate].id);
             AssessedPressureTarget assessed            = session.assess(fallback_target);
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[fallback_candidate].id) {
@@ -298,8 +297,8 @@ public:
             if (!goal && fallback_candidate != root_candidate_index) {
                 // The root remains the hard fallback if the cheapest reusable source cannot
                 // produce a legal publication target after maximal pressure.
-                AssessedPressureTarget root_assessed =
-                    session.assess(session.root_maximal_target(candidates[root_candidate_index].id));
+                AssessedPressureTarget root_assessed = session.assess(
+                    session.root_maximal_target(candidates[root_candidate_index].id));
                 const PressureTargetAssessment& root_assessment = root_assessed.assessment();
                 if (root_assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                     goal = logical_goal(root_assessment.candidate, root_assessment.source_mode,
@@ -311,16 +310,17 @@ public:
                         pressure.checkpoint_policy, machine_cost);
                     incumbent = make_incumbent(
                         session.root_maximal_target(candidates[root_candidate_index].id),
-                        root_candidate_index, root_assessment, std::move(root_assessed), cost, *goal);
+                        root_candidate_index, root_assessment, std::move(root_assessed), cost,
+                        *goal);
                     ++targets_evaluated;
                     planning_saturating_add(projection_work, root_assessment.projection_work);
                     mark_target(root_assessment.stable_target_ordinal,
                                 kTargetDiscovered | kTargetAssessed);
                 }
             } else if (goal) {
-                const FoldedCost cost = fold_assessment(
-                    candidates[fallback_candidate], assessment, pressure.owner_policy,
-                    pressure.checkpoint_policy, machine_cost);
+                const FoldedCost cost = fold_assessment(candidates[fallback_candidate], assessment,
+                                                        pressure.owner_policy,
+                                                        pressure.checkpoint_policy, machine_cost);
                 incumbent = make_incumbent(fallback_target, fallback_candidate, assessment,
                                            std::move(assessed), cost, *goal);
                 mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
@@ -542,8 +542,8 @@ public:
             path.cursor.emplace(session.begin_construction(target, restore));
         };
 
-        const auto lru_target = [&](std::uint32_t candidate)
-            -> std::optional<PressureTargetHandle> {
+        const auto lru_target =
+            [&](std::uint32_t candidate) -> std::optional<PressureTargetHandle> {
             std::optional<PressureTargetHandle> current;
             for (std::size_t depth = 0; depth < pressure.owner_policy.size(); ++depth) {
                 const PressureTargetHandle parent =
@@ -561,12 +561,12 @@ public:
                             });
                         const GuidanceCost cost = rank_guidance(candidate, *step.guidance);
                         if (evicts &&
-                            (!best || std::tuple{cost.newest_affected_hit_epoch,
-                                                 cost.affected_selected_hits,
-                                                 cost.retention_weight, cost.key()} <
-                                                 std::tuple{best->newest_affected_hit_epoch,
-                                                            best->affected_selected_hits,
-                                                            best->retention_weight, best->key()})) {
+                            (!best ||
+                             std::tuple{cost.newest_affected_hit_epoch, cost.affected_selected_hits,
+                                        cost.retention_weight, cost.key()} <
+                                 std::tuple{best->newest_affected_hit_epoch,
+                                            best->affected_selected_hits, best->retention_weight,
+                                            best->key()})) {
                             best        = cost;
                             best_option = step.option;
                         }
@@ -591,11 +591,10 @@ public:
         // afterwards. In particular, a shared source must be allowed to retain itself while an old
         // private owner supplies the publication cell.
         const auto seed_promising_maximal = [&]() {
-            const auto promising =
-                std::find_if(order.begin(), order.end(), [&](auto candidate) {
-                    return !candidate_seeded[candidate] &&
-                           identity_costs_[candidate].lower_bound_ns < incumbent.cost.total_ns;
-                });
+            const auto promising = std::find_if(order.begin(), order.end(), [&](auto candidate) {
+                return !candidate_seeded[candidate] &&
+                       identity_costs_[candidate].lower_bound_ns < incumbent.cost.total_ns;
+            });
             if (promising == order.end() || optional_targets >= kTargetBudget) { return false; }
             const auto candidate = *promising;
             if (const auto target = lru_target(candidate)) {
@@ -611,7 +610,7 @@ public:
                 if (candidate_seeded[candidate]) { return true; }
             }
             const auto gain = incumbent.cost.total_ns - identity_costs_[candidate].lower_bound_ns;
-            search_phase      = MaterializationSearchPhase::Assessment;
+            search_phase    = MaterializationSearchPhase::Assessment;
             if (!allow_work(assessment_step_ns, assessment_step_ns, gain, false)) { return false; }
             const auto target = session.maximal_target(candidates[candidate].id);
             const auto guide  = session.guidance(target);
@@ -873,12 +872,23 @@ public:
         std::optional<ResourcePlan> sealed =
             session.seal(std::move(*incumbent.assessed), prompt,
                          FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        // Final revalidation can report temporary unavailability (for example an active State
+        // fork awaiting execution, or a Host allocation blocked by extent geometry) that no
+        // pressure action removes. As on the identity path, leave admission queued and retry;
+        // throwing here would latch a permanent Engine failure.
+        if (!sealed) { return std::nullopt; }
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
-        diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
+        diagnostics.best_reuse_prompt_tokens     = best_offered_reuse(candidates);
+        diagnostics.reclaimed_device_state_slots = incumbent.unique_reclamation.device_state_slots;
+        diagnostics.reclaimed_device_main_kv_pages =
+            incumbent.unique_reclamation.device_main_kv_pages;
+        diagnostics.reclaimed_device_backend_kv_pages =
+            incumbent.unique_reclamation.device_backend_kv_pages;
+        diagnostics.reclaimed_host_state_slots = incumbent.unique_reclamation.host_state_slots;
+        diagnostics.reclaimed_host_kv_bytes    = incumbent.unique_reclamation.host_kv_bytes;
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -938,10 +948,22 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t target_ordinal            = 0;
+        // Device State victim class: 1 when the target removes the private endpoint State of a
+        // current conversation head. Classes are hard: value only ranks targets within a class,
+        // and among head-reclaiming targets the oldest authoritative head goes first.
+        std::uint8_t victim_class       = 0;
+        std::uint64_t oldest_head_epoch = 0;
+        // Worst recovery preference among touched owners (0 complete durable, 1 complete
+        // Device, 2 RAM-only). At equal value, prefer reclaiming the most recoverable owner; a
+        // target that touches no owner keeps the neutral worst rank and never gains from it.
+        std::uint8_t recovery_rank = 2;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
+                victim_class,
+                oldest_head_epoch,
                 total_ns,
+                recovery_rank,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
                 owner_evictions,
@@ -973,6 +995,7 @@ private:
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
         std::uint32_t degradation_units = 0;
         bool root_maximal               = false;
+        UniquePhysicalReclamation unique_reclamation;
     };
 
     struct IdentityRoot {
@@ -1023,10 +1046,19 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t stable_target_ordinal     = 0;
+        std::uint8_t victim_class               = 0;
+        std::uint64_t oldest_head_epoch         = 0;
+        // Worst recovery preference among touched owners (0 complete durable, 1 complete
+        // Device, 2 RAM-only). At equal value, prefer reclaiming the most recoverable owner; a
+        // target that touches no owner keeps the neutral worst rank and never gains from it.
+        std::uint8_t recovery_rank = 2;
 
         [[nodiscard]] auto key() const noexcept {
             return std::tuple{
+                victim_class,
+                oldest_head_epoch,
                 estimated_total_ns,
+                recovery_rank,
                 affected_selected_hits,
                 explicit_shared_losses,
                 owner_evictions,
@@ -1062,6 +1094,11 @@ private:
         if (restore || (complete && prior_complete)) { return cost.key() < prior.key(); }
         if (feasibility_first) {
             if (complete != prior_complete) { return complete; }
+            if (std::tuple{cost.victim_class, cost.oldest_head_epoch} !=
+                std::tuple{prior.victim_class, prior.oldest_head_epoch}) {
+                return std::tuple{cost.victim_class, cost.oldest_head_epoch} <
+                       std::tuple{prior.victim_class, prior.oldest_head_epoch};
+            }
             return std::tuple{cost.estimated_remaining_steps, cost.normalized_residual_q20,
                               cost.key()} < std::tuple{prior.estimated_remaining_steps,
                                                        prior.normalized_residual_q20, prior.key()};
@@ -1073,6 +1110,12 @@ private:
         };
         const auto a = relief(cost), b = relief(prior);
         if ((a != 0) != (b != 0)) { return a != 0; }
+        if (a && b &&
+            std::tuple{cost.victim_class, cost.oldest_head_epoch} !=
+                std::tuple{prior.victim_class, prior.oldest_head_epoch}) {
+            return std::tuple{cost.victim_class, cost.oldest_head_epoch} <
+                   std::tuple{prior.victim_class, prior.oldest_head_epoch};
+        }
         if (a && b) {
             const auto delta = [&](const GuidanceCost& item) {
                 return item.estimated_total_ns > parent.estimated_total_ns
@@ -1183,6 +1226,17 @@ private:
                 throw std::logic_error("pressure guidance references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
+            cost.recovery_rank = &outcome == &guidance.owner_outcomes.front()
+                                     ? policy->recovery_preference
+                                     : std::max(cost.recovery_rank, policy->recovery_preference);
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::PrivateEndpoint &&
+                policy->conversation_head) {
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
+                    cost.oldest_head_epoch = policy->authoritative_epoch;
+                }
+            }
             const bool may_reduce_recovery_value =
                 outcome.disposition == VictimDisposition::Evicted ||
                 outcome.dropped_checkpoints != 0 || outcome.degradation_units != 0;
@@ -1275,6 +1329,17 @@ private:
                 throw std::logic_error("pressure target references an unknown logical owner");
             }
             if (outcome.disposition == VictimDisposition::Evicted) { ++cost.owner_evictions; }
+            cost.recovery_rank = &outcome == &assessment.owner_outcomes.front()
+                                     ? policy->recovery_preference
+                                     : std::max(cost.recovery_rank, policy->recovery_preference);
+            if (outcome.device_state_victim_class == DeviceStateVictimClass::PrivateEndpoint &&
+                policy->conversation_head) {
+                const bool first_head = cost.victim_class == 0;
+                cost.victim_class     = 1;
+                if (first_head || policy->authoritative_epoch < cost.oldest_head_epoch) {
+                    cost.oldest_head_epoch = policy->authoritative_epoch;
+                }
+            }
         }
 
         impact_scratch_.clear();
@@ -1379,8 +1444,9 @@ private:
                     }
                     return outcomes;
                 }(),
-            .degradation_units = assessment.degradation_units,
-            .root_maximal      = assessment.root_maximal,
+            .degradation_units  = assessment.degradation_units,
+            .root_maximal       = assessment.root_maximal,
+            .unique_reclamation = assessment.unique_reclamation,
         };
     }
 

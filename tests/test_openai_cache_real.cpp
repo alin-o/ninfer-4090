@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -40,6 +41,7 @@ namespace ninfer::serve::testing {
 
 struct GenerationServiceTestAccess {
     static Engine& engine(GenerationService& service) { return *service.engine_; }
+
     static void set_before_payload_read(GenerationService& service,
                                         std::function<void()> callback) {
         service.set_before_payload_read_for_test(std::move(callback));
@@ -1348,40 +1350,104 @@ void exercise_service_ssd_winning_replacement(const char* artifact) {
     };
     const int suffix_tokens =
         restored.prompt_tokens - static_cast<int>(restored.metrics.prefix_cache_hit_tokens);
-    require(
-        before.logical_state_capacity_slots == 14 && before.logical_state_used_slots == 11 &&
-            before.logical_state_reserved_slots == 0 && before.logical_state_inflight_slots == 0 &&
-            before.device_state_occupied_slots == 6 && before.host_state_occupied_slots == 5 &&
-            before.shared_active_references == 0 && before_memory.host_state_capacity_slots == 8 &&
-            loads_before == 1 && restored.metrics.durable_loaded_from_ssd &&
-            !restored.metrics.durable_warm_available &&
-            restored.metrics.durable_fallback_reason == "ssd-successful-replacement" &&
-            restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix &&
-            restored.metrics.prefix_cache_hit_tokens == restored.metrics.durable_restore_frontier &&
-            restored.metrics.durable_restore_frontier == expected_frontier &&
-            suffix_tokens == expected_suffix_tokens &&
-            restored.generated_token_ids == oracle.generated_token_ids &&
-            after.shared_ssd_loads_completed == loads_before + 1U &&
-            after.logical_state_capacity_slots == before.logical_state_capacity_slots &&
-            after.logical_state_used_slots == 14 && after.logical_state_reserved_slots == 0 &&
-            after.logical_state_inflight_slots == 0 &&
-            after.device_state_occupied_slots == before.device_state_occupied_slots &&
-            after.host_state_occupied_slots == before_memory.host_state_capacity_slots &&
-            after.shared_active_references == 0 && shared_owner_count(service, after) == 3 &&
-            displaced != restored.checkpoint_lifecycle.end() &&
-            published != restored.checkpoint_lifecycle.end() &&
-            displaced->operation == CheckpointLifecycleOperation::Evicted &&
-            displaced->scope == CheckpointLifecycleScope::Shared &&
-            displaced->source_tier == CheckpointLifecycleTier::Host &&
-            displaced->destination_tier == CheckpointLifecycleTier::Ssd &&
-            displaced->status == CheckpointLifecycleStatus::Committed &&
-            displaced->frontier > expected_frontier &&
-            displaced->key_digests != std::array<std::uint64_t, 2>{} &&
-            displaced->key_digests != published->key_digests &&
-            published->frontier == expected_frontier &&
-            published->content_digest == initial_restore->content_digest &&
-            identifies_preexisting_shared_owner(*displaced),
-        "service-level 6/6 Device, 5/8 Host replay did not commit SSD-winning replacement");
+    // Name each failed condition; a combined predicate cannot diagnose an intermittent miss.
+    const std::array<std::pair<const char*, bool>, 39> replacement_checks{{
+        {"before.logical_state_capacity_slots == 14", before.logical_state_capacity_slots == 14},
+        {"before.logical_state_used_slots == 11", before.logical_state_used_slots == 11},
+        {"before.logical_state_reserved_slots == 0", before.logical_state_reserved_slots == 0},
+        {"before.logical_state_inflight_slots == 0", before.logical_state_inflight_slots == 0},
+        {"before.device_state_occupied_slots == 6", before.device_state_occupied_slots == 6},
+        {"before.host_state_occupied_slots == 5", before.host_state_occupied_slots == 5},
+        {"before.shared_active_references == 0", before.shared_active_references == 0},
+        {"before_memory.host_state_capacity_slots == 8",
+         before_memory.host_state_capacity_slots == 8},
+        {"loads_before == 1", loads_before == 1},
+        {"restored.metrics.durable_loaded_from_ssd", restored.metrics.durable_loaded_from_ssd},
+        {"!restored.metrics.durable_warm_available", !restored.metrics.durable_warm_available},
+        {"restored.metrics.durable_fallback_reason == \"ssd-successful-replacement\"",
+         restored.metrics.durable_fallback_reason == "ssd-successful-replacement"},
+        {"restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix",
+         restored.metrics.prefix_reuse_path == PrefixReusePath::SharedStablePrefix},
+        {"restored.metrics.prefix_cache_hit_tokens == restored.metrics.durable_restore_frontier",
+         restored.metrics.prefix_cache_hit_tokens == restored.metrics.durable_restore_frontier},
+        {"restored.metrics.durable_restore_frontier == expected_frontier",
+         restored.metrics.durable_restore_frontier == expected_frontier},
+        {"suffix_tokens == expected_suffix_tokens", suffix_tokens == expected_suffix_tokens},
+        {"restored.generated_token_ids == oracle.generated_token_ids",
+         restored.generated_token_ids == oracle.generated_token_ids},
+        {"after.shared_ssd_loads_completed == loads_before + 1U",
+         after.shared_ssd_loads_completed == loads_before + 1U},
+        {"after.logical_state_capacity_slots == before.logical_state_capacity_slots",
+         after.logical_state_capacity_slots == before.logical_state_capacity_slots},
+        {"after.logical_state_used_slots == 14", after.logical_state_used_slots == 14},
+        {"after.logical_state_reserved_slots == 0", after.logical_state_reserved_slots == 0},
+        {"after.logical_state_inflight_slots == 0", after.logical_state_inflight_slots == 0},
+        {"after.device_state_occupied_slots == before.device_state_occupied_slots",
+         after.device_state_occupied_slots == before.device_state_occupied_slots},
+        {"after.host_state_occupied_slots == before_memory.host_state_capacity_slots",
+         after.host_state_occupied_slots == before_memory.host_state_capacity_slots},
+        {"after.shared_active_references == 0", after.shared_active_references == 0},
+        {"shared_owner_count(service, after) == 3", shared_owner_count(service, after) == 3},
+        {"displaced != restored.checkpoint_lifecycle.end()",
+         displaced != restored.checkpoint_lifecycle.end()},
+        {"published != restored.checkpoint_lifecycle.end()",
+         published != restored.checkpoint_lifecycle.end()},
+        {"displaced->operation == CheckpointLifecycleOperation::Evicted",
+         displaced->operation == CheckpointLifecycleOperation::Evicted},
+        {"displaced->scope == CheckpointLifecycleScope::Shared",
+         displaced->scope == CheckpointLifecycleScope::Shared},
+        {"displaced->source_tier == CheckpointLifecycleTier::Host",
+         displaced->source_tier == CheckpointLifecycleTier::Host},
+        {"displaced->destination_tier == CheckpointLifecycleTier::Ssd",
+         displaced->destination_tier == CheckpointLifecycleTier::Ssd},
+        {"displaced->status == CheckpointLifecycleStatus::Committed",
+         displaced->status == CheckpointLifecycleStatus::Committed},
+        {"displaced->frontier > expected_frontier", displaced->frontier > expected_frontier},
+        {"displaced->key_digests != std::array<std::uint64_t, 2>{}",
+         displaced->key_digests != std::array<std::uint64_t, 2>{}},
+        {"displaced->key_digests != published->key_digests",
+         displaced->key_digests != published->key_digests},
+        {"published->frontier == expected_frontier", published->frontier == expected_frontier},
+        {"published->content_digest == initial_restore->content_digest",
+         published->content_digest == initial_restore->content_digest},
+        {"identifies_preexisting_shared_owner(*displaced)",
+         identifies_preexisting_shared_owner(*displaced)},
+    }};
+    std::string failed_checks;
+    for (const auto& [label, passed] : replacement_checks) {
+        if (!passed) { failed_checks += std::string("\n  ") + label; }
+    }
+    std::string victim_diag;
+    if (!failed_checks.empty() && displaced != restored.checkpoint_lifecycle.end()) {
+        const auto ordinal_of = [&](const GenerationOutcome& outcome) {
+            return std::any_of(outcome.checkpoint_lifecycle.begin(),
+                               outcome.checkpoint_lifecycle.end(), [&](const auto& fact) {
+                                   return fact.scope == CheckpointLifecycleScope::Shared &&
+                                          fact.key_digests == displaced->key_digests;
+                               });
+        };
+        victim_diag += "\n  displaced frontier=" + std::to_string(displaced->frontier) +
+                       " tiers=" + std::to_string(static_cast<int>(displaced->source_tier)) + "->" +
+                       std::to_string(static_cast<int>(displaced->destination_tier)) +
+                       " owner=" + (ordinal_of(resident_a) ? "a" : "") +
+                       (ordinal_of(resident_b) ? "b" : "") + (ordinal_of(explicit_c) ? "c" : "") +
+                       (ordinal_of(initial) ? "i" : "") +
+                       " writes_before=" + std::to_string(before.shared_ssd_writes_completed);
+        for (const auto* outcome : {&resident_a, &resident_b, &explicit_c}) {
+            victim_diag += "\n  facts:";
+            for (const auto& fact : outcome->checkpoint_lifecycle) {
+                if (fact.scope != CheckpointLifecycleScope::Shared) { continue; }
+                victim_diag += " op" + std::to_string(static_cast<int>(fact.operation)) + ":" +
+                               std::to_string(fact.frontier) + ":" +
+                               std::to_string(static_cast<int>(fact.destination_tier)) + ":" +
+                               std::to_string(static_cast<int>(fact.status));
+            }
+        }
+    }
+    const std::string replacement_failure =
+        "service-level 6/6 Device, 5/8 Host replay did not commit SSD-winning replacement:" +
+        failed_checks + victim_diag;
+    require(failed_checks.empty(), replacement_failure.c_str());
     require(std::string_view(ninfer::build::revision) != "unknown" &&
                 std::string_view(ninfer::build::revision).size() == 40,
             "service replay binary does not record an exact source revision");
@@ -1680,7 +1746,7 @@ void exercise_http_engine_failure(const char* artifact) {
     using Access = runtime::testing::SharedSnapshotTestAccess;
     std::vector<std::uint8_t> bytes;
     {
-        auto configured = options(artifact);
+        auto configured                             = options(artifact);
         configured.context_cache.device_state_slots = 4;
         GenerationService publisher(configured);
         (void)generate(publisher,
@@ -1688,21 +1754,21 @@ void exercise_http_engine_failure(const char* artifact) {
                            "\n=== CACHE_BREAKPOINT ===\nAnswer briefly.",
                        "Hi", false);
         (void)settled_stats(publisher, true);
-        auto [slot, snapshot] = Access::export_first_durable(
-            testing::GenerationServiceTestAccess::engine(publisher));
+        auto [slot, snapshot] =
+            Access::export_first_durable(testing::GenerationServiceTestAccess::engine(publisher));
         (void)slot;
         snapshot.await_transfer(snapshot.bytes);
         bytes = std::move(snapshot.bytes);
         snapshot.release_storage();
     }
     for (const std::uint32_t stats_interval : {0U, 60000U}) {
-        auto configured = options(artifact);
-        configured.host = "127.0.0.1";
-        configured.port = reserve_loopback_port();
-        configured.log_stats_interval_ms = stats_interval;
+        auto configured                             = options(artifact);
+        configured.host                             = "127.0.0.1";
+        configured.port                             = reserve_loopback_port();
+        configured.log_stats_interval_ms            = stats_interval;
         configured.context_cache.device_state_slots = 4;
         std::ostringstream logs;
-        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(logs);
+        auto sink   = std::make_shared<spdlog::sinks::ostream_sink_mt>(logs);
         auto logger = std::make_shared<spdlog::logger>("engine-failure-test", sink);
         GenerationService service(configured, {}, logger);
         auto& engine = testing::GenerationServiceTestAccess::engine(service);
@@ -1712,17 +1778,21 @@ void exercise_http_engine_failure(const char* artifact) {
         server.attach(service);
         std::promise<bool> stopped;
         auto result = stopped.get_future();
+
         struct Listener {
             HttpServer& server;
             std::thread thread;
+
             ~Listener() {
                 server.stop();
                 if (thread.joinable()) { thread.join(); }
             }
         } listener{server, std::thread([&] {
-                       try { stopped.set_value(server.listen()); }
-                       catch (...) { stopped.set_exception(std::current_exception()); }
+                       try {
+                           stopped.set_value(server.listen());
+                       } catch (...) { stopped.set_exception(std::current_exception()); }
                    })};
+
         httplib::Client client(configured.host, configured.port);
         client.set_read_timeout(5);
         const auto healthy = client.Get("/health");
@@ -1739,12 +1809,16 @@ void exercise_http_engine_failure(const char* artifact) {
                         throw std::logic_error("injected fatal engine failure");
                     }
                 }};
+
             ImportFailure() { runtime::testing::install_shared_snapshot_import_gate(&gate); }
+
             ~ImportFailure() { runtime::testing::clear_shared_snapshot_import_gate(); }
         } failure;
+
         bool injected = false;
-        try { (void)Access::import(engine, bytes); }
-        catch (const std::logic_error&) { injected = true; }
+        try {
+            (void)Access::import(engine, bytes);
+        } catch (const std::logic_error&) { injected = true; }
         require(injected && !service.healthy(), "fixture did not latch an engine failure");
         // No health probe or new inference request is needed to shut the listener down.
         require(result.wait_for(std::chrono::seconds(5)) == std::future_status::ready,

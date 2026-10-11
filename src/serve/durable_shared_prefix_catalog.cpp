@@ -1262,8 +1262,12 @@ DurableSharedPrefixRestore DurableSharedPrefixCatalog::restore_matching(
                     : "ssd-validation-failure";
         } catch (const std::invalid_argument& error) {
             runtime::DurableSharedSnapshotAccess::cancel_recovery(engine, reservation_id);
+            // Classify by the typed import-boundary kind, never by message text: an adoption
+            // rejection may legitimately mention "stale" or "checksum".
+            const auto* import_error = dynamic_cast<const runtime::DurableImportError*>(&error);
             observation.fallback_reason =
-                std::string_view(error.what()).find("stale") != std::string_view::npos
+                import_error != nullptr &&
+                        import_error->kind() == runtime::DurableImportErrorKind::StalePlan
                     ? "ssd-stale-replanned"
                     : "ssd-adoption-failure";
         } catch (...) {
